@@ -137,12 +137,20 @@ impl App {
         for e in self.events()? {
             self.hlc.observe(&e.hlc);
         }
+        // ulid 3.x generates through a monotonic Generator; on same-millisecond
+        // random-part overflow (astronomically rare), fall back to a fresh
+        // random id rather than failing the whole emit.
+        let mut ulid_gen = ulid::Generator::new();
         let events: Vec<Event> = ops
             .into_iter()
             .map(|op| {
                 let hlc = self.hlc.now();
+                let id = match ulid_gen.generate() {
+                    Ok(id) => id,
+                    Err(overflow) => overflow.commit_overflow_random(),
+                };
                 Event {
-                    id: EventId(ulid::Ulid::new()),
+                    id: EventId(id),
                     hlc,
                     author: self.author.clone(),
                     op,

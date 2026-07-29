@@ -46,11 +46,21 @@ impl FileEventLog {
     /// Append to this machine's current segment (0001.jsonl for phase 1;
     /// segment rotation arrives with sync push/pull in a later phase).
     ///
+    /// No fsync: a crash mid-write may drop the tail of the batch, and
+    /// readers tolerate torn tails by treating the incomplete line as a bad
+    /// line rather than failing the whole read.
+    ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized, or
     /// [`LogError::Io`] if the segment file can't be opened or written to.
     pub fn append(&mut self, events: &[Event]) -> Result<(), LogError> {
         let seg = self.machine_dir.join("0001.jsonl");
+        let mut batch = String::new();
+        for e in events {
+            let line = serde_json::to_string(e)?;
+            batch.push_str(&line);
+            batch.push('\n');
+        }
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -59,13 +69,11 @@ impl FileEventLog {
                 path: seg.clone(),
                 source,
             })?;
-        for e in events {
-            let line = serde_json::to_string(e)?;
-            writeln!(f, "{line}").map_err(|source| LogError::Io {
+        f.write_all(batch.as_bytes())
+            .map_err(|source| LogError::Io {
                 path: seg.clone(),
                 source,
             })?;
-        }
         Ok(())
     }
 
@@ -78,6 +86,11 @@ impl FileEventLog {
 
     /// Corrupt lines are skipped and reported, never fatal: one bad byte
     /// on a shuttle drive must not take down the whole catalog.
+    ///
+    /// Returned order is grouped by machine (directory iteration order,
+    /// which is unspecified), with segments sorted within each machine —
+    /// there is no global HLC order. Callers must not assume one; the CRDT
+    /// projection this feeds is order-independent by design.
     ///
     /// # Errors
     /// Returns [`LogError::Io`] if the events directory or a machine's
@@ -114,11 +127,19 @@ impl FileEventLog {
                     path: machine.path(),
                     source,
                 })?;
+                let file_type = entry.file_type().map_err(|source| LogError::Io {
+                    path: entry.path(),
+                    source,
+                })?;
                 let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
+                if file_type.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
                     segments.push(path);
                 }
             }
+            // Lexicographic sort: segment names must stay equal-width
+            // (NNNN.jsonl) for this to also be numeric order. The rotation
+            // implementer must preserve zero-padding or switch to a
+            // numeric-aware sort.
             segments.sort();
             for seg in segments {
                 let text = fs::read_to_string(&seg).map_err(|source| LogError::Io {
@@ -206,5 +227,19 @@ mod tests {
         std::fs::create_dir(dir.path().join("events/m1/0002.jsonl")).expect("mkdir");
         let all = log.read_all().expect("read");
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn events_merge_across_segments_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        log.append(&[ev(1)]).expect("append segment 1");
+        let seg2 = dir.path().join("events/m1/0002.jsonl");
+        let line = serde_json::to_string(&ev(2)).expect("serialize");
+        std::fs::write(&seg2, format!("{line}\n")).expect("write segment 2");
+        let all = log.read_all().expect("read");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].hlc.wall_ms, 1);
+        assert_eq!(all[1].hlc.wall_ms, 2);
     }
 }

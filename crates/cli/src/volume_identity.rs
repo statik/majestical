@@ -5,6 +5,7 @@
 //! to the mount's last path component as both id and label — weaker, but
 //! scan must never fail because identity resolution did.
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 pub struct VolumeIdentity {

@@ -446,11 +446,23 @@ fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
             .collect();
         println!("{}", serde_json::json!({ "volumes": rows }));
     } else {
-        println!(
-            "{:<30} {:<16} {:<32} {:<8} ASSETS",
-            "ID", "LABEL", "LAST SEEN", "ONLINE"
-        );
-        for (id, label, last_seen_ms) in &volumes {
+        print_volumes_table(&volumes, &counts, suspect_ceiling);
+    }
+    Ok(())
+}
+
+/// Renders the human-readable volumes table with column widths sized to
+/// the widest cell in each column (header included) — a fixed width breaks
+/// alignment once an auto-detected `uuid:` id (41 chars) or a
+/// "(clock suspect)"-annotated last-seen cell appears.
+fn print_volumes_table(
+    volumes: &[(String, String, u64)],
+    counts: &HashMap<String, u64>,
+    suspect_ceiling: u64,
+) {
+    let rows: Vec<(String, String, String, &'static str, u64)> = volumes
+        .iter()
+        .map(|(id, label, last_seen_ms)| {
             let mut last_seen = iso8601_ms(*last_seen_ms);
             if *last_seen_ms > suspect_ceiling {
                 last_seen.push_str(" (clock suspect)");
@@ -461,10 +473,20 @@ fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
                 "offline"
             };
             let count = counts.get(id).copied().unwrap_or(0);
-            println!("{id:<30} {label:<16} {last_seen:<32} {online:<8} {count}");
-        }
+            (id.clone(), label.clone(), last_seen, online, count)
+        })
+        .collect();
+    let id_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(2);
+    let label_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(5);
+    let seen_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(9);
+    let online_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(6);
+    println!(
+        "{:<id_w$} {:<label_w$} {:<seen_w$} {:<online_w$} ASSETS",
+        "ID", "LABEL", "LAST SEEN", "ONLINE"
+    );
+    for (id, label, last_seen, online, count) in &rows {
+        println!("{id:<id_w$} {label:<label_w$} {last_seen:<seen_w$} {online:<online_w$} {count}");
     }
-    Ok(())
 }
 
 fn main() -> Result<()> {

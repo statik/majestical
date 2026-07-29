@@ -29,4 +29,10 @@ planning session should triage these against the spec's build order.
 - **Case-insensitive search is ASCII-only** until FTS lands (documented in
   catalog-sqlite).
 - **`Op::FieldSet` has no CLI surface** — implemented and property-tested in core;
-  expose ratings/titles when the organize surface lands.
+  expose ratings/titles when the organize surface lands. (Done in phase 2: `maj meta`.)
+- **Extract `cmd_*` handlers into a commands module** — main.rs is at ~600 lines
+  after phase 2; when the next command lands, leave main.rs as clap definitions +
+  dispatch (phase 2 Task 4-5 quality review).
+- **Site copy phantom features** — the marketing site advertises `maj verify` and
+  `--tag -status/rejected` negation before they exist; reconcile when verify ships,
+  or reword sooner.

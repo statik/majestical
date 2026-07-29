@@ -1,6 +1,6 @@
 //! End-to-end: init a catalog, scan a folder, tag by name-match, search.
 use assert_cmd::Command;
-use predicates::str::contains;
+use predicates::str::{contains, diff};
 
 #[cfg(test)]
 fn maj_as(catalog: &std::path::Path, machine_id: &str) -> Command {
@@ -44,8 +44,8 @@ fn init_scan_tag_search_round_trip() {
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let id = hits["results"][0]["asset"].as_str().unwrap().to_string();
     assert_eq!(hits["count"], 1);
+    let id = first_asset_id(&out);
 
     maj(&root)
         .args(["tag", "add", &id, "topic/drone"])
@@ -504,14 +504,49 @@ fn meta_set_get_round_trip() {
         .args(["meta", "get", &id, "rating"])
         .assert()
         .success()
-        .stdout(contains("5"));
+        .stdout(diff("5\n"));
 
-    // Getting every field (no field name) lists it as a `field\tvalue` line.
+    // Getting every field (no field name) lists it as `field\tvalue` lines.
     maj(&root)
         .args(["meta", "get", &id])
         .assert()
         .success()
-        .stdout(contains("rating\t5"));
+        .stdout(diff("rating\t5\n"));
+}
+
+/// Getting a field that was never set prints an empty line in text mode,
+/// or `{"field":null}` in JSON — "not set yet" is not an error, mirroring
+/// `search`'s zero-hits style.
+#[test]
+fn meta_get_on_a_missing_field_is_empty_not_an_error() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .assert()
+        .success();
+    let out = maj(&root)
+        .args(["search", "--name", "clip", "--json"])
+        .output()
+        .unwrap();
+    let id = first_asset_id(&out);
+
+    maj(&root)
+        .args(["meta", "get", &id, "rating"])
+        .assert()
+        .success()
+        .stdout(diff("\n"));
+    maj(&root)
+        .args(["meta", "get", &id, "rating", "--json"])
+        .assert()
+        .success()
+        .stdout(diff("{\"rating\":null}\n"));
 }
 
 /// `meta set` on an unscanned asset fails the same way `tag add` does.

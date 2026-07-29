@@ -18,6 +18,8 @@ pub enum LogError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("no event log at {} — initialize the catalog first", path.display())]
+    NotInitialized { path: PathBuf },
     #[error("serializing event: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -31,6 +33,10 @@ impl FileEventLog {
     /// Initializes a fresh catalog root: creates `<root>/events` and
     /// `machine`'s own segment directory under it. Call once per catalog
     /// root (`maj catalog init`), before any `open`.
+    ///
+    /// Idempotent, git-init style: re-running against an already
+    /// initialized root just creates any missing directories and never
+    /// touches existing segment files, so it's always safe to call again.
     ///
     /// # Errors
     /// Returns [`LogError::Io`] if the directories can't be created.
@@ -53,18 +59,13 @@ impl FileEventLog {
     /// to create a catalog root from scratch.
     ///
     /// # Errors
-    /// Returns [`LogError::Io`] if `<root>/events` is missing, or if this
-    /// machine's segment directory can't be created.
+    /// Returns [`LogError::NotInitialized`] if `<root>/events` is missing,
+    /// or [`LogError::Io`] if this machine's segment directory can't be
+    /// created.
     pub fn open(root: &Path, machine: &MachineId) -> Result<Self, LogError> {
         let events_dir = root.join("events");
         if !events_dir.is_dir() {
-            return Err(LogError::Io {
-                path: events_dir,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "no catalog here — run `maj catalog init` first",
-                ),
-            });
+            return Err(LogError::NotInitialized { path: events_dir });
         }
         let machine_dir = events_dir.join(&machine.0);
         fs::create_dir_all(&machine_dir).map_err(|source| LogError::Io {
@@ -233,7 +234,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = FileEventLog::open(dir.path(), &MachineId("m1".into()));
         assert!(
-            matches!(result, Err(LogError::Io { .. })),
+            matches!(result, Err(LogError::NotInitialized { .. })),
             "open must fail on an uninitialized root"
         );
     }

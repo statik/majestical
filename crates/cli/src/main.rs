@@ -1,8 +1,10 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
+mod iso8601;
 mod volume_identity;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
+use iso8601::iso8601_ms;
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::{Clock, HlcClock, MAX_DRIFT_MS, MachineId, ObserveOutcome};
 use majestical_core::event::{AssetId, Event, EventId, Op};
@@ -41,6 +43,10 @@ struct Cli {
     /// Stable machine identity (env `MAJ_MACHINE_ID`).
     #[arg(long, env = "MAJ_MACHINE_ID", help = "Stable machine identity")]
     machine_id: String,
+    /// Human/service identity recorded on emitted events (env `MAJ_AUTHOR`).
+    /// Defaults to the machine id when omitted.
+    #[arg(long, env = "MAJ_AUTHOR", help = "Author identity for emitted events")]
+    author: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -116,14 +122,35 @@ struct App<L> {
 type FsApp = App<FileEventLog>;
 
 impl FsApp {
-    fn open(root: &Path, machine: &str) -> Result<Self> {
+    /// Opens an already-initialized catalog. Errors rather than creating one
+    /// implicitly — a missing catalog is almost always a typo'd path, and
+    /// silently creating an empty one there would hide that.
+    fn open(root: &Path, machine: &str, author: &str) -> Result<Self> {
+        anyhow::ensure!(
+            root.join("events").is_dir(),
+            "no catalog at {} — run `maj catalog init` first",
+            root.display()
+        );
         let machine = MachineId(machine.to_string());
         let log = FileEventLog::open(root, &machine)
             .with_context(|| format!("opening catalog at {}", root.display()))?;
         Ok(Self {
             log,
-            hlc: HlcClock::new(machine.clone(), Box::new(SystemClock)),
-            author: machine.0,
+            hlc: HlcClock::new(machine, Box::new(SystemClock)),
+            author: author.to_string(),
+            catalog_root: root.to_path_buf(),
+        })
+    }
+
+    /// Creates a fresh catalog at `root` (`maj catalog init`).
+    fn init(root: &Path, machine: &str, author: &str) -> Result<Self> {
+        let machine = MachineId(machine.to_string());
+        let log = FileEventLog::init(root, &machine)
+            .with_context(|| format!("initializing catalog at {}", root.display()))?;
+        Ok(Self {
+            log,
+            hlc: HlcClock::new(machine, Box::new(SystemClock)),
+            author: author.to_string(),
             catalog_root: root.to_path_buf(),
         })
     }
@@ -208,8 +235,8 @@ impl<L: EventLog> App<L> {
     }
 }
 
-fn cmd_catalog_init(cli: &Cli) -> Result<()> {
-    FsApp::open(&cli.catalog, &cli.machine_id)?;
+fn cmd_catalog_init(cli: &Cli, author: &str) -> Result<()> {
+    FsApp::init(&cli.catalog, &cli.machine_id, author)?;
     println!("initialized catalog at {}", cli.catalog.display());
     Ok(())
 }
@@ -286,13 +313,26 @@ fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// `tag add` writes metadata about an asset that must already have a
+/// physical observation on record — otherwise a typo'd id silently creates
+/// a phantom catalog entry that `search` and `scan` can never produce, and
+/// would look scanned when it never was.
+fn ensure_asset_known(projection: &Projection, asset: &AssetId) -> Result<()> {
+    anyhow::ensure!(
+        projection.has_instances(asset),
+        "unknown asset {} — scan its volume first, or check `maj search`",
+        asset.0
+    );
+    Ok(())
+}
+
 fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
     match cmd {
         TagCmd::Add { asset, tag } => {
-            app.emit(vec![Op::TagAdd {
-                asset: AssetId(asset),
-                tag,
-            }])?;
+            let p = app.projection()?;
+            let asset = AssetId(asset);
+            ensure_asset_known(&p, &asset)?;
+            app.emit(vec![Op::TagAdd { asset, tag }])?;
         }
         TagCmd::Rm { asset, tag } => {
             let p = app.projection()?;
@@ -376,41 +416,6 @@ fn volume_is_online(id: &str, label: &str) -> bool {
     true
 }
 
-/// Formats milliseconds since the Unix epoch as an ISO-8601 UTC timestamp
-/// (`YYYY-MM-DDTHH:MM:SSZ`), using civil calendar math rather than pulling
-/// in a datetime dependency for one display need.
-fn iso8601_ms(wall_ms: u64) -> String {
-    let secs = wall_ms / 1000;
-    let days = secs / 86_400;
-    let time_of_day = secs % 86_400;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day / 60) % 60;
-    let second = time_of_day % 60;
-    let (year, month, day) = civil_from_days(i64::try_from(days).unwrap_or(i64::MAX));
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days`: converts a day count since the Unix
-/// epoch (1970-01-01) into a (year, month, day) proleptic Gregorian date.
-/// <http://howardhinnant.github.io/date_algorithms.html>
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (
-        year,
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
-    )
-}
-
 fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let projection = app.projection()?;
     let db_path = catalog_dir.join("catalog.db");
@@ -491,43 +496,29 @@ fn print_volumes_table(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let author = cli.author.clone().unwrap_or_else(|| cli.machine_id.clone());
     match cli.cmd {
         Cmd::Catalog {
             cmd: CatalogCmd::Init,
-        } => cmd_catalog_init(&cli)?,
+        } => cmd_catalog_init(&cli, &author)?,
         Cmd::Scan { dir, volume } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             cmd_scan(&mut app, &dir, volume)?;
         }
         Cmd::Tag { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             cmd_tag(&mut app, cmd)?;
         }
         Cmd::Search { name, tag, json } => {
-            let app = FsApp::open(&cli.catalog, &cli.machine_id)?;
+            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             cmd_search(&app, &cli.catalog, name, tag, json)?;
         }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {
-            let app = FsApp::open(&cli.catalog, &cli.machine_id)?;
+            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             cmd_volumes_list(&app, &cli.catalog, json)?;
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod iso8601_ms_tests {
-    use super::iso8601_ms;
-
-    #[test]
-    fn formats_a_leap_day_midnight() {
-        assert_eq!(iso8601_ms(1_709_164_800_000), "2024-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn formats_the_last_second_of_a_year() {
-        assert_eq!(iso8601_ms(1_735_689_599_000), "2024-12-31T23:59:59Z");
-    }
 }

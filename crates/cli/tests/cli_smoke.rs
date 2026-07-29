@@ -114,6 +114,12 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
 /// adopted outright: the HLC clamps it (see `clock.rs`'s own tests for the
 /// clamp behavior), and the CLI surfaces a single warning on stderr rather
 /// than letting the poisoned event's ordering silently take over.
+///
+/// The poisoned event is an `AssetSeen` rather than a `TagAdd` so that
+/// `xxh3:deadbeef` has a recorded instance — `tag add` validates that the
+/// asset is known, and this scenario is about clock poisoning, not that
+/// validation, so the asset must actually be "scanned" (here, by the
+/// planted peer event rather than a real scan).
 #[test]
 fn far_future_peer_event_triggers_clamp_warning() {
     let catalog = tempfile::tempdir().unwrap();
@@ -141,9 +147,11 @@ fn far_future_peer_event_triggers_clamp_warning() {
             machine: majestical_core::clock::MachineId("peerbad".into()),
         },
         author: "peerbad".into(),
-        op: majestical_core::event::Op::TagAdd {
+        op: majestical_core::event::Op::AssetSeen {
             asset: majestical_core::event::AssetId("xxh3:deadbeef".into()),
-            tag: "poison".into(),
+            volume: "peerbad-volume".into(),
+            path: "poison.mov".into(),
+            size: 1,
         },
     };
     let line = serde_json::to_string(&poisoned).unwrap();
@@ -359,4 +367,110 @@ fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
         .assert()
         .success()
         .stdout(contains("(clock suspect)"));
+}
+
+/// Any command against a catalog directory that was never initialized fails
+/// fast with a clear message, rather than silently creating an empty
+/// catalog on a typo'd path.
+#[test]
+fn commands_against_an_uninitialized_catalog_fail_with_a_clear_message() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root)
+        .args(["search", "--name", "anything", "--json"])
+        .assert()
+        .failure()
+        .stderr(contains("no catalog at"))
+        .stderr(contains("maj catalog init"));
+}
+
+/// After `catalog init`, commands against that same root succeed.
+#[test]
+fn commands_succeed_after_catalog_init() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["search", "--name", "anything", "--json"])
+        .assert()
+        .success();
+}
+
+/// `tag add` on an asset id that was never scanned (no recorded instances)
+/// fails, and leaves the catalog unchanged — a subsequent search for the
+/// tag finds nothing.
+#[test]
+fn tag_add_on_an_unscanned_asset_fails_and_leaves_the_catalog_unchanged() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    maj(&root)
+        .args(["tag", "add", "xxh3:neverseen", "some/tag"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown asset xxh3:neverseen"));
+
+    let out = maj(&root)
+        .args(["search", "--tag", "some/tag", "--json"])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(hits["count"], 0);
+}
+
+/// Events carry the `--author`/`MAJ_AUTHOR` identity, distinct from the
+/// machine id, in the raw event log line on disk.
+#[test]
+fn emitted_events_carry_the_configured_author() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .env("MAJ_AUTHOR", "elliot")
+        .assert()
+        .success();
+
+    let seg = root.join("events/test-machine/0001.jsonl");
+    let contents = std::fs::read_to_string(&seg).unwrap();
+    assert!(
+        contents
+            .lines()
+            .all(|line| line.contains(r#""author":"elliot""#)),
+        "expected every event to carry author \"elliot\", got: {contents}"
+    );
+}
+
+/// The default author (no `--author`/`MAJ_AUTHOR`) is the machine id.
+#[test]
+fn author_defaults_to_the_machine_id() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .assert()
+        .success();
+
+    let seg = root.join("events/test-machine/0001.jsonl");
+    let contents = std::fs::read_to_string(&seg).unwrap();
+    assert!(
+        contents
+            .lines()
+            .all(|line| line.contains(r#""author":"test-machine""#)),
+        "expected every event to carry the default author \"test-machine\", got: {contents}"
+    );
 }

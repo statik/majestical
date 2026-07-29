@@ -147,6 +147,16 @@ impl Projection {
             .map(|(_, v)| v.as_str())
     }
 
+    /// True when `asset` has at least one physical observation
+    /// (`AssetSeen`) on record — i.e. it was actually scanned, not merely
+    /// referenced by a tag or field mutation.
+    #[must_use]
+    pub fn has_instances(&self, asset: &AssetId) -> bool {
+        self.assets
+            .get(asset)
+            .is_some_and(|s| !s.instances.is_empty())
+    }
+
     pub fn assets(&self) -> impl Iterator<Item = (&AssetId, &AssetState)> {
         self.assets.iter()
     }
@@ -375,5 +385,37 @@ mod tests {
         assert_eq!(fwd, rev);
         assert_eq!(fwd.field(&a, "rating"), Some("5"));
         assert!(!fwd.tags(&a).contains("t"));
+    }
+
+    #[test]
+    fn has_instances_requires_an_asset_seen_observation() {
+        let a = asset();
+        let mut p = Projection::default();
+        assert!(!p.has_instances(&a), "unscanned asset has no instances");
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::TagAdd {
+                asset: a.clone(),
+                tag: "t".into(),
+            },
+        ));
+        assert!(
+            !p.has_instances(&a),
+            "a tag alone must not count as an instance"
+        );
+        p.apply(&ev(
+            2,
+            2,
+            "m1",
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "V1".into(),
+                path: "a.mov".into(),
+                size: 1,
+            },
+        ));
+        assert!(p.has_instances(&a));
     }
 }

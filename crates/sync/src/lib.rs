@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error(
-        "event log io at {}: {source} — check the sync root is writable",
+        "event log io at {}: {source} — check the sync root is accessible",
         path.display()
     )]
     Io {
@@ -97,15 +97,28 @@ impl FileEventLog {
                 path: events_dir.clone(),
                 source,
             })?;
-            let mut segments: Vec<PathBuf> = fs::read_dir(machine.path())
-                .map_err(|source| LogError::Io {
+            let is_dir = machine.file_type().map_err(|source| LogError::Io {
+                path: machine.path(),
+                source,
+            })?;
+            if !is_dir.is_dir() {
+                continue;
+            }
+            let segment_entries = fs::read_dir(machine.path()).map_err(|source| LogError::Io {
+                path: machine.path(),
+                source,
+            })?;
+            let mut segments: Vec<PathBuf> = Vec::new();
+            for entry in segment_entries {
+                let entry = entry.map_err(|source| LogError::Io {
                     path: machine.path(),
                     source,
-                })?
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect();
+                })?;
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
+                    segments.push(path);
+                }
+            }
             segments.sort();
             for seg in segments {
                 let text = fs::read_to_string(&seg).map_err(|source| LogError::Io {
@@ -171,5 +184,27 @@ mod tests {
         let mut skipped = 0;
         let all = log.read_all_reporting(|_line| skipped += 1).expect("read");
         assert_eq!((all.len(), skipped), (1, 1));
+    }
+
+    #[test]
+    fn stray_files_in_events_root_are_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        log.append(&[ev(1)]).expect("append");
+        let events_dir = dir.path().join("events");
+        std::fs::write(events_dir.join(".DS_Store"), b"junk").expect("write DS_Store");
+        std::fs::write(events_dir.join("conflicted copy.jsonl"), b"junk").expect("write stray");
+        let all = log.read_all().expect("read");
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn directory_named_like_segment_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        log.append(&[ev(1)]).expect("append");
+        std::fs::create_dir(dir.path().join("events/m1/0002.jsonl")).expect("mkdir");
+        let all = log.read_all().expect("read");
+        assert_eq!(all.len(), 1);
     }
 }

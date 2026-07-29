@@ -1,11 +1,12 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::{Clock, HlcClock, MachineId};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_core::projection::Projection;
 use majestical_sync::FileEventLog;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 struct SystemClock;
@@ -54,6 +55,9 @@ enum Cmd {
         cmd: TagCmd,
     },
     /// Search the catalog projection.
+    #[command(group(
+        ArgGroup::new("search_by").args(["name", "tag"]).required(true).multiple(false)
+    ))]
     Search {
         #[arg(long)]
         name: Option<String>,
@@ -93,9 +97,8 @@ impl App {
         })
     }
 
-    /// Loads every event in the log once. Both `projection` (read paths) and
-    /// `emit` (write paths, to fold the log into the clock before stamping)
-    /// need the full event set, so callers doing both share one read.
+    /// Loads every event currently in the log. Each call re-reads the log
+    /// from disk; per-process caching arrives with the adapter refactor.
     fn events(&self) -> Result<Vec<Event>> {
         self.log.read_all().context("reading event log")
     }
@@ -134,6 +137,14 @@ impl App {
     }
 }
 
+// Restoring the workspace's full lint table (see Cargo.toml) brought in
+// `too_many_lines`. Splitting each `Cmd` arm into its own function is the
+// real fix, but that extraction is deferred to the adapter-layer phase;
+// this crate's single-file, single-`main` shape is intentional for now.
+#[expect(
+    clippy::too_many_lines,
+    reason = "extraction deferred to the adapter-layer phase"
+)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -151,9 +162,28 @@ fn main() -> Result<()> {
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                let bytes = std::fs::read(entry.path())
+                let size = entry
+                    .metadata()
+                    .with_context(|| format!("reading metadata for {}", entry.path().display()))?
+                    .len();
+                let file = std::fs::File::open(entry.path())
                     .with_context(|| format!("reading {}", entry.path().display()))?;
-                let hash = xxhash_rust::xxh3::xxh3_128(&bytes);
+                // Stream the hash rather than loading the whole file: media
+                // assets can be multi-gigabyte, so a `Vec<u8>` per file would
+                // blow up memory on a scan of a card full of video.
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                let mut reader = std::io::BufReader::new(file);
+                let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+                loop {
+                    let n = reader
+                        .read(&mut buf)
+                        .with_context(|| format!("reading {}", entry.path().display()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let hash = hasher.digest128();
                 // Phase 1: lossy UTF-8 conversion of the relative path. JSON
                 // events force UTF-8 anyway, so a non-UTF-8 path can't round
                 // trip through the log yet; revisit once ingest needs to
@@ -168,7 +198,7 @@ fn main() -> Result<()> {
                     asset: AssetId(format!("xxh3:{hash:032x}")),
                     volume: volume.clone(),
                     path: rel,
-                    size: bytes.len() as u64,
+                    size,
                 });
             }
             let n = ops.len();
@@ -208,10 +238,15 @@ fn main() -> Result<()> {
             let db_path = cli.catalog.join("catalog.db");
             let db = SqliteCatalog::rebuild(&db_path, &projection)
                 .context("rebuilding sqlite projection")?;
-            let ids = match (&name, &tag) {
-                (Some(n), None) => db.search_by_name(n)?,
-                (None, Some(t)) => db.search_by_tag(t)?,
-                _ => anyhow::bail!("pass exactly one of --name or --tag"),
+            let ids = match (name, tag) {
+                (Some(n), None) => db.search_by_name(&n)?,
+                (None, Some(t)) => db.search_by_tag(&t)?,
+                // The `search_by` ArgGroup (required, mutually exclusive)
+                // guarantees clap rejects these combinations before `main`
+                // ever runs, so this arm can't be reached.
+                (Some(_), Some(_)) | (None, None) => {
+                    unreachable!("clap's search_by ArgGroup allows exactly one of these")
+                }
             };
             if json {
                 let results: Vec<_> = ids

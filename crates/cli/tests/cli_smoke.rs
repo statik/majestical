@@ -39,18 +39,23 @@ fn init_scan_tag_search_round_trip() {
         .args(["tag", "add", &id, "topic/drone"])
         .assert()
         .success();
-    maj(&root)
+    let out = maj(&root)
         .args(["search", "--tag", "topic/drone", "--json"])
-        .assert()
-        .success()
-        .stdout(contains(&id));
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(hits["count"], 1);
+    assert_eq!(hits["results"][0]["asset"], id);
+
     maj(&root)
         .args(["tag", "rm", &id, "topic/drone"])
         .assert()
         .success();
-    maj(&root)
+    let out = maj(&root)
         .args(["search", "--tag", "topic/drone", "--json"])
-        .assert()
-        .success()
-        .stdout(contains("\"count\":0"));
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(hits["count"], 0);
+    assert_eq!(hits["results"].as_array().unwrap().len(), 0);
 }

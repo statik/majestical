@@ -355,7 +355,7 @@ impl Projection {
 
     /// Every recorded manifest generation, across every volume, paired with
     /// its volume id.
-    pub fn manifests_by_volume(&self) -> impl Iterator<Item = (&String, &ManifestRecord)> {
+    pub fn all_manifests(&self) -> impl Iterator<Item = (&String, &ManifestRecord)> {
         self.manifests
             .iter()
             .flat_map(|(volume, records)| records.iter().map(move |r| (volume, r)))

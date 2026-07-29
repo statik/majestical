@@ -90,8 +90,7 @@ impl SqliteCatalog {
              );
              CREATE TABLE manifests (
                volume TEXT NOT NULL, generation INTEGER NOT NULL,
-               mhl_path TEXT NOT NULL, roothash TEXT NOT NULL,
-               PRIMARY KEY (volume, generation, mhl_path)
+               mhl_path TEXT NOT NULL, roothash TEXT NOT NULL
              );",
         )
     }
@@ -170,7 +169,7 @@ impl SqliteCatalog {
     }
 
     fn insert_manifests(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
-        for (volume, record) in projection.manifests_by_volume() {
+        for (volume, record) in projection.all_manifests() {
             tx.execute(
                 "INSERT INTO manifests (volume, generation, mhl_path, roothash) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -708,6 +707,45 @@ mod tests {
                 "ascmhl/0001_dest_x.mhl".to_string(),
                 "xxh64:aa".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_manifests_that_differ_only_in_roothash() {
+        // Same (volume, generation, mhl_path) with a different roothash is
+        // exactly what roothash exists to catch — a tampered or re-recorded
+        // manifest — so it must not collide with the earlier record and
+        // abort the whole rebuild transaction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::ManifestRecorded {
+                    volume: "V1".into(),
+                    mhl_path: "ascmhl/0001_dest_x.mhl".into(),
+                    generation: 1,
+                    roothash: "xxh64:aa".into(),
+                },
+                Op::ManifestRecorded {
+                    volume: "V1".into(),
+                    mhl_path: "ascmhl/0001_dest_x.mhl".into(),
+                    generation: 1,
+                    roothash: "xxh64:bb".into(),
+                },
+            ],
+        );
+        let mut stmt = db
+            .conn
+            .prepare("SELECT roothash FROM manifests ORDER BY roothash")
+            .expect("prepare");
+        let roothashes: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            roothashes,
+            vec!["xxh64:aa".to_string(), "xxh64:bb".to_string()]
         );
     }
 }

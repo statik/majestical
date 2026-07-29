@@ -4,6 +4,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::{Clock, HlcClock, MachineId};
 use majestical_core::event::{AssetId, Event, EventId, Op};
+use majestical_core::ports::EventLog;
 use majestical_core::projection::Projection;
 use majestical_sync::FileEventLog;
 use std::io::Read;
@@ -79,14 +80,18 @@ enum TagCmd {
     Rm { asset: String, tag: String },
 }
 
-struct App {
-    log: FileEventLog,
+struct App<L: EventLog> {
+    log: L,
     hlc: HlcClock,
     author: String,
     catalog_root: PathBuf,
 }
 
-impl App {
+/// The CLI's concrete adapter wiring: a real, filesystem-backed event log.
+/// The `App<L>` split exists so tests and future adapters can swap it out.
+type FsApp = App<FileEventLog>;
+
+impl FsApp {
     fn open(root: &Path, machine: &str) -> Result<Self> {
         let machine = MachineId(machine.to_string());
         let log = FileEventLog::open(root, &machine)
@@ -98,7 +103,9 @@ impl App {
             catalog_root: root.to_path_buf(),
         })
     }
+}
 
+impl<L: EventLog> App<L> {
     /// Loads every event currently in the log. Each call re-reads the log
     /// from disk; per-process caching arrives with the adapter refactor.
     ///
@@ -109,7 +116,7 @@ impl App {
         let mut skipped = 0usize;
         let events = self
             .log
-            .read_all_reporting(|_line| skipped += 1)
+            .read_all_reporting(&mut |_line| skipped += 1)
             .context("reading event log")?;
         if skipped > 0 {
             eprintln!(
@@ -163,12 +170,12 @@ impl App {
 }
 
 fn cmd_catalog_init(cli: &Cli) -> Result<()> {
-    App::open(&cli.catalog, &cli.machine_id)?;
+    FsApp::open(&cli.catalog, &cli.machine_id)?;
     println!("initialized catalog at {}", cli.catalog.display());
     Ok(())
 }
 
-fn cmd_scan(app: &mut App, dir: &Path, volume: &str) -> Result<()> {
+fn cmd_scan(app: &mut FsApp, dir: &Path, volume: &str) -> Result<()> {
     let mut ops = Vec::new();
     for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
         let entry = entry.context("walking scan directory")?;
@@ -220,7 +227,7 @@ fn cmd_scan(app: &mut App, dir: &Path, volume: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tag(app: &mut App, cmd: TagCmd) -> Result<()> {
+fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
     match cmd {
         TagCmd::Add { asset, tag } => {
             app.emit(vec![Op::TagAdd {
@@ -249,7 +256,7 @@ fn cmd_tag(app: &mut App, cmd: TagCmd) -> Result<()> {
 }
 
 fn cmd_search(
-    app: &App,
+    app: &FsApp,
     catalog_dir: &Path,
     name: Option<String>,
     tag: Option<String>,
@@ -257,8 +264,9 @@ fn cmd_search(
 ) -> Result<()> {
     let projection = app.projection()?;
     let db_path = catalog_dir.join("catalog.db");
-    let db =
-        SqliteCatalog::rebuild(&db_path, &projection).context("rebuilding sqlite projection")?;
+    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
+    db.rebuild(&projection)
+        .context("rebuilding sqlite projection")?;
     let ids = match (name, tag) {
         (Some(n), None) => db.search_by_name(&n)?,
         (None, Some(t)) => db.search_by_tag(&t)?,
@@ -294,15 +302,15 @@ fn main() -> Result<()> {
             cmd: CatalogCmd::Init,
         } => cmd_catalog_init(&cli)?,
         Cmd::Scan { dir, volume } => {
-            let mut app = App::open(&cli.catalog, &cli.machine_id)?;
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
             cmd_scan(&mut app, &dir, &volume)?;
         }
         Cmd::Tag { cmd } => {
-            let mut app = App::open(&cli.catalog, &cli.machine_id)?;
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
             cmd_tag(&mut app, cmd)?;
         }
         Cmd::Search { name, tag, json } => {
-            let app = App::open(&cli.catalog, &cli.machine_id)?;
+            let app = FsApp::open(&cli.catalog, &cli.machine_id)?;
             cmd_search(&app, &cli.catalog, name, tag, json)?;
         }
     }

@@ -2,19 +2,15 @@
 //! recreates it wholesale from a `Projection` (incremental apply and
 //! FTS5/sqlite-vec arrive in later phases).
 use majestical_core::event::AssetId;
+use majestical_core::ports::{CatalogStore, PortError};
 use majestical_core::projection::Projection;
 use rusqlite::Connection;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog db: {0} — delete the file and rebuild from the event log")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("removing stale catalog at {}: {source} — close other apps using it and retry", path.display())]
-    RemoveStale {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 }
 
 pub struct SqliteCatalog {
@@ -22,31 +18,29 @@ pub struct SqliteCatalog {
 }
 
 impl SqliteCatalog {
-    /// Recreates the catalog database at `path` from `projection`, wholesale.
-    ///
-    /// Any existing file at `path` is discarded first — the database is a
-    /// disposable projection, not a source of truth.
+    /// Opens (creating if needed) the catalog database at `path`. Does not
+    /// populate it — call `rebuild` to (re)populate the projection tables.
     ///
     /// # Errors
-    /// Returns an error if the database file can't be opened or a write fails.
-    pub fn rebuild(path: &Path, projection: &Projection) -> Result<Self, CatalogError> {
-        // Projection files are disposable; the event log is the truth. A
-        // missing file is fine (nothing to discard); any other failure
-        // (permissions, the file being open elsewhere) must propagate rather
-        // than silently rebuilding on top of stale data.
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(CatalogError::RemoveStale {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
-        let mut conn = Connection::open(path)?;
-        conn.execute_batch(
-            "CREATE TABLE assets (id TEXT PRIMARY KEY);
+    /// Returns an error if the database file can't be opened.
+    pub fn open(path: &Path) -> Result<Self, CatalogError> {
+        let conn = Connection::open(path)?;
+        Ok(Self { conn })
+    }
+
+    /// Recreates the catalog's projection tables from `projection`, wholesale.
+    ///
+    /// Any existing tables are dropped first — the database is a disposable
+    /// projection, not a source of truth.
+    ///
+    /// # Errors
+    /// Returns an error if a table can't be (re)created or a write fails.
+    pub fn rebuild(&mut self, projection: &Projection) -> Result<(), CatalogError> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS tags;
+             DROP TABLE IF EXISTS instances;
+             DROP TABLE IF EXISTS assets;
+             CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
                volume TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
@@ -59,7 +53,7 @@ impl SqliteCatalog {
              CREATE INDEX tags_by_tag ON tags (tag);",
         )?;
 
-        let tx = conn.transaction()?;
+        let tx = self.conn.transaction()?;
         for (asset, state) in projection.assets() {
             tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
             for (volume, path, size) in &state.instances {
@@ -77,7 +71,7 @@ impl SqliteCatalog {
         }
         tx.commit()?;
 
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// Finds assets tagged with `tag` exactly.
@@ -123,6 +117,20 @@ fn escape_like(needle: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+impl CatalogStore for SqliteCatalog {
+    fn rebuild(&mut self, projection: &Projection) -> Result<(), PortError> {
+        Self::rebuild(self, projection).map_err(|e| PortError::new("catalog store", e))
+    }
+
+    fn search_by_tag(&self, tag: &str) -> Result<Vec<AssetId>, PortError> {
+        Self::search_by_tag(self, tag).map_err(|e| PortError::new("catalog store", e))
+    }
+
+    fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError> {
+        Self::search_by_name(self, needle).map_err(|e| PortError::new("catalog store", e))
+    }
 }
 
 #[cfg(test)]
@@ -172,7 +180,8 @@ mod tests {
             });
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = SqliteCatalog::rebuild(&dir.path().join("catalog.db"), &p).expect("rebuild");
+        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        db.rebuild(&p).expect("rebuild");
         assert_eq!(
             db.search_by_tag("topic/drone").expect("tag query"),
             vec![a.clone()]
@@ -207,6 +216,7 @@ mod tests {
     fn rebuild_discards_previous_data() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("catalog.db");
+        let mut db = SqliteCatalog::open(&path).expect("open");
 
         let a = AssetId("xxh3:aa".into());
         let mut p1 = Projection::default();
@@ -223,7 +233,7 @@ mod tests {
                 tag: "keep-a".into(),
             },
         });
-        SqliteCatalog::rebuild(&path, &p1).expect("rebuild a");
+        db.rebuild(&p1).expect("rebuild a");
 
         let b = AssetId("xxh3:bb".into());
         let mut p2 = Projection::default();
@@ -240,7 +250,7 @@ mod tests {
                 tag: "keep-b".into(),
             },
         });
-        let db = SqliteCatalog::rebuild(&path, &p2).expect("rebuild b");
+        db.rebuild(&p2).expect("rebuild b");
 
         assert_eq!(
             db.search_by_tag("keep-a").expect("query a"),

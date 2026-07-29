@@ -3,6 +3,7 @@
 //! so dumb transports (Dropbox, rsync, a shuttle drive) can carry it.
 use majestical_core::clock::MachineId;
 use majestical_core::event::Event;
+use majestical_core::ports::{EventLog, PortError};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,20 @@ impl FileEventLog {
             }
         }
         Ok(out)
+    }
+}
+
+impl EventLog for FileEventLog {
+    fn append(&mut self, events: &[Event]) -> Result<(), PortError> {
+        Self::append(self, events).map_err(|e| PortError::new("event log", e))
+    }
+
+    fn read_all_reporting(
+        &self,
+        on_bad_line: &mut dyn FnMut(&str),
+    ) -> Result<Vec<Event>, PortError> {
+        Self::read_all_reporting(self, |line| on_bad_line(line))
+            .map_err(|e| PortError::new("event log", e))
     }
 }
 

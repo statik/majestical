@@ -33,7 +33,9 @@ jobs:
         with:
           persist-credentials: false
       - run: |
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
           ./actionlint -color
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-      - run: uvx zizmor .github/workflows/
+      - run: uvx zizmor==1.28.0 .github/workflows/  # bump manually; dependabot can't see uvx pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

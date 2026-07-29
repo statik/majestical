@@ -625,6 +625,14 @@ fn para_add_list_rename_archive_round_trip() {
     assert_eq!(nodes[0]["id"], node_id);
     assert_eq!(nodes[0]["name"], "client-y");
     assert_eq!(nodes[0]["archived"], true);
+
+    // An archived node no longer resolves by `<kind>/<name>` — only a raw
+    // node id reaches it now (see `resolve_para_node`'s non-archived filter).
+    maj(&root)
+        .args(["para", "rename", "project/client-y", "z"])
+        .assert()
+        .failure()
+        .stderr(contains("no active PARA node"));
 }
 
 /// A second `para add` for the same (kind, name) while the first is still

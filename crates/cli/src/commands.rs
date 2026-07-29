@@ -489,6 +489,14 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
         println!("ok (no --root given; no directories moved)");
         return Ok(());
     }
+    // A node of kind `archive` already materializes under `Archives/` (its
+    // own `dir_name()`), so source and target would be the same path for
+    // every root — reject up front rather than reporting a no-op "move" in
+    // dry-run and a target-already-exists error in the real run.
+    anyhow::ensure!(
+        kind != ParaKind::Archive,
+        "node of kind archive is already under Archives/ — nothing to move"
+    );
 
     for root in roots {
         let source = root.join(kind.dir_name()).join(name);

@@ -190,6 +190,14 @@ impl CatalogStore for SqliteCatalog {
     fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError> {
         Self::search_by_name(self, needle).map_err(|e| PortError::new("catalog store", e))
     }
+
+    fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError> {
+        Self::volumes(self).map_err(|e| PortError::new("catalog store", e))
+    }
+
+    fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, PortError> {
+        Self::volume_asset_counts(self).map_err(|e| PortError::new("catalog store", e))
+    }
 }
 
 #[cfg(test)]

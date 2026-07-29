@@ -51,6 +51,14 @@ pub trait CatalogStore {
     /// # Errors
     /// Returns `PortError` when the query fails.
     fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError>;
+    /// Every volume ever seen: (id, label, last-seen wall ms), ordered by id.
+    /// # Errors
+    /// Returns `PortError` when the query fails.
+    fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError>;
+    /// Distinct asset count per volume, ordered by volume.
+    /// # Errors
+    /// Returns `PortError` when the query fails.
+    fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, PortError>;
 }
 
 #[cfg(test)]
@@ -72,6 +80,62 @@ mod tests {
         ) -> Result<Vec<Event>, PortError> {
             Ok(self.0.clone())
         }
+    }
+
+    #[derive(Default)]
+    struct MemStore {
+        vols: Vec<(String, String, u64)>,
+    }
+    impl CatalogStore for MemStore {
+        fn rebuild(&mut self, projection: &Projection) -> Result<(), PortError> {
+            self.vols = projection
+                .volumes()
+                .map(|(id, st)| {
+                    (
+                        id.clone(),
+                        st.label().unwrap_or("").to_string(),
+                        st.last_seen().map_or(0, |h| h.wall_ms),
+                    )
+                })
+                .collect();
+            Ok(())
+        }
+        fn search_by_tag(&self, _tag: &str) -> Result<Vec<AssetId>, PortError> {
+            Ok(Vec::new())
+        }
+        fn search_by_name(&self, _needle: &str) -> Result<Vec<AssetId>, PortError> {
+            Ok(Vec::new())
+        }
+        fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError> {
+            Ok(self.vols.clone())
+        }
+        fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn catalog_store_port_serves_volume_queries() {
+        let mut p = Projection::default();
+        p.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(1, 1)),
+            hlc: Hlc {
+                wall_ms: 7,
+                counter: 0,
+                machine: MachineId("m".into()),
+            },
+            author: "t".into(),
+            op: Op::VolumeSeen {
+                volume: "V1".into(),
+                label: "card-a".into(),
+            },
+        });
+        let mut store: Box<dyn CatalogStore> = Box::<MemStore>::default();
+        store.rebuild(&p).expect("rebuild");
+        assert_eq!(
+            store.volumes().expect("volumes"),
+            vec![("V1".to_string(), "card-a".to_string(), 7)]
+        );
     }
 
     #[test]

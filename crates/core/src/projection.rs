@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct AssetState {
     /// (volume, path, size) instances observed for this content hash.
     pub instances: BTreeSet<(String, String, u64)>,
-    /// tag -> live add-event ids.
+    /// tag -> live add-event ids; never holds an empty set — `TagRemove`'s
+    /// retain drops emptied entries.
     tag_adds: BTreeMap<String, BTreeSet<EventId>>,
     /// add-event ids tombstoned by observed removes.
     removed_adds: BTreeSet<EventId>,
@@ -43,6 +44,8 @@ impl Projection {
             }
             Op::TagAdd { asset, tag } => {
                 let st = self.assets.entry(asset.clone()).or_default();
+                // Guards against a remove that arrives before this add: if the
+                // id is already tombstoned, the add must not resurrect it.
                 if !st.removed_adds.contains(&event.id) {
                     st.tag_adds.entry(tag.clone()).or_default().insert(event.id);
                 }
@@ -56,12 +59,11 @@ impl Projection {
                 for add_id in observed {
                     st.removed_adds.insert(*add_id);
                 }
-                // An observed id is tombstoned globally, not scoped to the
-                // tag named on this event: if it names the wrong tag (a
-                // malformed or adversarial remove), or its matching add has
-                // not arrived yet, the id must still be evicted from
-                // whichever tag's live set it ends up in, however it later
-                // arrives, so the result stays independent of delivery order.
+                // Evicts an observed id from every tag's live set, not just
+                // the tag named on this event: if the add already applied
+                // under a different tag (a malformed or adversarial remove),
+                // it must still be evicted so the result stays independent
+                // of delivery order.
                 st.tag_adds.retain(|_, ids| {
                     for add_id in observed {
                         ids.remove(add_id);
@@ -90,13 +92,7 @@ impl Projection {
     pub fn tags(&self, asset: &AssetId) -> BTreeSet<String> {
         self.assets
             .get(asset)
-            .map(|s| {
-                s.tag_adds
-                    .iter()
-                    .filter(|(_, ids)| !ids.is_empty())
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            })
+            .map(|s| s.tag_adds.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -217,18 +213,54 @@ mod tests {
     }
 
     #[test]
+    fn remove_citing_unknown_id_is_a_harmless_tombstone() {
+        let unknown = EventId(ulid::Ulid::from_parts(9, 9));
+        let add = ev(
+            1,
+            1,
+            "m1",
+            Op::TagAdd {
+                asset: asset(),
+                tag: "t".into(),
+            },
+        );
+        let rm = ev(
+            2,
+            2,
+            "m2",
+            Op::TagRemove {
+                asset: asset(),
+                tag: "t".into(),
+                observed: vec![unknown],
+            },
+        );
+        let mut fwd = Projection::default();
+        fwd.apply(&add);
+        fwd.apply(&rm);
+        let mut rev = Projection::default();
+        rev.apply(&rm);
+        rev.apply(&add);
+        assert_eq!(fwd, rev);
+        assert!(
+            fwd.tags(&asset()).contains("t"),
+            "add for an id never cited by any remove must survive"
+        );
+    }
+
+    #[test]
     fn apply_is_idempotent_and_order_independent() {
         let a = asset();
+        let add = ev(
+            1,
+            1,
+            "m1",
+            Op::TagAdd {
+                asset: a.clone(),
+                tag: "t".into(),
+            },
+        );
         let events = vec![
-            ev(
-                1,
-                1,
-                "m1",
-                Op::TagAdd {
-                    asset: a.clone(),
-                    tag: "t".into(),
-                },
-            ),
+            add.clone(),
             ev(
                 2,
                 2,
@@ -236,7 +268,7 @@ mod tests {
                 Op::TagRemove {
                     asset: a.clone(),
                     tag: "t".into(),
-                    observed: vec![EventId(ulid::Ulid::from_parts(1, 1))],
+                    observed: vec![add.id],
                 },
             ),
             ev(

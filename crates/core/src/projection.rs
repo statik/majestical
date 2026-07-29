@@ -304,10 +304,14 @@ mod tests {
 
     #[test]
     fn volume_label_and_last_seen_are_lww_and_order_independent() {
+        // The later observation comes from "amy" — lexically smaller than
+        // "bob" — so this discriminates a real (wall, counter) comparison
+        // from a bug that picked the winner by machine-id tiebreak alone;
+        // that mutation would keep bob's label and fail this test.
         let early = ev(
             1,
             1,
-            "amy",
+            "bob",
             Op::VolumeSeen {
                 volume: "V1".into(),
                 label: "card-a".into(),
@@ -316,7 +320,7 @@ mod tests {
         let late = ev(
             2,
             2,
-            "bob",
+            "amy",
             Op::VolumeSeen {
                 volume: "V1".into(),
                 label: "card-a-renamed".into(),

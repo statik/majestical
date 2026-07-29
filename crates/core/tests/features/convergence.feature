@@ -24,15 +24,18 @@ Feature: Two machines converge through any exchange of event logs
     And the machines exchange event logs
     Then both machines see tags "topic/drone" on asset "A"
 
-  # Amy's observation is deliberately first, giving amy and bob equal wall
-  # time and counter (both machines' clocks start at the same fixed tick).
-  # The Hlc total order (wall, counter, machine) then breaks the tie on
-  # machine id, and "bob" > "amy" lexicographically — so bob's observation
-  # is HLC-later without needing a second exchange or a different clock
-  # value. That's a deterministic, minimal way to force an LWW winner.
+  # Bob observes first, so his event stamps (1,0,bob). After the first
+  # exchange amy adopts that timestamp into her own clock, so her own
+  # observation stamps (1,1,amy) — genuinely later by (wall, counter)
+  # despite "amy" sorting before "bob". This deliberately works against the
+  # machine-id tiebreak: a bug that picked the LWW winner by comparing
+  # machine ids instead of the full Hlc would pick bob's, not amy's, and
+  # this scenario would fail. The tiebreak case itself (equal wall and
+  # counter) is covered by the property tests, not here.
   Scenario: Volume observations converge to the freshest label
-    Given machine "amy" observes volume "V1" labeled "card-a"
-    And machine "bob" observes volume "V1" labeled "card-a-renamed"
+    Given machine "bob" observes volume "V1" labeled "card-a"
+    And the machines exchange event logs
+    And machine "amy" observes volume "V1" labeled "card-a-renamed"
     When the machines exchange event logs
     Then both machines see volume "V1" labeled "card-a-renamed"
 

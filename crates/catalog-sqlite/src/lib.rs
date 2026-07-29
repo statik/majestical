@@ -1,10 +1,10 @@
 //! `SQLite` projection of the catalog. Disposable by design: `rebuild`
 //! recreates it wholesale from a `Projection` (incremental apply and
 //! FTS5/sqlite-vec arrive in later phases).
-use majestical_core::event::AssetId;
+use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
 use majestical_core::ports::{CatalogStore, PortError};
 use majestical_core::projection::Projection;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,11 +39,26 @@ impl SqliteCatalog {
     /// Returns an error if a table can't be (re)created or a write fails.
     pub fn rebuild(&mut self, projection: &Projection) -> Result<(), CatalogError> {
         let tx = self.conn.transaction()?;
+        Self::create_tables(&tx)?;
+        Self::insert_assets(&tx, projection)?;
+        Self::insert_volumes(&tx, projection)?;
+        Self::insert_para_nodes(&tx, projection)?;
+        Self::insert_manifests(&tx, projection)?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn create_tables(tx: &Transaction) -> rusqlite::Result<()> {
         tx.execute_batch(
             "DROP TABLE IF EXISTS tags;
              DROP TABLE IF EXISTS instances;
              DROP TABLE IF EXISTS assets;
              DROP TABLE IF EXISTS volumes;
+             DROP TABLE IF EXISTS para_nodes;
+             DROP TABLE IF EXISTS asset_para;
+             DROP TABLE IF EXISTS verifications;
+             DROP TABLE IF EXISTS manifests;
              CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -59,9 +74,31 @@ impl SqliteCatalog {
                id TEXT PRIMARY KEY,
                label TEXT NOT NULL,
                last_seen_ms INTEGER NOT NULL
+             );
+             CREATE TABLE para_nodes (
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+               name TEXT NOT NULL, archived INTEGER NOT NULL
+             );
+             CREATE TABLE asset_para (
+               asset TEXT NOT NULL PRIMARY KEY REFERENCES assets(id),
+               node TEXT NOT NULL
+             );
+             CREATE TABLE verifications (
+               asset TEXT NOT NULL, volume TEXT NOT NULL, path TEXT NOT NULL,
+               algo TEXT NOT NULL, value TEXT NOT NULL, outcome TEXT NOT NULL,
+               hashdate_ms INTEGER NOT NULL
+             );
+             CREATE TABLE manifests (
+               volume TEXT NOT NULL, generation INTEGER NOT NULL,
+               mhl_path TEXT NOT NULL, roothash TEXT NOT NULL,
+               PRIMARY KEY (volume, generation, mhl_path)
              );",
-        )?;
+        )
+    }
 
+    /// Populates `assets`, `instances`, `tags`, `asset_para`, and
+    /// `verifications` — everything keyed off an individual asset.
+    fn insert_assets(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
         for (asset, state) in projection.assets() {
             tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
             for (volume, path, size) in &state.instances {
@@ -76,7 +113,34 @@ impl SqliteCatalog {
                     (&asset.0, &tag),
                 )?;
             }
+            if let Some(node) = projection.asset_para(asset) {
+                tx.execute(
+                    "INSERT INTO asset_para (asset, node) VALUES (?1, ?2)",
+                    (&asset.0, node),
+                )?;
+            }
+            for record in projection.verifications(asset) {
+                let hashdate_ms = i64::try_from(record.hashdate_ms).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO verifications \
+                     (asset, volume, path, algo, value, outcome, hashdate_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (
+                        &asset.0,
+                        &record.volume,
+                        &record.path,
+                        &record.algo,
+                        &record.value,
+                        verify_outcome_wire(record.outcome),
+                        hashdate_ms,
+                    ),
+                )?;
+            }
         }
+        Ok(())
+    }
+
+    fn insert_volumes(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
         for (id, state) in projection.volumes() {
             let label = state.label().unwrap_or("");
             let last_seen_ms = state.last_seen().map_or(0, |hlc| hlc.wall_ms);
@@ -86,8 +150,38 @@ impl SqliteCatalog {
                 (id, label, last_seen_ms),
             )?;
         }
-        tx.commit()?;
+        Ok(())
+    }
 
+    fn insert_para_nodes(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
+        for (id, state) in projection.para_nodes() {
+            // A node with a rename observed before its create has no kind or
+            // name yet; it materializes once the create event arrives, so it
+            // is skipped rather than inserted with placeholder values.
+            let (Some(kind), Some(name)) = (state.kind(), state.name()) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO para_nodes (id, kind, name, archived) VALUES (?1, ?2, ?3, ?4)",
+                (id, para_kind_wire(kind), name, state.archived()),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_manifests(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
+        for (volume, record) in projection.manifests_by_volume() {
+            tx.execute(
+                "INSERT INTO manifests (volume, generation, mhl_path, roothash) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                (
+                    volume,
+                    record.generation,
+                    &record.mhl_path,
+                    &record.roothash,
+                ),
+            )?;
+        }
         Ok(())
     }
 
@@ -146,6 +240,29 @@ impl SqliteCatalog {
         Ok(out)
     }
 
+    /// Every PARA node: (id, kind, name, archived), ordered by id.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn para_nodes(&self) -> Result<Vec<(String, String, String, bool)>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, name, archived FROM para_nodes ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Distinct asset count per volume, derived from `instances`, ordered by
     /// volume.
     ///
@@ -178,6 +295,30 @@ fn escape_like(needle: &str) -> String {
     escaped
 }
 
+/// The wire string for a `ParaKind`. Matches `Op::ParaNodeCreate`'s
+/// `serde(rename_all = "snake_case")` encoding — pinned by
+/// `event::tests::para_and_ingest_ops_wire_formats_are_stable` — so a stored
+/// value round-trips identically to what an event carried.
+fn para_kind_wire(kind: ParaKind) -> &'static str {
+    match kind {
+        ParaKind::Project => "project",
+        ParaKind::Area => "area",
+        ParaKind::Resource => "resource",
+        ParaKind::Archive => "archive",
+    }
+}
+
+/// The wire string for a `VerifyOutcome`. Matches
+/// `Op::VerificationRecorded`'s `serde(rename_all = "snake_case")` encoding —
+/// pinned by the same golden test as `para_kind_wire`.
+fn verify_outcome_wire(outcome: VerifyOutcome) -> &'static str {
+    match outcome {
+        VerifyOutcome::Original => "original",
+        VerifyOutcome::Verified => "verified",
+        VerifyOutcome::Failed => "failed",
+    }
+}
+
 impl CatalogStore for SqliteCatalog {
     fn rebuild(&mut self, projection: &Projection) -> Result<(), PortError> {
         Self::rebuild(self, projection).map_err(|e| PortError::new("catalog store", e))
@@ -204,7 +345,7 @@ impl CatalogStore for SqliteCatalog {
 mod tests {
     use super::*;
     use majestical_core::clock::{Hlc, MachineId};
-    use majestical_core::event::{AssetId, Event, EventId, Op};
+    use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind};
     use majestical_core::projection::Projection;
 
     #[test]
@@ -405,5 +546,53 @@ mod tests {
             "rebuild must discard the previous projection's data"
         );
         assert_eq!(db.search_by_tag("keep-b").expect("query b"), vec![b]);
+    }
+
+    #[test]
+    fn rebuild_populates_para_tables() {
+        let mut p = Projection::default();
+        for (n, op) in [
+            Op::ParaNodeCreate {
+                node: "N1".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            },
+            Op::AssetSeen {
+                asset: AssetId("xxh3:aa".into()),
+                volume: "V1".into(),
+                path: "a.mov".into(),
+                size: 1,
+            },
+            Op::AssetParaSet {
+                asset: AssetId("xxh3:aa".into()),
+                node: "N1".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.apply(&Event {
+                id: EventId(ulid::Ulid::from_parts(1, n as u128)),
+                hlc: Hlc {
+                    wall_ms: u64::try_from(n).expect("small") + 1,
+                    counter: 0,
+                    machine: MachineId("m1".into()),
+                },
+                author: "t".into(),
+                op,
+            });
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        db.rebuild(&p).expect("rebuild");
+        assert_eq!(
+            db.para_nodes().expect("para query"),
+            vec![(
+                "N1".to_string(),
+                "project".to_string(),
+                "client-x".to_string(),
+                false
+            )]
+        );
     }
 }

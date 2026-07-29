@@ -65,8 +65,9 @@ impl Machine {
 
     fn ingest(&mut self, events: &[Event]) {
         for e in events {
-            // The clamp scenario (poisoned future clocks) arrives in a
-            // later task; ignore the outcome here.
+            // This harness models well-behaved peers only, so every
+            // observe here is Adopted or AlreadyCurrent; the clamp is
+            // exercised by clock.rs's own tests.
             let _ = self.hlc.observe(&e.hlc);
             self.projection.apply(e);
             if !self.log.iter().any(|x| x.id == e.id) {

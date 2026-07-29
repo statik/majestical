@@ -110,6 +110,62 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
     );
 }
 
+/// A peer's clock reporting a timestamp far past physical now must not be
+/// adopted outright: the HLC clamps it (see `clock.rs`'s own tests for the
+/// clamp behavior), and the CLI surfaces a single warning on stderr rather
+/// than letting the poisoned event's ordering silently take over.
+#[test]
+fn far_future_peer_event_triggers_clamp_warning() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    // Hand-write a segment for a peer machine "peerbad" whose HLC is ~400
+    // days ahead of physical now, bypassing the CLI entirely so no local
+    // process ever produced this timestamp.
+    let peer_dir = root.join("events/peerbad");
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let future_ms = now_ms + 400 * 24 * 60 * 60 * 1000;
+    let poisoned = majestical_core::event::Event {
+        id: majestical_core::event::EventId(ulid::Ulid::from_parts(1, 1)),
+        hlc: majestical_core::clock::Hlc {
+            wall_ms: future_ms,
+            counter: 0,
+            machine: majestical_core::clock::MachineId("peerbad".into()),
+        },
+        author: "peerbad".into(),
+        op: majestical_core::event::Op::TagAdd {
+            asset: majestical_core::event::AssetId("xxh3:deadbeef".into()),
+            tag: "poison".into(),
+        },
+    };
+    let line = serde_json::to_string(&poisoned).unwrap();
+    std::fs::write(peer_dir.join("0001.jsonl"), format!("{line}\n")).unwrap();
+
+    let assert = maj(&root)
+        .args(["tag", "add", "xxh3:deadbeef", "poison"])
+        .assert()
+        .success();
+    let out = assert.get_output();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("warning"),
+        "clamp warning leaked onto stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("timestamps more than 24h in the future"),
+        "expected clamp warning on stderr, got: {stderr}"
+    );
+}
+
 /// Two machines sharing one catalog root, exercised through the real CLI
 /// and filesystem event log (not the in-memory cucumber harness): each
 /// machine's edits become visible to the other through independent

@@ -196,6 +196,33 @@ mod tests {
     }
 
     #[test]
+    fn clamp_never_regresses_a_clock_already_past_the_ceiling() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        // A remote exactly at the ceiling is in-drift, so it is adopted and
+        // last_wall now equals max_wall.
+        let near = Hlc {
+            wall_ms: 1000 + MAX_DRIFT_MS,
+            counter: 9,
+            machine: MachineId("near".into()),
+        };
+        assert_eq!(hlc.observe(&near), ObserveOutcome::Adopted);
+        let before = hlc.now();
+        let poison = Hlc {
+            wall_ms: u64::MAX / 2,
+            counter: 0,
+            machine: MachineId("bad".into()),
+        };
+        assert!(matches!(
+            hlc.observe(&poison),
+            ObserveOutcome::ClampedFuture { .. }
+        ));
+        assert!(
+            hlc.now() > before,
+            "clamping must never move the clock backward"
+        );
+    }
+
+    #[test]
     fn hlc_orders_by_wall_then_counter_then_machine() {
         let a = Hlc {
             wall_ms: 1,

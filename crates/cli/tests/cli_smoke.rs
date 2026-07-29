@@ -237,3 +237,125 @@ fn two_machines_converge_through_shared_catalog_root() {
     assert!(events_dir.join("machine-a").is_dir());
     assert!(events_dir.join("machine-b").is_dir());
 }
+
+/// A scan with an explicit `--volume` shows up in `volumes list --json`
+/// with that id as both id and label, the right asset count, and offline
+/// (there is no `/Volumes/card1` on the test machine).
+#[test]
+fn volumes_list_shows_explicit_volume_with_asset_count() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"fake video bytes a").unwrap();
+    std::fs::write(media.path().join("b.mov"), b"fake video bytes b").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["volumes", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let volumes = parsed["volumes"].as_array().unwrap();
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0]["id"], "card1");
+    assert_eq!(volumes[0]["label"], "card1");
+    assert_eq!(volumes[0]["asset_count"], 2);
+    assert_eq!(volumes[0]["online"], false);
+    assert_eq!(volumes[0]["clock_suspect"], false);
+}
+
+/// A scan without `--volume` auto-detects the volume's physical identity.
+/// The exact id is machine-specific (a `VolumeUUID` on macOS, a mount-point
+/// label elsewhere), so this only asserts the shape: non-empty, prefixed
+/// `uuid:` or `label:`.
+#[test]
+fn volumes_list_shows_auto_detected_volume() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["volumes", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let volumes = parsed["volumes"].as_array().unwrap();
+    assert_eq!(volumes.len(), 1);
+    let id = volumes[0]["id"].as_str().unwrap();
+    assert!(!id.is_empty());
+    assert!(
+        id.starts_with("uuid:") || id.starts_with("label:"),
+        "expected an auto-detected id prefix, got {id}"
+    );
+}
+
+/// A `VolumeSeen` whose HLC carries a timestamp far past physical now (a
+/// poisoned or misconfigured peer clock) must never silently win the
+/// last-seen display: `volumes list` flags it rather than showing a
+/// plausible-looking date forever. The HLC clamp only bounds the *local*
+/// clock's adoption of such a timestamp — it does not sanitize what's
+/// already durable in the event log — so this is display-layer detection,
+/// hand-written the same way `far_future_peer_event_triggers_clamp_warning`
+/// bypasses the CLI to plant the poisoned event directly.
+#[test]
+fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    let peer_dir = root.join("events/peerbad");
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let future_ms = now_ms + 400 * 24 * 60 * 60 * 1000;
+    let poisoned = majestical_core::event::Event {
+        id: majestical_core::event::EventId(ulid::Ulid::from_parts(1, 1)),
+        hlc: majestical_core::clock::Hlc {
+            wall_ms: future_ms,
+            counter: 0,
+            machine: majestical_core::clock::MachineId("peerbad".into()),
+        },
+        author: "peerbad".into(),
+        op: majestical_core::event::Op::VolumeSeen {
+            volume: "card1".into(),
+            label: "card1".into(),
+        },
+    };
+    let line = serde_json::to_string(&poisoned).unwrap();
+    std::fs::write(peer_dir.join("0001.jsonl"), format!("{line}\n")).unwrap();
+
+    let out = maj(&root)
+        .args(["volumes", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let volumes = parsed["volumes"].as_array().unwrap();
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0]["clock_suspect"], true);
+
+    maj(&root)
+        .args(["volumes", "list"])
+        .assert()
+        .success()
+        .stdout(contains("(clock suspect)"));
+}

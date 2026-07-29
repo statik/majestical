@@ -18,9 +18,26 @@ pub struct AssetState {
     fields: BTreeMap<String, (Hlc, String)>,
 }
 
+/// Tracked state for one volume, folded from every `VolumeSeen` observed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VolumeState {
+    /// Label from the highest-HLC observation (LWW by (Hlc, label) tuple).
+    label: Option<(Hlc, String)>,
+    /// Highest HLC at which this volume was observed.
+    pub last_seen: Option<Hlc>,
+}
+
+impl VolumeState {
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_ref().map(|(_, l)| l.as_str())
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Projection {
     assets: BTreeMap<AssetId, AssetState>,
+    volumes: BTreeMap<String, VolumeState>,
     applied: BTreeSet<EventId>,
 }
 
@@ -85,6 +102,18 @@ impl Projection {
                     }
                 }
             }
+            Op::VolumeSeen { volume, label } => {
+                let st = self.volumes.entry(volume.clone()).or_default();
+                let candidate = (event.hlc.clone(), label.clone());
+                match &st.label {
+                    Some(current) if *current >= candidate => {}
+                    _ => st.label = Some(candidate),
+                }
+                match &st.last_seen {
+                    Some(current) if *current >= event.hlc => {}
+                    _ => st.last_seen = Some(event.hlc.clone()),
+                }
+            }
         }
     }
 
@@ -117,6 +146,10 @@ impl Projection {
 
     pub fn assets(&self) -> impl Iterator<Item = (&AssetId, &AssetState)> {
         self.assets.iter()
+    }
+
+    pub fn volumes(&self) -> impl Iterator<Item = (&String, &VolumeState)> {
+        self.volumes.iter()
     }
 }
 
@@ -245,6 +278,41 @@ mod tests {
             fwd.tags(&asset()).contains("t"),
             "add for an id never cited by any remove must survive"
         );
+    }
+
+    #[test]
+    fn volume_label_and_last_seen_are_lww_and_order_independent() {
+        let early = ev(
+            1,
+            1,
+            "amy",
+            Op::VolumeSeen {
+                volume: "V1".into(),
+                label: "card-a".into(),
+            },
+        );
+        let late = ev(
+            2,
+            2,
+            "bob",
+            Op::VolumeSeen {
+                volume: "V1".into(),
+                label: "card-a-renamed".into(),
+            },
+        );
+        let mut fwd = Projection::default();
+        fwd.apply(&early);
+        fwd.apply(&late);
+        let mut rev = Projection::default();
+        rev.apply(&late);
+        rev.apply(&early);
+        assert_eq!(fwd, rev);
+        for p in [&fwd, &rev] {
+            let (id, state) = p.volumes().next().expect("one volume");
+            assert_eq!(id, "V1");
+            assert_eq!(state.label(), Some("card-a-renamed"));
+            assert_eq!(state.last_seen, Some(late.hlc.clone()));
+        }
     }
 
     #[test]

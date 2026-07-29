@@ -37,6 +37,7 @@ serde_json.workspace = true
 ulid.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
+plist.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

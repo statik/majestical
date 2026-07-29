@@ -69,6 +69,33 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MetaCmd,
     },
+    /// Manage PARA organization nodes.
+    Para {
+        #[command(subcommand)]
+        cmd: ParaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ParaCmd {
+    /// Create a node: `maj para add project client-x`.
+    Add { kind: String, name: String },
+    /// List every PARA node.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a node (last-write-wins across machines).
+    Rename { node: String, name: String },
+    /// Archive a node; with --root, also moves the materialized directory.
+    Archive {
+        node: String,
+        /// Destination root(s) where the node is materialized on disk.
+        #[arg(long)]
+        root: Vec<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +163,10 @@ fn main() -> Result<()> {
         Cmd::Meta { cmd } => {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             commands::cmd_meta(&mut app, cmd)?;
+        }
+        Cmd::Para { cmd } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            commands::cmd_para(&mut app, &cli.catalog, cmd)?;
         }
     }
     Ok(())

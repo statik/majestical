@@ -563,6 +563,218 @@ fn meta_set_on_an_unscanned_asset_fails() {
         .stderr(contains("unknown asset xxh3:neverseen"));
 }
 
+/// A minted PARA node id is a ULID: 26 characters, Crockford base32.
+#[cfg(test)]
+fn assert_is_ulid(s: &str) {
+    assert_eq!(s.len(), 26, "expected a 26-char ULID, got: {s}");
+    assert!(
+        s.chars().all(|c| c.is_ascii_alphanumeric()
+            && c != 'I'
+            && c != 'L'
+            && c != 'O'
+            && c != 'U'),
+        "expected Crockford base32 ULID chars, got: {s}"
+    );
+}
+
+/// `para add` mints a node, `para list --json` reflects it, `para rename`
+/// and `para archive` (with no `--root`, catalog-only) update it in place.
+#[test]
+fn para_add_list_rename_archive_round_trip() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    let out = maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let node_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_is_ulid(&node_id);
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["id"], node_id);
+    assert_eq!(nodes[0]["kind"], "project");
+    assert_eq!(nodes[0]["name"], "client-x");
+    assert_eq!(nodes[0]["archived"], false);
+
+    maj(&root)
+        .args(["para", "rename", "project/client-x", "client-y"])
+        .assert()
+        .success();
+
+    maj(&root)
+        .args(["para", "archive", "project/client-y"])
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["id"], node_id);
+    assert_eq!(nodes[0]["name"], "client-y");
+    assert_eq!(nodes[0]["archived"], true);
+
+    // An archived node no longer resolves by `<kind>/<name>` — only a raw
+    // node id reaches it now (see `resolve_para_node`'s non-archived filter).
+    maj(&root)
+        .args(["para", "rename", "project/client-y", "z"])
+        .assert()
+        .failure()
+        .stderr(contains("no active PARA node"));
+}
+
+/// A second `para add` for the same (kind, name) while the first is still
+/// active is rejected — it does not create a second, indistinguishable node.
+#[test]
+fn para_add_rejects_duplicate_active_name() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+}
+
+/// Node-reference resolution failures point the user at a concrete next
+/// step rather than a bare "not found".
+#[test]
+fn para_node_reference_errors_are_actionable() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    maj(&root)
+        .args(["para", "rename", "project/nope", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("maj para list"));
+
+    maj(&root)
+        .args(["para", "rename", "garbage", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("<kind>/<name>"));
+}
+
+/// `para archive --root <dir>` moves the node's materialized directory into
+/// `Archives/`; `--dry-run` reports the move without performing it.
+#[test]
+fn para_archive_moves_materialized_dir_with_root() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+
+    let materialized = tempfile::tempdir().unwrap();
+    let node_dir = materialized.path().join("Projects").join("client-x");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(node_dir.join("a.txt"), b"hello").unwrap();
+
+    maj(&root)
+        .args(["para", "archive", "project/client-x"])
+        .arg("--root")
+        .arg(materialized.path())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(contains("would move"));
+    assert!(node_dir.is_dir(), "dry run must not move the directory");
+
+    maj(&root)
+        .args(["para", "archive", "project/client-x"])
+        .arg("--root")
+        .arg(materialized.path())
+        .assert()
+        .success();
+    assert!(!node_dir.exists(), "source directory must be moved away");
+    let archived = materialized.path().join("Archives").join("client-x");
+    assert!(archived.join("a.txt").is_file());
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["archived"], true);
+}
+
+/// A multi-root archive run must converge on re-run rather than failing
+/// forever on a root an earlier partial run already moved. Simulates that
+/// partial progress directly (root1 already has its directory under
+/// `Archives/` and nothing left under `Projects/`) alongside a second root
+/// that is still materialized and needs an actual move; a single command
+/// covering both roots must skip the already-archived one, move the other,
+/// and still emit the archive event.
+#[test]
+fn para_archive_with_multiple_roots_skips_a_root_already_archived() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+
+    let root1 = tempfile::tempdir().unwrap();
+    let root1_archived = root1.path().join("Archives").join("client-x");
+    std::fs::create_dir_all(&root1_archived).unwrap();
+    std::fs::write(root1_archived.join("a.txt"), b"hello").unwrap();
+
+    let root2 = tempfile::tempdir().unwrap();
+    let root2_source = root2.path().join("Projects").join("client-x");
+    std::fs::create_dir_all(&root2_source).unwrap();
+    std::fs::write(root2_source.join("b.txt"), b"world").unwrap();
+
+    maj(&root)
+        .args(["para", "archive", "project/client-x"])
+        .arg("--root")
+        .arg(root1.path())
+        .arg("--root")
+        .arg(root2.path())
+        .assert()
+        .success()
+        .stdout(contains("already archived"));
+
+    assert!(!root2_source.exists(), "root2 source must be moved");
+    let root2_archived = root2.path().join("Archives").join("client-x");
+    assert!(root2_archived.join("b.txt").is_file());
+    // root1's already-archived directory is untouched by the skip.
+    assert!(root1_archived.join("a.txt").is_file());
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["archived"], true);
+}
+
 /// Two machines sharing a catalog root each set the same field; the write
 /// with the later HLC (here, the one issued second in wall-clock time) wins
 /// on both machines once they re-read the merged log — LWW convergence for

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/catalog-sqlite", "crates/core", "crates/sync"]
+members = ["crates/catalog-sqlite", "crates/cli", "crates/core", "crates/sync"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,12 @@ thiserror = "2"
 ulid = { version = "1", features = ["serde"] }
 proptest = "1"
 tempfile = "3"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+assert_cmd = "2"
+predicates = "3"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

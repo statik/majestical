@@ -1,0 +1,32 @@
+[package]
+name = "majestical-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maj"
+path = "src/main.rs"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "deny"
+print_stdout = "allow"          # CLI output is the product
+module_name_repetitions = "allow"
+
+[dependencies]
+majestical-core = { path = "../core" }
+majestical-sync = { path = "../sync" }
+majestical-catalog-sqlite = { path = "../catalog-sqlite" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+walkdir.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true

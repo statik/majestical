@@ -773,6 +773,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "majestical-ingest"
+version = "0.1.0"
+dependencies = [
+ "majestical-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ulid",
+ "walkdir",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "majestical-sync"
 version = "0.1.0"
 dependencies = [

@@ -9,7 +9,7 @@ Feature: Two machines converge through any exchange of event logs
     When the machines exchange event logs
     Then both machines see tags "status/select, topic/drone" on asset "A"
 
-  Scenario: A tag removed on one machine while re-added on another survives
+  Scenario: A re-add unseen by any remove survives concurrent removes
     Given machine "amy" tags asset "A" with "keep"
     And the machines exchange event logs
     And machine "bob" removes tag "keep" from asset "A"

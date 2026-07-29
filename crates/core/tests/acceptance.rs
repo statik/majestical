@@ -45,6 +45,10 @@ impl Machine {
         // numbered events never collide in `EventId` space — a bare
         // per-machine counter would let one machine's event silently
         // displace another's during `Projection::apply`'s de-dup.
+        // `DefaultHasher`'s output isn't stable across Rust releases, but
+        // that's fine here: ids only need to be unique within a single test
+        // run. Real clients mint random ULIDs; this deterministic scheme is
+        // test-only plumbing and must not be copied into sync code.
         let mut hasher = DefaultHasher::new();
         self.name.hash(&mut hasher);
         self.seq.hash(&mut hasher);
@@ -70,6 +74,12 @@ impl Machine {
     }
 }
 
+impl std::fmt::Debug for Machine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Machine(seq={})", self.seq)
+    }
+}
+
 #[derive(Debug, World)]
 #[world(init = Self::new)]
 struct CatalogWorld {
@@ -89,16 +99,15 @@ impl CatalogWorld {
         Self { machines }
     }
 
-    fn machine(&mut self, name: &str) -> &mut Machine {
-        self.machines
-            .entry(name.to_string())
-            .or_insert_with(|| Machine::new(name))
-    }
-}
-
-impl std::fmt::Debug for Machine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Machine(seq={})", self.seq)
+    // Deliberately strict: no lazy creation. A typo'd or unseeded machine
+    // name in a `.feature` file must fail loudly rather than silently
+    // starting a fresh machine with an empty log and projection.
+    fn machine(&mut self, name: &str) -> Result<&mut Machine, String> {
+        self.machines.get_mut(name).ok_or_else(|| {
+            format!(
+                "unknown machine {name} — scenarios may only use the seeded machines (amy, bob)"
+            )
+        })
     }
 }
 
@@ -111,11 +120,12 @@ fn asset(name: &str) -> AssetId {
     clippy::needless_pass_by_value,
     reason = "cucumber's {string} captures always bind as owned String"
 )]
-fn tag_add(w: &mut CatalogWorld, m: String, a: String, tag: String) {
-    w.machine(&m).emit(Op::TagAdd {
+fn tag_add(w: &mut CatalogWorld, m: String, a: String, tag: String) -> Result<(), String> {
+    w.machine(&m)?.emit(Op::TagAdd {
         asset: asset(&a),
         tag,
     });
+    Ok(())
 }
 
 #[given(expr = "machine {string} removes tag {string} from asset {string}")]
@@ -124,7 +134,7 @@ fn tag_add(w: &mut CatalogWorld, m: String, a: String, tag: String) {
     reason = "cucumber's {string} captures always bind as owned String"
 )]
 fn tag_rm(w: &mut CatalogWorld, m: String, tag: String, a: String) -> Result<(), String> {
-    let machine = w.machine(&m);
+    let machine = w.machine(&m)?;
     let observed = machine.projection.tag_add_ids(&asset(&a), &tag);
     if observed.is_empty() {
         return Err(format!(
@@ -159,12 +169,15 @@ fn exchange(w: &mut CatalogWorld) {
     reason = "cucumber's {string} captures always bind as owned String"
 )]
 fn assert_tags(w: &mut CatalogWorld, expected: String, a: String) -> Result<(), String> {
-    let want: Vec<&str> = expected.split(", ").collect();
+    // Sorted so feature authors can list tags in any order — `Projection::tags`
+    // always returns them in ascending order via its underlying `BTreeSet`.
+    let mut want: Vec<&str> = expected.split(", ").collect();
+    want.sort_unstable();
     for (name, m) in &w.machines {
         let got: Vec<String> = m.projection.tags(&asset(&a)).into_iter().collect();
         if got != want {
             return Err(format!(
-                "machine {name} diverged: got {got:?}, want {want:?}"
+                "machine {name} diverged: got {got:?}, want {want:?} (both compared ascending-sorted)"
             ));
         }
     }

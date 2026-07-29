@@ -19,18 +19,25 @@ pub struct AssetState {
 }
 
 /// Tracked state for one volume, folded from every `VolumeSeen` observed.
+///
+/// Label and last-seen are folded from the same LWW winner rather than
+/// tracked as separate fields: an `Hlc` totally orders (wall, counter,
+/// machine), so the observation with the highest `Hlc` is unambiguously
+/// both the freshest label and the most recent sighting.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VolumeState {
-    /// Label from the highest-HLC observation (LWW by (Hlc, label) tuple).
-    label: Option<(Hlc, String)>,
-    /// Highest HLC at which this volume was observed.
-    pub last_seen: Option<Hlc>,
+    seen: Option<(Hlc, String)>,
 }
 
 impl VolumeState {
     #[must_use]
     pub fn label(&self) -> Option<&str> {
-        self.label.as_ref().map(|(_, l)| l.as_str())
+        self.seen.as_ref().map(|(_, l)| l.as_str())
+    }
+
+    #[must_use]
+    pub fn last_seen(&self) -> Option<&Hlc> {
+        self.seen.as_ref().map(|(hlc, _)| hlc)
     }
 }
 
@@ -105,13 +112,9 @@ impl Projection {
             Op::VolumeSeen { volume, label } => {
                 let st = self.volumes.entry(volume.clone()).or_default();
                 let candidate = (event.hlc.clone(), label.clone());
-                match &st.label {
+                match &st.seen {
                     Some(current) if *current >= candidate => {}
-                    _ => st.label = Some(candidate),
-                }
-                match &st.last_seen {
-                    Some(current) if *current >= event.hlc => {}
-                    _ => st.last_seen = Some(event.hlc.clone()),
+                    _ => st.seen = Some(candidate),
                 }
             }
         }
@@ -311,7 +314,7 @@ mod tests {
             let (id, state) = p.volumes().next().expect("one volume");
             assert_eq!(id, "V1");
             assert_eq!(state.label(), Some("card-a-renamed"));
-            assert_eq!(state.last_seen, Some(late.hlc.clone()));
+            assert_eq!(state.last_seen(), Some(&late.hlc));
         }
     }
 

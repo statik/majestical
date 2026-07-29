@@ -239,8 +239,9 @@ fn two_machines_converge_through_shared_catalog_root() {
 }
 
 /// A scan with an explicit `--volume` shows up in `volumes list --json`
-/// with that id as both id and label, the right asset count, and offline
-/// (there is no `/Volumes/card1` on the test machine).
+/// with that id as both id and label, the right asset count, and offline.
+/// The volume name is deliberately implausible so a real mounted volume
+/// on the test machine can never coincide with it and flip `online` true.
 #[test]
 fn volumes_list_shows_explicit_volume_with_asset_count() {
     let media = tempfile::tempdir().unwrap();
@@ -253,7 +254,7 @@ fn volumes_list_shows_explicit_volume_with_asset_count() {
     maj(&root)
         .args(["scan"])
         .arg(media.path())
-        .args(["--volume", "card1"])
+        .args(["--volume", "maj-test-no-such-volume"])
         .assert()
         .success();
 
@@ -264,8 +265,8 @@ fn volumes_list_shows_explicit_volume_with_asset_count() {
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let volumes = parsed["volumes"].as_array().unwrap();
     assert_eq!(volumes.len(), 1);
-    assert_eq!(volumes[0]["id"], "card1");
-    assert_eq!(volumes[0]["label"], "card1");
+    assert_eq!(volumes[0]["id"], "maj-test-no-such-volume");
+    assert_eq!(volumes[0]["label"], "maj-test-no-such-volume");
     assert_eq!(volumes[0]["asset_count"], 2);
     assert_eq!(volumes[0]["online"], false);
     assert_eq!(volumes[0]["clock_suspect"], false);

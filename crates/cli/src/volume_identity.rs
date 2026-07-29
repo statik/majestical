@@ -8,6 +8,11 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
+/// Label (and `label:`-id suffix) used when a mount point has no path
+/// component of its own — i.e. "/". Shared with the CLI's `volume_is_online`
+/// heuristic, which treats this label as always present.
+pub const ROOT_LABEL: &str = "root";
+
 pub struct VolumeIdentity {
     pub id: String,
     pub label: String,
@@ -16,9 +21,10 @@ pub struct VolumeIdentity {
 #[must_use]
 pub fn resolve(path: &Path) -> VolumeIdentity {
     let mount = mount_point_of(path);
-    let label = mount
-        .file_name()
-        .map_or_else(|| "root".to_string(), |n| n.to_string_lossy().into_owned());
+    let label = mount.file_name().map_or_else(
+        || ROOT_LABEL.to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     #[cfg(target_os = "macos")]
     if let Some(uuid) = diskutil_volume_uuid(&mount) {
         return VolumeIdentity {

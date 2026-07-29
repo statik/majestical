@@ -363,7 +363,7 @@ fn cmd_search(
 /// False negative: a volume mounted somewhere other than `/Volumes` reads
 /// offline even when present.
 fn volume_is_online(id: &str, label: &str) -> bool {
-    if label == "root" {
+    if label == volume_identity::ROOT_LABEL {
         return true;
     }
     let candidate = PathBuf::from("/Volumes").join(label);
@@ -515,4 +515,19 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod iso8601_ms_tests {
+    use super::iso8601_ms;
+
+    #[test]
+    fn formats_a_leap_day_midnight() {
+        assert_eq!(iso8601_ms(1_709_164_800_000), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn formats_the_last_second_of_a_year() {
+        assert_eq!(iso8601_ms(1_735_689_599_000), "2024-12-31T23:59:59Z");
+    }
 }

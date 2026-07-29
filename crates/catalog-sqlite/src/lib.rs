@@ -79,7 +79,7 @@ impl SqliteCatalog {
         }
         for (id, state) in projection.volumes() {
             let label = state.label().unwrap_or("");
-            let last_seen_ms = state.last_seen.as_ref().map_or(0, |hlc| hlc.wall_ms);
+            let last_seen_ms = state.last_seen().map_or(0, |hlc| hlc.wall_ms);
             let last_seen_ms = i64::try_from(last_seen_ms).unwrap_or(i64::MAX);
             tx.execute(
                 "INSERT INTO volumes (id, label, last_seen_ms) VALUES (?1, ?2, ?3)",

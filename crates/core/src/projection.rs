@@ -18,9 +18,33 @@ pub struct AssetState {
     fields: BTreeMap<String, (Hlc, String)>,
 }
 
+/// Tracked state for one volume, folded from every `VolumeSeen` observed.
+///
+/// Label and last-seen are folded from the same LWW winner rather than
+/// tracked as separate fields: an `Hlc` totally orders (wall, counter,
+/// machine), so the observation with the highest `Hlc` is unambiguously
+/// both the freshest label and the most recent sighting.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VolumeState {
+    seen: Option<(Hlc, String)>,
+}
+
+impl VolumeState {
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.seen.as_ref().map(|(_, l)| l.as_str())
+    }
+
+    #[must_use]
+    pub fn last_seen(&self) -> Option<&Hlc> {
+        self.seen.as_ref().map(|(hlc, _)| hlc)
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Projection {
     assets: BTreeMap<AssetId, AssetState>,
+    volumes: BTreeMap<String, VolumeState>,
     applied: BTreeSet<EventId>,
 }
 
@@ -85,6 +109,14 @@ impl Projection {
                     }
                 }
             }
+            Op::VolumeSeen { volume, label } => {
+                let st = self.volumes.entry(volume.clone()).or_default();
+                let candidate = (event.hlc.clone(), label.clone());
+                match &st.seen {
+                    Some(current) if *current >= candidate => {}
+                    _ => st.seen = Some(candidate),
+                }
+            }
         }
     }
 
@@ -117,6 +149,10 @@ impl Projection {
 
     pub fn assets(&self) -> impl Iterator<Item = (&AssetId, &AssetState)> {
         self.assets.iter()
+    }
+
+    pub fn volumes(&self) -> impl Iterator<Item = (&String, &VolumeState)> {
+        self.volumes.iter()
     }
 }
 
@@ -245,6 +281,41 @@ mod tests {
             fwd.tags(&asset()).contains("t"),
             "add for an id never cited by any remove must survive"
         );
+    }
+
+    #[test]
+    fn volume_label_and_last_seen_are_lww_and_order_independent() {
+        let early = ev(
+            1,
+            1,
+            "amy",
+            Op::VolumeSeen {
+                volume: "V1".into(),
+                label: "card-a".into(),
+            },
+        );
+        let late = ev(
+            2,
+            2,
+            "bob",
+            Op::VolumeSeen {
+                volume: "V1".into(),
+                label: "card-a-renamed".into(),
+            },
+        );
+        let mut fwd = Projection::default();
+        fwd.apply(&early);
+        fwd.apply(&late);
+        let mut rev = Projection::default();
+        rev.apply(&late);
+        rev.apply(&early);
+        assert_eq!(fwd, rev);
+        for p in [&fwd, &rev] {
+            let (id, state) = p.volumes().next().expect("one volume");
+            assert_eq!(id, "V1");
+            assert_eq!(state.label(), Some("card-a-renamed"));
+            assert_eq!(state.last_seen(), Some(&late.hlc));
+        }
     }
 
     #[test]

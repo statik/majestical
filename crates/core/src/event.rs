@@ -31,6 +31,10 @@ pub enum Op {
         path: String,
         size: u64,
     },
+    /// Physical observation: a volume was present. `volume` is the stable
+    /// identity `AssetSeen.volume` refers to; `label` is the human name at
+    /// observation time.
+    VolumeSeen { volume: String, label: String },
     /// OR-Set add.
     TagAdd { asset: AssetId, tag: String },
     /// OR-Set remove: tombstones only the add-events it observed.
@@ -92,6 +96,28 @@ mod tests {
         assert_eq!(
             json,
             r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":{"type":"tag_remove","asset":"xxh3:aa","tag":"t","observed":["00000000010000000000000002"]}}"#
+        );
+    }
+
+    #[test]
+    fn volume_seen_wire_format_is_stable() {
+        let e = Event {
+            id: EventId(ulid::Ulid::from_parts(1, 1)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "elliot".into(),
+            op: Op::VolumeSeen {
+                volume: "uuid:abc".into(),
+                label: "card1".into(),
+            },
+        };
+        let json = serde_json::to_string(&e).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":{"type":"volume_seen","volume":"uuid:abc","label":"card1"}}"#
         );
     }
 }

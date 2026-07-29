@@ -43,6 +43,7 @@ impl SqliteCatalog {
             "DROP TABLE IF EXISTS tags;
              DROP TABLE IF EXISTS instances;
              DROP TABLE IF EXISTS assets;
+             DROP TABLE IF EXISTS volumes;
              CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -53,7 +54,12 @@ impl SqliteCatalog {
                asset TEXT NOT NULL REFERENCES assets(id),
                tag TEXT NOT NULL, PRIMARY KEY (asset, tag)
              );
-             CREATE INDEX tags_by_tag ON tags (tag);",
+             CREATE INDEX tags_by_tag ON tags (tag);
+             CREATE TABLE volumes (
+               id TEXT PRIMARY KEY,
+               label TEXT NOT NULL,
+               last_seen_ms INTEGER NOT NULL
+             );",
         )?;
 
         for (asset, state) in projection.assets() {
@@ -70,6 +76,15 @@ impl SqliteCatalog {
                     (&asset.0, &tag),
                 )?;
             }
+        }
+        for (id, state) in projection.volumes() {
+            let label = state.label().unwrap_or("");
+            let last_seen_ms = state.last_seen().map_or(0, |hlc| hlc.wall_ms);
+            let last_seen_ms = i64::try_from(last_seen_ms).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO volumes (id, label, last_seen_ms) VALUES (?1, ?2, ?3)",
+                (id, label, last_seen_ms),
+            )?;
         }
         tx.commit()?;
 
@@ -103,6 +118,48 @@ impl SqliteCatalog {
         let mut out = Vec::new();
         for row in rows {
             out.push(AssetId(row?));
+        }
+        Ok(out)
+    }
+
+    /// Every volume the catalog has ever seen: (id, label, `last_seen_ms`),
+    /// ordered by id.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn volumes(&self) -> Result<Vec<(String, String, u64)>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, last_seen_ms FROM volumes ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, label, last_seen_ms) = row?;
+            out.push((id, label, u64::try_from(last_seen_ms).unwrap_or(0)));
+        }
+        Ok(out)
+    }
+
+    /// Distinct asset count per volume, derived from `instances`, ordered by
+    /// volume.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT volume, COUNT(DISTINCT asset) FROM instances GROUP BY volume ORDER BY volume",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (volume, count) = row?;
+            out.push((volume, u64::try_from(count).unwrap_or(0)));
         }
         Ok(out)
     }
@@ -212,6 +269,57 @@ mod tests {
             vec![b],
             "instance with a literal '%' and '_' must be findable by that literal"
         );
+    }
+
+    #[test]
+    fn rebuild_populates_volumes_and_asset_counts() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:aa".into());
+        let b = AssetId("xxh3:bb".into());
+        for (n, op) in [
+            Op::VolumeSeen {
+                volume: "card1".into(),
+                label: "card-a".into(),
+            },
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "card1".into(),
+                path: "clips/a.mov".into(),
+                size: 1,
+            },
+            Op::AssetSeen {
+                asset: b.clone(),
+                volume: "card1".into(),
+                path: "clips/b.mov".into(),
+                size: 2,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.apply(&Event {
+                id: EventId(ulid::Ulid::from_parts(1, n as u128)),
+                hlc: Hlc {
+                    wall_ms: u64::try_from(n).expect("small") + 1,
+                    counter: 0,
+                    machine: MachineId("m1".into()),
+                },
+                author: "t".into(),
+                op,
+            });
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        db.rebuild(&p).expect("rebuild");
+
+        let volumes = db.volumes().expect("volumes query");
+        assert_eq!(
+            volumes,
+            vec![("card1".to_string(), "card-a".to_string(), 1)]
+        );
+
+        let counts = db.volume_asset_counts().expect("counts query");
+        assert_eq!(counts, vec![("card1".to_string(), 2)]);
     }
 
     #[test]

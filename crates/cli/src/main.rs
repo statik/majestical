@@ -1,12 +1,15 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
+mod volume_identity;
+
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use majestical_catalog_sqlite::SqliteCatalog;
-use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
+use majestical_core::clock::{Clock, HlcClock, MAX_DRIFT_MS, MachineId, ObserveOutcome};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_core::ports::EventLog;
 use majestical_core::projection::Projection;
 use majestical_sync::FileEventLog;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -53,8 +56,10 @@ enum Cmd {
     #[command(about = "Hash every file under a directory into the catalog as AssetSeen events")]
     Scan {
         dir: PathBuf,
+        /// Stable volume id and label. Omit to auto-detect (macOS: the
+        /// volume's `VolumeUUID`; elsewhere: the mount point's name).
         #[arg(long)]
-        volume: String,
+        volume: Option<String>,
     },
     /// Add or remove folksonomy tags.
     Tag {
@@ -70,6 +75,19 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every volume the catalog has ever seen.
+    Volumes {
+        #[command(subcommand)]
+        cmd: VolumesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumesCmd {
+    List {
         #[arg(long)]
         json: bool,
     },
@@ -196,7 +214,20 @@ fn cmd_catalog_init(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_scan(app: &mut FsApp, dir: &Path, volume: &str) -> Result<()> {
+/// Resolves the (id, label) pair a scan should tag its events with. An
+/// explicit `--volume` is used as both id and label — an override that
+/// keeps e2e tests deterministic. Omitted, the volume's physical identity
+/// is auto-detected (see `volume_identity`).
+fn resolve_volume(dir: &Path, volume: Option<String>) -> (String, String) {
+    if let Some(v) = volume {
+        return (v.clone(), v);
+    }
+    let identity = volume_identity::resolve(dir);
+    (identity.id, identity.label)
+}
+
+fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
+    let (volume_id, volume_label) = resolve_volume(dir, volume);
     let mut ops = Vec::new();
     for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
         let entry = entry.context("walking scan directory")?;
@@ -237,12 +268,19 @@ fn cmd_scan(app: &mut FsApp, dir: &Path, volume: &str) -> Result<()> {
             .replace('\\', "/");
         ops.push(Op::AssetSeen {
             asset: AssetId(format!("xxh3:{hash:032x}")),
-            volume: volume.to_string(),
+            volume: volume_id.clone(),
             path: rel,
             size,
         });
     }
     let n = ops.len();
+    ops.insert(
+        0,
+        Op::VolumeSeen {
+            volume: volume_id,
+            label: volume_label,
+        },
+    );
     app.emit(ops)?;
     println!("scanned: {n} assets");
     Ok(())
@@ -316,6 +354,141 @@ fn cmd_search(
     Ok(())
 }
 
+/// Cheap phase-2 "is this volume mounted right now" heuristic, not true
+/// device enumeration. `label:`-id volumes are considered online if
+/// `/Volumes/<label>` exists (or the label is the root volume's, which is
+/// always present). `uuid:`-id volumes are considered online only if a
+/// mount at `/Volumes/<label>` exists *and* resolving its identity still
+/// yields the same id — so a same-named but different card reads offline.
+/// False negative: a volume mounted somewhere other than `/Volumes` reads
+/// offline even when present.
+fn volume_is_online(id: &str, label: &str) -> bool {
+    if label == volume_identity::ROOT_LABEL {
+        return true;
+    }
+    let candidate = PathBuf::from("/Volumes").join(label);
+    if !candidate.exists() {
+        return false;
+    }
+    if id.starts_with("uuid:") {
+        return volume_identity::resolve(&candidate).id == id;
+    }
+    true
+}
+
+/// Formats milliseconds since the Unix epoch as an ISO-8601 UTC timestamp
+/// (`YYYY-MM-DDTHH:MM:SSZ`), using civil calendar math rather than pulling
+/// in a datetime dependency for one display need.
+fn iso8601_ms(wall_ms: u64) -> String {
+    let secs = wall_ms / 1000;
+    let days = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day / 60) % 60;
+    let second = time_of_day % 60;
+    let (year, month, day) = civil_from_days(i64::try_from(days).unwrap_or(i64::MAX));
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`: converts a day count since the Unix
+/// epoch (1970-01-01) into a (year, month, day) proleptic Gregorian date.
+/// <http://howardhinnant.github.io/date_algorithms.html>
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (
+        year,
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
+}
+
+fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
+    let projection = app.projection()?;
+    let db_path = catalog_dir.join("catalog.db");
+    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
+    db.rebuild(&projection)
+        .context("rebuilding sqlite projection")?;
+    let volumes = db.volumes().context("querying volumes")?;
+    let counts: HashMap<String, u64> = db
+        .volume_asset_counts()
+        .context("querying volume asset counts")?
+        .into_iter()
+        .collect();
+    // A stored last-seen wall time past this ceiling could only have come
+    // from a clock more than MAX_DRIFT_MS ahead of physical now — the HLC
+    // clamp bounds the *local* clock's adoption of such a timestamp, but
+    // doesn't touch what's already durable in the event log, so a poisoned
+    // VolumeSeen can still win the LWW max and display forever unflagged.
+    let suspect_ceiling = physical_now_ms().saturating_add(MAX_DRIFT_MS);
+
+    if json {
+        let rows: Vec<_> = volumes
+            .iter()
+            .map(|(id, label, last_seen_ms)| {
+                serde_json::json!({
+                    "id": id,
+                    "label": label,
+                    "last_seen": iso8601_ms(*last_seen_ms),
+                    "online": volume_is_online(id, label),
+                    "asset_count": counts.get(id).copied().unwrap_or(0),
+                    "clock_suspect": *last_seen_ms > suspect_ceiling,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "volumes": rows }));
+    } else {
+        print_volumes_table(&volumes, &counts, suspect_ceiling);
+    }
+    Ok(())
+}
+
+/// Renders the human-readable volumes table with column widths sized to
+/// the widest cell in each column (header included) — a fixed width breaks
+/// alignment once an auto-detected `uuid:` id (41 chars) or a
+/// "(clock suspect)"-annotated last-seen cell appears.
+fn print_volumes_table(
+    volumes: &[(String, String, u64)],
+    counts: &HashMap<String, u64>,
+    suspect_ceiling: u64,
+) {
+    let rows: Vec<(String, String, String, &'static str, u64)> = volumes
+        .iter()
+        .map(|(id, label, last_seen_ms)| {
+            let mut last_seen = iso8601_ms(*last_seen_ms);
+            if *last_seen_ms > suspect_ceiling {
+                last_seen.push_str(" (clock suspect)");
+            }
+            let online = if volume_is_online(id, label) {
+                "online"
+            } else {
+                "offline"
+            };
+            let count = counts.get(id).copied().unwrap_or(0);
+            (id.clone(), label.clone(), last_seen, online, count)
+        })
+        .collect();
+    let id_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(2);
+    let label_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(5);
+    let seen_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(9);
+    let online_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(6);
+    println!(
+        "{:<id_w$} {:<label_w$} {:<seen_w$} {:<online_w$} ASSETS",
+        "ID", "LABEL", "LAST SEEN", "ONLINE"
+    );
+    for (id, label, last_seen, online, count) in &rows {
+        println!("{id:<id_w$} {label:<label_w$} {last_seen:<seen_w$} {online:<online_w$} {count}");
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -324,7 +497,7 @@ fn main() -> Result<()> {
         } => cmd_catalog_init(&cli)?,
         Cmd::Scan { dir, volume } => {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
-            cmd_scan(&mut app, &dir, &volume)?;
+            cmd_scan(&mut app, &dir, volume)?;
         }
         Cmd::Tag { cmd } => {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id)?;
@@ -334,6 +507,27 @@ fn main() -> Result<()> {
             let app = FsApp::open(&cli.catalog, &cli.machine_id)?;
             cmd_search(&app, &cli.catalog, name, tag, json)?;
         }
+        Cmd::Volumes {
+            cmd: VolumesCmd::List { json },
+        } => {
+            let app = FsApp::open(&cli.catalog, &cli.machine_id)?;
+            cmd_volumes_list(&app, &cli.catalog, json)?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod iso8601_ms_tests {
+    use super::iso8601_ms;
+
+    #[test]
+    fn formats_a_leap_day_midnight() {
+        assert_eq!(iso8601_ms(1_709_164_800_000), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn formats_the_last_second_of_a_year() {
+        assert_eq!(iso8601_ms(1_735_689_599_000), "2024-12-31T23:59:59Z");
+    }
 }

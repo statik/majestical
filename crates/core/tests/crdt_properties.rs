@@ -23,6 +23,10 @@ enum OpKind {
         path: String,
         size: u64,
     },
+    VolumeObserved {
+        volume: String,
+        label: String,
+    },
 }
 
 fn build_events(kinds: &[(u64, OpKind)]) -> Vec<Event> {
@@ -61,6 +65,10 @@ fn build_events(kinds: &[(u64, OpKind)]) -> Vec<Event> {
                     path: path.clone(),
                     size: *size,
                 },
+                OpKind::VolumeObserved { volume, label } => Op::VolumeSeen {
+                    volume: volume.clone(),
+                    label: label.clone(),
+                },
             };
             Event {
                 id: ids[n],
@@ -91,6 +99,8 @@ fn arb_kind() -> impl Strategy<Value = OpKind> {
             path,
             size
         }),
+        ("[v-w]{1,2}", "[a-c]{1,3}")
+            .prop_map(|(volume, label)| OpKind::VolumeObserved { volume, label }),
     ]
 }
 

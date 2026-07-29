@@ -1463,7 +1463,7 @@ updates:
       default-days: 7
 ```
 
-- [ ] **Step 4: Verify** — `actionlint .github/workflows/ && uvx zizmor .github/workflows/` locally; `just ci`.
+- [ ] **Step 4: Verify** — `actionlint .github/workflows/*.yml && uvx zizmor .github/workflows/` locally (actionlint takes files, not directories); `just ci`.
 
 - [ ] **Step 5: Commit** — `git add -A && git commit -m "ci: add rust ci, actions linting, prek hooks, dependabot"`
 

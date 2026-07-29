@@ -43,9 +43,9 @@ Feature: Two machines converge through any exchange of event logs
   # his TagAdd event carries a wildly future Hlc. Amy's later TagRemove
   # still wins because OR-Set removal is causal (it cites the add's event
   # id) rather than LWW by timestamp — the poisoned clock cannot make its
-  # own add un-removable, and amy's own clamp (24h ahead of her physical
-  # now, per MAX_DRIFT_MS) keeps her subsequent HLCs from adopting the
-  # poison outright.
+  # own add un-removable, and amy's own clamp (bounded drift, per
+  # MAX_DRIFT_MS, ahead of her physical now) keeps her subsequent HLCs from
+  # adopting the poison outright.
   Scenario: A poisoned future clock cannot dominate ordering
     Given machine "amy" tags asset "A" with "good"
     And machine "bob" has a clock far in the future
@@ -54,3 +54,4 @@ Feature: Two machines converge through any exchange of event logs
     When machine "amy" removes tag "poison" from asset "A"
     And the machines exchange event logs
     Then both machines see tags "good" on asset "A"
+    And machine "amy" clamped a far-future timestamp

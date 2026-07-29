@@ -28,11 +28,16 @@ struct Machine {
     seq: u64,
     // Well-behaved peers never trigger `ObserveOutcome::ClampedFuture`, so
     // `ingest` asserts against it by default (see below). The
-    // poisoned-clock scenario deliberately breaks that assumption for
-    // whichever machine ingests the poisoned event; the "has a clock far
-    // in the future" step flips this to opt out of the self-check for the
-    // rest of that scenario only.
-    expect_clamps: bool,
+    // poisoned-clock scenario deliberately breaks that assumption: the "has
+    // a clock far in the future" step flips `allow_clamps` on every machine
+    // in the world (not just the poisoned one), because it's whichever
+    // *other* machine ingests the poisoned event that would otherwise trip
+    // the assert.
+    allow_clamps: bool,
+    // Count of `ClampedFuture` outcomes this machine has observed via
+    // `ingest`, so a scenario can assert the clamp actually fired rather
+    // than merely not panicking.
+    clamps: usize,
 }
 
 impl Machine {
@@ -43,7 +48,8 @@ impl Machine {
             log: Vec::new(),
             projection: Projection::default(),
             seq: 0,
-            expect_clamps: false,
+            allow_clamps: false,
+            clamps: 0,
         }
     }
 
@@ -77,14 +83,21 @@ impl Machine {
             // observe here must be Adopted or AlreadyCurrent unless the
             // scenario has deliberately poisoned a peer's clock (see the
             // "has a clock far in the future" step, which sets
-            // `expect_clamps`); the un-poisoned clamp behavior itself is
-            // exercised by clock.rs's own unit tests.
+            // `allow_clamps`); the un-poisoned clamp behavior itself is
+            // exercised by clock.rs's own unit tests. When clamps are
+            // allowed, a ClampedFuture outcome is counted instead of
+            // asserted against, so a scenario can later confirm the clamp
+            // actually fired.
             let outcome = self.hlc.observe(&e.hlc);
+            let clamped = matches!(outcome, ObserveOutcome::ClampedFuture { .. });
             assert!(
-                self.expect_clamps || !matches!(outcome, ObserveOutcome::ClampedFuture { .. }),
+                self.allow_clamps || !clamped,
                 "acceptance harness observed a poisoned-clock outcome unexpectedly on machine {}",
                 self.name
             );
+            if clamped {
+                self.clamps += 1;
+            }
             self.projection.apply(e);
             if !self.log.iter().any(|x| x.id == e.id) {
                 self.log.push(e.clone());
@@ -197,12 +210,16 @@ fn poison_clock(w: &mut CatalogWorld, m: String) -> Result<(), String> {
     // merely nudging it.
     const FAR_FUTURE_MS: u64 = 1 + MAX_DRIFT_MS + 1_000_000;
     let machine = w.machine(&m)?;
+    // Rebuilding the HlcClock resets last_wall/last_counter to 0, which
+    // would normally un-monotonic the clock — safe only here because
+    // FAR_FUTURE_MS dominates any timestamp this machine could have already
+    // produced or observed, so the very next `now()` still moves forward.
     machine.hlc = HlcClock::new(MachineId(m.clone()), Box::new(TickClock(FAR_FUTURE_MS)));
     // From this point on, any machine that ingests this one's events must
     // tolerate a ClampedFuture outcome — that's the behavior this scenario
     // exists to exercise, not a harness bug.
     for other in w.machines.values_mut() {
-        other.expect_clamps = true;
+        other.allow_clamps = true;
     }
     Ok(())
 }
@@ -258,6 +275,22 @@ fn assert_volume_label(w: &mut CatalogWorld, volume: String, want: String) -> Re
                 "machine {name} diverged on volume {volume:?}: got {got:?}, want {want:?}"
             ));
         }
+    }
+    Ok(())
+}
+
+#[then(expr = "machine {string} clamped a far-future timestamp")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn assert_clamped(w: &mut CatalogWorld, m: String) -> Result<(), String> {
+    let machine = w.machine(&m)?;
+    if machine.clamps == 0 {
+        return Err(format!(
+            "machine {m} never observed a ClampedFuture outcome — the clock-poisoning \
+             scenario didn't actually exercise the clamp"
+        ));
     }
     Ok(())
 }

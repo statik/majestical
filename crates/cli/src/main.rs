@@ -25,10 +25,10 @@ impl Clock for SystemClock {
 #[command(name = "maj", version, about = "Majestical media catalog")]
 struct Cli {
     /// Catalog directory (env `MAJ_CATALOG`).
-    #[arg(long, env = "MAJ_CATALOG")]
+    #[arg(long, env = "MAJ_CATALOG", help = "Catalog directory")]
     catalog: PathBuf,
     /// Stable machine identity (env `MAJ_MACHINE_ID`).
-    #[arg(long, env = "MAJ_MACHINE_ID")]
+    #[arg(long, env = "MAJ_MACHINE_ID", help = "Stable machine identity")]
     machine_id: String,
     #[command(subcommand)]
     cmd: Cmd,
@@ -42,6 +42,7 @@ enum Cmd {
         cmd: CatalogCmd,
     },
     /// Hash every file under a directory into the catalog as `AssetSeen` events.
+    #[command(about = "Hash every file under a directory into the catalog as AssetSeen events")]
     Scan {
         dir: PathBuf,
         #[arg(long)]

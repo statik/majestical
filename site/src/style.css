@@ -131,15 +131,55 @@ code {
   font-size: 0.9em;
 }
 
-/* ---- hero ---- */
+/* ---- hero ----
+   Full-bleed photograph: a hand holding a camera above open water
+   (marco haber, Unsplash — credited in the footer). A charcoal scrim
+   keeps the panel-toned type at AA contrast over the sea. */
 
 .hero {
   position: relative;
+  display: grid;
+  align-items: end;
+  min-height: min(92vh, 60rem);
   padding: clamp(4rem, 10vh, 7rem) 0 0;
+  background-image:
+    linear-gradient(
+      180deg,
+      rgba(23, 28, 29, 0.18) 0%,
+      rgba(23, 28, 29, 0.12) 40%,
+      rgba(23, 28, 29, 0.58) 78%,
+      rgba(23, 28, 29, 0.78) 100%
+    ),
+    url("./assets/ocean-camera.jpg");
+  background-size: cover;
+  background-position: center 30%;
+  border-bottom: 2px solid rgba(47, 85, 87, 0.55);
 }
 
-.hero .wrap {
-  padding-bottom: clamp(4rem, 9vh, 6.5rem);
+.hero-content {
+  padding-bottom: clamp(3rem, 8vh, 5.5rem);
+}
+
+.hero .eyebrow {
+  color: var(--mustard);
+}
+
+.hero .eyebrow::before {
+  background: var(--mustard);
+}
+
+.hero h1 {
+  color: var(--panel);
+  text-shadow: 0 1px 12px rgba(23, 28, 29, 0.45);
+}
+
+.hero .lead {
+  color: #dde2dd;
+  text-shadow: 0 1px 8px rgba(23, 28, 29, 0.5);
+}
+
+.hero .cta-note {
+  color: #c2cac4;
 }
 
 .cta-row {
@@ -183,29 +223,35 @@ code {
   outline-offset: 3px;
 }
 
+/* Light outline button for use over the hero photograph. */
+.button.ghost {
+  border-color: var(--panel);
+  color: var(--panel);
+}
+
+.button.ghost:hover {
+  background: rgba(230, 230, 223, 0.16);
+}
+
+.hero .button.primary {
+  background: var(--panel);
+  border-color: var(--panel);
+  color: var(--olive);
+}
+
+.hero .button.primary:hover {
+  background: #f2f2ec;
+}
+
+.hero .button:focus-visible {
+  outline-color: var(--mustard);
+}
+
 .cta-note {
   margin-top: 0.9rem;
   font-family: var(--sans);
   font-size: 0.85rem;
   color: var(--muted);
-}
-
-/* The shallow-water horizon: a crisp waterline, then teal shallows fading
-   over a sand flat. Color only, no imagery. */
-.horizon {
-  height: clamp(4.5rem, 12vh, 8rem);
-  border-top: 2px solid rgba(47, 85, 87, 0.45);
-  border-bottom: 1px solid var(--line);
-  background:
-    linear-gradient(
-      180deg,
-      rgba(47, 85, 87, 0.28) 0%,
-      rgba(95, 127, 134, 0.22) 34%,
-      rgba(95, 127, 134, 0.14) 58%,
-      rgba(183, 155, 101, 0.18) 82%,
-      rgba(214, 199, 164, 0.32) 100%
-    ),
-    linear-gradient(90deg, rgba(214, 199, 164, 0.18), transparent 35%, rgba(47, 85, 87, 0.12) 90%);
 }
 
 /* ---- sections & the countdown ---- */
@@ -343,6 +389,11 @@ code {
   font-size: 0.85rem;
 }
 
+.credit {
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+}
+
 .islands {
   display: block;
   width: min(20rem, 60%);
@@ -357,6 +408,20 @@ code {
   .grid,
   .split {
     grid-template-columns: 1fr;
+  }
+
+  /* Smaller photo variant keeps mobile payload at ~68KB. */
+  .hero {
+    min-height: 88vh;
+    background-image:
+      linear-gradient(
+        180deg,
+        rgba(23, 28, 29, 0.22) 0%,
+        rgba(23, 28, 29, 0.16) 38%,
+        rgba(23, 28, 29, 0.62) 76%,
+        rgba(23, 28, 29, 0.8) 100%
+      ),
+      url("./assets/ocean-camera-small.jpg");
   }
 }
 

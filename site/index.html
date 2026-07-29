@@ -15,7 +15,7 @@
     <a class="skip-link" href="#pillars">Skip to content</a>
 
     <header class="hero">
-      <div class="wrap">
+      <div class="wrap hero-content">
         <p class="eyebrow">Majestical · media catalog for macOS</p>
         <h1>
           Verified ingest.<br />
@@ -23,20 +23,19 @@
           Local&nbsp;AI.
         </h1>
         <p class="lead">
-          Majestical catalogs every drive you own. It checksums footage on the
-          way in, keeps thumbnails and metadata after the drive goes back on the
-          shelf, and finds “the sunset drone shot” without sending a byte to
-          anyone’s cloud.
+          Majestical keeps your footage above water. It checksums every byte on
+          the way in, keeps thumbnails and metadata after the drive goes back
+          on the shelf, and finds “the sunset drone shot” without sending a
+          byte to anyone’s cloud.
         </p>
         <div class="cta-row">
           <a class="button primary" id="download-btn" href="https://github.com/statik/majestical/releases">
             Download for macOS
           </a>
-          <a class="button" href="https://github.com/statik/majestical">View source on GitHub</a>
+          <a class="button ghost" href="https://github.com/statik/majestical">View source on GitHub</a>
         </div>
         <p class="cta-note" id="download-note">Open source, Apache-2.0. In active development.</p>
       </div>
-      <div class="horizon" aria-hidden="true"></div>
     </header>
 
     <main>
@@ -159,14 +158,15 @@ Archives/
           <h2 id="agents-title">Everything the app can do, the terminal can do.</h2>
           <p>
             The GUI, the <code>maj</code> CLI, and a built-in MCP server share
-            one engine. Ask Claude to find the selects, tag an ingest, or verify
-            a drive — every outcome a person can reach, an agent can reach, with
-            destructive steps gated behind confirmation.
+            one engine. Ask Claude to find the selects, tag an ingest, or check
+            a shelf of drives — every outcome a person can reach, an agent can
+            reach, with destructive steps gated behind confirmation.
           </p>
-          <pre class="terminal" aria-label="Example CLI session"><code><span class="prompt">$</span> maj search "sunset drone shots" --tag -status/rejected --json
-<span class="dim">{"count": 3, "results": [{"asset": "xxh3:9f2a…"}, …]}</span>
-<span class="prompt">$</span> maj verify /Volumes/archive-07
-<span class="dim">volume archive-07: 4,182 files verified · last proven good just now</span></code></pre>
+          <pre class="terminal" aria-label="Example CLI session"><code><span class="prompt">$</span> maj search --tag topic/drone --json
+<span class="dim">{"count":3,"results":[{"asset":"xxh3:9f2a…"},…]}</span>
+<span class="prompt">$</span> maj volumes list
+<span class="dim">ID          LABEL       LAST SEEN             ONLINE   ASSETS
+uuid:2FBE…  reef-cards  2026-07-12T18:40:11Z  offline  4182</span></code></pre>
         </div>
       </section>
 
@@ -210,6 +210,12 @@ Archives/
         <p>
           © Kindly Ops, LLC · Apache-2.0 ·
           <a href="https://github.com/statik/majestical">github.com/statik/majestical</a>
+        </p>
+        <p class="credit">
+          Photo by
+          <a href="https://unsplash.com/@marcohaber?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">marco haber</a>
+          on
+          <a href="https://unsplash.com/photos/a-person-floating-in-the-ocean-holding-a-camera-up-to-their-face-1RhslUGbITE?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">Unsplash</a>
         </p>
       </div>
     </footer>

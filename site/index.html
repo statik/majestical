@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Majestical — verified ingest, offline search, local AI for your media</title>
+    <meta
+      name="description"
+      content="Majestical is a macOS media catalog: checksummed ingest with ASC MHL, offline search of every drive you own, and semantic search that runs entirely on your Mac."
+    />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%234a4f3f'/%3E%3Ctext x='8' y='11.5' text-anchor='middle' font-family='Georgia' font-size='10' fill='%23e6e6df'%3EM%3C/text%3E%3C/svg%3E" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#pillars">Skip to content</a>
+
+    <header class="hero">
+      <div class="wrap">
+        <p class="eyebrow">Majestical · media catalog for macOS</p>
+        <h1>
+          Verified ingest.<br />
+          Offline search.<br />
+          Local&nbsp;AI.
+        </h1>
+        <p class="lead">
+          Majestical catalogs every drive you own. It checksums footage on the
+          way in, keeps thumbnails and metadata after the drive goes back on the
+          shelf, and finds “the sunset drone shot” without sending a byte to
+          anyone’s cloud.
+        </p>
+        <div class="cta-row">
+          <a class="button primary" id="download-btn" href="https://github.com/statik/majestical/releases">
+            Download for macOS
+          </a>
+          <a class="button" href="https://github.com/statik/majestical">View source on GitHub</a>
+        </div>
+        <p class="cta-note" id="download-note">Open source, Apache-2.0. In active development.</p>
+      </div>
+      <div class="horizon" aria-hidden="true"></div>
+    </header>
+
+    <main>
+      <section class="section" aria-labelledby="problem-title">
+        <div class="wrap">
+          <div class="marker-row">
+            <span class="mm" aria-hidden="true">MM&nbsp;4</span>
+            <hr class="chain" aria-hidden="true" />
+          </div>
+          <p class="eyebrow">The problem</p>
+          <h2 id="problem-title">Your footage is on eleven drives in a drawer.</h2>
+          <p>
+            Every shoot ends the same way: cards offloaded to whichever drive
+            had room, a folder name you meant to fix later, and a growing shelf
+            of disks only you can navigate — until you can’t. The tools that
+            offload carefully don’t search. The tools that search well want your
+            library uploaded, indexed on someone else’s hardware, and rented
+            back to you by the seat.
+          </p>
+          <p>
+            Majestical is built on a different assumption: the drives stay
+            yours, the index stays on your Mac, and losing the app should never
+            mean losing the work.
+          </p>
+        </div>
+      </section>
+
+      <section class="section" id="pillars" aria-labelledby="pillars-title">
+        <div class="wrap">
+          <div class="marker-row">
+            <span class="mm" aria-hidden="true">MM&nbsp;3</span>
+            <hr class="chain" aria-hidden="true" />
+          </div>
+          <p class="eyebrow">What it does</p>
+          <h2 id="pillars-title">Four things, done properly.</h2>
+          <div class="grid">
+            <article class="card">
+              <h3>Proven intact</h3>
+              <p>
+                Ingest verifies every byte — source read, destination read-back,
+                xxHash checksums — and writes industry-standard ASC&nbsp;MHL
+                manifests that travel with the media. Chain of custody isn’t a
+                paid tier.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Searchable on the shelf</h3>
+              <p>
+                The catalog keeps thumbnails, metadata, and checksums for every
+                volume it has ever seen. Search a drive that’s in a drawer, in
+                another city, or in a pelican case in someone’s trunk — and know
+                exactly which disk to plug in.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Semantic search, at home</h3>
+              <p>
+                Image and keyframe embeddings run on your Mac’s neural engine.
+                Type what you remember — “red boat at golden hour” — and get
+                clips with timestamps. Point it at Ollama, LM&nbsp;Studio, or
+                OpenRouter for captions and tag suggestions; each catalog
+                chooses its own privacy line.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Team sync, no server</h3>
+              <p>
+                The catalog is an append-only event log that merges cleanly in
+                any order. Sync it through a NAS folder, Dropbox, or the shuttle
+                drive itself — plug in at the far end and both catalogs
+                converge. Nobody runs infrastructure.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="para-title">
+        <div class="wrap">
+          <div class="marker-row">
+            <span class="mm" aria-hidden="true">MM&nbsp;2</span>
+            <hr class="chain" aria-hidden="true" />
+          </div>
+          <p class="eyebrow">Organization</p>
+          <h2 id="para-title">Opinionated folders. Freeform tags.</h2>
+          <div class="split">
+            <div>
+              <p>
+                Ingest files everything into a PARA layout — Projects, Areas,
+                Resources, Archives — so the disk stays legible with or without
+                the app. Everything else is folksonomy: tag what matters, in
+                your own words, and the app suggests the vocabulary your team
+                already uses instead of enforcing one.
+              </p>
+              <p>
+                Existing drives are cataloged exactly as they are. Nothing gets
+                reorganized without you asking.
+              </p>
+            </div>
+            <pre class="tree" aria-label="Example folder layout"><code>Projects/
+  2026-reef-survey/
+    2026-07-12/card-A001/…
+Areas/
+  gear-inventory/
+Resources/
+  stock-audio/
+Archives/
+  2025-keys-documentary/</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="agents-title">
+        <div class="wrap">
+          <div class="marker-row">
+            <span class="mm" aria-hidden="true">MM&nbsp;1</span>
+            <hr class="chain" aria-hidden="true" />
+          </div>
+          <p class="eyebrow">For people and agents</p>
+          <h2 id="agents-title">Everything the app can do, the terminal can do.</h2>
+          <p>
+            The GUI, the <code>maj</code> CLI, and a built-in MCP server share
+            one engine. Ask Claude to find the selects, tag an ingest, or verify
+            a drive — every outcome a person can reach, an agent can reach, with
+            destructive steps gated behind confirmation.
+          </p>
+          <pre class="terminal" aria-label="Example CLI session"><code><span class="prompt">$</span> maj search "sunset drone shots" --tag -status/rejected --json
+<span class="dim">{"count": 3, "results": [{"asset": "xxh3:9f2a…"}, …]}</span>
+<span class="prompt">$</span> maj verify /Volumes/archive-07
+<span class="dim">volume archive-07: 4,182 files verified · last proven good just now</span></code></pre>
+        </div>
+      </section>
+
+      <section class="section section-final" aria-labelledby="download-title">
+        <div class="wrap">
+          <div class="marker-row">
+            <span class="mm mm-zero" aria-hidden="true">MM&nbsp;0</span>
+            <hr class="chain" aria-hidden="true" />
+          </div>
+          <p class="eyebrow">End of the road</p>
+          <h2 id="download-title">Get Majestical.</h2>
+          <p>
+            Free and open source under Apache-2.0. Built in Rust, native on
+            Apple silicon, updates itself from GitHub releases.
+          </p>
+          <div class="cta-row">
+            <a class="button primary" id="download-btn-2" href="https://github.com/statik/majestical/releases">
+              Download for macOS
+            </a>
+            <a class="button" href="https://github.com/statik/majestical/releases">All releases</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="wrap">
+        <svg class="islands" viewBox="0 0 320 24" role="img" aria-label="A chain of small islands">
+          <g fill="currentColor">
+            <ellipse cx="10" cy="6" rx="7" ry="2.4" />
+            <ellipse cx="44" cy="8" rx="10" ry="2.8" />
+            <ellipse cx="86" cy="10" rx="8" ry="2.4" />
+            <ellipse cx="122" cy="12" rx="12" ry="3" />
+            <ellipse cx="163" cy="14" rx="7" ry="2.2" />
+            <ellipse cx="196" cy="15" rx="9" ry="2.6" />
+            <ellipse cx="232" cy="17" rx="6" ry="2" />
+            <ellipse cx="262" cy="18" rx="8" ry="2.4" />
+            <ellipse cx="296" cy="20" rx="5" ry="1.8" />
+          </g>
+        </svg>
+        <p>
+          © Kindly Ops, LLC · Apache-2.0 ·
+          <a href="https://github.com/statik/majestical">github.com/statik/majestical</a>
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

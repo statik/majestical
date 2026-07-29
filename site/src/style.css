@@ -1,0 +1,374 @@
+/* Majestical marketing site.
+   Palette: the design-memo (Arrival) system, verbatim.
+   Signature: mile-marker countdown to MM 0, island-chain rules,
+   and a shallow-water horizon under the hero. */
+
+:root {
+  color-scheme: light;
+  --paper: #cfd4cf;
+  --paper-deep: #7f8985;
+  --panel: #e6e6df;
+  --ink: #171c1d;
+  --muted: #4a5250;
+  --olive: #4a4f3f;
+  --amber: #9a7a55;
+  --ochre: #b79b65;
+  --mustard: #d6c7a4;
+  --teal: #2f5557;
+  --blue: #5f7f86;
+  --line: #9aa39d;
+  --code: #111819;
+  --code-bg: #bdc8c3;
+
+  --serif: Georgia, "Times New Roman", serif;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--serif);
+  background: linear-gradient(160deg, #dce0dc, var(--paper) 55%, #c4cbc6);
+  color: var(--ink);
+  line-height: 1.6;
+}
+
+.wrap {
+  width: min(70rem, 100% - 3rem);
+  margin-inline: auto;
+}
+
+.skip-link {
+  position: absolute;
+  left: -100vw;
+  top: 0;
+  padding: 0.5rem 1rem;
+  background: var(--olive);
+  color: var(--panel);
+  font-family: var(--sans);
+}
+
+.skip-link:focus {
+  left: 0;
+  z-index: 10;
+}
+
+/* ---- type ---- */
+
+.eyebrow {
+  margin: 0 0 1rem;
+  color: var(--teal);
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  max-width: 18ch;
+  color: var(--olive);
+  font-size: clamp(2.8rem, 8vw, 5.8rem);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 1.02;
+}
+
+h2 {
+  margin: 0;
+  max-width: 24ch;
+  color: var(--olive);
+  font-size: clamp(1.9rem, 4.5vw, 3.2rem);
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+}
+
+h3 {
+  margin: 0 0 0.5rem;
+  color: var(--olive);
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+p {
+  max-width: 62ch;
+  margin: 1.1rem 0 0;
+  color: var(--muted);
+  font-size: clamp(1.02rem, 1.4vw, 1.15rem);
+}
+
+.lead {
+  max-width: 56ch;
+  font-size: clamp(1.15rem, 2vw, 1.45rem);
+}
+
+/* Body copy that must be readable stays ink; --muted is reserved for
+   secondary text, but our sections are primary content, so keep contrast. */
+.section p,
+.hero .lead {
+  color: #333b39;
+}
+
+a {
+  color: var(--teal);
+}
+
+code {
+  padding: 0.1rem 0.35rem;
+  border-radius: 8px;
+  background: var(--code-bg);
+  color: var(--code);
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+/* ---- hero ---- */
+
+.hero {
+  position: relative;
+  padding: clamp(4rem, 10vh, 7rem) 0 0;
+}
+
+.hero .wrap {
+  padding-bottom: clamp(4rem, 9vh, 6.5rem);
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin-top: 2rem;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.7rem 1.3rem;
+  border: 1px solid var(--olive);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--olive);
+  font-family: var(--sans);
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.button:hover {
+  background: rgba(74, 79, 63, 0.1);
+}
+
+.button.primary {
+  background: var(--olive);
+  color: var(--panel);
+}
+
+.button.primary:hover {
+  background: #3a3f31;
+  transform: translateY(-1px);
+}
+
+.button:focus-visible {
+  outline: 3px solid var(--teal);
+  outline-offset: 3px;
+}
+
+.cta-note {
+  margin-top: 0.9rem;
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+/* The shallow-water horizon: a crisp waterline, then teal shallows fading
+   over a sand flat. Color only, no imagery. */
+.horizon {
+  height: clamp(4.5rem, 12vh, 8rem);
+  border-top: 2px solid rgba(47, 85, 87, 0.45);
+  border-bottom: 1px solid var(--line);
+  background:
+    linear-gradient(
+      180deg,
+      rgba(47, 85, 87, 0.28) 0%,
+      rgba(95, 127, 134, 0.22) 34%,
+      rgba(95, 127, 134, 0.14) 58%,
+      rgba(183, 155, 101, 0.18) 82%,
+      rgba(214, 199, 164, 0.32) 100%
+    ),
+    linear-gradient(90deg, rgba(214, 199, 164, 0.18), transparent 35%, rgba(47, 85, 87, 0.12) 90%);
+}
+
+/* ---- sections & the countdown ---- */
+
+.section {
+  padding: clamp(3.2rem, 8vh, 5.5rem) 0 0;
+}
+
+.section-final {
+  padding-bottom: clamp(3.5rem, 9vh, 6rem);
+}
+
+.marker-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.6rem;
+}
+
+/* Mile-marker sign: small green highway sign counting down to MM 0. */
+.mm {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.32rem 0.6rem;
+  border-radius: 7px;
+  background: var(--olive);
+  box-shadow: inset 0 0 0 2px var(--panel), 0 1px 2px rgba(23, 28, 29, 0.25);
+  color: var(--panel);
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.mm-zero {
+  background: var(--teal);
+}
+
+/* Island-chain rule: a dotted line whose dashes thin out like the
+   archipelago running southwest on a chart. */
+.chain {
+  flex: 1;
+  height: 0;
+  margin: 0;
+  border: 0;
+  border-top: 3px dotted var(--ochre);
+  opacity: 0.75;
+  mask-image: linear-gradient(90deg, #000 55%, rgba(0, 0, 0, 0.35));
+}
+
+/* ---- cards ---- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.1rem;
+  margin-top: 2rem;
+}
+
+.card {
+  padding: 1.5rem 1.6rem 1.7rem;
+  border: 1px solid var(--line);
+  border-top: 7px double var(--olive);
+  background:
+    linear-gradient(90deg, rgba(214, 199, 164, 0.22), transparent 40%),
+    rgba(230, 230, 223, 0.92);
+  box-shadow: 0 1px 0 rgba(23, 28, 29, 0.12), 0 14px 34px rgba(44, 55, 55, 0.1);
+}
+
+.card p {
+  margin-top: 0.4rem;
+  font-size: 1rem;
+}
+
+/* ---- split (PARA) ---- */
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 2rem;
+  align-items: start;
+  margin-top: 0.6rem;
+}
+
+.tree,
+.terminal {
+  overflow-x: auto;
+  margin: 1.6rem 0 0;
+  padding: 1.1rem 1.3rem;
+  border: 1px solid var(--line);
+  border-left: 6px solid var(--blue);
+  border-radius: 10px;
+  background: var(--code-bg);
+  color: var(--code);
+  font-family: var(--mono);
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+.terminal .prompt {
+  color: var(--teal);
+  font-weight: 700;
+}
+
+.terminal .dim {
+  color: #3d4a48;
+}
+
+/* ---- reveal on scroll (JS adds .js to <html>) ---- */
+
+.js .section .wrap {
+  opacity: 0;
+  transform: translateY(1.2rem);
+  transition: opacity 600ms ease, transform 600ms ease;
+}
+
+.js .section.is-visible .wrap {
+  opacity: 1;
+  transform: none;
+}
+
+/* ---- footer ---- */
+
+.footer {
+  padding: 2.5rem 0 3rem;
+  border-top: 1px solid var(--line);
+  margin-top: clamp(3rem, 8vh, 5rem);
+  background: linear-gradient(180deg, transparent, rgba(127, 137, 133, 0.25));
+}
+
+.footer p {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+}
+
+.islands {
+  display: block;
+  width: min(20rem, 60%);
+  height: auto;
+  color: var(--paper-deep);
+  opacity: 0.8;
+}
+
+/* ---- small screens & motion ---- */
+
+@media (max-width: 720px) {
+  .grid,
+  .split {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+  }
+
+  .js .section .wrap {
+    opacity: 1;
+    transform: none;
+  }
+}

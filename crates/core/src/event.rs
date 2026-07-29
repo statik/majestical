@@ -48,10 +48,9 @@ pub enum Op {
 mod tests {
     use super::*;
     use crate::clock::{Hlc, MachineId};
-    use serde::de::Error as _;
 
     #[test]
-    fn event_json_round_trips() -> Result<(), serde_json::Error> {
+    fn event_json_round_trips() {
         let e = Event {
             id: EventId(ulid::Ulid::from_parts(1, 1)),
             hlc: Hlc {
@@ -65,14 +64,8 @@ mod tests {
                 tag: "person/dana".into(),
             },
         };
-        let json = serde_json::to_string(&e)?;
-        let back: Event = serde_json::from_str(&json)?;
-        if e == back {
-            Ok(())
-        } else {
-            Err(serde_json::Error::custom(format!(
-                "round trip mismatch: {e:?} != {back:?}"
-            )))
-        }
+        let json = serde_json::to_string(&e).expect("serialize");
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(e, back);
     }
 }

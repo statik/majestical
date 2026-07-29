@@ -50,7 +50,7 @@ impl HlcClock {
             self.last_wall = wall;
             self.last_counter = 0;
         } else {
-            self.last_counter += 1;
+            self.last_counter = self.last_counter.saturating_add(1);
         }
         Hlc {
             wall_ms: self.last_wall,
@@ -73,11 +73,19 @@ impl HlcClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     struct FixedClock(u64);
     impl Clock for FixedClock {
         fn wall_ms(&self) -> u64 {
             self.0
+        }
+    }
+
+    struct SteppingClock(Cell<u64>);
+    impl Clock for SteppingClock {
+        fn wall_ms(&self) -> u64 {
+            self.0.get()
         }
     }
 
@@ -87,6 +95,25 @@ mod tests {
         let a = hlc.now();
         let b = hlc.now();
         assert!(b > a, "same wall ms must bump counter");
+    }
+
+    #[test]
+    fn hlc_is_monotonic_when_wall_clock_moves_backward() {
+        let mut hlc = HlcClock::new(
+            MachineId("m1".into()),
+            Box::new(SteppingClock(Cell::new(1000))),
+        );
+        let a = hlc.now();
+        // `tests` is a child module of `clock`, so it can reach the private
+        // `clock` field directly to swap in a clock reporting an earlier
+        // wall time — simulating a backward jump without needing a shared,
+        // externally mutable handle into the boxed `dyn Clock` trait object.
+        hlc.clock = Box::new(SteppingClock(Cell::new(500)));
+        let b = hlc.now();
+        assert!(
+            b > a,
+            "wall clock moving backward must not un-monotonic the HLC"
+        );
     }
 
     #[test]

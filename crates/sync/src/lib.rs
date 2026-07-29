@@ -18,6 +18,8 @@ pub enum LogError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("no event log at {} — initialize the catalog first", path.display())]
+    NotInitialized { path: PathBuf },
     #[error("serializing event: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -28,12 +30,44 @@ pub struct FileEventLog {
 }
 
 impl FileEventLog {
-    /// Opens (creating if needed) the segment directory for `machine` under `root`.
+    /// Initializes a fresh catalog root: creates `<root>/events` and
+    /// `machine`'s own segment directory under it. Call once per catalog
+    /// root (`maj catalog init`), before any `open`.
+    ///
+    /// Idempotent, git-init style: re-running against an already
+    /// initialized root just creates any missing directories and never
+    /// touches existing segment files, so it's always safe to call again.
     ///
     /// # Errors
-    /// Returns [`LogError::Io`] if the machine's segment directory can't be created.
-    pub fn open(root: &Path, machine: &MachineId) -> Result<Self, LogError> {
+    /// Returns [`LogError::Io`] if the directories can't be created.
+    pub fn init(root: &Path, machine: &MachineId) -> Result<Self, LogError> {
         let machine_dir = root.join("events").join(&machine.0);
+        fs::create_dir_all(&machine_dir).map_err(|source| LogError::Io {
+            path: machine_dir.clone(),
+            source,
+        })?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            machine_dir,
+        })
+    }
+
+    /// Opens the segment directory for `machine` under an already
+    /// initialized `root`. Creates this machine's own subdirectory if it
+    /// doesn't exist yet — a new machine joining an existing catalog — but
+    /// requires `<root>/events` itself to already exist; use [`Self::init`]
+    /// to create a catalog root from scratch.
+    ///
+    /// # Errors
+    /// Returns [`LogError::NotInitialized`] if `<root>/events` is missing,
+    /// or [`LogError::Io`] if this machine's segment directory can't be
+    /// created.
+    pub fn open(root: &Path, machine: &MachineId) -> Result<Self, LogError> {
+        let events_dir = root.join("events");
+        if !events_dir.is_dir() {
+            return Err(LogError::NotInitialized { path: events_dir });
+        }
+        let machine_dir = events_dir.join(&machine.0);
         fs::create_dir_all(&machine_dir).map_err(|source| LogError::Io {
             path: machine_dir.clone(),
             source,
@@ -196,9 +230,19 @@ mod tests {
     }
 
     #[test]
+    fn open_errors_when_root_not_initialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = FileEventLog::open(dir.path(), &MachineId("m1".into()));
+        assert!(
+            matches!(result, Err(LogError::NotInitialized { .. })),
+            "open must fail on an uninitialized root"
+        );
+    }
+
+    #[test]
     fn append_then_read_all_machines() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log1 = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open m1");
+        let mut log1 = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init m1");
         let mut log2 = FileEventLog::open(dir.path(), &MachineId("m2".into())).expect("open m2");
         log1.append(&[ev(1), ev(2)]).expect("append m1");
         log2.append(&[ev(3)]).expect("append m2");
@@ -212,7 +256,7 @@ mod tests {
     #[test]
     fn corrupt_line_is_skipped_and_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
         log.append(&[ev(1)]).expect("append");
         let seg = dir.path().join("events/m1/0001.jsonl");
         let good = std::fs::read_to_string(&seg).expect("read seg");
@@ -225,7 +269,7 @@ mod tests {
     #[test]
     fn stray_files_in_events_root_are_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
         log.append(&[ev(1)]).expect("append");
         let events_dir = dir.path().join("events");
         std::fs::write(events_dir.join(".DS_Store"), b"junk").expect("write DS_Store");
@@ -237,7 +281,7 @@ mod tests {
     #[test]
     fn directory_named_like_segment_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
         log.append(&[ev(1)]).expect("append");
         std::fs::create_dir(dir.path().join("events/m1/0002.jsonl")).expect("mkdir");
         let all = log.read_all().expect("read");
@@ -247,7 +291,7 @@ mod tests {
     #[test]
     fn events_merge_across_segments_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = FileEventLog::open(dir.path(), &MachineId("m1".into())).expect("open");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
         log.append(&[ev(1)]).expect("append segment 1");
         let seg2 = dir.path().join("events/m1/0002.jsonl");
         let line = serde_json::to_string(&ev(2)).expect("serialize");

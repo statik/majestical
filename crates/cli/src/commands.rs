@@ -3,15 +3,28 @@
 use crate::app::{FsApp, physical_now_ms};
 use crate::iso8601::iso8601_ms;
 use crate::volume_identity;
-use crate::{MetaCmd, TagCmd};
+use crate::{MetaCmd, ParaCmd, TagCmd};
 use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
-use majestical_core::event::{AssetId, Op};
+use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Opens the sqlite catalog at `<catalog_dir>/catalog.db` and rebuilds it
+/// from the current projection. Shared by every read path that needs an ad
+/// hoc sqlite view — `search`, `volumes list`, and `para list` — so the
+/// open+rebuild pair lives in exactly one place.
+pub(crate) fn open_rebuilt_catalog(app: &FsApp, catalog_dir: &Path) -> Result<SqliteCatalog> {
+    let projection = app.projection()?;
+    let db_path = catalog_dir.join("catalog.db");
+    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
+    db.rebuild(&projection)
+        .context("rebuilding sqlite projection")?;
+    Ok(db)
+}
 
 pub(crate) fn cmd_catalog_init(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
     FsApp::init(catalog, machine_id, author)?;
@@ -200,11 +213,7 @@ pub(crate) fn cmd_search(
     tag: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let projection = app.projection()?;
-    let db_path = catalog_dir.join("catalog.db");
-    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
-    db.rebuild(&projection)
-        .context("rebuilding sqlite projection")?;
+    let db = open_rebuilt_catalog(app, catalog_dir)?;
     let ids = match (name, tag) {
         (Some(n), None) => db.search_by_name(&n)?,
         (None, Some(t)) => db.search_by_tag(&t)?,
@@ -256,11 +265,7 @@ pub(crate) fn volume_is_online(id: &str, label: &str) -> bool {
 }
 
 pub(crate) fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let projection = app.projection()?;
-    let db_path = catalog_dir.join("catalog.db");
-    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
-    db.rebuild(&projection)
-        .context("rebuilding sqlite projection")?;
+    let db = open_rebuilt_catalog(app, catalog_dir)?;
     let volumes = db.volumes().context("querying volumes")?;
     let counts: HashMap<String, u64> = db
         .volume_asset_counts()
@@ -331,4 +336,187 @@ pub(crate) fn print_volumes_table(
     for (id, label, last_seen, online, count) in &rows {
         println!("{id:<id_w$} {label:<label_w$} {last_seen:<seen_w$} {online:<online_w$} {count}");
     }
+}
+
+fn parse_kind(kind: &str) -> Result<ParaKind> {
+    match kind {
+        "project" => Ok(ParaKind::Project),
+        "area" => Ok(ParaKind::Area),
+        "resource" => Ok(ParaKind::Resource),
+        "archive" => Ok(ParaKind::Archive),
+        other => {
+            anyhow::bail!("unknown PARA kind '{other}' — one of: project, area, resource, archive")
+        }
+    }
+}
+
+/// Resolves `<kind>/<name>` or a raw node ULID against non-archived nodes.
+pub(crate) fn resolve_para_node(projection: &Projection, reference: &str) -> Result<String> {
+    if projection.para_node(reference).is_some() {
+        return Ok(reference.to_string());
+    }
+    let Some((kind_str, name)) = reference.split_once('/') else {
+        anyhow::bail!(
+            "unknown PARA node '{reference}' — use <kind>/<name> or a node id from `maj para list`"
+        );
+    };
+    let kind = parse_kind(kind_str)?;
+    let matches: Vec<&String> = projection
+        .para_nodes()
+        .filter(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name))
+        .map(|(id, _)| id)
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no active PARA node '{reference}' — see `maj para list`"),
+        [id] => Ok((*id).clone()),
+        many => anyhow::bail!(
+            "'{reference}' is ambiguous (concurrent creates); use a node id: {}",
+            many.iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+pub(crate) fn cmd_para(app: &mut FsApp, catalog_dir: &Path, cmd: ParaCmd) -> Result<()> {
+    match cmd {
+        ParaCmd::Add { kind, name } => cmd_para_add(app, &kind, &name)?,
+        ParaCmd::List { json } => cmd_para_list(app, catalog_dir, json)?,
+        ParaCmd::Rename { node, name } => cmd_para_rename(app, &node, &name)?,
+        ParaCmd::Archive {
+            node,
+            root,
+            dry_run,
+        } => cmd_para_archive(app, &node, &root, dry_run)?,
+    }
+    Ok(())
+}
+
+/// Creates a node, rejecting a duplicate non-archived `(kind, name)` — two
+/// active nodes with the same reference would be indistinguishable to
+/// `resolve_para_node`.
+fn cmd_para_add(app: &mut FsApp, kind_str: &str, name: &str) -> Result<()> {
+    let kind = parse_kind(kind_str)?;
+    let projection = app.projection()?;
+    let duplicate = projection
+        .para_nodes()
+        .any(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
+    anyhow::ensure!(
+        !duplicate,
+        "a PARA node '{kind_str}/{name}' already exists — see `maj para list`"
+    );
+    let node_id = ulid::Ulid::generate().to_string();
+    app.emit(vec![Op::ParaNodeCreate {
+        node: node_id.clone(),
+        kind,
+        name: name.to_string(),
+    }])?;
+    println!("{node_id}");
+    Ok(())
+}
+
+fn cmd_para_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
+    let db = open_rebuilt_catalog(app, catalog_dir)?;
+    let nodes = db.para_nodes().context("querying para nodes")?;
+    if json {
+        let rows: Vec<_> = nodes
+            .iter()
+            .map(|(id, kind, name, archived)| {
+                serde_json::json!({
+                    "id": id, "kind": kind, "name": name, "archived": archived
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "nodes": rows }));
+    } else {
+        print_para_table(&nodes);
+    }
+    Ok(())
+}
+
+/// Renders the human-readable para-nodes table, following
+/// `print_volumes_table`'s width-sizing pattern.
+fn print_para_table(nodes: &[(String, String, String, bool)]) {
+    let id_w = nodes.iter().map(|r| r.0.len()).max().unwrap_or(0).max(2);
+    let kind_w = nodes.iter().map(|r| r.1.len()).max().unwrap_or(0).max(4);
+    let name_w = nodes.iter().map(|r| r.2.len()).max().unwrap_or(0).max(4);
+    println!(
+        "{:<id_w$} {:<kind_w$} {:<name_w$} ARCHIVED",
+        "ID", "KIND", "NAME"
+    );
+    for (id, kind, name, archived) in nodes {
+        println!("{id:<id_w$} {kind:<kind_w$} {name:<name_w$} {archived}");
+    }
+}
+
+fn cmd_para_rename(app: &mut FsApp, node: &str, name: &str) -> Result<()> {
+    let projection = app.projection()?;
+    let node_id = resolve_para_node(&projection, node)?;
+    app.emit(vec![Op::ParaNodeRename {
+        node: node_id,
+        name: name.to_string(),
+    }])?;
+    println!("ok");
+    Ok(())
+}
+
+/// Archives a node. With `--root`s, each root's materialized directory
+/// (`<root>/<KindDir>/<name>`) is moved to `<root>/Archives/<name>` before
+/// the archive event is emitted; with no roots, only the event is emitted
+/// and a note is printed that nothing was moved on disk.
+///
+/// If a move fails partway through a multi-root run, the roots already
+/// moved stay moved and the archive event is NOT emitted — acceptable
+/// partial progress; the error tells the caller to re-run.
+fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: bool) -> Result<()> {
+    let projection = app.projection()?;
+    let node_id = resolve_para_node(&projection, node)?;
+    let state = projection
+        .para_node(&node_id)
+        .context("resolved node vanished from the projection")?;
+    let Some(kind) = state.kind() else {
+        anyhow::bail!("PARA node {node_id} has no kind recorded — its create event may be missing");
+    };
+    let Some(name) = state.name() else {
+        anyhow::bail!("PARA node {node_id} has no name recorded — its create event may be missing");
+    };
+
+    if roots.is_empty() {
+        if !dry_run {
+            app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
+        }
+        println!("ok (no --root given; no directories moved)");
+        return Ok(());
+    }
+
+    for root in roots {
+        let source = root.join(kind.dir_name()).join(name);
+        let archives_dir = root.join("Archives");
+        let target = archives_dir.join(name);
+        if dry_run {
+            println!("would move {} -> {}", source.display(), target.display());
+            continue;
+        }
+        anyhow::ensure!(
+            source.is_dir(),
+            "source directory {} does not exist — nothing to archive",
+            source.display()
+        );
+        anyhow::ensure!(
+            !target.exists(),
+            "archive target {} already exists",
+            target.display()
+        );
+        std::fs::create_dir_all(&archives_dir)
+            .with_context(|| format!("creating {}", archives_dir.display()))?;
+        std::fs::rename(&source, &target)
+            .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
+        println!("moved {} -> {}", source.display(), target.display());
+    }
+
+    if !dry_run {
+        app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
+    }
+    Ok(())
 }

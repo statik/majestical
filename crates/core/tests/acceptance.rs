@@ -70,12 +70,25 @@ impl Machine {
     }
 }
 
-#[derive(Debug, Default, World)]
+#[derive(Debug, World)]
+#[world(init = Self::new)]
 struct CatalogWorld {
     machines: BTreeMap<String, Machine>,
 }
 
 impl CatalogWorld {
+    // Both machines exist from the start of every scenario. A machine
+    // created lazily on first mention would start with an empty log and
+    // an empty projection, so a step reached before any exchange (e.g.
+    // "bob removes tag X") would cite no observed adds — a no-op remove
+    // that silently exercises nothing.
+    fn new() -> Self {
+        let mut machines = BTreeMap::new();
+        machines.insert("amy".to_string(), Machine::new("amy"));
+        machines.insert("bob".to_string(), Machine::new("bob"));
+        Self { machines }
+    }
+
     fn machine(&mut self, name: &str) -> &mut Machine {
         self.machines
             .entry(name.to_string())
@@ -110,14 +123,21 @@ fn tag_add(w: &mut CatalogWorld, m: String, a: String, tag: String) {
     clippy::needless_pass_by_value,
     reason = "cucumber's {string} captures always bind as owned String"
 )]
-fn tag_rm(w: &mut CatalogWorld, m: String, tag: String, a: String) {
+fn tag_rm(w: &mut CatalogWorld, m: String, tag: String, a: String) -> Result<(), String> {
     let machine = w.machine(&m);
     let observed = machine.projection.tag_add_ids(&asset(&a), &tag);
+    if observed.is_empty() {
+        return Err(format!(
+            "remove would cite nothing — machine {m} hasn't seen any adds for tag {tag:?}; \
+             scenario ordering bug?"
+        ));
+    }
     machine.emit(Op::TagRemove {
         asset: asset(&a),
         tag,
         observed,
     });
+    Ok(())
 }
 
 #[given("the machines exchange event logs")]

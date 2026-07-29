@@ -83,6 +83,7 @@ struct App {
     log: FileEventLog,
     hlc: HlcClock,
     author: String,
+    catalog_root: PathBuf,
 }
 
 impl App {
@@ -94,13 +95,29 @@ impl App {
             log,
             hlc: HlcClock::new(machine.clone(), Box::new(SystemClock)),
             author: machine.0,
+            catalog_root: root.to_path_buf(),
         })
     }
 
     /// Loads every event currently in the log. Each call re-reads the log
     /// from disk; per-process caching arrives with the adapter refactor.
+    ///
+    /// Corrupt lines are skipped rather than failing the read; a warning is
+    /// printed to stderr so the user knows metadata may be missing, without
+    /// polluting stdout (which carries this process's data output).
     fn events(&self) -> Result<Vec<Event>> {
-        self.log.read_all().context("reading event log")
+        let mut skipped = 0usize;
+        let events = self
+            .log
+            .read_all_reporting(|_line| skipped += 1)
+            .context("reading event log")?;
+        if skipped > 0 {
+            eprintln!(
+                "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
+                self.catalog_root.display()
+            );
+        }
+        Ok(events)
     }
 
     fn projection_of(events: &[Event]) -> Projection {

@@ -722,6 +722,59 @@ fn para_archive_moves_materialized_dir_with_root() {
     assert_eq!(nodes[0]["archived"], true);
 }
 
+/// A multi-root archive run must converge on re-run rather than failing
+/// forever on a root an earlier partial run already moved. Simulates that
+/// partial progress directly (root1 already has its directory under
+/// `Archives/` and nothing left under `Projects/`) alongside a second root
+/// that is still materialized and needs an actual move; a single command
+/// covering both roots must skip the already-archived one, move the other,
+/// and still emit the archive event.
+#[test]
+fn para_archive_with_multiple_roots_skips_a_root_already_archived() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+
+    let root1 = tempfile::tempdir().unwrap();
+    let root1_archived = root1.path().join("Archives").join("client-x");
+    std::fs::create_dir_all(&root1_archived).unwrap();
+    std::fs::write(root1_archived.join("a.txt"), b"hello").unwrap();
+
+    let root2 = tempfile::tempdir().unwrap();
+    let root2_source = root2.path().join("Projects").join("client-x");
+    std::fs::create_dir_all(&root2_source).unwrap();
+    std::fs::write(root2_source.join("b.txt"), b"world").unwrap();
+
+    maj(&root)
+        .args(["para", "archive", "project/client-x"])
+        .arg("--root")
+        .arg(root1.path())
+        .arg("--root")
+        .arg(root2.path())
+        .assert()
+        .success()
+        .stdout(contains("already archived"));
+
+    assert!(!root2_source.exists(), "root2 source must be moved");
+    let root2_archived = root2.path().join("Archives").join("client-x");
+    assert!(root2_archived.join("b.txt").is_file());
+    // root1's already-archived directory is untouched by the skip.
+    assert!(root1_archived.join("a.txt").is_file());
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["archived"], true);
+}
+
 /// Two machines sharing a catalog root each set the same field; the write
 /// with the later HLC (here, the one issued second in wall-clock time) wins
 /// on both machines once they re-read the merged log — LWW convergence for

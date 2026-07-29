@@ -351,6 +351,9 @@ fn parse_kind(kind: &str) -> Result<ParaKind> {
 }
 
 /// Resolves `<kind>/<name>` or a raw node ULID against non-archived nodes.
+/// The non-archived restriction applies only to the `<kind>/<name>` form; a
+/// raw node id resolves an archived node too (intentional — once a node is
+/// archived, its id is the only way left to address it).
 pub(crate) fn resolve_para_node(projection: &Projection, reference: &str) -> Result<String> {
     if projection.para_node(reference).is_some() {
         return Ok(reference.to_string());
@@ -464,11 +467,15 @@ fn cmd_para_rename(app: &mut FsApp, node: &str, name: &str) -> Result<()> {
 /// Archives a node. With `--root`s, each root's materialized directory
 /// (`<root>/<KindDir>/<name>`) is moved to `<root>/Archives/<name>` before
 /// the archive event is emitted; with no roots, only the event is emitted
-/// and a note is printed that nothing was moved on disk.
+/// (skipped in `--dry-run`) and a note is printed that nothing was moved on
+/// disk.
 ///
 /// If a move fails partway through a multi-root run, the roots already
-/// moved stay moved and the archive event is NOT emitted — acceptable
-/// partial progress; the error tells the caller to re-run.
+/// moved stay moved and the archive event is NOT emitted. A root whose
+/// source is gone and target already exists is treated as already archived
+/// and skipped rather than re-erroring — so re-running the exact same
+/// command converges instead of failing forever on the root that succeeded
+/// last time.
 fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: bool) -> Result<()> {
     let projection = app.projection()?;
     let node_id = resolve_para_node(&projection, node)?;
@@ -483,10 +490,12 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
     };
 
     if roots.is_empty() {
-        if !dry_run {
+        if dry_run {
+            println!("would archive (dry run; no --root given; no directories to move)");
+        } else {
             app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
+            println!("ok (no --root given; no directories moved)");
         }
-        println!("ok (no --root given; no directories moved)");
         return Ok(());
     }
     // A node of kind `archive` already materializes under `Archives/` (its
@@ -502,6 +511,14 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
         let source = root.join(kind.dir_name()).join(name);
         let archives_dir = root.join("Archives");
         let target = archives_dir.join(name);
+        // Source gone, target present: an earlier partial run already moved
+        // this root. Skip rather than erroring, so a plain re-run of the
+        // same command converges instead of failing on the root that
+        // already succeeded.
+        if !source.is_dir() && target.is_dir() {
+            println!("already archived at {} — skipping", target.display());
+            continue;
+        }
         if dry_run {
             println!("would move {} -> {}", source.display(), target.display());
             continue;

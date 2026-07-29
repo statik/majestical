@@ -80,7 +80,7 @@ enum TagCmd {
     Rm { asset: String, tag: String },
 }
 
-struct App<L: EventLog> {
+struct App<L> {
     log: L,
     hlc: HlcClock,
     author: String,

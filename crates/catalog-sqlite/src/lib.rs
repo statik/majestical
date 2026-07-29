@@ -9,7 +9,7 @@ use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
-    #[error("catalog db: {0} — delete the file and rebuild from the event log")]
+    #[error("catalog db: {0} — delete the file and re-run")]
     Sqlite(#[from] rusqlite::Error),
 }
 
@@ -31,12 +31,15 @@ impl SqliteCatalog {
     /// Recreates the catalog's projection tables from `projection`, wholesale.
     ///
     /// Any existing tables are dropped first — the database is a disposable
-    /// projection, not a source of truth.
+    /// projection, not a source of truth. The drop, create, and every insert
+    /// run inside one transaction, so a failure partway through leaves the
+    /// previous catalog intact for readers instead of an emptied database.
     ///
     /// # Errors
     /// Returns an error if a table can't be (re)created or a write fails.
     pub fn rebuild(&mut self, projection: &Projection) -> Result<(), CatalogError> {
-        self.conn.execute_batch(
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
             "DROP TABLE IF EXISTS tags;
              DROP TABLE IF EXISTS instances;
              DROP TABLE IF EXISTS assets;
@@ -53,7 +56,6 @@ impl SqliteCatalog {
              CREATE INDEX tags_by_tag ON tags (tag);",
         )?;
 
-        let tx = self.conn.transaction()?;
         for (asset, state) in projection.assets() {
             tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
             for (volume, path, size) in &state.instances {
@@ -209,6 +211,35 @@ mod tests {
                 .expect("literal percent and underscore query"),
             vec![b],
             "instance with a literal '%' and '_' must be findable by that literal"
+        );
+    }
+
+    #[test]
+    fn catalog_store_trait_object_rebuilds_and_queries() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:aa".into());
+        p.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(1, 0)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::TagAdd {
+                asset: a.clone(),
+                tag: "topic/drone".into(),
+            },
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut owned = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        let store: &mut dyn CatalogStore = &mut owned;
+        store.rebuild(&p).expect("rebuild via trait object");
+        assert_eq!(
+            store
+                .search_by_tag("topic/drone")
+                .expect("tag query via trait object"),
+            vec![a]
         );
     }
 

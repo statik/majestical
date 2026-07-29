@@ -1,12 +1,11 @@
-# Phase 2 watch list
+# Phase 2 watch list (now the phase 3 backlog)
 
-Deferred items recorded during Phase 1 execution and its final review. The Phase 2
-planning session should triage these against the spec's build order.
+Deferred items recorded during Phase 1/2 execution and their final reviews. The
+phase 3 planning session should triage the open items against the spec's build
+order. Items marked "(Done in phase 2)" are resolved and listed for the record.
 
-- **EventLog / CatalogStore port traits in core** before adapters multiply — only
-  `Clock` exists as a trait today; the CLI couples to the concrete types (spec §1).
-- **HLC `observe()` max-drift bound** before ingesting remote logs — one bad peer
-  clock must not permanently poison local ordering (also noted in the phase 1 plan).
+## Open
+
 - **Segment rotation** must keep zero-padded `NNNN` names — lexicographic sort
   constraint documented at `crates/sync/src/lib.rs` next to `segments.sort()`.
 - **Incremental SQLite apply** — full projection rebuild per search won't scale
@@ -18,21 +17,35 @@ planning session should triage these against the spec's build order.
   the ingest phase must preserve exact bytes end to end.
 - **cargo-mutants on the CRDT and verification modules** — spec §7 calls for it;
   not yet run.
-- **Author identity configuration** — CLI sets `author = machine_id`; the event
-  model documents author as a human identity distinct from the machine.
-- **Asset-existence validation on `tag add`** — tagging an unknown id currently
-  creates a phantom asset.
-- **`catalog init` should be load-bearing** — other commands auto-create the tree,
-  so a typo'd `MAJ_CATALOG` silently births an empty catalog.
 - **Workspace→cli lint-table drift** — the CLI hand-copies the clippy table (Cargo
   can't merge them); workspace lint changes won't propagate automatically.
 - **Case-insensitive search is ASCII-only** until FTS lands (documented in
   catalog-sqlite).
-- **`Op::FieldSet` has no CLI surface** — implemented and property-tested in core;
-  expose ratings/titles when the organize surface lands. (Done in phase 2: `maj meta`.)
 - **Extract `cmd_*` handlers into a commands module** — main.rs is at ~600 lines
   after phase 2; when the next command lands, leave main.rs as clap definitions +
   dispatch (phase 2 Task 4-5 quality review).
-- **Site copy phantom features** — the marketing site advertises `maj verify` and
-  `--tag -status/rejected` negation before they exist; reconcile when verify ships,
-  or reword sooner.
+- **Site copy phantom features** — resolved for the CLI transcript (real commands
+  as of the photo-hero redesign); revisit remaining aspirational prose when the
+  AI phase ships.
+- **CatalogStore port lags the inherent surface** — `volumes()` and
+  `volume_asset_counts()` exist only on `SqliteCatalog`, so a second adapter or
+  trait-generic CLI can't serve `volumes list` (phase 2 final review).
+- **`meta get` shows poisoned LWW winners unflagged** — a far-future peer clock's
+  FieldSet wins the display forever; needs the clock-suspect analog that
+  `volumes list` has (phase 2 final review).
+- **`volume_is_online` is /Volumes-only, and internal-disk scans all map to the
+  "root" volume row** — documented fallback; revisit when ingest lands (phase 2
+  final review).
+- **PortError double-display / `on_bad_line` file-flavored naming** — accepted
+  house-style minors; rename when the seam is next touched.
+
+## Done in phase 2
+
+- **EventLog / CatalogStore port traits in core** (PR #14).
+- **HLC `observe()` max-drift bound** with clamp warnings and acceptance-level
+  assertion (PRs #14, #18).
+- **Author identity configuration** — `--author` / `MAJ_AUTHOR` (PR #16).
+- **Asset-existence validation on `tag add`** (and `meta set`) (PR #16).
+- **`catalog init` is load-bearing** — commands error on uninitialized roots
+  (PR #16).
+- **`Op::FieldSet` CLI surface** — `maj meta set/get` (PR #16).

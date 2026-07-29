@@ -1,0 +1,265 @@
+//! Ingest planning: walk the source, decide per file, hash only when the
+//! size prefilter says a duplicate is possible.
+use crate::IngestError;
+use majestical_core::event::AssetId;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// What the catalog already knows: content hashes grouped by file size, so
+/// the planner can skip hashing sources whose size matches nothing.
+#[derive(Debug, Default)]
+pub struct KnownAssets {
+    by_size: BTreeMap<u64, BTreeSet<String>>,
+}
+
+impl KnownAssets {
+    #[must_use]
+    pub fn from_pairs(pairs: Vec<(String, u64)>) -> Self {
+        let mut by_size: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+        for (hash, size) in pairs {
+            by_size.entry(size).or_default().insert(hash);
+        }
+        Self { by_size }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupeMode {
+    Skip,
+    CopyAnyway,
+    Link,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum Decision {
+    /// New content: copy and verify.
+    Copy,
+    /// Content hash already in the catalog; `action` is the run's mode.
+    Duplicate { asset: AssetId, action: DedupeMode },
+    /// Not ingestable; the run continues without it.
+    Rejected { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlannedFile {
+    pub source: PathBuf,
+    /// Path relative to the source root, `/`-separated.
+    pub rel: String,
+    pub size: u64,
+    /// xxh3-128 hex computed during planning, only when the size prefilter
+    /// matched (dedupe confirmation); the engine reuses it when present.
+    pub prehash: Option<String>,
+    pub decision: Decision,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IngestPlan {
+    pub files: Vec<PlannedFile>,
+}
+
+/// Streams an xxh3-128 hash over `path`. Media files are large and read
+/// sequentially, so a bigger buffer than `cmd_scan`'s 64 KiB pays off here.
+fn hash_file(path: &Path) -> Result<String, IngestError> {
+    let file = std::fs::File::open(path).map_err(|source| IngestError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = vec![0u8; 1024 * 1024].into_boxed_slice();
+    loop {
+        let n = reader.read(&mut buf).map_err(|source| IngestError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:032x}", hasher.digest128()))
+}
+
+#[cfg(test)]
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
+}
+
+/// Walks `source` and decides, per file, whether it is new content, a
+/// confirmed duplicate of something already in the catalog, or rejected.
+///
+/// # Errors
+/// Returns `IngestError::Walk` if the directory walk itself fails (e.g. a
+/// permission error reading an entry's metadata); per-file problems such as
+/// non-UTF-8 names or zero-byte files are recorded as `Decision::Rejected`
+/// rather than aborting the whole plan.
+pub fn plan_source(
+    source: &Path,
+    known: &KnownAssets,
+    mode: DedupeMode,
+) -> Result<IngestPlan, IngestError> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(source).sort_by_file_name() {
+        let entry = entry.map_err(|source_err| IngestError::Walk {
+            path: source_err
+                .path()
+                .map_or_else(|| source.to_path_buf(), Path::to_path_buf),
+            source: source_err,
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel_path = path.strip_prefix(source).unwrap_or(path);
+
+        let Some(rel_utf8) = rel_path.to_str() else {
+            files.push(PlannedFile {
+                source: path.to_path_buf(),
+                rel: rel_path.to_string_lossy().replace('\\', "/"),
+                size: 0,
+                prehash: None,
+                decision: Decision::Rejected {
+                    reason: IngestError::NonUtf8Path {
+                        path: path.to_path_buf(),
+                    }
+                    .to_string(),
+                },
+            });
+            continue;
+        };
+        let rel = rel_utf8.replace('\\', "/");
+
+        let size = entry
+            .metadata()
+            .map_err(|source_err| IngestError::Walk {
+                path: path.to_path_buf(),
+                source: source_err,
+            })?
+            .len();
+
+        if size == 0 {
+            files.push(PlannedFile {
+                source: path.to_path_buf(),
+                rel,
+                size,
+                prehash: None,
+                decision: Decision::Rejected {
+                    reason: "0-byte file — nothing to verify; ingest refuses it".to_string(),
+                },
+            });
+            continue;
+        }
+
+        let (prehash, decision) = match known.by_size.get(&size) {
+            None => (None, Decision::Copy),
+            Some(candidates) => {
+                let hash = hash_file(path)?;
+                if candidates.contains(&hash) {
+                    (
+                        Some(hash.clone()),
+                        Decision::Duplicate {
+                            asset: AssetId(format!("xxh3:{hash}")),
+                            action: mode,
+                        },
+                    )
+                } else {
+                    (Some(hash), Decision::Copy)
+                }
+            }
+        };
+
+        files.push(PlannedFile {
+            source: path.to_path_buf(),
+            rel,
+            size,
+            prehash,
+            decision,
+        });
+    }
+    Ok(IngestPlan { files })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write(dir: &std::path::Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        fs::write(p, bytes).expect("write");
+    }
+
+    #[test]
+    fn plans_new_files_and_confirms_duplicates_by_content_hash() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "clips/a.mov", b"AAAA");
+        write(src.path(), "clips/b.mov", b"BBBBBB");
+        // Known catalog: an asset with a's exact bytes (size 4) and an
+        // unrelated same-size-as-b asset whose hash won't match b.
+        let known =
+            KnownAssets::from_pairs(vec![(hash_bytes(b"AAAA"), 4), (hash_bytes(b"XXXXXX"), 6)]);
+        let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+        let by_rel: std::collections::BTreeMap<_, _> =
+            plan.files.iter().map(|f| (f.rel.clone(), f)).collect();
+        // a: size matched AND pre-hash confirmed -> duplicate, skipped.
+        match &by_rel["clips/a.mov"].decision {
+            Decision::Duplicate { asset, action } => {
+                assert_eq!(asset.0, format!("xxh3:{}", hash_bytes(b"AAAA")));
+                assert_eq!(*action, DedupeMode::Skip);
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+        // b: size matched but hash differs -> copies (prehash retained).
+        assert!(matches!(by_rel["clips/b.mov"].decision, Decision::Copy));
+        assert!(by_rel["clips/b.mov"].prehash.is_some());
+    }
+
+    #[test]
+    fn size_prefilter_avoids_hashing_unmatched_sizes() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "c.mov", b"CCCCCCCC");
+        let known = KnownAssets::from_pairs(vec![]);
+        let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+        assert!(matches!(plan.files[0].decision, Decision::Copy));
+        assert!(
+            plan.files[0].prehash.is_none(),
+            "no known asset of size 8 — planner must not have hashed the source"
+        );
+    }
+
+    #[test]
+    fn zero_byte_file_is_flagged() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "empty.bin", b"");
+        let known = KnownAssets::from_pairs(vec![]);
+        let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+        assert_eq!(plan.files.len(), 1);
+        assert!(matches!(plan.files[0].decision, Decision::Rejected { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_name_is_rejected_per_file_not_fatally() {
+        use std::os::unix::ffi::OsStrExt;
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "ok.mov", b"OK");
+        let bad = src.path().join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
+        if fs::write(&bad, b"BAD").is_err() {
+            // APFS refuses invalid-UTF-8 names; nothing to test on this fs.
+            return;
+        }
+        let known = KnownAssets::from_pairs(vec![]);
+        let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+        assert_eq!(plan.files.len(), 2);
+        let rejected: Vec<_> = plan
+            .files
+            .iter()
+            .filter(|f| matches!(f.decision, Decision::Rejected { .. }))
+            .collect();
+        assert_eq!(rejected.len(), 1, "only the raw-byte name is rejected");
+    }
+}

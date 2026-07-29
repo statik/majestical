@@ -3,6 +3,7 @@
 use crate::clock::Hlc;
 use serde::{Deserialize, Serialize};
 
+/// Unique, HLC-sortable event identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventId(pub ulid::Ulid);
 
@@ -14,6 +15,8 @@ pub struct AssetId(pub String);
 pub struct Event {
     pub id: EventId,
     pub hlc: Hlc,
+    /// The human identity (person or service) that authored this event,
+    /// distinct from the machine id carried inside `hlc`.
     pub author: String,
     pub op: Op,
 }
@@ -67,5 +70,28 @@ mod tests {
         let json = serde_json::to_string(&e).expect("serialize");
         let back: Event = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn event_wire_format_is_stable() {
+        let e = Event {
+            id: EventId(ulid::Ulid::from_parts(1, 1)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "elliot".into(),
+            op: Op::TagRemove {
+                asset: AssetId("xxh3:aa".into()),
+                tag: "t".into(),
+                observed: vec![EventId(ulid::Ulid::from_parts(1, 2))],
+            },
+        };
+        let json = serde_json::to_string(&e).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":{"type":"tag_remove","asset":"xxh3:aa","tag":"t","observed":["00000000010000000000000002"]}}"#
+        );
     }
 }

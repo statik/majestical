@@ -9,6 +9,14 @@ updates:
     groups:
       cargo-all:
         patterns: ["*"]
+    ignore:
+      # rusqlite 0.38+ pulls libsqlite3-sys that needs unstable cfg_select!
+      # on stable rustc, and 0.40 removed the u64 ToSql impl. Migrate
+      # deliberately (phase 2 watch list), then drop this ignore.
+      - dependency-name: rusqlite
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
   - package-ecosystem: github-actions
     directory: /
     schedule:

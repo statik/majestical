@@ -1473,6 +1473,11 @@ updates:
 
 Ingest/verified copy + ASC MHL, embeddings + semantic search, describer backends, sync push/pull + segment rotation, Tauri app, MCP server, FTS5/sqlite-vec, PARA node operations. Each gets its own plan per the spec's build order.
 
+Design note carried forward from Task 2 quality review: `HlcClock::observe` accepts
+arbitrarily-future remote timestamps. The sync-phase plan must add a max-drift bound
+(clamp or reject remotes far ahead of local wall time) before observe() is fed
+remote event data, so one bad peer clock cannot permanently poison local ordering.
+
 ## Self-review notes
 
 - Spec coverage: this plan implements spec §1 (workspace/ports subset), §2 (event/CRDT/projection model), and the filename-search slice of build-order 2. Deferred items listed above.

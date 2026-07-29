@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use majestical_catalog_sqlite::SqliteCatalog;
-use majestical_core::clock::{Clock, HlcClock, MachineId};
+use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_core::ports::EventLog;
 use majestical_core::projection::Projection;
@@ -141,8 +141,21 @@ impl<L: EventLog> App<L> {
 
     fn emit(&mut self, ops: Vec<Op>) -> Result<Vec<Event>> {
         // Fold existing log into the clock so new events order after it.
+        // A peer's clock may be wrong; count how many events got clamped
+        // rather than adopted so the operator can be warned once below.
+        let mut clamped = 0usize;
         for e in self.events()? {
-            self.hlc.observe(&e.hlc);
+            if matches!(
+                self.hlc.observe(&e.hlc),
+                ObserveOutcome::ClampedFuture { .. }
+            ) {
+                clamped += 1;
+            }
+        }
+        if clamped > 0 {
+            eprintln!(
+                "warning: {clamped} event(s) carry timestamps more than 24h in the future — a peer's clock may be wrong; ordering was clamped locally"
+            );
         }
         // ulid 3.x generates through a monotonic Generator; on same-millisecond
         // random-part overflow (astronomically rare), fall back to a fresh

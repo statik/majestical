@@ -65,7 +65,9 @@ impl Machine {
 
     fn ingest(&mut self, events: &[Event]) {
         for e in events {
-            self.hlc.observe(&e.hlc);
+            // The clamp scenario (poisoned future clocks) arrives in a
+            // later task; ignore the outcome here.
+            let _ = self.hlc.observe(&e.hlc);
             self.projection.apply(e);
             if !self.log.iter().any(|x| x.id == e.id) {
                 self.log.push(e.clone());

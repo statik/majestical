@@ -20,6 +20,26 @@ pub struct Hlc {
     pub machine: MachineId,
 }
 
+/// Ceiling on how far a remote HLC may advance the local clock past
+/// physical now: 24h — generous for catalogs synced by shuttle drive
+/// across time zones; the point is stopping year-scale poison, not
+/// millisecond skew.
+pub const MAX_DRIFT_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Result of folding a remote timestamp into the local clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserveOutcome {
+    /// Remote was ahead and within drift; adopted.
+    Adopted,
+    /// Remote was behind or equal; nothing to do.
+    AlreadyCurrent,
+    /// Remote wall time exceeded physical-now + `MAX_DRIFT_MS`. Local state
+    /// advanced only to the clamp. New local events may order before the
+    /// poisoned events — deliberately, so one bad peer clock cannot
+    /// permanently win every LWW merge.
+    ClampedFuture { remote_wall_ms: u64 },
+}
+
 /// Hybrid Logical Clock: combines wall-clock time with a logical counter so
 /// timestamps are monotonic even when the wall clock stalls or moves backward,
 /// and so remote events can be causally ordered after local ones via `observe`.
@@ -59,13 +79,31 @@ impl HlcClock {
         }
     }
 
-    /// Folds a remote timestamp in so subsequent local events order after it.
-    pub fn observe(&mut self, remote: &Hlc) {
+    /// Folds a remote timestamp in so subsequent local events order after
+    /// it, unless doing so would advance the local clock more than
+    /// `MAX_DRIFT_MS` past physical now — a poisoned or misconfigured
+    /// peer clock is clamped rather than adopted outright.
+    #[must_use]
+    pub fn observe(&mut self, remote: &Hlc) -> ObserveOutcome {
+        let physical_now = self.clock.wall_ms();
+        let max_wall = physical_now.saturating_add(MAX_DRIFT_MS);
+        if remote.wall_ms > max_wall {
+            if max_wall > self.last_wall {
+                self.last_wall = max_wall;
+                self.last_counter = 0;
+            }
+            return ObserveOutcome::ClampedFuture {
+                remote_wall_ms: remote.wall_ms,
+            };
+        }
         if remote.wall_ms > self.last_wall
             || (remote.wall_ms == self.last_wall && remote.counter > self.last_counter)
         {
             self.last_wall = remote.wall_ms;
             self.last_counter = remote.counter;
+            ObserveOutcome::Adopted
+        } else {
+            ObserveOutcome::AlreadyCurrent
         }
     }
 }
@@ -124,8 +162,37 @@ mod tests {
             counter: 3,
             machine: MachineId("m2".into()),
         };
-        hlc.observe(&remote);
+        assert!(matches!(hlc.observe(&remote), ObserveOutcome::Adopted));
         assert!(hlc.now() > remote, "local must order after observed remote");
+    }
+
+    #[test]
+    fn observe_within_drift_is_adopted() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        let remote = Hlc {
+            wall_ms: 2000,
+            counter: 3,
+            machine: MachineId("m2".into()),
+        };
+        assert!(matches!(hlc.observe(&remote), ObserveOutcome::Adopted));
+        assert!(hlc.now() > remote);
+    }
+
+    #[test]
+    fn observe_far_future_is_clamped() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        let poison = Hlc {
+            wall_ms: 1000 + MAX_DRIFT_MS + 5000,
+            counter: 0,
+            machine: MachineId("bad".into()),
+        };
+        let outcome = hlc.observe(&poison);
+        assert!(matches!(outcome, ObserveOutcome::ClampedFuture { .. }));
+        let next = hlc.now();
+        assert!(
+            next.wall_ms <= 1000 + MAX_DRIFT_MS,
+            "local clock must not adopt poison"
+        );
     }
 
     #[test]

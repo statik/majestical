@@ -21,6 +21,38 @@ pub struct Event {
     pub op: Op,
 }
 
+/// PARA node kind. Serialized lowercase; pinned by golden tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParaKind {
+    Project,
+    Area,
+    Resource,
+    Archive,
+}
+
+impl ParaKind {
+    /// The on-disk directory a node of this kind materializes under.
+    #[must_use]
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Project => "Projects",
+            Self::Area => "Areas",
+            Self::Resource => "Resources",
+            Self::Archive => "Archives",
+        }
+    }
+}
+
+/// Outcome of one hash verification of one file instance (spec §2 hash history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyOutcome {
+    Original,
+    Verified,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Op {
@@ -48,6 +80,38 @@ pub enum Op {
         asset: AssetId,
         field: String,
         value: String,
+    },
+    /// A PARA node exists. `node` is a ULID minted once at creation, so
+    /// kind is immutable; name participates in LWW with `ParaNodeRename`.
+    ParaNodeCreate {
+        node: String,
+        kind: ParaKind,
+        name: String,
+    },
+    /// HLC-LWW rename of a node.
+    ParaNodeRename { node: String, name: String },
+    /// Marks a node archived. Monotonic: no unarchive op this phase.
+    ParaNodeArchive { node: String },
+    /// HLC-LWW assignment of an asset to a PARA node.
+    AssetParaSet { asset: AssetId, node: String },
+    /// Physical observation: this instance's bytes hashed to `value` at
+    /// `hashdate_ms`, with `outcome` per the ASC MHL action model.
+    VerificationRecorded {
+        asset: AssetId,
+        volume: String,
+        path: String,
+        algo: String,
+        value: String,
+        outcome: VerifyOutcome,
+        hashdate_ms: u64,
+    },
+    /// An ASC MHL generation was written for `volume`; `roothash` is the
+    /// xxh64 of the manifest file itself, so on-disk tampering is detectable.
+    ManifestRecorded {
+        volume: String,
+        mhl_path: String,
+        generation: u32,
+        roothash: String,
     },
 }
 
@@ -97,6 +161,85 @@ mod tests {
             json,
             r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":{"type":"tag_remove","asset":"xxh3:aa","tag":"t","observed":["00000000010000000000000002"]}}"#
         );
+    }
+
+    fn golden(op: Op) -> String {
+        let e = Event {
+            id: EventId(ulid::Ulid::from_parts(1, 1)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "elliot".into(),
+            op,
+        };
+        serde_json::to_string(&e).expect("serialize")
+    }
+
+    const PREFIX: &str = r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":"#;
+
+    #[test]
+    fn para_and_ingest_ops_wire_formats_are_stable() {
+        let node = "00000000010000000000000002".to_string();
+        for (op, want) in [
+            (
+                Op::ParaNodeCreate {
+                    node: node.clone(),
+                    kind: ParaKind::Project,
+                    name: "client-x".into(),
+                },
+                r#"{"type":"para_node_create","node":"00000000010000000000000002","kind":"project","name":"client-x"}"#,
+            ),
+            (
+                Op::ParaNodeRename {
+                    node: node.clone(),
+                    name: "client-y".into(),
+                },
+                r#"{"type":"para_node_rename","node":"00000000010000000000000002","name":"client-y"}"#,
+            ),
+            (
+                Op::ParaNodeArchive { node: node.clone() },
+                r#"{"type":"para_node_archive","node":"00000000010000000000000002"}"#,
+            ),
+            (
+                Op::AssetParaSet {
+                    asset: AssetId("xxh3:aa".into()),
+                    node: node.clone(),
+                },
+                r#"{"type":"asset_para_set","asset":"xxh3:aa","node":"00000000010000000000000002"}"#,
+            ),
+            (
+                Op::VerificationRecorded {
+                    asset: AssetId("xxh3:aa".into()),
+                    volume: "uuid:abc".into(),
+                    path: "clips/a.mov".into(),
+                    algo: "xxh64".into(),
+                    value: "0011223344556677".into(),
+                    outcome: VerifyOutcome::Verified,
+                    hashdate_ms: 42,
+                },
+                r#"{"type":"verification_recorded","asset":"xxh3:aa","volume":"uuid:abc","path":"clips/a.mov","algo":"xxh64","value":"0011223344556677","outcome":"verified","hashdate_ms":42}"#,
+            ),
+            (
+                Op::ManifestRecorded {
+                    volume: "uuid:abc".into(),
+                    mhl_path: "ascmhl/0001_dest_2026-07-29_120000.mhl".into(),
+                    generation: 1,
+                    roothash: "xxh64:8899aabbccddeeff".into(),
+                },
+                r#"{"type":"manifest_recorded","volume":"uuid:abc","mhl_path":"ascmhl/0001_dest_2026-07-29_120000.mhl","generation":1,"roothash":"xxh64:8899aabbccddeeff"}"#,
+            ),
+        ] {
+            let json = golden(op);
+            assert_eq!(json, format!("{PREFIX}{want}}}"));
+            let back: Event = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                golden(back.op),
+                json,
+                "round trip must reproduce the wire format"
+            );
+        }
     }
 
     #[test]

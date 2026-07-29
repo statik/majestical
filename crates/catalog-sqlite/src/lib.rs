@@ -345,7 +345,7 @@ impl CatalogStore for SqliteCatalog {
 mod tests {
     use super::*;
     use majestical_core::clock::{Hlc, MachineId};
-    use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind};
+    use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind, VerifyOutcome};
     use majestical_core::projection::Projection;
 
     #[test]
@@ -548,29 +548,12 @@ mod tests {
         assert_eq!(db.search_by_tag("keep-b").expect("query b"), vec![b]);
     }
 
-    #[test]
-    fn rebuild_populates_para_tables() {
+    /// Applies `ops` in order (each event gets an increasing `wall_ms`, so
+    /// HLCs are distinct) to a fresh `Projection`, then rebuilds a fresh
+    /// `SqliteCatalog` at `path` from it.
+    fn rebuild_from_ops(path: &std::path::Path, ops: Vec<Op>) -> SqliteCatalog {
         let mut p = Projection::default();
-        for (n, op) in [
-            Op::ParaNodeCreate {
-                node: "N1".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            },
-            Op::AssetSeen {
-                asset: AssetId("xxh3:aa".into()),
-                volume: "V1".into(),
-                path: "a.mov".into(),
-                size: 1,
-            },
-            Op::AssetParaSet {
-                asset: AssetId("xxh3:aa".into()),
-                node: "N1".into(),
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (n, op) in ops.into_iter().enumerate() {
             p.apply(&Event {
                 id: EventId(ulid::Ulid::from_parts(1, n as u128)),
                 hlc: Hlc {
@@ -582,9 +565,22 @@ mod tests {
                 op,
             });
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        let mut db = SqliteCatalog::open(path).expect("open");
         db.rebuild(&p).expect("rebuild");
+        db
+    }
+
+    #[test]
+    fn rebuild_populates_para_nodes_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::ParaNodeCreate {
+                node: "N1".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }],
+        );
         assert_eq!(
             db.para_nodes().expect("para query"),
             vec![(
@@ -593,6 +589,125 @@ mod tests {
                 "client-x".to_string(),
                 false
             )]
+        );
+    }
+
+    #[test]
+    fn rebuild_populates_asset_para_table() {
+        let asset = AssetId("xxh3:aa".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::AssetSeen {
+                    asset: asset.clone(),
+                    volume: "V1".into(),
+                    path: "a.mov".into(),
+                    size: 1,
+                },
+                Op::AssetParaSet {
+                    asset: asset.clone(),
+                    node: "N1".into(),
+                },
+            ],
+        );
+        // Direct row query — a skipped `asset_para` insert leaves the table
+        // empty, which this discriminates as a query failure rather than
+        // silently reading through a table checked elsewhere.
+        let row: (String, String) = db
+            .conn
+            .query_row("SELECT asset, node FROM asset_para", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("asset_para row");
+        assert_eq!(row, ("xxh3:aa".to_string(), "N1".to_string()));
+    }
+
+    #[test]
+    fn rebuild_populates_verifications_table() {
+        let asset = AssetId("xxh3:aa".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::AssetSeen {
+                    asset: asset.clone(),
+                    volume: "V1".into(),
+                    path: "a.mov".into(),
+                    size: 1,
+                },
+                Op::VerificationRecorded {
+                    asset: asset.clone(),
+                    volume: "V1".into(),
+                    path: "a.mov".into(),
+                    algo: "xxh64".into(),
+                    value: "00".into(),
+                    outcome: VerifyOutcome::Verified,
+                    hashdate_ms: 42,
+                },
+            ],
+        );
+        let row: (String, String, String, String, String, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT asset, volume, path, algo, value, outcome, hashdate_ms \
+                 FROM verifications",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .expect("verifications row");
+        assert_eq!(
+            row,
+            (
+                "xxh3:aa".to_string(),
+                "V1".to_string(),
+                "a.mov".to_string(),
+                "xxh64".to_string(),
+                "00".to_string(),
+                "verified".to_string(),
+                42,
+            )
+        );
+    }
+
+    #[test]
+    fn rebuild_populates_manifests_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::ManifestRecorded {
+                volume: "V1".into(),
+                mhl_path: "ascmhl/0001_dest_x.mhl".into(),
+                generation: 1,
+                roothash: "xxh64:aa".into(),
+            }],
+        );
+        let row: (String, i64, String, String) = db
+            .conn
+            .query_row(
+                "SELECT volume, generation, mhl_path, roothash FROM manifests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("manifests row");
+        assert_eq!(
+            row,
+            (
+                "V1".to_string(),
+                1,
+                "ascmhl/0001_dest_x.mhl".to_string(),
+                "xxh64:aa".to_string()
+            )
         );
     }
 }

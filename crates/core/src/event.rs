@@ -81,8 +81,10 @@ pub enum Op {
         field: String,
         value: String,
     },
-    /// A PARA node exists. `node` is a ULID minted once at creation, so
-    /// kind is immutable; name participates in LWW with `ParaNodeRename`.
+    /// A PARA node exists. `node` is a ULID minted once at creation; in
+    /// legitimate histories only one create exists per node, but `kind` and
+    /// `name` still fold as HLC-LWW (like `ParaNodeRename`) so pathological
+    /// concurrent creates for the same node id still converge.
     ParaNodeCreate {
         node: String,
         kind: ParaKind,

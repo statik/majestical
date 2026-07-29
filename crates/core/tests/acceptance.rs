@@ -6,7 +6,7 @@
 //! `cfg(test)` the way `#[test]` functions are, and the workspace denies
 //! `panic`/`unwrap_used` outside test code.
 use cucumber::{World, given, then, when};
-use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
+use majestical_core::clock::{Clock, HlcClock, MAX_DRIFT_MS, MachineId, ObserveOutcome};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_core::projection::Projection;
 use std::collections::BTreeMap;
@@ -26,6 +26,13 @@ struct Machine {
     log: Vec<Event>,
     projection: Projection,
     seq: u64,
+    // Well-behaved peers never trigger `ObserveOutcome::ClampedFuture`, so
+    // `ingest` asserts against it by default (see below). The
+    // poisoned-clock scenario deliberately breaks that assumption for
+    // whichever machine ingests the poisoned event; the "has a clock far
+    // in the future" step flips this to opt out of the self-check for the
+    // rest of that scenario only.
+    expect_clamps: bool,
 }
 
 impl Machine {
@@ -36,6 +43,7 @@ impl Machine {
             log: Vec::new(),
             projection: Projection::default(),
             seq: 0,
+            expect_clamps: false,
         }
     }
 
@@ -65,15 +73,17 @@ impl Machine {
 
     fn ingest(&mut self, events: &[Event]) {
         for e in events {
-            // This harness models well-behaved peers only, so every
-            // observe here must be Adopted or AlreadyCurrent; the clamp
-            // is exercised by clock.rs's own tests.
+            // This harness models well-behaved peers by default, so every
+            // observe here must be Adopted or AlreadyCurrent unless the
+            // scenario has deliberately poisoned a peer's clock (see the
+            // "has a clock far in the future" step, which sets
+            // `expect_clamps`); the un-poisoned clamp behavior itself is
+            // exercised by clock.rs's own unit tests.
+            let outcome = self.hlc.observe(&e.hlc);
             assert!(
-                !matches!(
-                    self.hlc.observe(&e.hlc),
-                    ObserveOutcome::ClampedFuture { .. }
-                ),
-                "acceptance harness observed a poisoned-clock outcome unexpectedly"
+                self.expect_clamps || !matches!(outcome, ObserveOutcome::ClampedFuture { .. }),
+                "acceptance harness observed a poisoned-clock outcome unexpectedly on machine {}",
+                self.name
             );
             self.projection.apply(e);
             if !self.log.iter().any(|x| x.id == e.id) {
@@ -138,6 +148,7 @@ fn tag_add(w: &mut CatalogWorld, m: String, a: String, tag: String) -> Result<()
 }
 
 #[given(expr = "machine {string} removes tag {string} from asset {string}")]
+#[when(expr = "machine {string} removes tag {string} from asset {string}")]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "cucumber's {string} captures always bind as owned String"
@@ -156,6 +167,43 @@ fn tag_rm(w: &mut CatalogWorld, m: String, tag: String, a: String) -> Result<(),
         tag,
         observed,
     });
+    Ok(())
+}
+
+#[given(expr = "machine {string} observes volume {string} labeled {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn observe_volume(
+    w: &mut CatalogWorld,
+    m: String,
+    volume: String,
+    label: String,
+) -> Result<(), String> {
+    w.machine(&m)?.emit(Op::VolumeSeen { volume, label });
+    Ok(())
+}
+
+#[given(expr = "machine {string} has a clock far in the future")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn poison_clock(w: &mut CatalogWorld, m: String) -> Result<(), String> {
+    // Every machine's TickClock is fixed at wall_ms 1 (see Machine::new), so
+    // anything past 1 + MAX_DRIFT_MS is unambiguously beyond drift from any
+    // well-behaved peer's perspective — poisoning ordering rather than
+    // merely nudging it.
+    const FAR_FUTURE_MS: u64 = 1 + MAX_DRIFT_MS + 1_000_000;
+    let machine = w.machine(&m)?;
+    machine.hlc = HlcClock::new(MachineId(m.clone()), Box::new(TickClock(FAR_FUTURE_MS)));
+    // From this point on, any machine that ingests this one's events must
+    // tolerate a ClampedFuture outcome — that's the behavior this scenario
+    // exists to exercise, not a harness bug.
+    for other in w.machines.values_mut() {
+        other.expect_clamps = true;
+    }
     Ok(())
 }
 
@@ -187,6 +235,27 @@ fn assert_tags(w: &mut CatalogWorld, expected: String, a: String) -> Result<(), 
         if got != want {
             return Err(format!(
                 "machine {name} diverged: got {got:?}, want {want:?} (both compared ascending-sorted)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[then(expr = "both machines see volume {string} labeled {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn assert_volume_label(w: &mut CatalogWorld, volume: String, want: String) -> Result<(), String> {
+    for (name, m) in &w.machines {
+        let got = m
+            .projection
+            .volumes()
+            .find(|(id, _)| **id == volume)
+            .and_then(|(_, state)| state.label());
+        if got != Some(want.as_str()) {
+            return Err(format!(
+                "machine {name} diverged on volume {volume:?}: got {got:?}, want {want:?}"
             ));
         }
     }

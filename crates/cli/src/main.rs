@@ -10,16 +10,22 @@ use majestical_sync::FileEventLog;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Current wall-clock time in milliseconds since the Unix epoch, shared by
+/// `SystemClock` and the clamp-warning's "how far ahead" calculation below.
+fn physical_now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 struct SystemClock;
 impl Clock for SystemClock {
     fn wall_ms(&self) -> u64 {
-        u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX)
+        physical_now_ms()
     }
 }
 
@@ -142,19 +148,21 @@ impl<L: EventLog> App<L> {
     fn emit(&mut self, ops: Vec<Op>) -> Result<Vec<Event>> {
         // Fold existing log into the clock so new events order after it.
         // A peer's clock may be wrong; count how many events got clamped
-        // rather than adopted so the operator can be warned once below.
+        // rather than adopted, and track the worst offender, so the
+        // operator can be warned once below.
         let mut clamped = 0usize;
+        let mut worst_remote_wall_ms = 0u64;
         for e in self.events()? {
-            if matches!(
-                self.hlc.observe(&e.hlc),
-                ObserveOutcome::ClampedFuture { .. }
-            ) {
+            if let ObserveOutcome::ClampedFuture { remote_wall_ms } = self.hlc.observe(&e.hlc) {
                 clamped += 1;
+                worst_remote_wall_ms = worst_remote_wall_ms.max(remote_wall_ms);
             }
         }
         if clamped > 0 {
+            let days_ahead =
+                worst_remote_wall_ms.saturating_sub(physical_now_ms()) / (24 * 60 * 60 * 1000);
             eprintln!(
-                "warning: {clamped} event(s) carry timestamps more than 24h in the future — a peer's clock may be wrong; ordering was clamped locally"
+                "warning: {clamped} event(s) carry timestamps more than 24h in the future (worst: ~{days_ahead}d ahead) — a peer's clock may be wrong; ordering was clamped locally"
             );
         }
         // ulid 3.x generates through a monotonic Generator; on same-millisecond

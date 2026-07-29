@@ -1,0 +1,17 @@
+[package]
+name = "majestical-catalog-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+majestical-core = { path = "../core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ulid.workspace = true

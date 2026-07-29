@@ -1,0 +1,42 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions: {}
+jobs:
+  build:
+    name: Build and publish maj
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (branch tip 2026-07-29)
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # No caching in this workflow: a poisoned cache must not be able to
+      # reach published artifacts.
+      - name: Build universal maj binary
+        run: |
+          cargo build --release -p majestical-cli --target aarch64-apple-darwin
+          cargo build --release -p majestical-cli --target x86_64-apple-darwin
+          lipo -create -output maj \
+            target/aarch64-apple-darwin/release/maj \
+            target/x86_64-apple-darwin/release/maj
+          ./maj --version
+      - name: Package and checksum
+        run: |
+          tar czf "maj-${GITHUB_REF_NAME}-universal-apple-darwin.tar.gz" maj
+          shasum -a 256 maj-*.tar.gz > checksums.txt
+          cat checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            maj-*.tar.gz checksums.txt \
+            --verify-tag \
+            --title "Majestical ${GITHUB_REF_NAME}" \
+            --notes "The maj command-line catalog: scan folders into a content-addressed catalog, tag with folksonomy semantics, search offline, and converge catalogs across machines through a shared folder. Unsigned binary — macOS Gatekeeper may warn on first run (xattr -d com.apple.quarantine ./maj). The desktop app arrives in a later phase."

@@ -6,7 +6,7 @@
 //! `cfg(test)` the way `#[test]` functions are, and the workspace denies
 //! `panic`/`unwrap_used` outside test code.
 use cucumber::{World, given, then, when};
-use majestical_core::clock::{Clock, HlcClock, MachineId};
+use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_core::projection::Projection;
 use std::collections::BTreeMap;
@@ -65,7 +65,16 @@ impl Machine {
 
     fn ingest(&mut self, events: &[Event]) {
         for e in events {
-            self.hlc.observe(&e.hlc);
+            // This harness models well-behaved peers only, so every
+            // observe here must be Adopted or AlreadyCurrent; the clamp
+            // is exercised by clock.rs's own tests.
+            assert!(
+                !matches!(
+                    self.hlc.observe(&e.hlc),
+                    ObserveOutcome::ClampedFuture { .. }
+                ),
+                "acceptance harness observed a poisoned-clock outcome unexpectedly"
+            );
             self.projection.apply(e);
             if !self.log.iter().any(|x| x.id == e.id) {
                 self.log.push(e.clone());

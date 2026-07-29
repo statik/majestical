@@ -89,6 +89,29 @@ enum Cmd {
         #[command(subcommand)]
         cmd: VolumesCmd,
     },
+    /// Get or set LWW metadata fields on an asset.
+    Meta {
+        #[command(subcommand)]
+        cmd: MetaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MetaCmd {
+    /// Set a field's value (last-write-wins across machines).
+    Set {
+        asset: String,
+        field: String,
+        value: String,
+    },
+    /// Get a single field's value, or every field set on the asset.
+    Get {
+        asset: String,
+        /// Omit to print every field.
+        field: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -313,10 +336,10 @@ fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// `tag add` writes metadata about an asset that must already have a
-/// physical observation on record — otherwise a typo'd id silently creates
-/// a phantom catalog entry that `search` and `scan` can never produce, and
-/// would look scanned when it never was.
+/// Both `tag add` and `meta set` write metadata about an asset that must
+/// already have a physical observation on record — otherwise a typo'd id
+/// silently creates a phantom catalog entry that `search` and `scan` can
+/// never produce, and would look scanned when it never was.
 fn ensure_asset_known(projection: &Projection, asset: &AssetId) -> Result<()> {
     anyhow::ensure!(
         projection.has_instances(asset),
@@ -352,6 +375,62 @@ fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
     }
     println!("ok");
     Ok(())
+}
+
+fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
+    match cmd {
+        MetaCmd::Set {
+            asset,
+            field,
+            value,
+        } => {
+            let p = app.projection()?;
+            let asset = AssetId(asset);
+            ensure_asset_known(&p, &asset)?;
+            app.emit(vec![Op::FieldSet {
+                asset,
+                field,
+                value,
+            }])?;
+            println!("ok");
+        }
+        MetaCmd::Get { asset, field, json } => {
+            let p = app.projection()?;
+            let asset = AssetId(asset);
+            print_meta_get(&p, &asset, field.as_deref(), json);
+        }
+    }
+    Ok(())
+}
+
+/// Prints either a single field's value or every field set on `asset`.
+/// A single missing field prints nothing (an empty line in text mode, `null`
+/// in JSON) rather than erroring — mirroring `search`'s "zero hits" style
+/// rather than treating "not set yet" as a failure.
+fn print_meta_get(projection: &Projection, asset: &AssetId, field: Option<&str>, json: bool) {
+    if let Some(field) = field {
+        let value = projection.field(asset, field);
+        if json {
+            println!("{}", serde_json::json!({ field: value }));
+        } else if let Some(value) = value {
+            println!("{value}");
+        } else {
+            println!();
+        }
+        return;
+    }
+    let fields: Vec<(&str, &str)> = projection.fields(asset).collect();
+    if json {
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        println!("{}", serde_json::Value::Object(obj));
+    } else {
+        for (k, v) in fields {
+            println!("{k}\t{v}");
+        }
+    }
 }
 
 fn cmd_search(
@@ -518,6 +597,10 @@ fn main() -> Result<()> {
         } => {
             let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             cmd_volumes_list(&app, &cli.catalog, json)?;
+        }
+        Cmd::Meta { cmd } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            cmd_meta(&mut app, cmd)?;
         }
     }
     Ok(())

@@ -147,6 +147,15 @@ impl Projection {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Every field name/value pair currently set for `asset` (the LWW
+    /// winners), in field-name order.
+    pub fn fields<'a>(&'a self, asset: &AssetId) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.assets
+            .get(asset)
+            .into_iter()
+            .flat_map(|s| s.fields.iter().map(|(k, (_, v))| (k.as_str(), v.as_str())))
+    }
+
     /// True when `asset` has at least one physical observation
     /// (`AssetSeen`) on record — i.e. it was actually scanned, not merely
     /// referenced by a tag or field mutation.
@@ -385,6 +394,36 @@ mod tests {
         assert_eq!(fwd, rev);
         assert_eq!(fwd.field(&a, "rating"), Some("5"));
         assert!(!fwd.tags(&a).contains("t"));
+    }
+
+    #[test]
+    fn fields_lists_every_field_set_on_an_asset() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::FieldSet {
+                asset: a.clone(),
+                field: "rating".into(),
+                value: "5".into(),
+            },
+        ));
+        p.apply(&ev(
+            2,
+            2,
+            "m1",
+            Op::FieldSet {
+                asset: a.clone(),
+                field: "title".into(),
+                value: "Sunset".into(),
+            },
+        ));
+        let mut fields: Vec<(&str, &str)> = p.fields(&a).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, vec![("rating", "5"), ("title", "Sunset")]);
+        assert!(p.fields(&AssetId("xxh3:unknown".into())).next().is_none());
     }
 
     #[test]

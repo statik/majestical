@@ -474,3 +474,104 @@ fn author_defaults_to_the_machine_id() {
         "expected every event to carry the default author \"test-machine\", got: {contents}"
     );
 }
+
+/// `meta set` then `meta get` round trips a single field's value.
+#[test]
+fn meta_set_get_round_trip() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .assert()
+        .success();
+    let out = maj(&root)
+        .args(["search", "--name", "clip", "--json"])
+        .output()
+        .unwrap();
+    let id = first_asset_id(&out);
+
+    maj(&root)
+        .args(["meta", "set", &id, "rating", "5"])
+        .assert()
+        .success();
+    maj(&root)
+        .args(["meta", "get", &id, "rating"])
+        .assert()
+        .success()
+        .stdout(contains("5"));
+
+    // Getting every field (no field name) lists it as a `field\tvalue` line.
+    maj(&root)
+        .args(["meta", "get", &id])
+        .assert()
+        .success()
+        .stdout(contains("rating\t5"));
+}
+
+/// `meta set` on an unscanned asset fails the same way `tag add` does.
+#[test]
+fn meta_set_on_an_unscanned_asset_fails() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    maj(&root).args(["catalog", "init"]).assert().success();
+
+    maj(&root)
+        .args(["meta", "set", "xxh3:neverseen", "rating", "5"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown asset xxh3:neverseen"));
+}
+
+/// Two machines sharing a catalog root each set the same field; the write
+/// with the later HLC (here, the one issued second in wall-clock time) wins
+/// on both machines once they re-read the merged log — LWW convergence for
+/// `FieldSet`, exercised end to end through the real CLI and filesystem
+/// event log rather than the in-memory cucumber harness.
+#[test]
+fn meta_set_later_write_wins_across_machines() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    maj_as(&root, "machine-a")
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj_as(&root, "machine-a")
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "card1"])
+        .assert()
+        .success();
+    let out = maj_as(&root, "machine-a")
+        .args(["search", "--name", "clip", "--json"])
+        .output()
+        .unwrap();
+    let id = first_asset_id(&out);
+
+    // machine-b writes first (HLC-earlier)...
+    maj_as(&root, "machine-b")
+        .args(["meta", "set", &id, "rating", "3"])
+        .assert()
+        .success();
+    // ...machine-a writes second (HLC-later) and must win on both machines.
+    maj_as(&root, "machine-a")
+        .args(["meta", "set", &id, "rating", "5"])
+        .assert()
+        .success();
+
+    for machine in ["machine-a", "machine-b"] {
+        maj_as(&root, machine)
+            .args(["meta", "get", &id, "rating"])
+            .assert()
+            .success()
+            .stdout(contains("5"));
+    }
+}

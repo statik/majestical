@@ -41,11 +41,14 @@ pub struct ManifestRecord {
     pub roothash: String,
 }
 
-/// PARA node folded state. Kind is immutable (node ids are minted once);
-/// name is LWW across create+rename; archived is monotonic.
+/// PARA node folded state. `kind` is meant to be immutable in legitimate
+/// histories (node ids are minted once, at creation), but is folded as LWW
+/// rather than first-write-wins: two concurrent `ParaNodeCreate`s for the
+/// same node id must still resolve to the same winner regardless of apply
+/// order. `name` is LWW across create+rename; `archived` is monotonic.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ParaNodeState {
-    kind: Option<ParaKind>,
+    kind: Option<(Hlc, ParaKind)>,
     name: Option<(Hlc, String)>,
     archived: bool,
 }
@@ -53,7 +56,7 @@ pub struct ParaNodeState {
 impl ParaNodeState {
     #[must_use]
     pub fn kind(&self) -> Option<ParaKind> {
-        self.kind
+        self.kind.as_ref().map(|(_, k)| *k)
     }
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -218,7 +221,7 @@ impl Projection {
 
     /// HLC-LWW slot update: the higher `(hlc, value)` tuple wins, matching
     /// the ordering every LWW field in this projection uses.
-    fn lww(slot: &mut Option<(Hlc, String)>, hlc: Hlc, value: String) {
+    fn lww<T: Ord>(slot: &mut Option<(Hlc, T)>, hlc: Hlc, value: T) {
         let candidate = (hlc, value);
         match slot {
             Some(current) if *current >= candidate => {}
@@ -226,11 +229,13 @@ impl Projection {
         }
     }
 
-    /// `kind` is set at most once (node ids are minted once, so kind is
-    /// immutable); `name` follows the same LWW rule as `ParaNodeRename`.
+    /// `kind` is meant to be set once in legitimate histories (node ids are
+    /// minted once), but is folded as LWW — like `name` — so that two
+    /// concurrent creates for the same node still converge regardless of
+    /// apply order.
     fn apply_para_create(&mut self, node: &str, kind: ParaKind, hlc: Hlc, name: &str) {
         let st = self.para_nodes.entry(node.to_string()).or_default();
-        st.kind.get_or_insert(kind);
+        Self::lww(&mut st.kind, hlc.clone(), kind);
         Self::lww(&mut st.name, hlc, name.to_string());
     }
 

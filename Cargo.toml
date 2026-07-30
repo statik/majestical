@@ -29,6 +29,8 @@ image = "0.25.10"
 webp = "0.3.1"
 fast_image_resize = "6.1.0"
 zstd = "0.13.3"
+ort = "=2.0.0-rc.13"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

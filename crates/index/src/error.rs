@@ -15,4 +15,6 @@ pub enum IndexError {
     Resize(String),
     #[error("model fetch: {0}")]
     Model(String),
+    #[error("encoder: {0}")]
+    Encoder(String),
 }

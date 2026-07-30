@@ -1355,6 +1355,10 @@ fn legacy_run_journals_move_to_state_dir() {
     );
     let moved: Vec<_> = walkdir_find(&state, "01OLD.jsonl");
     assert_eq!(moved.len(), 1, "journal moved into the state dir");
+    assert!(
+        walkdir_find(&state, "01OLD.jsonl.partial").is_empty(),
+        "the copy-then-rename temp file must not linger after a successful migration"
+    );
 }
 
 /// A legacy `runs/` dir can hold more than plain journals — a Syncthing

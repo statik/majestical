@@ -34,7 +34,7 @@ majestical-catalog-sqlite = { path = "../catalog-sqlite" }
 majestical-ingest = { path = "../ingest" }
 anyhow.workspace = true
 clap.workspace = true
-dirs = "6"
+dirs.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 walkdir.workspace = true

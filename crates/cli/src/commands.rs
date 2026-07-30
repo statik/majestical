@@ -810,10 +810,11 @@ fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
 /// wherever `<id>` interpolates to in the path (a crafted id like
 /// `../../x` would otherwise escape `runs/` entirely the first time
 /// anything opens that path for append). Requiring the journal to already
-/// exist closes both: nothing is created in the *sync root* until this
-/// check passes (resolving the state dir's `runs/` path is a harmless
-/// local side effect — see `state_dir::catalog_paths` — but it never
-/// touches the catalog directory being synced).
+/// exist closes both: nothing is *created* in the sync root until this
+/// check passes. Resolving the state dir (`state_dir::catalog_paths`) may
+/// still perform one-time legacy cleanup there — deleting a pre-phase-4
+/// `catalog.db` or moving `runs/*.jsonl` out — but that only ever removes
+/// stale derived files, never creates anything new.
 fn check_resume_journal_exists(catalog_dir: &Path, run_id: &str) -> Result<()> {
     let journal_path = journal_path_for(catalog_dir, run_id)?;
     anyhow::ensure!(

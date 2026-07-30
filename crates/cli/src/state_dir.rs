@@ -84,15 +84,23 @@ fn migrate_legacy_journals(legacy_runs: &Path, state_runs: &Path) -> Result<()> 
         if !is_jsonl_file {
             continue;
         }
-        let name = from.file_name().unwrap_or_default();
-        let to = state_runs.join(name);
+        let name = entry.file_name();
+        let to = state_runs.join(&name);
         if to.exists() {
             std::fs::remove_file(&from)
                 .with_context(|| format!("removing already-migrated journal {}", from.display()))?;
             continue;
         }
-        // Sync root and state dir may be different filesystems: copy + delete.
-        std::fs::copy(&from, &to).with_context(|| format!("moving journal {}", from.display()))?;
+        // Sync root and state dir may be different filesystems, so the copy
+        // can't be atomic — but landing it under a temp name first and then
+        // renaming into place (same filesystem, atomic) means a kill mid-copy
+        // leaves only an orphaned temp file, never a truncated file at `to`
+        // that a later run would mistake for "already migrated" and use to
+        // delete the still-intact source.
+        let tmp = state_runs.join(format!("{}.partial", name.to_string_lossy()));
+        std::fs::copy(&from, &tmp).with_context(|| format!("moving journal {}", from.display()))?;
+        std::fs::rename(&tmp, &to)
+            .with_context(|| format!("finalizing migrated journal {}", to.display()))?;
         std::fs::remove_file(&from)
             .with_context(|| format!("removing migrated journal {}", from.display()))?;
         moved_any = true;

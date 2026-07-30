@@ -289,12 +289,9 @@ impl SqliteCatalog {
                asset TEXT NOT NULL REFERENCES assets(id),
                volume TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
                mtime_ms INTEGER NOT NULL,
-               -- (asset, volume, path) is unique again: the projection's
-               -- instances are now an HLC-LWW map keyed on (volume, path),
-               -- so a rescan updates in place rather than producing a second
-               -- row with a different size. This supersedes the wider
-               -- (asset, volume, path, size) key from PR 2, which existed
-               -- only to work around the old set model's duplication.
+               -- (asset, volume, path) is unique: the projection's instances
+               -- are an HLC-LWW map keyed on (volume, path), so a rescan
+               -- updates in place rather than producing a second row.
                PRIMARY KEY (asset, volume, path)
              );
              CREATE TABLE tags (

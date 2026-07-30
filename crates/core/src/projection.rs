@@ -192,7 +192,12 @@ impl Projection {
                 size,
                 mtime_ms,
             } => {
-                self.apply_asset_seen(asset, volume, path, *size, *mtime_ms, event.hlc.clone());
+                let candidate = InstanceInfo {
+                    hlc: event.hlc.clone(),
+                    size: *size,
+                    mtime_ms: *mtime_ms,
+                };
+                self.apply_asset_seen(asset, volume, path, candidate);
                 Touched::Asset(asset.clone())
             }
             Op::TagAdd { asset, tag } => {
@@ -284,15 +289,8 @@ impl Projection {
         asset: &AssetId,
         volume: &str,
         path: &str,
-        size: u64,
-        mtime_ms: u64,
-        hlc: Hlc,
+        candidate: InstanceInfo,
     ) {
-        let candidate = InstanceInfo {
-            hlc,
-            size,
-            mtime_ms,
-        };
         let st = self.assets.entry(asset.clone()).or_default();
         match st.instances.entry((volume.to_string(), path.to_string())) {
             std::collections::btree_map::Entry::Vacant(slot) => {

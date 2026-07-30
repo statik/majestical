@@ -822,3 +822,37 @@ fn meta_set_later_write_wins_across_machines() {
             .stdout(contains("5"));
     }
 }
+
+/// `maj verify` re-checks a destination against its own ASC MHL history:
+/// clean the first time (nothing altered, a new generation is written),
+/// and reports + fails once a file has been altered underneath it. Verify
+/// needs no catalog — the history lives entirely under `<dir>/ascmhl` — an
+/// arbitrary, never-initialized catalog root is passed only because
+/// `--catalog`/`--machine-id` are still required, non-`Option` global args
+/// (see the dispatch comment on `Cmd::Verify` in `main.rs`).
+#[test]
+fn maj_verify_reports_altered_file_on_second_run() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+
+    let hash_list = majestical_ingest::mhl::hash_dir(media.path(), "2026-07-30T00:00:00Z").unwrap();
+    majestical_ingest::mhl::write_generation(media.path(), &hash_list).unwrap();
+
+    maj(&root)
+        .args(["verify"])
+        .arg(media.path())
+        .assert()
+        .success()
+        .stdout(contains("wrote generation 2"));
+
+    std::fs::write(media.path().join("a.mov"), b"ZZZZ").unwrap();
+
+    maj(&root)
+        .args(["verify"])
+        .arg(media.path())
+        .assert()
+        .failure()
+        .stdout(contains("ALTERED a.mov"));
+}

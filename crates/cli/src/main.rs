@@ -74,6 +74,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ParaCmd,
     },
+    /// Re-verify a destination against its ASC MHL history; appends a generation.
+    Verify {
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,6 +174,14 @@ fn main() -> Result<()> {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             commands::cmd_para(&mut app, &cli.catalog, cmd)?;
         }
+        // Deliberately does not open a catalog: `verify` re-checks a
+        // destination directory against its own ASC MHL history, which
+        // needs neither the event log nor a machine identity. `--catalog`/
+        // `--machine-id` are still required by clap here (they're
+        // top-level, non-Option args with no default) — a wart documented
+        // in Task 6's report rather than restructured, since every other
+        // subcommand does need them.
+        Cmd::Verify { dir, json } => commands::cmd_verify(&dir, json)?,
     }
     Ok(())
 }

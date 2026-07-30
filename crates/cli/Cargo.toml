@@ -31,6 +31,7 @@ similar_names = "allow"
 majestical-core = { path = "../core" }
 majestical-sync = { path = "../sync" }
 majestical-catalog-sqlite = { path = "../catalog-sqlite" }
+majestical-ingest = { path = "../ingest" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

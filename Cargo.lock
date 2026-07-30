@@ -804,6 +804,7 @@ dependencies = [
  "clap",
  "majestical-catalog-sqlite",
  "majestical-core",
+ "majestical-ingest",
  "majestical-sync",
  "plist",
  "predicates",

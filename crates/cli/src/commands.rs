@@ -9,6 +9,7 @@ use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
+use majestical_ingest::mhl;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -543,5 +544,53 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
     if !dry_run {
         app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
     }
+    Ok(())
+}
+
+/// Re-verifies `dir` against its own ASC MHL history and appends a new
+/// generation recording the result. Needs no catalog — the history lives
+/// entirely under `dir/ascmhl`.
+pub(crate) fn cmd_verify(dir: &Path, json: bool) -> Result<()> {
+    let hashdate = iso8601_ms(physical_now_ms());
+    let report =
+        mhl::verify_dir(dir, &hashdate).with_context(|| format!("verifying {}", dir.display()))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "verified": report.verified,
+                "altered": report.altered,
+                "missing": report.missing,
+                "new": report.new_files,
+                "generation": report.written.generation,
+            })
+        );
+    } else {
+        for rel in &report.altered {
+            println!("ALTERED {rel}");
+        }
+        for rel in &report.missing {
+            println!("MISSING {rel}");
+        }
+        for rel in &report.new_files {
+            println!("NEW {rel}");
+        }
+        println!(
+            "{} verified, {} altered, {} missing, {} new — wrote generation {}",
+            report.verified.len(),
+            report.altered.len(),
+            report.missing.len(),
+            report.new_files.len(),
+            report.written.generation
+        );
+    }
+
+    anyhow::ensure!(
+        report.altered.is_empty() && report.missing.is_empty(),
+        "verification failed: {} altered, {} missing",
+        report.altered.len(),
+        report.missing.len()
+    );
     Ok(())
 }

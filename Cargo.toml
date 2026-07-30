@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/catalog-sqlite", "crates/cli", "crates/core", "crates/sync"]
+members = ["crates/catalog-sqlite", "crates/cli", "crates/core", "crates/ingest", "crates/sync"]
 
 [workspace.package]
 version = "0.1.0"

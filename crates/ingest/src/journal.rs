@@ -270,6 +270,24 @@ mod tests {
         assert_eq!(folded.planned.len(), 2);
     }
 
+    /// `load`'s `NotFound` guard exists to distinguish "no journal written
+    /// yet" (fold to empty, not an error) from a genuine I/O problem, which
+    /// must still propagate. A directory where a file is expected produces
+    /// a `read_to_string` error whose kind is not `NotFound`, so this must
+    /// surface as `Err`, not silently fold to an empty `Folded` — the
+    /// discriminator for a guard mutated to always match.
+    #[test]
+    fn load_propagates_a_non_missing_error_instead_of_folding_to_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-file");
+        std::fs::create_dir(&path).expect("mkdir");
+        let result = Journal::load(&path);
+        assert!(
+            result.is_err(),
+            "a directory at the journal path must not silently fold to an empty journal"
+        );
+    }
+
     #[test]
     fn corrupt_trailing_line_is_tolerated() {
         let dir = tempfile::tempdir().expect("tempdir");

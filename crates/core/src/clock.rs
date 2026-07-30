@@ -216,6 +216,100 @@ mod tests {
         );
     }
 
+    /// `MAX_DRIFT_MS` is only ever used symbolically in the other tests here
+    /// (e.g. `1000 + MAX_DRIFT_MS + 5000`), so any arithmetic mutation of
+    /// its defining expression is self-consistent with them regardless of
+    /// what the constant actually evaluates to. Pinning the literal value
+    /// is the only way to discriminate a mutated `*`/`+`/`/` in `24 * 60 *
+    /// 60 * 1000`.
+    #[test]
+    fn max_drift_ms_is_24_hours_in_milliseconds() {
+        assert_eq!(MAX_DRIFT_MS, 86_400_000);
+    }
+
+    /// `observe_far_future_is_clamped` only asserts `next.wall_ms <= ceiling`
+    /// — a bound so loose it also passes if the clamp never advanced
+    /// `last_wall` at all (a fresh clock's next tick is far under the
+    /// ceiling too). Asserting the exact value discriminates a `>` -> `<`
+    /// mutation in the clamp-advance guard, which would leave `last_wall`
+    /// stuck at its pre-observe value instead of advancing to `max_wall`.
+    #[test]
+    fn observe_far_future_advances_local_clock_to_exactly_the_clamp_ceiling() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        let poison = Hlc {
+            wall_ms: 1000 + MAX_DRIFT_MS + 5000,
+            counter: 0,
+            machine: MachineId("bad".into()),
+        };
+        assert!(matches!(
+            hlc.observe(&poison),
+            ObserveOutcome::ClampedFuture { .. }
+        ));
+        let next = hlc.now();
+        assert_eq!(
+            next.wall_ms,
+            1000 + MAX_DRIFT_MS,
+            "the clamp must actually advance last_wall to the ceiling, not leave it untouched"
+        );
+    }
+
+    /// A remote at the same wall time as the already-adopted clock only
+    /// counts as newer information (`Adopted`) when its counter is
+    /// strictly higher — equal or lower must be `AlreadyCurrent`.
+    /// Discriminates `>` -> `>=`/`==`/`<` mutations in the equal-wall
+    /// tiebreak comparison.
+    #[test]
+    fn observe_equal_wall_needs_a_strictly_higher_counter_to_adopt() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        let seed = Hlc {
+            wall_ms: 2000,
+            counter: 5,
+            machine: MachineId("seed".into()),
+        };
+        assert_eq!(hlc.observe(&seed), ObserveOutcome::Adopted);
+
+        let same_counter = Hlc {
+            wall_ms: 2000,
+            counter: 5,
+            machine: MachineId("m2".into()),
+        };
+        assert_eq!(hlc.observe(&same_counter), ObserveOutcome::AlreadyCurrent);
+
+        let lower_counter = Hlc {
+            wall_ms: 2000,
+            counter: 2,
+            machine: MachineId("m3".into()),
+        };
+        assert_eq!(hlc.observe(&lower_counter), ObserveOutcome::AlreadyCurrent);
+    }
+
+    /// `wall_ms` is the primary ordering key: a remote from an older wall
+    /// time must never be adopted no matter how much higher its counter
+    /// is. Discriminates `==` -> `!=` and `&&` -> `||` in the equal-wall
+    /// tiebreak clause, either of which would let the counter comparison
+    /// leak into deciding outcomes for genuinely unequal walls.
+    #[test]
+    fn observe_older_wall_is_never_adopted_regardless_of_counter() {
+        let mut hlc = HlcClock::new(MachineId("m1".into()), Box::new(FixedClock(1000)));
+        let seed = Hlc {
+            wall_ms: 2000,
+            counter: 0,
+            machine: MachineId("seed".into()),
+        };
+        assert_eq!(hlc.observe(&seed), ObserveOutcome::Adopted);
+
+        let older_but_higher_counter = Hlc {
+            wall_ms: 1500,
+            counter: 999,
+            machine: MachineId("m2".into()),
+        };
+        assert_eq!(
+            hlc.observe(&older_but_higher_counter),
+            ObserveOutcome::AlreadyCurrent,
+            "a higher counter must not override an older wall time"
+        );
+    }
+
     #[test]
     fn hlc_orders_by_wall_then_counter_then_machine() {
         let a = Hlc {

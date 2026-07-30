@@ -85,6 +85,10 @@ fn copies_verifies_and_places_to_every_destination() {
         .iter()
         .find(|p| p.rel == "clips/a.mov")
         .expect("a placed");
+    // The accumulator in `stream_to_sinks` starts at 0 and only ever grows
+    // by `+=`; asserting the real byte count (not just that hashes match)
+    // catches a `+=` -> `*=` mutation, which would leave `size` stuck at 0.
+    assert_eq!(placed_a.size, 4);
     assert_eq!(
         placed_a.xxh64,
         format!("{:016x}", xxhash_rust::xxh64::xxh64(b"AAAA", 0))
@@ -253,4 +257,49 @@ fn duplicate_skip_does_not_copy() {
     assert!(outcome.placed.is_empty());
     assert_eq!(outcome.skipped_duplicates.len(), 1);
     assert!(!d1.path().join("Projects/x/day1/dup.mov").exists());
+}
+
+/// Every other test in this file seeds `KnownAssets::default()` or a
+/// candidate whose content genuinely matches, so `pf.prehash` is always
+/// `None` for a `Copy` decision — the `Some(prehash)` branch in `copy_one`
+/// that re-checks the source hasn't changed since planning never runs.
+/// Seeding a same-size candidate with a *different* hash forces the planner
+/// to hash the source during planning (`Decision::Copy` with `prehash:
+/// Some(..)`) without it being a duplicate, exercising that branch's normal
+/// (non-corrupted) path: the prehash matches the copy-time hash, so the
+/// file must still be placed, not failed. This discriminates a `!=` -> `==`
+/// mutation in that check, which would instead fail every such file.
+#[test]
+fn a_correctly_predicted_prehash_does_not_block_the_copy() {
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA")]);
+    let known = KnownAssets::from_pairs(vec![(
+        format!("{:032x}", xxhash_rust::xxh3::xxh3_128(b"ZZZZ")),
+        4,
+    )]);
+    let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+    assert!(
+        plan.files[0].prehash.is_some(),
+        "the size-prefilter match must have hashed the source during planning"
+    );
+    assert!(matches!(
+        plan.files[0].decision,
+        majestical_ingest::plan::Decision::Copy
+    ));
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 1 },
+    )
+    .expect("run");
+    assert_eq!(
+        outcome.placed.len(),
+        1,
+        "a prehash that matches the actual bytes must not block the copy: {:?}",
+        outcome.failed
+    );
+    assert!(outcome.failed.is_empty());
 }

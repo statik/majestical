@@ -123,6 +123,14 @@ mod tests {
     use crate::clock::{Hlc, MachineId};
 
     #[test]
+    fn dir_name_maps_every_kind_to_its_para_directory() {
+        assert_eq!(ParaKind::Project.dir_name(), "Projects");
+        assert_eq!(ParaKind::Area.dir_name(), "Areas");
+        assert_eq!(ParaKind::Resource.dir_name(), "Resources");
+        assert_eq!(ParaKind::Archive.dir_name(), "Archives");
+    }
+
+    #[test]
     fn event_json_round_trips() {
         let e = Event {
             id: EventId(ulid::Ulid::from_parts(1, 1)),

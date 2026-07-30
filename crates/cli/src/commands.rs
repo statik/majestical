@@ -14,14 +14,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Opens the sqlite catalog at `<catalog_dir>/catalog.db` and rebuilds it
-/// from the current projection. Shared by every read path that needs an ad
-/// hoc sqlite view — `search`, `volumes list`, and `para list` — so the
-/// open+rebuild pair lives in exactly one place.
+/// Opens the sqlite catalog from the per-machine local state dir (see
+/// `state_dir`) and rebuilds it from the current projection. Shared by
+/// every read path that needs an ad hoc sqlite view — `search`,
+/// `volumes list`, and `para list` — so the open+rebuild pair lives in
+/// exactly one place.
 pub(crate) fn open_rebuilt_catalog(app: &FsApp, catalog_dir: &Path) -> Result<SqliteCatalog> {
     let projection = app.projection()?;
-    let db_path = catalog_dir.join("catalog.db");
-    let mut db = SqliteCatalog::open(&db_path).context("opening sqlite catalog")?;
+    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    let mut db = SqliteCatalog::open(&paths.db_path).context("opening sqlite catalog")?;
     db.rebuild(&projection)
         .context("rebuilding sqlite projection")?;
     Ok(db)
@@ -798,8 +799,9 @@ fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpe
         .collect()
 }
 
-fn journal_path_for(catalog_dir: &Path, run_id: &str) -> PathBuf {
-    catalog_dir.join("runs").join(format!("{run_id}.jsonl"))
+fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    Ok(paths.runs_dir.join(format!("{run_id}.jsonl")))
 }
 
 /// Guards `--resume <id>`: a run id with no journal on disk is almost always
@@ -810,7 +812,7 @@ fn journal_path_for(catalog_dir: &Path, run_id: &str) -> PathBuf {
 /// anything opens that path for append). Requiring the journal to already
 /// exist closes both: nothing is created until this check passes.
 fn check_resume_journal_exists(catalog_dir: &Path, run_id: &str) -> Result<()> {
-    let journal_path = journal_path_for(catalog_dir, run_id);
+    let journal_path = journal_path_for(catalog_dir, run_id)?;
     anyhow::ensure!(
         journal_path.is_file(),
         "no journal for run '{run_id}' — check the id printed at the start of the original run"
@@ -833,7 +835,7 @@ fn run_ingest_engine(
     dests: &[engine::DestSpec],
     jobs: Option<usize>,
 ) -> Result<engine::Outcome> {
-    let journal_path = journal_path_for(catalog_dir, run_id);
+    let journal_path = journal_path_for(catalog_dir, run_id)?;
     let resume_set = journal::Journal::load(&journal_path)
         .with_context(|| format!("loading journal at {}", journal_path.display()))?
         .placed;

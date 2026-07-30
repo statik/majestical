@@ -14,6 +14,8 @@ pub struct KnownAssets {
 }
 
 impl KnownAssets {
+    /// `pairs` are bare xxh3-128 hex digests (no `xxh3:` prefix) paired with
+    /// the byte size the catalog recorded for that content.
     #[must_use]
     pub fn from_pairs(pairs: Vec<(String, u64)>) -> Self {
         let mut by_size: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
@@ -88,21 +90,33 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
 }
 
+/// The un-ingestable-name detail `rel_utf8` reports: a human reason plus a
+/// best-effort lossy relative path, since the true bytes may not be
+/// representable as a `String` at all.
+struct NonUtf8Rel {
+    reason: String,
+    lossy_rel: String,
+}
+
 /// Reduces `path` to a `/`-separated string relative to `source`. Pure and
 /// filesystem-free so the non-UTF-8 rejection path is unit-testable without
 /// depending on whether the host filesystem permits invalid-UTF-8 names.
 ///
 /// # Errors
-/// Returns the rejection reason as `Err(String)` when `path`'s relative
-/// component is not valid UTF-8.
-fn rel_utf8(source: &Path, path: &Path) -> Result<String, String> {
+/// Returns `Err(NonUtf8Rel)` when `path`'s relative component is not valid
+/// UTF-8; callers get both the reason and a lossy rel in one pass, rather
+/// than recomputing the lossy conversion themselves.
+fn rel_utf8(source: &Path, path: &Path) -> Result<String, NonUtf8Rel> {
     let rel_path = path.strip_prefix(source).unwrap_or(path);
     match rel_path.to_str() {
         Some(s) => Ok(s.replace('\\', "/")),
-        None => Err(IngestError::NonUtf8Path {
-            path: path.to_path_buf(),
-        }
-        .to_string()),
+        None => Err(NonUtf8Rel {
+            reason: IngestError::NonUtf8Path {
+                path: path.to_path_buf(),
+            }
+            .to_string(),
+            lossy_rel: rel_path.to_string_lossy().replace('\\', "/"),
+        }),
     }
 }
 
@@ -131,25 +145,9 @@ pub fn plan_source(
             continue;
         }
         let path = entry.path();
-        let rel = match rel_utf8(source, path) {
-            Ok(rel) => rel,
-            Err(reason) => {
-                let lossy_rel = path
-                    .strip_prefix(source)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                files.push(PlannedFile {
-                    source: path.to_path_buf(),
-                    rel: lossy_rel,
-                    size: 0,
-                    prehash: None,
-                    decision: Decision::Rejected { reason },
-                });
-                continue;
-            }
-        };
-
+        // Read the size before the UTF-8 check: a non-UTF-8-named file is
+        // still rejected, but it must be rejected with its real size, not
+        // a fabricated 0 indistinguishable from a genuine empty file.
         let size = entry
             .metadata()
             .map_err(|source_err| IngestError::Walk {
@@ -157,6 +155,24 @@ pub fn plan_source(
                 source: source_err,
             })?
             .len();
+
+        let rel = match rel_utf8(source, path) {
+            Ok(rel) => rel,
+            Err(NonUtf8Rel { reason, lossy_rel }) => {
+                files.push(PlannedFile {
+                    // Lossy, not `path.to_path_buf()`: serde's `Path`
+                    // serialization errors on invalid UTF-8, and this file
+                    // is Rejected — it is never reopened, so losing the
+                    // exact raw bytes here is harmless.
+                    source: PathBuf::from(path.to_string_lossy().into_owned()),
+                    rel: lossy_rel,
+                    size,
+                    prehash: None,
+                    decision: Decision::Rejected { reason },
+                });
+                continue;
+            }
+        };
 
         if size == 0 {
             files.push(PlannedFile {
@@ -266,7 +282,35 @@ mod tests {
         let source = Path::new("/src");
         let path = source.join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
         let err = rel_utf8(source, &path).expect_err("non-UTF-8 name must be rejected");
-        assert!(err.contains("non-UTF-8"), "got: {err}");
+        assert!(err.reason.contains("non-UTF-8"), "got: {}", err.reason);
+        assert!(
+            err.lossy_rel.contains("bad"),
+            "lossy_rel should still carry the recoverable prefix: {}",
+            err.lossy_rel
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_non_utf8_file_serializes_with_a_lossy_source_path() {
+        // What plan_source records for the rejection arm: a lossy `source`
+        // path, built directly from rel_utf8's Err — no filesystem writes,
+        // so this runs even on filesystems (e.g. APFS) that refuse to
+        // create files with raw-byte names.
+        use std::os::unix::ffi::OsStrExt;
+        let source = Path::new("/src");
+        let path = source.join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
+        let err = rel_utf8(source, &path).expect_err("non-UTF-8 name must be rejected");
+        let planned = PlannedFile {
+            source: PathBuf::from(path.to_string_lossy().into_owned()),
+            rel: err.lossy_rel,
+            size: 3,
+            prehash: None,
+            decision: Decision::Rejected { reason: err.reason },
+        };
+        let json = serde_json::to_string(&planned).expect("serialize a lossy-path PlannedFile");
+        let back: PlannedFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(planned, back);
     }
 
     #[cfg(unix)]

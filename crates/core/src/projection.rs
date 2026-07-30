@@ -3,9 +3,22 @@
 //! before its add still wins over exactly that add and nothing else.
 use crate::clock::Hlc;
 use crate::event::{AssetId, Event, EventId, Op, ParaKind, VerifyOutcome};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Which projected entity an applied event changed. `Nothing` means the event
+/// was a duplicate (idempotent replay) and no state moved.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Touched {
+    Nothing,
+    Asset(AssetId),
+    Volume(String),
+    ParaNode(String),
+    /// Manifest set for a volume id changed.
+    Manifests(String),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetState {
     /// (volume, path, size) instances observed for this content hash.
     pub instances: BTreeSet<(String, String, u64)>,
@@ -23,7 +36,7 @@ pub struct AssetState {
 }
 
 /// One verification observation; a plain fact, deduped by full value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VerificationRecord {
     pub volume: String,
     pub path: String,
@@ -34,7 +47,7 @@ pub struct VerificationRecord {
 }
 
 /// One recorded ASC MHL generation; a plain fact.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ManifestRecord {
     pub generation: u32,
     pub mhl_path: String,
@@ -46,7 +59,7 @@ pub struct ManifestRecord {
 /// rather than first-write-wins: two concurrent `ParaNodeCreate`s for the
 /// same node id must still resolve to the same winner regardless of apply
 /// order. `name` is LWW across create+rename; `archived` is monotonic.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParaNodeState {
     kind: Option<(Hlc, ParaKind)>,
     name: Option<(Hlc, String)>,
@@ -74,7 +87,7 @@ impl ParaNodeState {
 /// tracked as separate fields: an `Hlc` totally orders (wall, counter,
 /// machine), so the observation with the highest `Hlc` is unambiguously
 /// both the freshest label and the most recent sighting.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeState {
     seen: Option<(Hlc, String)>,
 }
@@ -91,7 +104,7 @@ impl VolumeState {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Projection {
     assets: BTreeMap<AssetId, AssetState>,
     volumes: BTreeMap<String, VolumeState>,
@@ -102,9 +115,18 @@ pub struct Projection {
 }
 
 impl Projection {
+    /// Thin wrapper over [`Self::apply_tracking`] for callers that don't need
+    /// to know which entity changed.
     pub fn apply(&mut self, event: &Event) {
+        let _ = self.apply_tracking(event);
+    }
+
+    /// Applies `event` and reports which entity it changed, or
+    /// [`Touched::Nothing`] if this event id was already applied.
+    #[must_use]
+    pub fn apply_tracking(&mut self, event: &Event) -> Touched {
         if !self.applied.insert(event.id) {
-            return;
+            return Touched::Nothing;
         }
         match &event.op {
             Op::AssetSeen {
@@ -112,32 +134,49 @@ impl Projection {
                 volume,
                 path,
                 size,
-            } => self.apply_asset_seen(asset, volume, path, *size),
-            Op::TagAdd { asset, tag } => self.apply_tag_add(event.id, asset, tag),
+            } => {
+                self.apply_asset_seen(asset, volume, path, *size);
+                Touched::Asset(asset.clone())
+            }
+            Op::TagAdd { asset, tag } => {
+                self.apply_tag_add(event.id, asset, tag);
+                Touched::Asset(asset.clone())
+            }
             Op::TagRemove {
                 asset, observed, ..
-            } => self.apply_tag_remove(asset, observed),
+            } => {
+                self.apply_tag_remove(asset, observed);
+                Touched::Asset(asset.clone())
+            }
             Op::FieldSet {
                 asset,
                 field,
                 value,
-            } => self.apply_field_set(asset, event.hlc.clone(), field, value),
+            } => {
+                self.apply_field_set(asset, event.hlc.clone(), field, value);
+                Touched::Asset(asset.clone())
+            }
             Op::VolumeSeen { volume, label } => {
                 let st = self.volumes.entry(volume.clone()).or_default();
                 Self::lww(&mut st.seen, event.hlc.clone(), label.clone());
+                Touched::Volume(volume.clone())
             }
             Op::ParaNodeCreate { node, kind, name } => {
                 self.apply_para_create(node, *kind, event.hlc.clone(), name);
+                Touched::ParaNode(node.clone())
             }
             Op::ParaNodeRename { node, name } => {
                 self.apply_para_rename(node, event.hlc.clone(), name);
+                Touched::ParaNode(node.clone())
             }
             Op::ParaNodeArchive { node } => {
                 self.para_nodes.entry(node.clone()).or_default().archived = true;
+                Touched::ParaNode(node.clone())
             }
             Op::AssetParaSet { asset, node } => {
                 let st = self.assets.entry(asset.clone()).or_default();
                 Self::lww(&mut st.para, event.hlc.clone(), node.clone());
+                Touched::Asset(asset.clone())
             }
             Op::VerificationRecorded {
                 asset,
@@ -147,30 +186,36 @@ impl Projection {
                 value,
                 outcome,
                 hashdate_ms,
-            } => self.insert_verification(
-                asset,
-                VerificationRecord {
-                    volume: volume.clone(),
-                    path: path.clone(),
-                    algo: algo.clone(),
-                    value: value.clone(),
-                    outcome: *outcome,
-                    hashdate_ms: *hashdate_ms,
-                },
-            ),
+            } => {
+                self.insert_verification(
+                    asset,
+                    VerificationRecord {
+                        volume: volume.clone(),
+                        path: path.clone(),
+                        algo: algo.clone(),
+                        value: value.clone(),
+                        outcome: *outcome,
+                        hashdate_ms: *hashdate_ms,
+                    },
+                );
+                Touched::Asset(asset.clone())
+            }
             Op::ManifestRecorded {
                 volume,
                 mhl_path,
                 generation,
                 roothash,
-            } => self.insert_manifest(
-                volume,
-                ManifestRecord {
-                    generation: *generation,
-                    mhl_path: mhl_path.clone(),
-                    roothash: roothash.clone(),
-                },
-            ),
+            } => {
+                self.insert_manifest(
+                    volume,
+                    ManifestRecord {
+                        generation: *generation,
+                        mhl_path: mhl_path.clone(),
+                        roothash: roothash.clone(),
+                    },
+                );
+                Touched::Manifests(volume.clone())
+            }
         }
     }
 
@@ -382,6 +427,132 @@ mod tests {
     }
     fn asset() -> AssetId {
         AssetId("xxh3:aa".into())
+    }
+
+    fn test_event(n: u64, op: Op) -> Event {
+        Event {
+            id: EventId(ulid::Ulid::from_parts(1, n.into())),
+            hlc: Hlc {
+                wall_ms: n,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op,
+        }
+    }
+
+    /// One op of every current `Op` variant, values borrowed from the golden
+    /// wire-format tests in `event.rs`, so the serde round-trip below
+    /// exercises every state structure in the projection.
+    fn sample_ops() -> Vec<Op> {
+        vec![
+            Op::AssetSeen {
+                asset: asset(),
+                volume: "uuid:abc".into(),
+                path: "clips/a.mov".into(),
+                size: 4,
+            },
+            Op::VolumeSeen {
+                volume: "uuid:abc".into(),
+                label: "card1".into(),
+            },
+            Op::TagAdd {
+                asset: asset(),
+                tag: "person/dana".into(),
+            },
+            Op::TagRemove {
+                asset: asset(),
+                tag: "t".into(),
+                observed: vec![EventId(ulid::Ulid::from_parts(1, 2))],
+            },
+            Op::FieldSet {
+                asset: asset(),
+                field: "rating".into(),
+                value: "5".into(),
+            },
+            Op::ParaNodeCreate {
+                node: "00000000010000000000000002".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            },
+            Op::ParaNodeRename {
+                node: "00000000010000000000000002".into(),
+                name: "client-y".into(),
+            },
+            Op::ParaNodeArchive {
+                node: "00000000010000000000000002".into(),
+            },
+            Op::AssetParaSet {
+                asset: asset(),
+                node: "00000000010000000000000002".into(),
+            },
+            Op::VerificationRecorded {
+                asset: asset(),
+                volume: "uuid:abc".into(),
+                path: "clips/a.mov".into(),
+                algo: "xxh64".into(),
+                value: "0011223344556677".into(),
+                outcome: VerifyOutcome::Verified,
+                hashdate_ms: 42,
+            },
+            Op::ManifestRecorded {
+                volume: "uuid:abc".into(),
+                mhl_path: "ascmhl/0001_dest_2026-07-29_120000.mhl".into(),
+                generation: 1,
+                roothash: "xxh64:8899aabbccddeeff".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn apply_tracking_reports_the_touched_entity() {
+        let mut p = Projection::default();
+        let e = test_event(
+            1,
+            Op::VolumeSeen {
+                volume: "v1".into(),
+                label: "V".into(),
+            },
+        );
+        assert_eq!(p.apply_tracking(&e), Touched::Volume("v1".into()));
+        let e2 = test_event(
+            2,
+            Op::TagAdd {
+                asset: AssetId("xxh3:a".into()),
+                tag: "t".into(),
+            },
+        );
+        assert_eq!(
+            p.apply_tracking(&e2),
+            Touched::Asset(AssetId("xxh3:a".into()))
+        );
+    }
+
+    #[test]
+    fn reapplying_an_event_touches_nothing() {
+        let mut p = Projection::default();
+        let e = test_event(
+            1,
+            Op::VolumeSeen {
+                volume: "v1".into(),
+                label: "V".into(),
+            },
+        );
+        assert_ne!(p.apply_tracking(&e), Touched::Nothing);
+        assert_eq!(p.apply_tracking(&e), Touched::Nothing);
+    }
+
+    #[test]
+    fn projection_round_trips_through_serde_json() {
+        let mut p = Projection::default();
+        for (n, op) in sample_ops().into_iter().enumerate() {
+            let n = u64::try_from(n).unwrap_or(0) + 1;
+            p.apply(&test_event(n, op));
+        }
+        let json = serde_json::to_string(&p).expect("serialize");
+        let back: Projection = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(p, back);
     }
 
     #[test]

@@ -25,6 +25,15 @@ impl PortError {
     }
 }
 
+/// Position within one machine's segment file. `offset` is a byte offset that
+/// always lands on a line boundary (readers never advance past a torn tail).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogCursor {
+    pub machine: String,
+    pub segment: String,
+    pub offset: u64,
+}
+
 /// Durable append-only event storage.
 pub trait EventLog {
     /// # Errors
@@ -38,6 +47,19 @@ pub trait EventLog {
         &self,
         on_bad_line: &mut dyn FnMut(&str),
     ) -> Result<Vec<Event>, PortError>;
+
+    /// Read only events past `cursors` (unknown segments read from 0). Returns
+    /// the new events plus updated cursors covering every segment seen. Errors
+    /// if a cursor points past the end of (or at a missing) segment — the
+    /// caller falls back to a full rebuild.
+    /// # Errors
+    /// Returns `PortError` when the underlying storage cannot be read, or when
+    /// a cursor doesn't correspond to a valid position in its segment.
+    fn read_since_reporting(
+        &self,
+        cursors: &[LogCursor],
+        on_bad_line: &mut dyn FnMut(&str),
+    ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError>;
 }
 
 /// Queryable projection storage, disposable and rebuildable.
@@ -67,6 +89,10 @@ mod tests {
     use crate::clock::{Hlc, MachineId};
     use crate::event::{AssetId, Event, EventId, Op};
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("cursor reads not implemented yet")]
+    struct CursorReadsUnsupported;
+
     #[derive(Default)]
     struct MemLog(Vec<Event>);
     impl EventLog for MemLog {
@@ -79,6 +105,20 @@ mod tests {
             _on_bad_line: &mut dyn FnMut(&str),
         ) -> Result<Vec<Event>, PortError> {
             Ok(self.0.clone())
+        }
+        fn read_since_reporting(
+            &self,
+            cursors: &[LogCursor],
+            on_bad_line: &mut dyn FnMut(&str),
+        ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError> {
+            if !cursors.is_empty() {
+                return Err(PortError::new(
+                    "cursor reads not implemented yet",
+                    CursorReadsUnsupported,
+                ));
+            }
+            let events = self.read_all_reporting(on_bad_line)?;
+            Ok((events, Vec::new()))
         }
     }
 

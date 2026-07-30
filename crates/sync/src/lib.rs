@@ -3,7 +3,7 @@
 //! so dumb transports (Dropbox, rsync, a shuttle drive) can carry it.
 use majestical_core::clock::MachineId;
 use majestical_core::event::Event;
-use majestical_core::ports::{EventLog, PortError};
+use majestical_core::ports::{EventLog, LogCursor, PortError};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,8 @@ pub enum LogError {
     NotInitialized { path: PathBuf },
     #[error("serializing event: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("cursor-based reads are not implemented yet")]
+    CursorReadsUnsupported,
 }
 
 pub struct FileEventLog {
@@ -191,6 +193,71 @@ impl FileEventLog {
         }
         Ok(out)
     }
+
+    /// Current byte length of every segment across every machine, as
+    /// [`LogCursor`]s a caller can pass to a future `read_since` to skip
+    /// what's already been read.
+    ///
+    /// # Errors
+    /// Returns [`LogError::Io`] if the events directory or a machine's
+    /// segments can't be read.
+    fn current_cursors(&self) -> Result<Vec<LogCursor>, LogError> {
+        let events_dir = self.root.join("events");
+        let mut out = Vec::new();
+        let machines = fs::read_dir(&events_dir).map_err(|source| LogError::Io {
+            path: events_dir.clone(),
+            source,
+        })?;
+        for machine in machines {
+            let machine = machine.map_err(|source| LogError::Io {
+                path: events_dir.clone(),
+                source,
+            })?;
+            let is_dir = machine.file_type().map_err(|source| LogError::Io {
+                path: machine.path(),
+                source,
+            })?;
+            if !is_dir.is_dir() {
+                continue;
+            }
+            let machine_name = machine.file_name().to_string_lossy().into_owned();
+            let segment_entries = fs::read_dir(machine.path()).map_err(|source| LogError::Io {
+                path: machine.path(),
+                source,
+            })?;
+            for entry in segment_entries {
+                let entry = entry.map_err(|source| LogError::Io {
+                    path: machine.path(),
+                    source,
+                })?;
+                let file_type = entry.file_type().map_err(|source| LogError::Io {
+                    path: entry.path(),
+                    source,
+                })?;
+                let path = entry.path();
+                if !file_type.is_file() || path.extension().is_none_or(|x| x != "jsonl") {
+                    continue;
+                }
+                let len = fs::metadata(&path)
+                    .map_err(|source| LogError::Io {
+                        path: path.clone(),
+                        source,
+                    })?
+                    .len();
+                let segment = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push(LogCursor {
+                    machine: machine_name.clone(),
+                    segment,
+                    offset: len,
+                });
+            }
+        }
+        out.sort_by(|a, b| (&a.machine, &a.segment).cmp(&(&b.machine, &b.segment)));
+        Ok(out)
+    }
 }
 
 impl EventLog for FileEventLog {
@@ -204,6 +271,26 @@ impl EventLog for FileEventLog {
     ) -> Result<Vec<Event>, PortError> {
         Self::read_all_reporting(self, |line| on_bad_line(line))
             .map_err(|e| PortError::new("event log", e))
+    }
+
+    /// Not yet implemented: always reads from scratch when `cursors` is
+    /// empty (Task 3 adds real incremental positioning); any non-empty
+    /// cursor list is rejected so callers fall back to a full rebuild.
+    fn read_since_reporting(
+        &self,
+        cursors: &[LogCursor],
+        on_bad_line: &mut dyn FnMut(&str),
+    ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError> {
+        if !cursors.is_empty() {
+            return Err(PortError::new(
+                "cursor reads not implemented yet",
+                LogError::CursorReadsUnsupported,
+            ));
+        }
+        let events = Self::read_all_reporting(self, |line| on_bad_line(line))
+            .map_err(|e| PortError::new("event log", e))?;
+        let cursors = Self::current_cursors(self).map_err(|e| PortError::new("event log", e))?;
+        Ok((events, cursors))
     }
 }
 

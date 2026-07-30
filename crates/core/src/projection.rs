@@ -443,65 +443,99 @@ mod tests {
     }
 
     /// One op of every current `Op` variant, values borrowed from the golden
-    /// wire-format tests in `event.rs`, so the serde round-trip below
-    /// exercises every state structure in the projection.
-    fn sample_ops() -> Vec<Op> {
+    /// wire-format tests in `event.rs`, paired with the `Touched` value
+    /// `apply_tracking` must report for it — so both the serde round-trip
+    /// and the touched-entity mapping are pinned against the same list.
+    fn sample_ops() -> Vec<(Op, Touched)> {
         vec![
-            Op::AssetSeen {
-                asset: asset(),
-                volume: "uuid:abc".into(),
-                path: "clips/a.mov".into(),
-                size: 4,
-            },
-            Op::VolumeSeen {
-                volume: "uuid:abc".into(),
-                label: "card1".into(),
-            },
-            Op::TagAdd {
-                asset: asset(),
-                tag: "person/dana".into(),
-            },
-            Op::TagRemove {
-                asset: asset(),
-                tag: "t".into(),
-                observed: vec![EventId(ulid::Ulid::from_parts(1, 2))],
-            },
-            Op::FieldSet {
-                asset: asset(),
-                field: "rating".into(),
-                value: "5".into(),
-            },
-            Op::ParaNodeCreate {
-                node: "00000000010000000000000002".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            },
-            Op::ParaNodeRename {
-                node: "00000000010000000000000002".into(),
-                name: "client-y".into(),
-            },
-            Op::ParaNodeArchive {
-                node: "00000000010000000000000002".into(),
-            },
-            Op::AssetParaSet {
-                asset: asset(),
-                node: "00000000010000000000000002".into(),
-            },
-            Op::VerificationRecorded {
-                asset: asset(),
-                volume: "uuid:abc".into(),
-                path: "clips/a.mov".into(),
-                algo: "xxh64".into(),
-                value: "0011223344556677".into(),
-                outcome: VerifyOutcome::Verified,
-                hashdate_ms: 42,
-            },
-            Op::ManifestRecorded {
-                volume: "uuid:abc".into(),
-                mhl_path: "ascmhl/0001_dest_2026-07-29_120000.mhl".into(),
-                generation: 1,
-                roothash: "xxh64:8899aabbccddeeff".into(),
-            },
+            (
+                Op::AssetSeen {
+                    asset: asset(),
+                    volume: "uuid:abc".into(),
+                    path: "clips/a.mov".into(),
+                    size: 4,
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::VolumeSeen {
+                    volume: "uuid:abc".into(),
+                    label: "card1".into(),
+                },
+                Touched::Volume("uuid:abc".into()),
+            ),
+            (
+                Op::TagAdd {
+                    asset: asset(),
+                    tag: "person/dana".into(),
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::TagRemove {
+                    asset: asset(),
+                    tag: "t".into(),
+                    observed: vec![EventId(ulid::Ulid::from_parts(1, 2))],
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::FieldSet {
+                    asset: asset(),
+                    field: "rating".into(),
+                    value: "5".into(),
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::ParaNodeCreate {
+                    node: "00000000010000000000000002".into(),
+                    kind: ParaKind::Project,
+                    name: "client-x".into(),
+                },
+                Touched::ParaNode("00000000010000000000000002".into()),
+            ),
+            (
+                Op::ParaNodeRename {
+                    node: "00000000010000000000000002".into(),
+                    name: "client-y".into(),
+                },
+                Touched::ParaNode("00000000010000000000000002".into()),
+            ),
+            (
+                Op::ParaNodeArchive {
+                    node: "00000000010000000000000002".into(),
+                },
+                Touched::ParaNode("00000000010000000000000002".into()),
+            ),
+            (
+                Op::AssetParaSet {
+                    asset: asset(),
+                    node: "00000000010000000000000002".into(),
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::VerificationRecorded {
+                    asset: asset(),
+                    volume: "uuid:abc".into(),
+                    path: "clips/a.mov".into(),
+                    algo: "xxh64".into(),
+                    value: "0011223344556677".into(),
+                    outcome: VerifyOutcome::Verified,
+                    hashdate_ms: 42,
+                },
+                Touched::Asset(asset()),
+            ),
+            (
+                Op::ManifestRecorded {
+                    volume: "uuid:abc".into(),
+                    mhl_path: "ascmhl/0001_dest_2026-07-29_120000.mhl".into(),
+                    generation: 1,
+                    roothash: "xxh64:8899aabbccddeeff".into(),
+                },
+                Touched::Manifests("uuid:abc".into()),
+            ),
         ]
     }
 
@@ -546,13 +580,27 @@ mod tests {
     #[test]
     fn projection_round_trips_through_serde_json() {
         let mut p = Projection::default();
-        for (n, op) in sample_ops().into_iter().enumerate() {
+        for (n, (op, _)) in sample_ops().into_iter().enumerate() {
             let n = u64::try_from(n).unwrap_or(0) + 1;
             p.apply(&test_event(n, op));
         }
         let json = serde_json::to_string(&p).expect("serialize");
         let back: Projection = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(p, back);
+    }
+
+    /// Pins the exact `Touched` value for one op of every variant — without
+    /// this, a wrong mapping on an untested arm (e.g. `ManifestRecorded`
+    /// reporting `Touched::Volume` instead of `Touched::Manifests`) would
+    /// compile and silently corrupt the incremental-apply path that consumes
+    /// `Touched`.
+    #[test]
+    fn apply_tracking_touches_the_correct_entity_for_every_op_variant() {
+        let mut p = Projection::default();
+        for (n, (op, expected)) in sample_ops().into_iter().enumerate() {
+            let n = u64::try_from(n).unwrap_or(0) + 1;
+            assert_eq!(p.apply_tracking(&test_event(n, op)), expected);
+        }
     }
 
     #[test]

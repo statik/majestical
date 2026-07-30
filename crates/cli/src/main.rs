@@ -50,9 +50,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
-    /// Search the catalog: bare terms match names (and, once the semantic
-    /// index lands, image content); key:value tokens are hard filters
-    /// (tag: vol: para: kind: online: before: after:), '-' negates.
+    /// Search the catalog: bare terms match names; key:value tokens are
+    /// hard filters (tag: vol: para: kind: online: before: after:), '-'
+    /// negates.
     Search {
         /// May start with '-' (a leading negated filter, e.g. `-tag:x`) —
         /// `allow_hyphen_values` stops clap from treating the whole query as

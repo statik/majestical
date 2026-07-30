@@ -242,18 +242,21 @@ const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
 /// match first); `key:value` tokens resolve to hard `Filter`s and narrow the
 /// result to their conjunction. Terms and filters combine by intersection —
 /// a term match that fails a filter is dropped, never re-ranked above it. With
-/// no filters, only the top `limit * 4` ranked terms are ever fetched (cheap,
-/// since nothing downstream can add matches back in); with filters present,
-/// every ranked match is fetched and intersected before `limit` is applied —
-/// a filter-matching asset that ranks outside a small prefetch window must
-/// still be found, not silently dropped by a pre-filter slice.
+/// filters present, every ranked match is fetched and intersected before
+/// `limit` is applied — a filter-matching asset that ranks outside a small
+/// prefetch window must still be found, not silently dropped by a pre-filter
+/// slice.
 ///
 /// # Errors
 /// Returns an error if the query fails to parse, names an unknown or
 /// malformed filter, or (once parsed) carries neither terms nor filters.
 pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> Result<()> {
-    let (db, projection) = open_catalog(app, catalog_dir)?;
     let parsed = crate::query::parse_query(&args.query)?;
+    anyhow::ensure!(
+        !parsed.terms.is_empty() || !parsed.filters.is_empty(),
+        "empty query: give search terms or at least one filter"
+    );
+    let (db, projection) = open_catalog(app, catalog_dir)?;
     // Resolved once and shared: `resolve_filter`'s `online:` arm and
     // `print_search_results`'s per-volume online flag both need the mounted
     // set, and each call shells out to `diskutil` per mount — computing it
@@ -267,7 +270,7 @@ pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> 
     };
     let ranked: Vec<(AssetId, f64)> = if parsed.terms.is_empty() {
         let Some(set) = &allowed else {
-            anyhow::bail!("empty query: give search terms or at least one filter");
+            unreachable!("empty query is rejected above before a catalog is even opened");
         };
         set.iter()
             .map(|a| (a.clone(), 0.0))
@@ -277,7 +280,7 @@ pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> 
         let search_limit = if allowed.is_some() {
             usize::MAX
         } else {
-            args.limit.saturating_mul(4)
+            args.limit
         };
         db.search_names_ranked(&parsed.terms, search_limit)?
             .into_iter()

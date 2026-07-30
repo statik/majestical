@@ -100,7 +100,8 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// # Errors
 /// Returns an error when the string isn't `YYYY-MM-DD`, names an impossible
 /// civil date (bad month, or a day beyond that month's real length,
-/// leap-year aware), or predates the Unix epoch.
+/// leap-year aware), predates the Unix epoch, or names a year past 9999 (a
+/// bound that also keeps `days * 86_400_000` below from overflowing `i64`).
 pub(crate) fn parse_date_ms(value: &str) -> Result<u64> {
     let mut parts = value.split('-');
     let (Some(y), Some(m), Some(d), None) =
@@ -113,8 +114,8 @@ pub(crate) fn parse_date_ms(value: &str) -> Result<u64> {
     let m: i64 = m.parse().map_err(|_| bad())?;
     let d: i64 = d.parse().map_err(|_| bad())?;
 
-    if y < 1970 {
-        bail!("date out of range (pre-epoch): '{value}'");
+    if !(1970..=9999).contains(&y) {
+        bail!("year out of range (expected 1970-9999): '{value}'");
     }
     if !(1..=12).contains(&m) {
         bail!("invalid month in date '{value}'");
@@ -242,5 +243,9 @@ mod tests {
         );
         assert!(parse_date_ms("not-a-date").is_err());
         assert!(parse_date_ms("1969-12-31").is_err(), "pre-epoch rejected");
+        assert!(
+            parse_date_ms("300000000000-01-01").is_err(),
+            "an absurdly large year must be rejected, not overflow the days*ms multiply"
+        );
     }
 }

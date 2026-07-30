@@ -59,7 +59,7 @@ pub(crate) fn mounted_volumes() -> std::collections::BTreeMap<String, std::path:
 /// Walks up from `path` until the device id changes; the last path before
 /// the change is the mount point. Falls back to `path` itself if metadata
 /// can't be read (e.g. it doesn't exist).
-pub(crate) fn mount_point_of(path: &Path) -> std::path::PathBuf {
+fn mount_point_of(path: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::MetadataExt;
     let start = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let Ok(start_meta) = std::fs::metadata(&start) else {

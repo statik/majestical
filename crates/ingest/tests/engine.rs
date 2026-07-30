@@ -199,6 +199,59 @@ fn resume_skips_placed_files() {
     assert_eq!(outcome.skipped_resumed, 2);
 }
 
+/// Deletes a "victim" file's already-placed final path in the same
+/// directory the moment a temp sink is opened for a "trigger" filename.
+/// Used to simulate a file vanishing from a destination between its own
+/// placement and the run's end-of-run sweep — a hazard nothing but that
+/// sweep can catch.
+struct DeletingSinks {
+    trigger_filename: &'static str,
+    victim_filename: &'static str,
+}
+
+impl SinkFactory for DeletingSinks {
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Sink>> {
+        if path.to_string_lossy().contains(self.trigger_filename)
+            && let Some(parent) = path.parent()
+        {
+            let _ = std::fs::remove_file(parent.join(self.victim_filename));
+        }
+        RealSinks.open(path)
+    }
+}
+
+#[test]
+fn sweep_missing_demotes_a_placed_file_that_vanished_before_the_sweep() {
+    // jobs: 1 and walkdir's sorted order guarantee a.mov is fully copied,
+    // verified, and placed at both destinations before b.mov's sinks ever
+    // open — so the deletion below always hits a real, already-placed file.
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let mut journal = Journal::create(&d1.path().join("run.jsonl")).expect("journal");
+    let sinks = DeletingSinks {
+        trigger_filename: "b.mov",
+        victim_filename: "a.mov",
+    };
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &sinks,
+        &EngineConfig { jobs: 1 },
+    )
+    .expect("run");
+    assert_eq!(outcome.placed.len(), 1, "only b survives the sweep");
+    assert_eq!(outcome.placed[0].rel, "b.mov");
+    assert_eq!(outcome.failed.len(), 1, "a is demoted by the sweep");
+    assert_eq!(outcome.failed[0].rel, "a.mov");
+    assert!(
+        outcome.failed[0].reason.contains("end-of-run sweep"),
+        "reason should name the sweep: {}",
+        outcome.failed[0].reason
+    );
+}
+
 #[test]
 fn duplicate_skip_does_not_copy() {
     let (src, d1, d2) = setup(&[("dup.mov", b"AAAA")]);

@@ -117,6 +117,7 @@ pub fn run(
     sinks: &dyn SinkFactory,
     config: &EngineConfig,
 ) -> Result<Outcome, IngestError> {
+    check_shared_subdir(dests)?;
     let (queue, mut outcome) = partition_plan(plan, resume);
     let (mut placed, mut failed) = run_workers(queue, dests, journal, sinks, config.jobs)?;
     sweep_missing(dests, &mut placed, &mut failed);
@@ -125,6 +126,29 @@ pub fn run(
     outcome.placed = placed;
     outcome.failed = failed;
     Ok(outcome)
+}
+
+/// `dest_rel_for` and `sweep_missing` both assume every destination in a
+/// run shares one subdir (the caller renders it once from the PARA layout
+/// template). Task 7 is expected to always satisfy this, but a silent
+/// violation would produce confidently wrong paths rather than a visible
+/// error, so it is checked up front instead.
+///
+/// # Errors
+/// Returns `IngestError::MismatchedSubdirs` if any two destinations differ.
+fn check_shared_subdir(dests: &[DestSpec]) -> Result<(), IngestError> {
+    let Some(first) = dests.first() else {
+        return Ok(());
+    };
+    for dest in &dests[1..] {
+        if dest.subdir != first.subdir {
+            return Err(IngestError::MismatchedSubdirs {
+                first: first.subdir.clone(),
+                other: dest.subdir.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Splits `plan.files` into work the pool must copy and the parts of
@@ -371,10 +395,10 @@ fn fail(ctx: &WorkerContext<'_>, rel: &str, reason: String) -> Result<PlacedFile
 /// journal the outcome. Per-destination failures are isolated in
 /// `verify_and_place`; only a journal I/O error escalates to `Abort`.
 fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, CopyOutcome> {
+    append_or_abort(ctx, &Record::FilePlanned { file: pf.clone() })?;
+
     let token = ulid::Ulid::generate().to_string();
     let mut attempts = open_sinks(ctx.dests, &pf.rel, &token, ctx.sinks);
-
-    append_or_abort(ctx, &Record::FilePlanned { file: pf.clone() })?;
 
     let stream = match stream_to_sinks(&pf.source, &mut attempts) {
         Ok(stream) => stream,
@@ -608,4 +632,24 @@ fn readback_xxh64(path: &Path) -> std::io::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:016x}", hasher.digest()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differing_subdirs_across_destinations_are_rejected() {
+        let dests = vec![
+            DestSpec {
+                root: PathBuf::from("/d1"),
+                subdir: "Projects/x/day1".into(),
+            },
+            DestSpec {
+                root: PathBuf::from("/d2"),
+                subdir: "Projects/x/day2".into(),
+            },
+        ];
+        assert!(check_shared_subdir(&dests).is_err());
+    }
 }

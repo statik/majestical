@@ -36,4 +36,9 @@ pub enum IngestError {
     },
     #[error("encoding journal record: {0}")]
     JournalEncode(#[source] serde_json::Error),
+    #[error(
+        "all destinations must share one subdir this phase: {first:?} != {other:?} \
+         — Task 7's per-destination layout is not wired up yet"
+    )]
+    MismatchedSubdirs { first: String, other: String },
 }

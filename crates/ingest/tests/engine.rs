@@ -1,9 +1,11 @@
 //! Engine acceptance: real files in temp dirs, fault injection via `SinkFactory`.
+mod common;
+
+use common::CorruptingSinks;
 use majestical_ingest::engine::{DestSpec, EngineConfig, RealSinks, Sink, SinkFactory, run};
 use majestical_ingest::journal::Journal;
 use majestical_ingest::plan::{DedupeMode, KnownAssets, plan_source};
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::Path;
 
 // These helpers need `#[cfg(test)]` even though this whole file only ever
@@ -91,51 +93,6 @@ fn copies_verifies_and_places_to_every_destination() {
         placed_a.xxh3,
         format!("{:032x}", xxhash_rust::xxh3::xxh3_128(b"AAAA"))
     );
-}
-
-/// Flips the first byte it writes for paths containing `target`, corrupting
-/// the destination between write and read-back — exactly the failure
-/// read-back verification exists to catch.
-struct CorruptingSinks {
-    target: String,
-}
-
-struct CorruptingSink {
-    inner: Box<dyn Sink>,
-    corrupt: bool,
-    done: bool,
-}
-
-impl Write for CorruptingSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.corrupt && !self.done && !buf.is_empty() {
-            self.done = true;
-            let mut flipped = buf.to_vec();
-            flipped[0] ^= 0xFF;
-            return self.inner.write(&flipped);
-        }
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl Sink for CorruptingSink {
-    fn finish(&mut self) -> std::io::Result<()> {
-        self.inner.finish()
-    }
-}
-
-impl SinkFactory for CorruptingSinks {
-    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Sink>> {
-        let corrupt = path.to_string_lossy().contains(&self.target);
-        Ok(Box::new(CorruptingSink {
-            inner: RealSinks.open(path)?,
-            corrupt,
-            done: false,
-        }))
-    }
 }
 
 #[test]

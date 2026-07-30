@@ -64,15 +64,35 @@ pub trait EventLog {
 }
 
 /// One hard search filter, already resolved to storage terms (para refs are
-/// node ids; `Online` carries the currently-mounted volume ids).
+/// node ids; `Online` carries the currently-mounted volume ids). The
+/// contracts below are what the sqlite adapter implements; other adapters
+/// must match them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Filter {
+    /// Matches an asset with this exact tag.
     Tag { value: String, negated: bool },
+    /// Matches an asset with an instance on a volume whose label OR id
+    /// equals `value` — including an instance whose volume has no
+    /// `volumes` row at all (a "ghost" volume, reachable via partial
+    /// cross-machine sync).
     Volume { value: String, negated: bool },
+    /// Matches an asset currently assigned to this PARA node.
     Para { node: String, negated: bool },
+    /// Matches an asset with an instance whose kind is `value` — one of
+    /// `core::media_kind::MediaKind::as_str()`'s strings ("image", "video",
+    /// "other").
     Kind { value: String, negated: bool },
+    /// `want: true` matches an asset with an instance on one of `ids` (the
+    /// currently-mounted volume set); `want: false` matches an asset with an
+    /// instance on none of them. An empty `ids` is the "nothing is mounted"
+    /// case: `want: true` then matches nothing, `want: false` matches any
+    /// asset that has at least one instance.
     Online { ids: Vec<String>, want: bool },
+    /// Matches an asset with an instance whose `mtime_ms` (wall-clock
+    /// milliseconds) is strictly less than this bound.
     Before(u64),
+    /// Matches an asset with an instance whose `mtime_ms` (wall-clock
+    /// milliseconds) is strictly greater than this bound.
     After(u64),
 }
 
@@ -80,6 +100,8 @@ pub enum Filter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetSummary {
     pub asset: AssetId,
+    /// The first instance's basename, or empty for a tag-only asset with no
+    /// recorded instance.
     pub name: String,
     /// (volume id, volume label) pairs holding an instance.
     pub volumes: Vec<(String, String)>,

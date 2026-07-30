@@ -1,8 +1,9 @@
 //! `SQLite` projection of the catalog. Disposable by design: `rebuild`
 //! recreates it wholesale from a `Projection`; `open_synced` instead applies
 //! only the log events past a stored cursor, falling back to a full rebuild
-//! when there's no usable snapshot to resume from (FTS5/sqlite-vec arrive in
-//! later phases).
+//! when there's no usable snapshot to resume from. Includes an FTS5 name
+//! index (`names_fts`); the vector index for semantic search lives outside
+//! this crate per the phase 4 design.
 use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
 use majestical_core::media_kind::media_kind;
 use majestical_core::ports::{AssetSummary, CatalogStore, EventLog, Filter, LogCursor, PortError};

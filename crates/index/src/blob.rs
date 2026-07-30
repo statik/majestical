@@ -50,11 +50,6 @@ impl BlobStore {
     }
 
     #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    #[must_use]
     pub fn path_for(&self, asset_hex: &str, derivation: &Derivation<'_>) -> PathBuf {
         let prefix = asset_hex.get(..2).unwrap_or("xx");
         let dir = self.root.join(prefix).join(asset_hex);
@@ -159,8 +154,20 @@ impl BlobStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::blob::{BlobStore, Derivation, asset_hex};
+    use crate::blob::{BlobStore, Derivation, THUMB_NAME, asset_hex};
     use crate::error::IndexError;
+    use crate::thumbs::THUMB_EDGE;
+
+    /// A thumbnail size bump (`THUMB_EDGE`) must not silently keep writing
+    /// blobs under the old size's filename — the two must always agree, or
+    /// two different sizes would collide at the same content-addressed path.
+    #[test]
+    fn thumb_name_encodes_the_current_thumb_edge() {
+        assert!(
+            THUMB_NAME.contains(&THUMB_EDGE.to_string()),
+            "THUMB_NAME ({THUMB_NAME}) must encode THUMB_EDGE ({THUMB_EDGE})"
+        );
+    }
 
     #[test]
     fn blob_paths_are_derivation_keyed() {

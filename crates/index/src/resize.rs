@@ -16,13 +16,12 @@ pub fn resize_rgb(
     dst_w: u32,
     dst_h: u32,
 ) -> Result<image::RgbImage, IndexError> {
-    let src_img = fr::images::Image::from_vec_u8(
-        src.width(),
-        src.height(),
-        src.as_raw().clone(),
-        fr::PixelType::U8x3,
-    )
-    .map_err(|e| IndexError::Resize(e.to_string()))?;
+    // A borrowed view (`ImageRef`), not `Image::from_vec_u8` — the source
+    // only needs read access, so this avoids copying the whole decoded
+    // buffer (tens to hundreds of MB for a large still).
+    let src_img =
+        fr::images::ImageRef::new(src.width(), src.height(), src.as_raw(), fr::PixelType::U8x3)
+            .map_err(|e| IndexError::Resize(e.to_string()))?;
     let mut dst_img = fr::images::Image::new(dst_w, dst_h, fr::PixelType::U8x3);
     let mut resizer = fr::Resizer::new();
     resizer

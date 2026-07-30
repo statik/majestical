@@ -145,17 +145,16 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 }
 
 /// Builds the plan for one pass: gathers sources fresh from the projection
-/// (so `--watch` sees newly scanned assets), diffs against the blob store,
-/// then narrows `items` to `kinds`. Deliberately does not apply `--limit`
-/// here — that happens after `run_once` narrows further to kinds that
-/// actually have an executor (only thumbnails so far), so a mixed-kind plan
-/// never lets non-executable items consume `--limit`'s budget ahead of the
+/// (so `--watch` sees newly scanned assets), diffs against `blobs`, then
+/// narrows `items` to `kinds`. Deliberately does not apply `--limit` here —
+/// that happens after `run_once` narrows further to kinds that actually
+/// have an executor (only thumbnails so far), so a mixed-kind plan never
+/// lets non-executable items consume `--limit`'s budget ahead of the
 /// executable ones once embeddings/keyframes gain executors too.
-fn build_plan(projection: &Projection, catalog_dir: &Path, kinds: &BTreeSet<String>) -> WorkPlan {
+fn build_plan(projection: &Projection, blobs: &BlobStore, kinds: &BTreeSet<String>) -> WorkPlan {
     let sources = gather_sources(projection);
-    let blobs = BlobStore::new(catalog_dir);
     let caps = capabilities();
-    let mut plan = work::plan_work(&sources, &blobs, &caps);
+    let mut plan = work::plan_work(&sources, blobs, &caps);
     plan.items
         .retain(|item| kinds.contains(workkind_name(item.kind)));
     plan
@@ -177,7 +176,8 @@ fn run_once(
     json: bool,
 ) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
-    let plan = build_plan(&projection, catalog_dir, kinds);
+    let blobs = BlobStore::new(catalog_dir);
+    let plan = build_plan(&projection, &blobs, kinds);
     let mut thumb_items: Vec<work::WorkItem> = plan
         .items
         .into_iter()
@@ -186,7 +186,6 @@ fn run_once(
     if let Some(limit) = limit {
         thumb_items.truncate(limit);
     }
-    let blobs = BlobStore::new(catalog_dir);
     let jobs = threads.unwrap_or_else(default_index_jobs);
     let (written, failed) = run_thumb_items(&blobs, &thumb_items, jobs);
     print_run_result(written, &failed, json);
@@ -197,7 +196,9 @@ fn print_run_result(written: u64, failed: &[(PathBuf, String)], json: bool) {
     if json {
         let failed_json: Vec<_> = failed
             .iter()
-            .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
+            .map(|(path, err)| {
+                serde_json::json!({ "path": path.display().to_string(), "error": err })
+            })
             .collect();
         println!(
             "{}",
@@ -206,8 +207,11 @@ fn print_run_result(written: u64, failed: &[(PathBuf, String)], json: bool) {
     } else {
         println!("thumbnails: {written} written, {} failed", failed.len());
     }
-    for (path, err) in failed {
-        eprintln!("failed {}: {err}", path.display());
+    // No path prefix here: every `IndexError` display already embeds the
+    // path it failed on (the structured path is still available in the
+    // `--json` branch above, for callers that want it out-of-band).
+    for (_, err) in failed {
+        eprintln!("failed: {err}");
     }
 }
 
@@ -268,8 +272,9 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
 /// Returns an error if the catalog can't be opened/synced.
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
+    let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-    let plan = build_plan(&projection, catalog_dir, &kinds);
+    let plan = build_plan(&projection, &blobs, &kinds);
     if json {
         println!(
             "{}",

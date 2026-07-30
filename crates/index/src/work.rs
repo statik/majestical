@@ -65,7 +65,7 @@ pub struct KindStatus {
     pub pending: u64,
     /// Blob missing and the asset's volume isn't mounted right now.
     pub offline: u64,
-    /// Blob missing and the source format can't be decoded (RAW).
+    /// Blob missing and the source format can't be decoded (RAW/AVIF).
     pub unsupported: u64,
     /// Blob missing and this machine has no ffmpeg installed.
     pub needs_ffmpeg: u64,
@@ -119,8 +119,9 @@ pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities
     plan
 }
 
-/// THUMBS: blob exists -> done; else offline (no path) / unsupported (RAW
-/// ext) / `needs_ffmpeg` (video without ffmpeg) / pending+item, in that order.
+/// THUMBS: blob exists -> done; else offline (no path) / unsupported
+/// (RAW/AVIF ext) / `needs_ffmpeg` (video without ffmpeg) / pending+item, in
+/// that order.
 fn plan_thumb(
     source: &AssetSource,
     hex: &str,

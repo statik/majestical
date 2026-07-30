@@ -35,9 +35,9 @@ fn decode_via_sips(path: &Path) -> Result<image::DynamicImage, IndexError> {
     let tmp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
-        .map_err(|source| IndexError::Blob {
+        .map_err(|e| IndexError::Decode {
             path: path.to_path_buf(),
-            source,
+            message: format!("creating temp png for sips: {e}"),
         })?;
     let tmp_path = tmp.path();
 

@@ -128,7 +128,13 @@ impl Journal {
     /// line that fails to decode — a torn tail from a crash mid-`write_all`,
     /// or an old torn line `open_append` has since newline-terminated in
     /// place — is skipped rather than treated as a fatal error, and folding
-    /// continues with whatever lines follow it.
+    /// continues with whatever lines follow it. Now that `fold_one` lets a
+    /// later `FileFailed` demote an earlier `placed` entry, losing a
+    /// demotion's line to corruption leaves that rel in `placed` when it
+    /// should not be — but such a loss can only be a torn write of that
+    /// very record (the one case corruption can strike is the record that
+    /// never finished landing), which `break` would have lost identically;
+    /// `continue` is no worse than the alternative it replaced.
     ///
     /// # Errors
     /// Returns `IngestError::Journal` if the file exists but cannot be read.
@@ -187,15 +193,27 @@ fn repair_torn_tail(file: &mut std::fs::File, path: &Path) -> Result<(), IngestE
     Ok(())
 }
 
+/// Folds one record into `folded`. `placed` and `failed` are mutually
+/// exclusive per rel and order-sensitive: a later `FileFailed` (e.g. from
+/// an end-of-run sweep demoting a file whose final path vanished) removes
+/// that rel from `placed`, and symmetrically a later `FilePlaced` (a
+/// successful retry after a prior failure) clears any stale entry from
+/// `failed`. Without this, a demotion recorded after the original
+/// `FilePlaced` line would leave the rel in both sets — and since resume
+/// only ever consults `placed`, the stale entry there is the one that
+/// matters: it would make resume skip re-copying a file the journal itself
+/// says is missing.
 fn fold_one(folded: &mut Folded, record: Record) {
     match record {
         Record::FilePlanned { file } => {
             folded.planned.insert(file.rel.clone(), file);
         }
         Record::FilePlaced { rel } => {
+            folded.failed.remove(&rel);
             folded.placed.insert(rel);
         }
         Record::FileFailed { rel, reason } => {
+            folded.placed.remove(&rel);
             folded.failed.insert(rel, reason);
         }
         Record::RunStarted { .. } | Record::FileCopied { .. } | Record::FileVerified { .. } => {}
@@ -309,10 +327,18 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Any prefix of a journal folds without panicking, and its placed
-        /// set is a subset of the full journal's placed set.
+        /// Any prefix of a journal folds without panicking. Since a later
+        /// `FileFailed` can now demote an earlier `FilePlaced` (fold_one is
+        /// order-sensitive), a prefix's placed set is NOT generally a
+        /// subset of the full fold's placed set: "b" below is placed
+        /// within a short prefix but demoted to failed by a line that only
+        /// appears in the full sequence, so `prefix.placed` contains "b"
+        /// while `full.placed` does not. What does still hold is the
+        /// mutual-exclusion invariant `fold_one` maintains per rel: any rel
+        /// a prefix ever placed ends up in exactly one of the full fold's
+        /// `placed` or `failed` sets, never neither.
         #[test]
-        fn any_prefix_folds_consistently(cut in 0usize..6) {
+        fn any_prefix_folds_consistently(cut in 0usize..8) {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("run.jsonl");
             {
@@ -322,6 +348,11 @@ mod tests {
                 journal.append(&Record::FileVerified { rel: "a".into() }).expect("verified a");
                 journal.append(&Record::FilePlaced { rel: "a".into() }).expect("placed a");
                 journal.append(&Record::FilePlanned { file: planned("b") }).expect("planned b");
+                journal.append(&Record::FilePlaced { rel: "b".into() }).expect("placed b");
+                journal.append(&Record::FileFailed {
+                    rel: "b".into(),
+                    reason: "demoted".into(),
+                }).expect("failed b");
             }
             let full = Journal::load(&path).expect("load full");
 
@@ -335,7 +366,13 @@ mod tests {
             std::fs::write(&path, prefix_text).expect("write prefix");
 
             let prefix = Journal::load(&path).expect("load prefix");
-            prop_assert!(prefix.placed.is_subset(&full.placed));
+            let full_placed_or_failed: BTreeSet<String> = full
+                .placed
+                .iter()
+                .cloned()
+                .chain(full.failed.keys().cloned())
+                .collect();
+            prop_assert!(prefix.placed.is_subset(&full_placed_or_failed));
         }
     }
 }

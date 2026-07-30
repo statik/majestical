@@ -265,6 +265,14 @@ fn sweep_missing_demotes_a_placed_file_that_vanished_before_the_sweep() {
         folded.failed.contains_key("a.mov"),
         "journal must record the sweep demotion so resume re-copies it"
     );
+    // Recording the FileFailed line is not enough on its own: resume reads
+    // `placed`, not `failed`, so the demotion only matters if it also
+    // removes "a.mov" from `placed`. An insert-only fold would leave it in
+    // both sets, and resume would still (wrongly) skip it.
+    assert!(
+        !folded.placed.contains("a.mov"),
+        "the sweep's FileFailed must remove a.mov from placed, not just add it to failed"
+    );
 }
 
 #[test]

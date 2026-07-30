@@ -253,10 +253,8 @@ impl FileEventLog {
         let consumed = buf.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
         let mut events = Vec::new();
         for line in buf[..consumed].split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
             match std::str::from_utf8(line) {
+                Ok(text) if text.trim().is_empty() => {}
                 Ok(text) => match serde_json::from_str::<Event>(text) {
                     Ok(event) => events.push(event),
                     Err(_) => on_bad_line(text),
@@ -581,5 +579,22 @@ mod tests {
             .expect("meta")
             .len();
         assert_eq!(m2_cursor.offset, len);
+    }
+
+    #[test]
+    fn cursors_are_sorted_across_machines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("zebra".into())).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        for name in ["alpha", "m9", "charlie", "beta", "omega", "m1"] {
+            let mut other =
+                FileEventLog::open(dir.path(), &MachineId(name.into())).expect("open other");
+            other.append(&[ev(2)]).expect("append other");
+        }
+        let (_, cursors) = log.read_since_reporting(&[], |_| {}).expect("read");
+        let names: Vec<&str> = cursors.iter().map(|c| c.machine.as_str()).collect();
+        let mut expected = names.clone();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "cursors must be in canonical sorted order");
     }
 }

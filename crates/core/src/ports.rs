@@ -90,9 +90,13 @@ mod tests {
     use crate::event::{AssetId, Event, EventId, Op};
 
     #[derive(Debug, thiserror::Error)]
-    #[error("cursor reads not implemented yet")]
-    struct CursorReadsUnsupported;
+    #[error("cursor references a segment this log does not have")]
+    struct UnknownSegment;
 
+    /// This test double never keeps segments, so it never has anything to
+    /// resume from: any cursor a caller supplies necessarily names a segment
+    /// that doesn't exist here, which is exactly the error a real log
+    /// returns for a vanished segment.
     #[derive(Default)]
     struct MemLog(Vec<Event>);
     impl EventLog for MemLog {
@@ -112,10 +116,7 @@ mod tests {
             on_bad_line: &mut dyn FnMut(&str),
         ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError> {
             if !cursors.is_empty() {
-                return Err(PortError::new(
-                    "cursor reads not implemented yet",
-                    CursorReadsUnsupported,
-                ));
+                return Err(PortError::new("reading new events", UnknownSegment));
             }
             let events = self.read_all_reporting(on_bad_line)?;
             Ok((events, Vec::new()))

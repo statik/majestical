@@ -73,6 +73,12 @@ impl FsApp {
 }
 
 impl<L: EventLog> App<L> {
+    /// The underlying event log, for adapters (e.g. the sqlite catalog) that
+    /// need to read it directly rather than through `events`/`projection`.
+    pub(crate) fn log(&self) -> &L {
+        &self.log
+    }
+
     /// Loads every event currently in the log. Each call re-reads the log
     /// from disk; per-process caching arrives with the adapter refactor.
     ///

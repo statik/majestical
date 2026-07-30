@@ -10,8 +10,12 @@ workspace = true
 [dependencies]
 majestical-core = { path = "../core" }
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+majestical-sync = { path = "../sync" }
+proptest = { workspace = true }
 tempfile.workspace = true
 ulid.workspace = true

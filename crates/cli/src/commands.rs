@@ -15,17 +15,24 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Opens the sqlite catalog from the per-machine local state dir (see
-/// `state_dir`) and rebuilds it from the current projection. Shared by
+/// `state_dir`), applying only the events past its last-saved cursor (or
+/// rebuilding from scratch if there's no usable saved state). Shared by
 /// every read path that needs an ad hoc sqlite view — `search`,
-/// `volumes list`, and `para list` — so the open+rebuild pair lives in
-/// exactly one place.
-pub(crate) fn open_rebuilt_catalog(app: &FsApp, catalog_dir: &Path) -> Result<SqliteCatalog> {
-    let projection = app.projection()?;
+/// `volumes list`, and `para list` — so the open+sync pair lives in exactly
+/// one place.
+pub(crate) fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCatalog, Projection)> {
     let paths = crate::state_dir::catalog_paths(catalog_dir)?;
-    let mut db = SqliteCatalog::open(&paths.db_path).context("opening sqlite catalog")?;
-    db.rebuild(&projection)
-        .context("rebuilding sqlite projection")?;
-    Ok(db)
+    let mut skipped = 0usize;
+    let (db, projection, _mode) =
+        SqliteCatalog::open_synced(&paths.db_path, app.log(), &mut |_line| skipped += 1)
+            .context("opening sqlite catalog")?;
+    if skipped > 0 {
+        eprintln!(
+            "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
+            catalog_dir.display()
+        );
+    }
+    Ok((db, projection))
 }
 
 pub(crate) fn cmd_catalog_init(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
@@ -215,7 +222,7 @@ pub(crate) fn cmd_search(
     tag: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let db = open_rebuilt_catalog(app, catalog_dir)?;
+    let (db, _projection) = open_catalog(app, catalog_dir)?;
     let ids = match (name, tag) {
         (Some(n), None) => db.search_by_name(&n)?,
         (None, Some(t)) => db.search_by_tag(&t)?,
@@ -267,7 +274,7 @@ pub(crate) fn volume_is_online(id: &str, label: &str) -> bool {
 }
 
 pub(crate) fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let db = open_rebuilt_catalog(app, catalog_dir)?;
+    let (db, _projection) = open_catalog(app, catalog_dir)?;
     let volumes = db.volumes().context("querying volumes")?;
     let counts: HashMap<String, u64> = db
         .volume_asset_counts()
@@ -422,7 +429,7 @@ fn cmd_para_add(app: &mut FsApp, kind_str: &str, name: &str) -> Result<()> {
 }
 
 fn cmd_para_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let db = open_rebuilt_catalog(app, catalog_dir)?;
+    let (db, _projection) = open_catalog(app, catalog_dir)?;
     let nodes = db.para_nodes().context("querying para nodes")?;
     if json {
         let rows: Vec<_> = nodes

@@ -1,16 +1,45 @@
 //! `SQLite` projection of the catalog. Disposable by design: `rebuild`
-//! recreates it wholesale from a `Projection` (incremental apply and
-//! FTS5/sqlite-vec arrive in later phases).
+//! recreates it wholesale from a `Projection`; `open_synced` instead applies
+//! only the log events past a stored cursor, falling back to a full rebuild
+//! when there's no usable snapshot to resume from (FTS5/sqlite-vec arrive in
+//! later phases).
 use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
-use majestical_core::ports::{CatalogStore, PortError};
-use majestical_core::projection::Projection;
+use majestical_core::ports::{CatalogStore, EventLog, LogCursor, PortError};
+use majestical_core::projection::{
+    AssetState, ManifestRecord, ParaNodeState, Projection, Touched, VolumeState,
+};
 use rusqlite::{Connection, Transaction};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog db: {0} — delete the file and re-run")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("event log: {0}")]
+    Port(#[from] PortError),
+    #[error("apply snapshot: {0} — delete catalog.db and re-run")]
+    Snapshot(#[from] serde_json::Error),
+}
+
+/// On-disk format version for the `apply_snapshot` row. Bumped whenever the
+/// serialized shape changes in a way old rows can't deserialize into;
+/// `load_apply_state` treats a mismatch the same as a missing snapshot.
+const SNAPSHOT_VERSION: i64 = 1;
+
+/// The serialized payload of `apply_snapshot.projection`.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    projection: Projection,
+}
+
+/// How `open_synced` populated the catalog: from a stored cursor plus new
+/// events, or from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyMode {
+    Incremental { applied: usize },
+    FullRebuild,
 }
 
 pub struct SqliteCatalog {
@@ -49,6 +78,190 @@ impl SqliteCatalog {
         Ok(())
     }
 
+    /// Opens the catalog at `db_path` and brings it up to date with `log`,
+    /// applying only the events past whatever cursor was last saved here —
+    /// or, when there's no usable saved state (first open, a corrupt or
+    /// version-mismatched snapshot, or a stale cursor `log` can no longer
+    /// resume from), rebuilding from scratch. Returns the resulting
+    /// projection alongside the mode actually taken, so a caller (or a test)
+    /// can tell which path ran.
+    ///
+    /// Corrupt log lines are skipped rather than failing the read, same as
+    /// `EventLog::read_since_reporting`; `on_bad_line` is handed straight
+    /// through so a caller can warn about them — this library never prints,
+    /// since a disposable catalog file has no business writing to a
+    /// process's stderr.
+    ///
+    /// # Errors
+    /// Returns an error if the database can't be opened, the log can't be
+    /// read, or a write fails.
+    pub fn open_synced(
+        db_path: &Path,
+        log: &dyn EventLog,
+        on_bad_line: &mut dyn FnMut(&str),
+    ) -> Result<(Self, Projection, ApplyMode), CatalogError> {
+        let mut db = Self::open(db_path)?;
+        if let Some((cursors, mut projection)) = db.load_apply_state() {
+            match log.read_since_reporting(&cursors, on_bad_line) {
+                Ok((events, new_cursors)) => {
+                    if events.is_empty() {
+                        return Ok((db, projection, ApplyMode::Incremental { applied: 0 }));
+                    }
+                    let mut touched = BTreeSet::new();
+                    for event in &events {
+                        touched.insert(projection.apply_tracking(event));
+                    }
+                    touched.remove(&Touched::Nothing);
+                    let applied = events.len();
+                    db.apply_touched(&projection, &touched, &new_cursors)?;
+                    return Ok((db, projection, ApplyMode::Incremental { applied }));
+                }
+                Err(_stale) => { /* fall through to full rebuild */ }
+            }
+        }
+        let (events, cursors) = log.read_since_reporting(&[], on_bad_line)?;
+        let mut projection = Projection::default();
+        for event in &events {
+            projection.apply(event);
+        }
+        db.rebuild(&projection)?;
+        db.save_apply_state(&cursors, &projection)?;
+        Ok((db, projection, ApplyMode::FullRebuild))
+    }
+
+    /// Reads the last-saved (cursors, projection) pair, or `None` if there is
+    /// none usable — missing table, version mismatch, or a value that fails
+    /// to parse. Any of these just means "rebuild from scratch"; the
+    /// database is disposable, so none of them are logged.
+    fn load_apply_state(&self) -> Option<(Vec<LogCursor>, Projection)> {
+        let (version, projection_json): (i64, String) = self
+            .conn
+            .query_row(
+                "SELECT version, projection FROM apply_snapshot WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        if version != SNAPSHOT_VERSION {
+            return None;
+        }
+        let snapshot: Snapshot = serde_json::from_str(&projection_json).ok()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT machine, segment, offset FROM apply_cursors ORDER BY machine, segment")
+            .ok()?;
+        let rows = stmt
+            .query_map([], |r| {
+                let offset: i64 = r.get(2)?;
+                Ok(LogCursor {
+                    machine: r.get(0)?,
+                    segment: r.get(1)?,
+                    offset: u64::try_from(offset).unwrap_or(0),
+                })
+            })
+            .ok()?;
+        let mut cursors = Vec::new();
+        for row in rows {
+            cursors.push(row.ok()?);
+        }
+        Some((cursors, snapshot.projection))
+    }
+
+    /// Writes `cursors` and `projection` as the new apply-state snapshot, in
+    /// one transaction.
+    fn save_apply_state(
+        &mut self,
+        cursors: &[LogCursor],
+        projection: &Projection,
+    ) -> Result<(), CatalogError> {
+        let snapshot_json = serde_json::to_string(&Snapshot {
+            projection: projection.clone(),
+        })?;
+        let tx = self.conn.transaction()?;
+        Self::write_apply_state(&tx, cursors, &snapshot_json)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces `apply_cursors` and upserts the single `apply_snapshot` row.
+    /// Shared by `save_apply_state` and `apply_touched`, both of which need
+    /// this as one step inside a larger transaction.
+    fn write_apply_state(
+        tx: &Transaction,
+        cursors: &[LogCursor],
+        snapshot_json: &str,
+    ) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM apply_cursors", [])?;
+        for c in cursors {
+            let offset = i64::try_from(c.offset).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO apply_cursors (machine, segment, offset) VALUES (?1, ?2, ?3)",
+                (&c.machine, &c.segment, offset),
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO apply_snapshot (id, version, projection) VALUES (1, ?1, ?2) \
+             ON CONFLICT (id) DO UPDATE SET version = excluded.version, \
+             projection = excluded.projection",
+            (SNAPSHOT_VERSION, snapshot_json),
+        )?;
+        Ok(())
+    }
+
+    /// Applies only the touched entities to the existing tables: for each
+    /// entity, its rows are deleted and, if it still exists in `projection`,
+    /// reinserted from scratch — cheaper than `rebuild`'s full drop/recreate
+    /// when only a handful of entities changed. Saves `cursors` and
+    /// `projection` as the new apply-state snapshot in the same transaction.
+    ///
+    /// # Errors
+    /// Returns an error if serializing the snapshot or any write fails.
+    pub fn apply_touched(
+        &mut self,
+        projection: &Projection,
+        touched: &BTreeSet<Touched>,
+        cursors: &[LogCursor],
+    ) -> Result<(), CatalogError> {
+        let snapshot_json = serde_json::to_string(&Snapshot {
+            projection: projection.clone(),
+        })?;
+        let tx = self.conn.transaction()?;
+        for t in touched {
+            match t {
+                Touched::Nothing => {}
+                Touched::Asset(id) => {
+                    tx.execute("DELETE FROM tags WHERE asset = ?1", [&id.0])?;
+                    tx.execute("DELETE FROM instances WHERE asset = ?1", [&id.0])?;
+                    tx.execute("DELETE FROM asset_para WHERE asset = ?1", [&id.0])?;
+                    tx.execute("DELETE FROM verifications WHERE asset = ?1", [&id.0])?;
+                    tx.execute("DELETE FROM assets WHERE id = ?1", [&id.0])?;
+                    if let Some((_, state)) = projection.assets().find(|(a, _)| *a == id) {
+                        Self::insert_one_asset(&tx, projection, id, state)?;
+                    }
+                }
+                Touched::Volume(id) => {
+                    tx.execute("DELETE FROM volumes WHERE id = ?1", [id])?;
+                    if let Some((_, state)) = projection.volumes().find(|(v, _)| *v == id) {
+                        Self::insert_one_volume(&tx, id, state)?;
+                    }
+                }
+                Touched::ParaNode(id) => {
+                    tx.execute("DELETE FROM para_nodes WHERE id = ?1", [id])?;
+                    if let Some(state) = projection.para_node(id) {
+                        Self::insert_one_para_node(&tx, id, state)?;
+                    }
+                }
+                Touched::Manifests(volume) => {
+                    tx.execute("DELETE FROM manifests WHERE volume = ?1", [volume])?;
+                    Self::insert_manifests_for(&tx, projection, volume)?;
+                }
+            }
+        }
+        Self::write_apply_state(&tx, cursors, &snapshot_json)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn create_tables(tx: &Transaction) -> rusqlite::Result<()> {
         tx.execute_batch(
             "DROP TABLE IF EXISTS tags;
@@ -59,11 +272,13 @@ impl SqliteCatalog {
              DROP TABLE IF EXISTS asset_para;
              DROP TABLE IF EXISTS verifications;
              DROP TABLE IF EXISTS manifests;
+             DROP TABLE IF EXISTS apply_cursors;
+             DROP TABLE IF EXISTS apply_snapshot;
              CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
                volume TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
-               PRIMARY KEY (asset, volume, path)
+               PRIMARY KEY (asset, volume, path, size)
              );
              CREATE TABLE tags (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -91,6 +306,15 @@ impl SqliteCatalog {
              CREATE TABLE manifests (
                volume TEXT NOT NULL, generation INTEGER NOT NULL,
                mhl_path TEXT NOT NULL, roothash TEXT NOT NULL
+             );
+             CREATE TABLE apply_cursors (
+               machine TEXT NOT NULL, segment TEXT NOT NULL, offset INTEGER NOT NULL,
+               PRIMARY KEY (machine, segment)
+             );
+             CREATE TABLE apply_snapshot (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               version INTEGER NOT NULL,
+               projection TEXT NOT NULL
              );",
         )
     }
@@ -99,88 +323,142 @@ impl SqliteCatalog {
     /// `verifications` — everything keyed off an individual asset.
     fn insert_assets(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
         for (asset, state) in projection.assets() {
-            tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
-            for (volume, path, size) in &state.instances {
-                tx.execute(
-                    "INSERT INTO instances (asset, volume, path, size) VALUES (?1, ?2, ?3, ?4)",
-                    (&asset.0, volume, path, size),
-                )?;
-            }
-            for tag in projection.tags(asset) {
-                tx.execute(
-                    "INSERT INTO tags (asset, tag) VALUES (?1, ?2)",
-                    (&asset.0, &tag),
-                )?;
-            }
-            if let Some(node) = projection.asset_para(asset) {
-                tx.execute(
-                    "INSERT INTO asset_para (asset, node) VALUES (?1, ?2)",
-                    (&asset.0, node),
-                )?;
-            }
-            for record in projection.verifications(asset) {
-                let hashdate_ms = i64::try_from(record.hashdate_ms).unwrap_or(i64::MAX);
-                tx.execute(
-                    "INSERT INTO verifications \
-                     (asset, volume, path, algo, value, outcome, hashdate_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (
-                        &asset.0,
-                        &record.volume,
-                        &record.path,
-                        &record.algo,
-                        &record.value,
-                        verify_outcome_wire(record.outcome),
-                        hashdate_ms,
-                    ),
-                )?;
-            }
+            Self::insert_one_asset(tx, projection, asset, state)?;
+        }
+        Ok(())
+    }
+
+    /// Inserts one asset's row plus every `instances`/`tags`/`asset_para`/
+    /// `verifications` row derived from it. Shared by the bulk `rebuild` path
+    /// and incremental apply's per-asset delete-and-reinsert.
+    fn insert_one_asset(
+        tx: &Transaction,
+        projection: &Projection,
+        asset: &AssetId,
+        state: &AssetState,
+    ) -> rusqlite::Result<()> {
+        tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
+        for (volume, path, size) in &state.instances {
+            tx.execute(
+                "INSERT INTO instances (asset, volume, path, size) VALUES (?1, ?2, ?3, ?4)",
+                (&asset.0, volume, path, size),
+            )?;
+        }
+        for tag in projection.tags(asset) {
+            tx.execute(
+                "INSERT INTO tags (asset, tag) VALUES (?1, ?2)",
+                (&asset.0, &tag),
+            )?;
+        }
+        if let Some(node) = projection.asset_para(asset) {
+            tx.execute(
+                "INSERT INTO asset_para (asset, node) VALUES (?1, ?2)",
+                (&asset.0, node),
+            )?;
+        }
+        for record in projection.verifications(asset) {
+            let hashdate_ms = i64::try_from(record.hashdate_ms).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO verifications \
+                 (asset, volume, path, algo, value, outcome, hashdate_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    &asset.0,
+                    &record.volume,
+                    &record.path,
+                    &record.algo,
+                    &record.value,
+                    verify_outcome_wire(record.outcome),
+                    hashdate_ms,
+                ),
+            )?;
         }
         Ok(())
     }
 
     fn insert_volumes(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
         for (id, state) in projection.volumes() {
-            let label = state.label().unwrap_or("");
-            let last_seen_ms = state.last_seen().map_or(0, |hlc| hlc.wall_ms);
-            let last_seen_ms = i64::try_from(last_seen_ms).unwrap_or(i64::MAX);
-            tx.execute(
-                "INSERT INTO volumes (id, label, last_seen_ms) VALUES (?1, ?2, ?3)",
-                (id, label, last_seen_ms),
-            )?;
+            Self::insert_one_volume(tx, id, state)?;
         }
+        Ok(())
+    }
+
+    fn insert_one_volume(tx: &Transaction, id: &str, state: &VolumeState) -> rusqlite::Result<()> {
+        let label = state.label().unwrap_or("");
+        let last_seen_ms = state.last_seen().map_or(0, |hlc| hlc.wall_ms);
+        let last_seen_ms = i64::try_from(last_seen_ms).unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT INTO volumes (id, label, last_seen_ms) VALUES (?1, ?2, ?3)",
+            (id, label, last_seen_ms),
+        )?;
         Ok(())
     }
 
     fn insert_para_nodes(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
         for (id, state) in projection.para_nodes() {
-            // A node with a rename observed before its create has no kind or
-            // name yet; it materializes once the create event arrives, so it
-            // is skipped rather than inserted with placeholder values.
-            let (Some(kind), Some(name)) = (state.kind(), state.name()) else {
-                continue;
-            };
-            tx.execute(
-                "INSERT INTO para_nodes (id, kind, name, archived) VALUES (?1, ?2, ?3, ?4)",
-                (id, para_kind_wire(kind), name, state.archived()),
-            )?;
+            Self::insert_one_para_node(tx, id, state)?;
         }
         Ok(())
     }
 
+    fn insert_one_para_node(
+        tx: &Transaction,
+        id: &str,
+        state: &ParaNodeState,
+    ) -> rusqlite::Result<()> {
+        // A node with a rename observed before its create has no kind or
+        // name yet; it materializes once the create event arrives, so it
+        // is skipped rather than inserted with placeholder values.
+        let (Some(kind), Some(name)) = (state.kind(), state.name()) else {
+            return Ok(());
+        };
+        tx.execute(
+            "INSERT INTO para_nodes (id, kind, name, archived) VALUES (?1, ?2, ?3, ?4)",
+            (id, para_kind_wire(kind), name, state.archived()),
+        )?;
+        Ok(())
+    }
+
     fn insert_manifests(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
-        for (volume, record) in projection.all_manifests() {
-            tx.execute(
-                "INSERT INTO manifests (volume, generation, mhl_path, roothash) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                (
-                    volume,
-                    record.generation,
-                    &record.mhl_path,
-                    &record.roothash,
-                ),
-            )?;
+        let mut volumes = BTreeSet::new();
+        for (volume, _) in projection.all_manifests() {
+            volumes.insert(volume.clone());
         }
+        for volume in volumes {
+            Self::insert_manifests_for(tx, projection, &volume)?;
+        }
+        Ok(())
+    }
+
+    /// Inserts every manifest generation recorded for one volume. Shared by
+    /// the bulk `rebuild` path and incremental apply's per-volume
+    /// delete-and-reinsert on `Touched::Manifests`.
+    fn insert_manifests_for(
+        tx: &Transaction,
+        projection: &Projection,
+        volume: &str,
+    ) -> rusqlite::Result<()> {
+        for record in projection.manifests(volume) {
+            Self::insert_one_manifest(tx, volume, record)?;
+        }
+        Ok(())
+    }
+
+    fn insert_one_manifest(
+        tx: &Transaction,
+        volume: &str,
+        record: &ManifestRecord,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT INTO manifests (volume, generation, mhl_path, roothash) \
+             VALUES (?1, ?2, ?3, ?4)",
+            (
+                volume,
+                record.generation,
+                &record.mhl_path,
+                &record.roothash,
+            ),
+        )?;
         Ok(())
     }
 
@@ -276,6 +554,52 @@ impl SqliteCatalog {
         for row in rows {
             let (volume, count) = row?;
             out.push((volume, u64::try_from(count).unwrap_or(0)));
+        }
+        Ok(out)
+    }
+
+    /// Dumps every projection table's rows (not `apply_cursors`/
+    /// `apply_snapshot` — cursors legitimately differ between an incremental
+    /// open and a full rebuild over the same log), each row ordered by its
+    /// full column list for a deterministic string. A test/debug aid for
+    /// comparing two catalogs' contents, not a stable format — callers must
+    /// not parse it.
+    ///
+    /// # Errors
+    /// Returns an error if a query fails.
+    pub fn debug_dump(&self) -> Result<String, CatalogError> {
+        let tables: [(&str, &str); 8] = [
+            ("assets", "id"),
+            ("instances", "asset, volume, path, size"),
+            ("tags", "asset, tag"),
+            ("volumes", "id, label, last_seen_ms"),
+            ("para_nodes", "id, kind, name, archived"),
+            ("asset_para", "asset, node"),
+            (
+                "verifications",
+                "asset, volume, path, algo, value, outcome, hashdate_ms",
+            ),
+            ("manifests", "volume, generation, mhl_path, roothash"),
+        ];
+        let mut out = String::new();
+        for (table, cols) in tables {
+            let n = cols.split(',').count();
+            let sql = format!("SELECT {cols} FROM {table} ORDER BY {cols}");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                let mut cells = Vec::with_capacity(n);
+                for i in 0..n {
+                    let value: rusqlite::types::Value = r.get(i)?;
+                    cells.push(format!("{value:?}"));
+                }
+                Ok(cells.join("|"))
+            })?;
+            for row in rows {
+                out.push_str(table);
+                out.push('|');
+                out.push_str(&row?);
+                out.push('\n');
+            }
         }
         Ok(out)
     }

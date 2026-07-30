@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0b11659361444d99b1b08691fcc13a01b372e69b1f01de5e979fb06c37341545 # shrinks to ops = [AssetSeen { asset: AssetId("xxh3:b"), volume: "w", path: "pq", size: 0 }, AssetSeen { asset: AssetId("xxh3:b"), volume: "w", path: "pq", size: 1 }], split = 0

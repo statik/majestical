@@ -9,11 +9,6 @@ use anyhow::{Context, Result};
 use xxhash_rust::xxh3::xxh3_128;
 
 pub(crate) struct CatalogPaths {
-    #[expect(
-        dead_code,
-        reason = "consumed by the vector index location added in a later PR"
-    )]
-    pub state_dir: PathBuf,
     pub db_path: PathBuf,
     pub runs_dir: PathBuf,
 }
@@ -50,7 +45,6 @@ pub(crate) fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
     migrate_legacy(catalog_root, &runs_dir)?;
     Ok(CatalogPaths {
         db_path: state_dir.join("catalog.db"),
-        state_dir,
         runs_dir,
     })
 }
@@ -64,23 +58,46 @@ fn migrate_legacy(catalog_root: &Path, state_runs: &Path) -> Result<()> {
     }
     let legacy_runs = catalog_root.join("runs");
     if legacy_runs.is_dir() {
-        for entry in std::fs::read_dir(&legacy_runs)
-            .with_context(|| format!("reading {}", legacy_runs.display()))?
-        {
-            let entry = entry.with_context(|| format!("reading {}", legacy_runs.display()))?;
-            let from = entry.path();
-            let Some(name) = from.file_name() else {
-                continue;
-            };
-            let to = state_runs.join(name);
-            // Sync root and state dir may be different filesystems: copy + delete.
-            std::fs::copy(&from, &to)
-                .with_context(|| format!("moving journal {}", from.display()))?;
-            std::fs::remove_file(&from)
-                .with_context(|| format!("removing migrated journal {}", from.display()))?;
+        migrate_legacy_journals(&legacy_runs, state_runs)?;
+        // Junk left behind on purpose (a subdirectory, a stray dotfile) means
+        // this can never be removed — that's expected, not an error.
+        let _ = std::fs::remove_dir(&legacy_runs);
+    }
+    Ok(())
+}
+
+/// Moves every `*.jsonl` journal out of a legacy `runs/` dir, ignoring
+/// anything else (subdirectories, `.DS_Store`, sync-tool version folders —
+/// whatever else ends up next to synced files). A journal already present
+/// at the destination is left alone (another machine may already have
+/// migrated it, and it's the copy actively in use) — only its now-redundant
+/// legacy source is removed.
+fn migrate_legacy_journals(legacy_runs: &Path, state_runs: &Path) -> Result<()> {
+    let mut moved_any = false;
+    for entry in std::fs::read_dir(legacy_runs)
+        .with_context(|| format!("reading {}", legacy_runs.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", legacy_runs.display()))?;
+        let from = entry.path();
+        let is_jsonl_file = entry.file_type().is_ok_and(|t| t.is_file())
+            && from.extension().is_some_and(|ext| ext == "jsonl");
+        if !is_jsonl_file {
+            continue;
         }
-        std::fs::remove_dir(&legacy_runs)
-            .with_context(|| format!("removing legacy runs dir {}", legacy_runs.display()))?;
+        let name = from.file_name().unwrap_or_default();
+        let to = state_runs.join(name);
+        if to.exists() {
+            std::fs::remove_file(&from)
+                .with_context(|| format!("removing already-migrated journal {}", from.display()))?;
+            continue;
+        }
+        // Sync root and state dir may be different filesystems: copy + delete.
+        std::fs::copy(&from, &to).with_context(|| format!("moving journal {}", from.display()))?;
+        std::fs::remove_file(&from)
+            .with_context(|| format!("removing migrated journal {}", from.display()))?;
+        moved_any = true;
+    }
+    if moved_any {
         eprintln!("note: moved legacy run journals into the local state dir");
     }
     Ok(())

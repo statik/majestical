@@ -18,22 +18,12 @@ fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
 
 #[cfg(test)]
 fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.file_name().is_some_and(|n| n == name) {
-                found.push(p);
-            }
-        }
-    }
-    found
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == name)
+        .map(walkdir::DirEntry::into_path)
+        .collect()
 }
 
 /// Parses a `search --json` asset id out of the first result.
@@ -1235,6 +1225,10 @@ fn ingest_resume_with_an_unknown_run_id_fails_and_creates_nothing() {
         !d1.path().join("ascmhl").exists(),
         "an unknown --resume id must not copy anything"
     );
+    assert!(
+        walkdir_find(&state, "nonexistent.jsonl").is_empty(),
+        "an unknown --resume id must not create a journal in the state dir either"
+    );
 }
 
 /// An archived PARA node is rejected as an ingest target, even when
@@ -1361,4 +1355,108 @@ fn legacy_run_journals_move_to_state_dir() {
     );
     let moved: Vec<_> = walkdir_find(&state, "01OLD.jsonl");
     assert_eq!(moved.len(), 1, "journal moved into the state dir");
+}
+
+/// A legacy `runs/` dir can hold more than plain journals — a Syncthing
+/// `.stversions/` subdirectory, a stray `.DS_Store`, whatever else ends up
+/// next to synced files. Migration must not choke on those: it moves only
+/// `*.jsonl` regular files, leaves anything else in place, and the catalog
+/// stays usable (including on a second command run, since the non-journal
+/// entries mean the legacy `runs/` dir can never be fully cleaned up).
+#[test]
+fn legacy_runs_dir_with_non_journal_entries_migrates_the_journal_and_leaves_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(catalog.join("runs")).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    std::fs::write(catalog.join("runs").join("01OLD.jsonl"), b"{}\n").unwrap();
+    std::fs::write(catalog.join("runs").join(".DS_Store"), b"junk").unwrap();
+    std::fs::create_dir_all(catalog.join("runs").join(".stversions")).unwrap();
+    std::fs::write(
+        catalog.join("runs").join(".stversions").join("01OLD.jsonl"),
+        b"old version\n",
+    )
+    .unwrap();
+
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+
+    let moved: Vec<_> = walkdir_find(&state, "01OLD.jsonl");
+    assert_eq!(moved.len(), 1, "the journal moved into the state dir");
+    assert!(
+        catalog.join("runs").join(".DS_Store").is_file(),
+        "non-journal junk is left in the sync root"
+    );
+    assert!(
+        catalog
+            .join("runs")
+            .join(".stversions")
+            .join("01OLD.jsonl")
+            .is_file(),
+        "a subdirectory under runs/ is left in the sync root"
+    );
+
+    // The catalog must still be usable on a second run, even though the
+    // legacy runs/ dir can never be fully removed (junk remains in it).
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+}
+
+/// If the state dir already has a journal for a run id (e.g. a second
+/// machine already migrated it), migration must not clobber it with
+/// whatever's in the sync root's legacy copy — the state-dir copy is the
+/// one actively in use locally. The legacy source is still removed so the
+/// sync root converges to having no `runs/` dir.
+#[test]
+fn legacy_journal_migration_does_not_overwrite_an_existing_state_dir_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    // Any command opens the catalog, which creates the state dir's runs/.
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+    let state_runs = walkdir::WalkDir::new(&state)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name() == "runs")
+        .expect("state dir must already have a runs/ dir")
+        .into_path();
+    std::fs::write(state_runs.join("01OLD.jsonl"), b"state dir content\n").unwrap();
+
+    std::fs::create_dir_all(catalog.join("runs")).unwrap();
+    std::fs::write(
+        catalog.join("runs").join("01OLD.jsonl"),
+        b"stale legacy content\n",
+    )
+    .unwrap();
+
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(state_runs.join("01OLD.jsonl")).unwrap();
+    assert_eq!(
+        content, "state dir content\n",
+        "an existing state-dir journal must not be overwritten by the legacy copy"
+    );
+    assert!(
+        !catalog.join("runs").join("01OLD.jsonl").exists(),
+        "the legacy source is still removed so the sync root converges"
+    );
 }

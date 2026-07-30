@@ -82,6 +82,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    /// Manage the encoder model used for embeddings/keyframes.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
     /// List every volume the catalog has ever seen.
     Volumes {
         #[command(subcommand)]
@@ -219,6 +224,16 @@ enum IndexCmd {
 }
 
 #[derive(Subcommand)]
+enum ModelCmd {
+    /// Download the encoder model (pinned URLs, sha256-verified).
+    Fetch {
+        /// Re-hash files that already exist.
+        #[arg(long)]
+        verify: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SearchesCmd {
     /// List saved searches.
     List {
@@ -312,6 +327,14 @@ fn main() -> Result<()> {
             let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             dispatch_index(&app, &cli.catalog, cmd)?;
         }
+        // Deliberately does not open a catalog: fetching the encoder model
+        // is a machine-local cache operation, unrelated to any one
+        // catalog's event log. `--catalog`/`--machine-id` are still
+        // required by clap here (they're top-level, non-Option args with
+        // no default) — the same accepted wart as `Verify` above.
+        Cmd::Model {
+            cmd: ModelCmd::Fetch { verify },
+        } => index_cmd::cmd_model_fetch(verify)?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {

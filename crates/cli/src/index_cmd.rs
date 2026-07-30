@@ -27,14 +27,17 @@ pub(crate) struct IndexRunArgs {
     pub(crate) json: bool,
 }
 
-/// What this machine can currently produce. Hardcoded until the encoder
-/// model fetch and ffmpeg detection land in later tasks: today only
-/// thumbnailing is possible, so `run`/`status` report needs-model and
-/// needs-ffmpeg honestly instead of claiming capabilities that don't exist
-/// yet on this branch.
+/// What this machine can currently produce: the encoder model if it's been
+/// fetched into the cache (see `maj model fetch`) and present at every
+/// file's exact size. ffmpeg detection lands with the video task; until then
+/// keyframes honestly report needs-ffmpeg.
 fn capabilities() -> Capabilities {
+    let model_tag = majestical_index::model::model_dir()
+        .ok()
+        .filter(|dir| majestical_index::model::model_present(dir))
+        .map(|_| majestical_index::model::MODEL_TAG.to_string());
     Capabilities {
-        model_tag: None,
+        model_tag,
         ffmpeg: false,
     }
 }
@@ -289,6 +292,22 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
         print_kind_status("embeddings", &plan.embeddings);
         print_kind_status("keyframes", &plan.keyframes);
     }
+    Ok(())
+}
+
+/// Downloads the pinned encoder model into the shared cache
+/// (`MAJ_MODEL_DIR`, or the platform data dir — see
+/// [`majestical_index::model::model_dir`]), verifying every file's sha256
+/// before it's installed.
+///
+/// # Errors
+/// Returns an error if the cache directory can't be resolved, or if any
+/// file fails to download or verify.
+pub(crate) fn cmd_model_fetch(verify: bool) -> Result<()> {
+    let dir = majestical_index::model::model_dir()?;
+    println!("model cache: {}", dir.display());
+    majestical_index::model::fetch(&dir, verify, &mut |line| println!("{line}"))?;
+    println!("model '{}' ready", majestical_index::model::MODEL_TAG);
     Ok(())
 }
 

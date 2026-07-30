@@ -4,6 +4,7 @@
 //! here is disposable and regenerable; the event log stays the only truth.
 pub mod blob;
 pub mod error;
+pub mod model;
 pub mod resize;
 pub mod thumbs;
 pub mod work;

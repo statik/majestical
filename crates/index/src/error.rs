@@ -13,4 +13,6 @@ pub enum IndexError {
     VectorShape { path: PathBuf, len: usize },
     #[error("image resize: {0}")]
     Resize(String),
+    #[error("model fetch: {0}")]
+    Model(String),
 }

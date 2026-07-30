@@ -56,6 +56,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use quick_xml::reader::Reader as QReader;
 use quick_xml::writer::Writer as QWriter;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// What produced a recorded hash: a first sighting, a re-verification that
@@ -339,6 +340,33 @@ pub fn verify_dir(root: &Path, hashdate: &str) -> Result<VerifyReport, IngestErr
     })
 }
 
+/// Writes `bytes` to `path` durably and atomically: to a `.tmp-<name>`
+/// sibling in the same directory first, fsynced, then renamed into place.
+/// Mirrors the copy engine's temp-name-then-rename pattern (`engine.rs`'s
+/// `dest_paths`/`FileSink::finish`) so a crash mid-write leaves only an
+/// inert `.tmp-` file behind — never a truncated `.mhl` or chain file that
+/// the oracle's chain check can't distinguish from real tampering, which
+/// is exactly the failure mode ASC MHL exists to detect. The temp name's
+/// leading `.` keeps it out of `hash_dir` (dot-prefix skip) and out of
+/// `generation_files`'s `NNNN...` parse (a `.`-prefixed stem can't start
+/// with a digit), so a stale leftover from a real crash is inert on the
+/// next run rather than corrupting generation numbering or verification.
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = temp_sibling(path);
+    {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp_path, path)
+}
+
+/// `.tmp-<name>` in the same directory as `path`.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    path.with_file_name(format!(".tmp-{file_name}"))
+}
+
 /// Writes `hash_list` as the next generation under `root/ascmhl`, updates
 /// `ascmhl_chain.xml` with the new generation's c4 hash, and returns the
 /// written path, generation number, and c4 roothash.
@@ -362,7 +390,7 @@ pub fn write_generation(
     let manifest_path = ascmhl_dir.join(&filename);
 
     let xml_bytes = build_manifest_xml(hash_list, &manifest_path)?;
-    std::fs::write(&manifest_path, &xml_bytes).map_err(|source| IngestError::Mhl {
+    write_file_atomic(&manifest_path, &xml_bytes).map_err(|source| IngestError::Mhl {
         path: manifest_path.clone(),
         msg: format!("writing manifest: {source}"),
     })?;
@@ -387,6 +415,12 @@ pub fn write_generation(
 /// Reformats a `creation_date` (expected to start with an ISO-8601
 /// `YYYY-MM-DDTHH:MM:SS` prefix, `Z` or offset-suffixed) into the oracle's
 /// filename timestamp shape: `YYYY-MM-DD_HHMMSSZ`.
+///
+/// The trailing `Z` is always appended literally, not derived from the
+/// input's actual offset — callers must supply a UTC `creation_date` (as
+/// `hash_dir`/`verify_dir` do). An offset-suffixed input is only tolerated
+/// well enough not to panic (see the offset test below); its `Z` would be
+/// mislabeled, not converted.
 fn filename_timestamp(creation_date: &str) -> String {
     let prefix: String = creation_date.chars().take(19).collect();
     let mut out = String::with_capacity(20);
@@ -872,7 +906,7 @@ fn write_chain(chain_path: &Path, entries: &[ChainEntry]) -> Result<(), IngestEr
 
     let mut bytes = writer.into_inner();
     bytes.push(b'\n');
-    std::fs::write(chain_path, &bytes).map_err(|source| IngestError::Mhl {
+    write_file_atomic(chain_path, &bytes).map_err(|source| IngestError::Mhl {
         path: chain_path.to_path_buf(),
         msg: format!("writing chain file: {source}"),
     })
@@ -1069,5 +1103,34 @@ mod history_tests {
         write_fixture(dir.path());
         let result = verify_dir(dir.path(), "2026-07-30T00:00:00Z");
         assert!(result.is_err());
+    }
+
+    /// A `.tmp-` leftover from a crash mid-write (see `write_file_atomic`)
+    /// must be inert: it's neither picked up as a real generation by
+    /// `next_generation` nor hashed as content by `verify_dir`.
+    #[test]
+    fn stale_tmp_file_in_ascmhl_does_not_break_next_generation_or_verify() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_fixture(dir.path());
+
+        let baseline = hash_dir(dir.path(), "2026-07-30T00:00:00Z").expect("hash_dir");
+        write_generation(dir.path(), &baseline).expect("write baseline generation");
+
+        let ascmhl_dir = dir.path().join("ascmhl");
+        fs::write(
+            ascmhl_dir.join(".tmp-0002_x_2026-07-30_000000Z.mhl"),
+            b"<truncated",
+        )
+        .expect("write stale tmp manifest");
+        fs::write(ascmhl_dir.join(".tmp-ascmhl_chain.xml"), b"<truncated")
+            .expect("write stale tmp chain");
+
+        assert_eq!(next_generation(dir.path()).expect("next_generation"), 2);
+
+        let report = verify_dir(dir.path(), "2026-07-30T00:01:00Z").expect("verify_dir");
+        assert!(report.altered.is_empty());
+        assert!(report.missing.is_empty());
+        assert!(report.new_files.is_empty());
+        assert_eq!(report.written.generation, 2);
     }
 }

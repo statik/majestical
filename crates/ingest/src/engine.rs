@@ -632,7 +632,7 @@ fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> V
             }
             continue;
         }
-        match readback_xxh64(&attempt.temp_path) {
+        match crate::hashing::xxh64_file(&attempt.temp_path) {
             Ok(hex) if hex == expected_xxh64_hex => {
                 if let Err(err) = std::fs::rename(&attempt.temp_path, &attempt.final_path) {
                     failures.push(format!(
@@ -660,10 +660,6 @@ fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> V
         }
     }
     failures
-}
-
-fn readback_xxh64(path: &Path) -> std::io::Result<String> {
-    crate::hashing::xxh64_file(path)
 }
 
 #[cfg(test)]

@@ -15,6 +15,12 @@ use majestical_ingest::mhl::{HashAction, hash_dir, verify_dir, write_generation}
 use std::path::Path;
 use std::process::{Command, Output};
 
+// These helpers need `#[cfg(test)]` even though this whole file only ever
+// compiles as a test binary: clippy's expect/unwrap-in-tests exemption
+// (clippy.toml's `allow-expect-in-tests`) keys off the literal attribute on
+// each item, not the ambient `cfg(test)` the compiler already applies here
+// — confirmed by removing them and observing `expect_used` reappear (same
+// finding as `tests/engine.rs`).
 #[cfg(test)]
 fn write_fixture(root: &Path) {
     std::fs::create_dir_all(root.join("clips")).expect("mkdir clips");

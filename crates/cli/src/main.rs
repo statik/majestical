@@ -1,6 +1,7 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
 mod app;
 mod commands;
+mod index_cmd;
 mod iso8601;
 mod query;
 mod search;
@@ -11,7 +12,7 @@ use anyhow::Result;
 use app::FsApp;
 use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "maj", version, about = "Majestical media catalog")]
@@ -75,6 +76,11 @@ enum Cmd {
     Searches {
         #[command(subcommand)]
         cmd: SearchesCmd,
+    },
+    /// Work the derived-data queue (thumbnails, embeddings, keyframes).
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCmd,
     },
     /// List every volume the catalog has ever seen.
     Volumes {
@@ -186,6 +192,33 @@ enum MetaCmd {
 }
 
 #[derive(Subcommand)]
+enum IndexCmd {
+    /// Work the derivation queue (thumbnails now; embeddings and keyframes
+    /// once their capabilities are installed).
+    Run {
+        /// Keep working the queue, polling every 5s for newly scanned assets.
+        #[arg(long)]
+        watch: bool,
+        /// Parallel workers (default: CPU cores, max 4).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Stop after this many items.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Comma-separated subset: thumbs,embeddings,keyframes.
+        #[arg(long, value_delimiter = ',')]
+        kinds: Option<Vec<String>>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show queue status per derivation kind.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SearchesCmd {
     /// List saved searches.
     List {
@@ -213,6 +246,30 @@ enum CatalogCmd {
 enum TagCmd {
     Add { asset: String, tag: String },
     Rm { asset: String, tag: String },
+}
+
+/// Dispatches `maj index`'s subcommands. Split out of `main` purely to stay
+/// under the crate's max-function-length lint.
+fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
+    match cmd {
+        IndexCmd::Run {
+            watch,
+            threads,
+            limit,
+            kinds,
+            json,
+        } => {
+            let args = index_cmd::IndexRunArgs {
+                watch,
+                threads,
+                limit,
+                kinds,
+                json,
+            };
+            index_cmd::cmd_index_run(app, catalog, &args)
+        }
+        IndexCmd::Status { json } => index_cmd::cmd_index_status(app, catalog, json),
+    }
 }
 
 fn main() -> Result<()> {
@@ -250,6 +307,10 @@ fn main() -> Result<()> {
         Cmd::Searches { cmd } => {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             search::cmd_searches(&mut app, cmd)?;
+        }
+        Cmd::Index { cmd } => {
+            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            dispatch_index(&app, &cli.catalog, cmd)?;
         }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },

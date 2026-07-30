@@ -32,6 +32,7 @@ majestical-core = { path = "../core" }
 majestical-sync = { path = "../sync" }
 majestical-catalog-sqlite = { path = "../catalog-sqlite" }
 majestical-ingest = { path = "../ingest" }
+majestical-index = { path = "../index" }
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
@@ -45,3 +46,4 @@ plist.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+image.workspace = true

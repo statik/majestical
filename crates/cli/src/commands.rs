@@ -62,6 +62,7 @@ pub(crate) fn mtime_ms_of(metadata: &std::fs::Metadata) -> u64 {
 }
 
 pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
+    let auto_detect = volume.is_none();
     let (volume_id, volume_label) = resolve_volume(dir, volume);
     let mut ops = Vec::new();
     for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
@@ -95,12 +96,31 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
         // events force UTF-8 anyway, so a non-UTF-8 path can't round
         // trip through the log yet; revisit once ingest needs to
         // preserve exact bytes.
-        let rel = entry
+        let scan_rel = entry
             .path()
             .strip_prefix(dir)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
+        // An explicit `--volume` override has no real mount to re-base
+        // against (it's a synthetic id kept for e2e-test determinism), so
+        // its instances stay scan-dir-relative, as before. An auto-detected
+        // volume gets a path relative to the volume's actual root, so a
+        // later indexer run can re-find the bytes regardless of which
+        // subdirectory was scanned.
+        let rel = if auto_detect {
+            let abs = entry
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| entry.path().to_path_buf());
+            let mount = volume_identity::mount_point_of(&abs);
+            abs.strip_prefix(&mount).map_or_else(
+                |_| scan_rel.clone(),
+                |p| p.to_string_lossy().replace('\\', "/"),
+            )
+        } else {
+            scan_rel
+        };
         ops.push(Op::AssetSeen {
             asset: AssetId(format!("xxh3:{hash:032x}")),
             volume: volume_id.clone(),
@@ -921,6 +941,24 @@ fn volume_seen_ops(
     ops
 }
 
+/// Re-bases a placed file's destination-root-relative path to be relative to
+/// its destination volume's actual mount root instead — same treatment as
+/// an auto-detected `scan`, so the indexer can later re-find these bytes
+/// regardless of which destination root was used. Unlike `scan`, ingest has
+/// no synthetic `--volume` override to special-case: `dest_volumes` ids are
+/// always `volume_identity::resolve`'s real, auto-detected identities.
+/// Falls back to the destination-relative path if the strip fails (e.g. the
+/// file vanished between placement and this call).
+fn vol_rel_path(root: &Path, dest_rel: &str) -> String {
+    let abs = root.join(dest_rel);
+    let abs = abs.canonicalize().unwrap_or(abs);
+    let mount = volume_identity::mount_point_of(&abs);
+    abs.strip_prefix(&mount).map_or_else(
+        |_| dest_rel.to_string(),
+        |p| p.to_string_lossy().replace('\\', "/"),
+    )
+}
+
 /// `AssetSeen` + `VerificationRecorded` for every placed file at every
 /// destination, plus one `AssetParaSet` per distinct asset actually placed
 /// this run (not one per file — a burst-shot asset placed under several
@@ -938,17 +976,18 @@ fn asset_and_para_ops(
         for (root, dest_id, _) in dest_volumes {
             let mtime_ms =
                 std::fs::metadata(root.join(&placed.dest_rel)).map_or(0, |m| mtime_ms_of(&m));
+            let vol_rel = vol_rel_path(root, &placed.dest_rel);
             ops.push(Op::AssetSeen {
                 asset: asset.clone(),
                 volume: dest_id.clone(),
-                path: placed.dest_rel.clone(),
+                path: vol_rel.clone(),
                 size: placed.size,
                 mtime_ms,
             });
             ops.push(Op::VerificationRecorded {
                 asset: asset.clone(),
                 volume: dest_id.clone(),
-                path: placed.dest_rel.clone(),
+                path: vol_rel,
                 algo: "xxh64".to_string(),
                 value: placed.xxh64.clone(),
                 outcome: VerifyOutcome::Verified,

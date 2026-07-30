@@ -1,31 +1,9 @@
 //! End-to-end: init a catalog, scan a folder, tag by name-match, search.
-use assert_cmd::Command;
+mod common;
+
+use common::{maj, maj_as, walkdir_find};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, diff};
-
-#[cfg(test)]
-fn maj_as(catalog: &std::path::Path, state: &std::path::Path, machine_id: &str) -> Command {
-    let mut c = Command::cargo_bin("maj").unwrap();
-    c.env("MAJ_CATALOG", catalog)
-        .env("MAJ_MACHINE_ID", machine_id)
-        .env("MAJ_STATE_DIR", state);
-    c
-}
-
-#[cfg(test)]
-fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
-    maj_as(catalog, state, "test-machine")
-}
-
-#[cfg(test)]
-fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name() == name)
-        .map(walkdir::DirEntry::into_path)
-        .collect()
-}
 
 /// Parses a `search --json` asset id out of the first result.
 #[cfg(test)]
@@ -78,6 +56,42 @@ fn assert_ingest_event_granularity(root: &std::path::Path, dest_count: usize) {
         assert!(
             roothash.starts_with("c4"),
             "expected a c4-prefixed roothash, got {roothash}"
+        );
+    }
+}
+
+/// Asserts every `VerificationRecorded` carries the same path as its paired
+/// `AssetSeen` — both are emitted per destination from the same local
+/// `vol_rel` value in `asset_and_para_ops`, pushed as an immediately
+/// adjacent pair for each destination in `dest_volumes` order, so the two
+/// filtered event streams stay pairwise aligned by emission order (not
+/// matched by (asset, volume), which two destinations sharing one
+/// auto-detected volume id — e.g. two tempdirs both on the root volume —
+/// would collapse into one, hiding a mismatch rather than catching it). A
+/// regression re-basing one event but not the other would otherwise pass CI
+/// silently.
+#[cfg(test)]
+fn assert_verification_paths_match_asset_seen_paths(root: &std::path::Path) {
+    let events = read_events(root);
+    let asset_seen_paths: Vec<&str> = events
+        .iter()
+        .filter(|e| e["op"]["type"] == "asset_seen")
+        .map(|e| e["op"]["path"].as_str().unwrap())
+        .collect();
+    let verification_paths: Vec<&str> = events
+        .iter()
+        .filter(|e| e["op"]["type"] == "verification_recorded")
+        .map(|e| e["op"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        asset_seen_paths.len(),
+        verification_paths.len(),
+        "expected one VerificationRecorded per AssetSeen"
+    );
+    for (seen_path, verified_path) in asset_seen_paths.iter().zip(&verification_paths) {
+        assert_eq!(
+            seen_path, verified_path,
+            "VerificationRecorded's path must match its paired AssetSeen's path"
         );
     }
 }
@@ -1063,6 +1077,11 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
             "expected a real mtime_ms on an ingest-placed AssetSeen event, got {e}"
         );
     }
+
+    // A regression re-basing `AssetSeen`'s path but not
+    // `VerificationRecorded`'s (or vice versa) would otherwise pass CI
+    // silently — see `assert_verification_paths_match_asset_seen_paths`.
+    assert_verification_paths_match_asset_seen_paths(&root);
 
     for dest in [d1.path(), d2.path()] {
         assert!(

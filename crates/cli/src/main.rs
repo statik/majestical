@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod iso8601;
+mod state_dir;
 mod volume_identity;
 
 use anyhow::Result;

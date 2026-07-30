@@ -3,16 +3,27 @@ use assert_cmd::Command;
 use predicates::str::{contains, diff};
 
 #[cfg(test)]
-fn maj_as(catalog: &std::path::Path, machine_id: &str) -> Command {
+fn maj_as(catalog: &std::path::Path, state: &std::path::Path, machine_id: &str) -> Command {
     let mut c = Command::cargo_bin("maj").unwrap();
     c.env("MAJ_CATALOG", catalog)
-        .env("MAJ_MACHINE_ID", machine_id);
+        .env("MAJ_MACHINE_ID", machine_id)
+        .env("MAJ_STATE_DIR", state);
     c
 }
 
 #[cfg(test)]
-fn maj(catalog: &std::path::Path) -> Command {
-    maj_as(catalog, "test-machine")
+fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
+    maj_as(catalog, state, "test-machine")
+}
+
+#[cfg(test)]
+fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == name)
+        .map(walkdir::DirEntry::into_path)
+        .collect()
 }
 
 /// Parses a `search --json` asset id out of the first result.
@@ -77,9 +88,13 @@ fn init_scan_tag_search_round_trip() {
     std::fs::write(media.path().join("notes.txt"), b"hello").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
@@ -87,7 +102,7 @@ fn init_scan_tag_search_round_trip() {
         .success()
         .stdout(contains("2 assets"));
     // Find the asset id for sunset.mov via name search (json output).
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--name", "sunset", "--json"])
         .output()
         .unwrap();
@@ -95,11 +110,11 @@ fn init_scan_tag_search_round_trip() {
     assert_eq!(hits["count"], 1);
     let id = first_asset_id(&out);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["tag", "add", &id, "topic/drone"])
         .assert()
         .success();
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--tag", "topic/drone", "--json"])
         .output()
         .unwrap();
@@ -107,11 +122,11 @@ fn init_scan_tag_search_round_trip() {
     assert_eq!(hits["count"], 1);
     assert_eq!(hits["results"][0]["asset"], id);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["tag", "rm", &id, "topic/drone"])
         .assert()
         .success();
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--tag", "topic/drone", "--json"])
         .output()
         .unwrap();
@@ -130,9 +145,13 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
     std::fs::write(media.path().join("sunset.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
@@ -144,7 +163,7 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
     contents.push_str("not valid json\n");
     std::fs::write(&seg, contents).unwrap();
 
-    let assert = maj(&root)
+    let assert = maj(&root, &state)
         .args(["search", "--name", "sunset", "--json"])
         .assert()
         .success();
@@ -172,7 +191,11 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
 fn far_future_peer_event_triggers_clamp_warning() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
     // Hand-write a segment for a peer machine "peerbad" whose HLC is ~400
     // days ahead of physical now, bypassing the CLI entirely so no local
@@ -205,7 +228,7 @@ fn far_future_peer_event_triggers_clamp_warning() {
     let line = serde_json::to_string(&poisoned).unwrap();
     std::fs::write(peer_dir.join("0001.jsonl"), format!("{line}\n")).unwrap();
 
-    let assert = maj(&root)
+    let assert = maj(&root, &state)
         .args(["tag", "add", "xxh3:deadbeef", "poison"])
         .assert()
         .success();
@@ -232,56 +255,57 @@ fn two_machines_converge_through_shared_catalog_root() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["catalog", "init"])
         .assert()
         .success();
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
         .assert()
         .success();
-    let out = maj_as(&root, "machine-a")
+    let out = maj_as(&root, &state, "machine-a")
         .args(["search", "--name", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["tag", "add", &id, "tag/a"])
         .assert()
         .success();
 
     // machine-b, in a separate process, sees machine-a's asset and tag.
-    let out = maj_as(&root, "machine-b")
+    let out = maj_as(&root, &state, "machine-b")
         .args(["search", "--tag", "tag/a", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(hits["count"], 1);
     assert_eq!(hits["results"][0]["asset"], id);
-    maj_as(&root, "machine-b")
+    maj_as(&root, &state, "machine-b")
         .args(["tag", "add", &id, "tag/b"])
         .assert()
         .success();
 
     // machine-a removes machine-b's tag, citing the add-ids it observes
     // via the merged projection.
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["tag", "rm", &id, "tag/b"])
         .assert()
         .success();
 
     for machine in ["machine-a", "machine-b"] {
-        let out = maj_as(&root, machine)
+        let out = maj_as(&root, &state, machine)
             .args(["search", "--tag", "tag/a", "--json"])
             .output()
             .unwrap();
         let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(hits["count"], 1, "{machine} should still see tag/a");
 
-        let out = maj_as(&root, machine)
+        let out = maj_as(&root, &state, machine)
             .args(["search", "--tag", "tag/b", "--json"])
             .output()
             .unwrap();
@@ -305,16 +329,20 @@ fn volumes_list_shows_explicit_volume_with_asset_count() {
     std::fs::write(media.path().join("b.mov"), b"fake video bytes b").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "maj-test-no-such-volume"])
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["volumes", "list", "--json"])
         .output()
         .unwrap();
@@ -338,15 +366,19 @@ fn volumes_list_shows_auto_detected_volume() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["volumes", "list", "--json"])
         .output()
         .unwrap();
@@ -373,7 +405,11 @@ fn volumes_list_shows_auto_detected_volume() {
 fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
     let peer_dir = root.join("events/peerbad");
     std::fs::create_dir_all(&peer_dir).unwrap();
@@ -401,7 +437,7 @@ fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
     let line = serde_json::to_string(&poisoned).unwrap();
     std::fs::write(peer_dir.join("0001.jsonl"), format!("{line}\n")).unwrap();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["volumes", "list", "--json"])
         .output()
         .unwrap();
@@ -410,7 +446,7 @@ fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
     assert_eq!(volumes.len(), 1);
     assert_eq!(volumes[0]["clock_suspect"], true);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["volumes", "list"])
         .assert()
         .success()
@@ -424,8 +460,9 @@ fn volumes_list_flags_a_far_future_last_seen_as_clock_suspect() {
 fn commands_against_an_uninitialized_catalog_fail_with_a_clear_message() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root)
+    maj(&root, &state)
         .args(["search", "--name", "anything", "--json"])
         .assert()
         .failure()
@@ -438,9 +475,13 @@ fn commands_against_an_uninitialized_catalog_fail_with_a_clear_message() {
 fn commands_succeed_after_catalog_init() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["search", "--name", "anything", "--json"])
         .assert()
         .success();
@@ -453,15 +494,19 @@ fn commands_succeed_after_catalog_init() {
 fn tag_add_on_an_unscanned_asset_fails_and_leaves_the_catalog_unchanged() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["tag", "add", "xxh3:neverseen", "some/tag"])
         .assert()
         .failure()
         .stderr(contains("unknown asset xxh3:neverseen"));
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--tag", "some/tag", "--json"])
         .output()
         .unwrap();
@@ -477,9 +522,13 @@ fn emitted_events_carry_the_configured_author() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
@@ -504,9 +553,13 @@ fn author_defaults_to_the_machine_id() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
@@ -530,32 +583,36 @@ fn meta_set_get_round_trip() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
         .assert()
         .success();
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--name", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "set", &id, "rating", "5"])
         .assert()
         .success();
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "get", &id, "rating"])
         .assert()
         .success()
         .stdout(diff("5\n"));
 
     // Getting every field (no field name) lists it as `field\tvalue` lines.
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "get", &id])
         .assert()
         .success()
@@ -571,26 +628,30 @@ fn meta_get_on_a_missing_field_is_empty_not_an_error() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
         .assert()
         .success();
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--name", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "get", &id, "rating"])
         .assert()
         .success()
         .stdout(diff("\n"));
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "get", &id, "rating", "--json"])
         .assert()
         .success()
@@ -602,9 +663,13 @@ fn meta_get_on_a_missing_field_is_empty_not_an_error() {
 fn meta_set_on_an_unscanned_asset_fails() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["meta", "set", "xxh3:neverseen", "rating", "5"])
         .assert()
         .failure()
@@ -631,9 +696,13 @@ fn assert_is_ulid(s: &str) {
 fn para_add_list_rename_archive_round_trip() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "add", "project", "client-x"])
         .output()
         .unwrap();
@@ -641,7 +710,7 @@ fn para_add_list_rename_archive_round_trip() {
     let node_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_is_ulid(&node_id);
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "list", "--json"])
         .output()
         .unwrap();
@@ -653,17 +722,17 @@ fn para_add_list_rename_archive_round_trip() {
     assert_eq!(nodes[0]["name"], "client-x");
     assert_eq!(nodes[0]["archived"], false);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "rename", "project/client-x", "client-y"])
         .assert()
         .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "archive", "project/client-y"])
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "list", "--json"])
         .output()
         .unwrap();
@@ -676,7 +745,7 @@ fn para_add_list_rename_archive_round_trip() {
 
     // An archived node no longer resolves by `<kind>/<name>` — only a raw
     // node id reaches it now (see `resolve_para_node`'s non-archived filter).
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "rename", "project/client-y", "z"])
         .assert()
         .failure()
@@ -689,13 +758,17 @@ fn para_add_list_rename_archive_round_trip() {
 fn para_add_rejects_duplicate_active_name() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "add", "project", "client-x"])
         .assert()
         .success();
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "add", "project", "client-x"])
         .assert()
         .failure()
@@ -708,15 +781,19 @@ fn para_add_rejects_duplicate_active_name() {
 fn para_node_reference_errors_are_actionable() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "rename", "project/nope", "x"])
         .assert()
         .failure()
         .stderr(contains("maj para list"));
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "rename", "garbage", "x"])
         .assert()
         .failure()
@@ -729,8 +806,12 @@ fn para_node_reference_errors_are_actionable() {
 fn para_archive_moves_materialized_dir_with_root() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "client-x"])
         .assert()
         .success();
@@ -740,7 +821,7 @@ fn para_archive_moves_materialized_dir_with_root() {
     std::fs::create_dir_all(&node_dir).unwrap();
     std::fs::write(node_dir.join("a.txt"), b"hello").unwrap();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "archive", "project/client-x"])
         .arg("--root")
         .arg(materialized.path())
@@ -750,7 +831,7 @@ fn para_archive_moves_materialized_dir_with_root() {
         .stdout(contains("would move"));
     assert!(node_dir.is_dir(), "dry run must not move the directory");
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "archive", "project/client-x"])
         .arg("--root")
         .arg(materialized.path())
@@ -760,7 +841,7 @@ fn para_archive_moves_materialized_dir_with_root() {
     let archived = materialized.path().join("Archives").join("client-x");
     assert!(archived.join("a.txt").is_file());
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "list", "--json"])
         .output()
         .unwrap();
@@ -781,8 +862,12 @@ fn para_archive_moves_materialized_dir_with_root() {
 fn para_archive_with_multiple_roots_skips_a_root_already_archived() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "client-x"])
         .assert()
         .success();
@@ -797,7 +882,7 @@ fn para_archive_with_multiple_roots_skips_a_root_already_archived() {
     std::fs::create_dir_all(&root2_source).unwrap();
     std::fs::write(root2_source.join("b.txt"), b"world").unwrap();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "archive", "project/client-x"])
         .arg("--root")
         .arg(root1.path())
@@ -813,7 +898,7 @@ fn para_archive_with_multiple_roots_skips_a_root_already_archived() {
     // root1's already-archived directory is untouched by the skip.
     assert!(root1_archived.join("a.txt").is_file());
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "list", "--json"])
         .output()
         .unwrap();
@@ -834,36 +919,37 @@ fn meta_set_later_write_wins_across_machines() {
     std::fs::write(media.path().join("clip.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["catalog", "init"])
         .assert()
         .success();
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["scan"])
         .arg(media.path())
         .args(["--volume", "card1"])
         .assert()
         .success();
-    let out = maj_as(&root, "machine-a")
+    let out = maj_as(&root, &state, "machine-a")
         .args(["search", "--name", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
 
     // machine-b writes first (HLC-earlier)...
-    maj_as(&root, "machine-b")
+    maj_as(&root, &state, "machine-b")
         .args(["meta", "set", &id, "rating", "3"])
         .assert()
         .success();
     // ...machine-a writes second (HLC-later) and must win on both machines.
-    maj_as(&root, "machine-a")
+    maj_as(&root, &state, "machine-a")
         .args(["meta", "set", &id, "rating", "5"])
         .assert()
         .success();
 
     for machine in ["machine-a", "machine-b"] {
-        maj_as(&root, machine)
+        maj_as(&root, &state, machine)
             .args(["meta", "get", &id, "rating"])
             .assert()
             .success()
@@ -884,11 +970,12 @@ fn maj_verify_reports_altered_file_on_second_run() {
     std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
 
     let hash_list = majestical_ingest::mhl::hash_dir(media.path(), "2026-07-30T00:00:00Z").unwrap();
     majestical_ingest::mhl::write_generation(media.path(), &hash_list).unwrap();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["verify"])
         .arg(media.path())
         .assert()
@@ -897,7 +984,7 @@ fn maj_verify_reports_altered_file_on_second_run() {
 
     std::fs::write(media.path().join("a.mov"), b"ZZZZ").unwrap();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["verify"])
         .arg(media.path())
         .assert()
@@ -926,16 +1013,20 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
     std::fs::write(media.path().join("clips/a.mov"), b"fake video bytes").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
     let d1 = tempfile::tempdir().unwrap();
     let d2 = tempfile::tempdir().unwrap();
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "shoot"])
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["ingest"])
         .arg(media.path())
         .arg("--dest")
@@ -973,25 +1064,25 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
         );
     }
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["search", "--name", "a.mov", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(hits["count"], 1);
 
-    maj(&root)
+    maj(&root, &state)
         .args(["verify"])
         .arg(d1.path())
         .assert()
         .success();
-    maj(&root)
+    maj(&root, &state)
         .args(["verify"])
         .arg(d2.path())
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["ingest"])
         .arg(media.path())
         .arg("--dest")
@@ -1020,15 +1111,19 @@ fn ingest_dry_run_places_nothing_and_writes_no_journal() {
     std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
     let d1 = tempfile::tempdir().unwrap();
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "shoot"])
         .assert()
         .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["ingest"])
         .arg(media.path())
         .arg("--dest")
@@ -1042,10 +1137,18 @@ fn ingest_dry_run_places_nothing_and_writes_no_journal() {
         !d1.path().join("ascmhl").exists(),
         "dry run must not copy anything"
     );
-    let runs_dir = root.join("runs");
     assert!(
-        !runs_dir.is_dir() || std::fs::read_dir(&runs_dir).unwrap().next().is_none(),
-        "dry run must not write a journal"
+        !root.join("runs").exists(),
+        "dry run must not write a journal into the sync root"
+    );
+    let journals: Vec<_> = walkdir::WalkDir::new(&state)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .collect();
+    assert!(
+        journals.is_empty(),
+        "dry run must not write a journal into the state dir, found: {journals:?}"
     );
 }
 
@@ -1058,15 +1161,19 @@ fn ingest_rejects_a_non_directory_source() {
     std::fs::write(&file, b"AAAA").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
     let d1 = tempfile::tempdir().unwrap();
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "shoot"])
         .assert()
         .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["ingest"])
         .arg(&file)
         .arg("--dest")
@@ -1086,15 +1193,19 @@ fn ingest_resume_with_an_unknown_run_id_fails_and_creates_nothing() {
     std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
     let d1 = tempfile::tempdir().unwrap();
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "shoot"])
         .assert()
         .success();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["ingest"])
         .arg(media.path())
         .arg("--dest")
@@ -1114,6 +1225,10 @@ fn ingest_resume_with_an_unknown_run_id_fails_and_creates_nothing() {
         !d1.path().join("ascmhl").exists(),
         "an unknown --resume id must not copy anything"
     );
+    assert!(
+        walkdir_find(&state, "nonexistent.jsonl").is_empty(),
+        "an unknown --resume id must not create a journal in the state dir either"
+    );
 }
 
 /// An archived PARA node is rejected as an ingest target, even when
@@ -1125,26 +1240,30 @@ fn ingest_rejects_an_archived_para_target() {
     std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
     let d1 = tempfile::tempdir().unwrap();
 
-    maj(&root).args(["catalog", "init"]).assert().success();
-    maj(&root)
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
         .args(["para", "add", "project", "shoot"])
         .assert()
         .success();
-    maj(&root)
+    maj(&root, &state)
         .args(["para", "archive", "project/shoot"])
         .assert()
         .success();
 
-    let out = maj(&root)
+    let out = maj(&root, &state)
         .args(["para", "list", "--json"])
         .output()
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let node_id = parsed["nodes"][0]["id"].as_str().unwrap().to_string();
 
-    maj(&root)
+    maj(&root, &state)
         .args(["ingest"])
         .arg(media.path())
         .arg("--dest")
@@ -1153,4 +1272,195 @@ fn ingest_rejects_an_archived_para_target() {
         .assert()
         .failure()
         .stderr(contains("is archived"));
+}
+
+/// `catalog.db` is a disposable local projection, not shared catalog data —
+/// it must live under the per-machine state dir, never in the sync root.
+#[test]
+fn catalog_db_lives_in_state_dir_not_sync_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("a.txt"), b"hello").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+    maj(&catalog, &state)
+        .args(["search", "--name", "a.txt"])
+        .assert()
+        .success();
+    assert!(
+        !catalog.join("catalog.db").exists(),
+        "catalog.db must not be created in the sync root"
+    );
+    let dbs: Vec<_> = walkdir_find(&state, "catalog.db");
+    assert_eq!(dbs.len(), 1, "exactly one catalog.db under the state dir");
+}
+
+/// A pre-phase-4 `catalog.db` left behind in the sync root (from before the
+/// local-state split) is cleaned up automatically the next time any command
+/// opens the catalog — it's disposable and gets rebuilt locally, so leaving
+/// it in the shared sync root would just be stale, confusing clutter.
+#[test]
+fn legacy_catalog_db_in_sync_root_is_removed_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    std::fs::write(catalog.join("catalog.db"), b"legacy").unwrap();
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+    assert!(
+        !catalog.join("catalog.db").exists(),
+        "legacy db must be cleaned out of the sync root"
+    );
+}
+
+/// Pre-phase-4 ingest run journals under `<catalog>/runs/` are migrated into
+/// the local state dir on the next open, so `--resume` keeps working for
+/// runs started before the split without leaving journals in the sync root.
+#[test]
+fn legacy_run_journals_move_to_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(catalog.join("runs")).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    std::fs::write(catalog.join("runs").join("01OLD.jsonl"), b"{}\n").unwrap();
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+    assert!(
+        !catalog.join("runs").exists(),
+        "legacy runs/ removed from sync root"
+    );
+    let moved: Vec<_> = walkdir_find(&state, "01OLD.jsonl");
+    assert_eq!(moved.len(), 1, "journal moved into the state dir");
+    assert!(
+        walkdir_find(&state, "01OLD.jsonl.partial").is_empty(),
+        "the copy-then-rename temp file must not linger after a successful migration"
+    );
+}
+
+/// A legacy `runs/` dir can hold more than plain journals — a Syncthing
+/// `.stversions/` subdirectory, a stray `.DS_Store`, whatever else ends up
+/// next to synced files. Migration must not choke on those: it moves only
+/// `*.jsonl` regular files, leaves anything else in place, and the catalog
+/// stays usable (including on a second command run, since the non-journal
+/// entries mean the legacy `runs/` dir can never be fully cleaned up).
+#[test]
+fn legacy_runs_dir_with_non_journal_entries_migrates_the_journal_and_leaves_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(catalog.join("runs")).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    std::fs::write(catalog.join("runs").join("01OLD.jsonl"), b"{}\n").unwrap();
+    std::fs::write(catalog.join("runs").join(".DS_Store"), b"junk").unwrap();
+    std::fs::create_dir_all(catalog.join("runs").join(".stversions")).unwrap();
+    std::fs::write(
+        catalog.join("runs").join(".stversions").join("01OLD.jsonl"),
+        b"old version\n",
+    )
+    .unwrap();
+
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+
+    let moved: Vec<_> = walkdir_find(&state, "01OLD.jsonl");
+    assert_eq!(moved.len(), 1, "the journal moved into the state dir");
+    assert!(
+        catalog.join("runs").join(".DS_Store").is_file(),
+        "non-journal junk is left in the sync root"
+    );
+    assert!(
+        catalog
+            .join("runs")
+            .join(".stversions")
+            .join("01OLD.jsonl")
+            .is_file(),
+        "a subdirectory under runs/ is left in the sync root"
+    );
+
+    // The catalog must still be usable on a second run, even though the
+    // legacy runs/ dir can never be fully removed (junk remains in it).
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+}
+
+/// If the state dir already has a journal for a run id (e.g. a second
+/// machine already migrated it), migration must not clobber it with
+/// whatever's in the sync root's legacy copy — the state-dir copy is the
+/// one actively in use locally. The legacy source is still removed so the
+/// sync root converges to having no `runs/` dir.
+#[test]
+fn legacy_journal_migration_does_not_overwrite_an_existing_state_dir_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    // Any command opens the catalog, which creates the state dir's runs/.
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+    let state_runs = walkdir::WalkDir::new(&state)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name() == "runs")
+        .expect("state dir must already have a runs/ dir")
+        .into_path();
+    std::fs::write(state_runs.join("01OLD.jsonl"), b"state dir content\n").unwrap();
+
+    std::fs::create_dir_all(catalog.join("runs")).unwrap();
+    std::fs::write(
+        catalog.join("runs").join("01OLD.jsonl"),
+        b"stale legacy content\n",
+    )
+    .unwrap();
+
+    maj(&catalog, &state)
+        .args(["search", "--name", "nothing"])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(state_runs.join("01OLD.jsonl")).unwrap();
+    assert_eq!(
+        content, "state dir content\n",
+        "an existing state-dir journal must not be overwritten by the legacy copy"
+    );
+    assert!(
+        !catalog.join("runs").join("01OLD.jsonl").exists(),
+        "the legacy source is still removed so the sync root converges"
+    );
 }

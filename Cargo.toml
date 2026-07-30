@@ -16,6 +16,7 @@ proptest = "1"
 tempfile = "3"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 assert_cmd = "2"

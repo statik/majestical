@@ -4,11 +4,13 @@
 //! when there's no usable snapshot to resume from (FTS5/sqlite-vec arrive in
 //! later phases).
 use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
-use majestical_core::ports::{CatalogStore, EventLog, LogCursor, PortError};
+use majestical_core::media_kind::media_kind;
+use majestical_core::ports::{AssetSummary, CatalogStore, EventLog, Filter, LogCursor, PortError};
 use majestical_core::projection::{
     AssetState, ManifestRecord, ParaNodeState, Projection, Touched, VolumeState,
 };
-use rusqlite::{Connection, Transaction};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Transaction, params_from_iter};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -38,7 +40,15 @@ pub enum CatalogError {
 /// path, size)>` to an HLC-LWW `BTreeMap<(volume, path), InstanceInfo>` (see
 /// `majestical_core::projection`), forcing a full rebuild for any snapshot
 /// written under the old shape.
-const SNAPSHOT_VERSION: i64 = 2;
+///
+/// This constant doubles as the schema version: any change to the tables
+/// `create_tables` builds must bump it, so a pre-change db file takes the
+/// full-rebuild path (which drops and recreates every table) instead of
+/// running incremental applies against a schema it predates.
+///
+/// Bumped to 3: `instances` gained a `kind` column and `names_fts` (the FTS5
+/// name index) was added.
+const SNAPSHOT_VERSION: i64 = 3;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.
@@ -242,6 +252,7 @@ impl SqliteCatalog {
                 Touched::Asset(id) => {
                     tx.execute("DELETE FROM tags WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM instances WHERE asset = ?1", [&id.0])?;
+                    tx.execute("DELETE FROM names_fts WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM asset_para WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM verifications WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM assets WHERE id = ?1", [&id.0])?;
@@ -284,15 +295,19 @@ impl SqliteCatalog {
              DROP TABLE IF EXISTS manifests;
              DROP TABLE IF EXISTS apply_cursors;
              DROP TABLE IF EXISTS apply_snapshot;
+             DROP TABLE IF EXISTS names_fts;
              CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
                volume TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
-               mtime_ms INTEGER NOT NULL,
+               mtime_ms INTEGER NOT NULL, kind TEXT NOT NULL,
                -- (asset, volume, path) is unique: the projection's instances
                -- are an HLC-LWW map keyed on (volume, path), so a rescan
                -- updates in place rather than producing a second row.
                PRIMARY KEY (asset, volume, path)
+             );
+             CREATE VIRTUAL TABLE names_fts USING fts5(
+               name, asset UNINDEXED, tokenize = 'unicode61 remove_diacritics 2'
              );
              CREATE TABLE tags (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -352,11 +367,28 @@ impl SqliteCatalog {
         state: &AssetState,
     ) -> rusqlite::Result<()> {
         tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
+        let mut names = BTreeSet::new();
         for ((volume, path), info) in &state.instances {
             tx.execute(
-                "INSERT INTO instances (asset, volume, path, size, mtime_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&asset.0, volume, path, info.size, info.mtime_ms),
+                "INSERT INTO instances (asset, volume, path, size, mtime_ms, kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    &asset.0,
+                    volume,
+                    path,
+                    info.size,
+                    info.mtime_ms,
+                    media_kind(path).as_str(),
+                ),
+            )?;
+            if let Some(name) = path.rsplit('/').next() {
+                names.insert(name.to_string());
+            }
+        }
+        for name in &names {
+            tx.execute(
+                "INSERT INTO names_fts (name, asset) VALUES (?1, ?2)",
+                (name, &asset.0),
             )?;
         }
         for tag in projection.tags(asset) {
@@ -477,35 +509,222 @@ impl SqliteCatalog {
         Ok(())
     }
 
-    /// Finds assets tagged with `tag` exactly.
+    /// Assets whose basename matches any of `terms` by word-prefix, ranked
+    /// best-first (FTS5's `rank`), capped at `limit` rows. Unicode-aware and
+    /// case-insensitive via the `unicode61 remove_diacritics 2` tokenizer.
     ///
     /// # Errors
     /// Returns an error if the underlying query fails.
-    pub fn search_by_tag(&self, tag: &str) -> Result<Vec<AssetId>, CatalogError> {
-        self.query("SELECT asset FROM tags WHERE tag = ?1 ORDER BY asset", tag)
+    pub fn search_names_ranked(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(AssetId, f64)>, CatalogError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Each term quoted (embedded quotes doubled) with a prefix star,
+        // OR-joined: beach -> "beach"* — FTS5 string syntax, immune to
+        // operator injection.
+        let match_expr = terms
+            .iter()
+            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut stmt = self.conn.prepare(
+            "SELECT asset, rank FROM names_fts WHERE names_fts MATCH ?1
+             ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            (&match_expr, i64::try_from(limit).unwrap_or(i64::MAX)),
+            |r| Ok((AssetId(r.get(0)?), r.get::<_, f64>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
-    /// Case-insensitive (ASCII only — proper Unicode folding arrives with FTS)
-    /// substring match on the full instance path.
+    /// Assets satisfying every filter in `filters` (conjunction).
     ///
     /// # Errors
     /// Returns an error if the underlying query fails.
-    pub fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, CatalogError> {
-        self.query(
-            "SELECT DISTINCT asset FROM instances \
-             WHERE path LIKE '%' || ?1 || '%' ESCAPE '\\' ORDER BY asset",
-            &escape_like(needle),
+    pub fn assets_matching(&self, filters: &[Filter]) -> Result<BTreeSet<AssetId>, CatalogError> {
+        let mut sql = String::from("SELECT a.id FROM assets a WHERE 1=1 ");
+        let mut params: Vec<Value> = Vec::new();
+        for filter in filters {
+            let next_param = params.len() + 1;
+            sql.push_str(&Self::filter_clause(filter, next_param, &mut params));
+            sql.push(' ');
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |r| r.get::<_, String>(0))?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(AssetId(row?));
+        }
+        Ok(out)
+    }
+
+    /// Builds one filter's SQL clause (starting with `AND`), pushing its
+    /// bind values onto `params` starting at 1-based index `next_param`.
+    fn filter_clause(filter: &Filter, next_param: usize, params: &mut Vec<Value>) -> String {
+        match filter {
+            Filter::Tag { value, negated } => {
+                params.push(Value::Text(value.clone()));
+                let not = if *negated { "NOT " } else { "" };
+                format!(
+                    "AND {not}EXISTS (SELECT 1 FROM tags t \
+                     WHERE t.asset = a.id AND t.tag = ?{next_param})"
+                )
+            }
+            Filter::Volume { value, negated } => {
+                params.push(Value::Text(value.clone()));
+                params.push(Value::Text(value.clone()));
+                let not = if *negated { "NOT " } else { "" };
+                let p2 = next_param + 1;
+                format!(
+                    "AND {not}EXISTS (SELECT 1 FROM instances i \
+                     LEFT JOIN volumes v ON v.id = i.volume \
+                     WHERE i.asset = a.id AND (v.label = ?{next_param} OR i.volume = ?{p2}))"
+                )
+            }
+            Filter::Para { node, negated } => {
+                params.push(Value::Text(node.clone()));
+                let not = if *negated { "NOT " } else { "" };
+                format!(
+                    "AND {not}EXISTS (SELECT 1 FROM asset_para ap \
+                     WHERE ap.asset = a.id AND ap.node = ?{next_param})"
+                )
+            }
+            Filter::Kind { value, negated } => {
+                params.push(Value::Text(value.clone()));
+                let not = if *negated { "NOT " } else { "" };
+                format!(
+                    "AND {not}EXISTS (SELECT 1 FROM instances i \
+                     WHERE i.asset = a.id AND i.kind = ?{next_param})"
+                )
+            }
+            Filter::Online { ids, want } => Self::online_clause(ids, *want, next_param, params),
+            Filter::Before(ms) => {
+                params.push(Value::Integer(i64::try_from(*ms).unwrap_or(i64::MAX)));
+                format!(
+                    "AND EXISTS (SELECT 1 FROM instances i \
+                     WHERE i.asset = a.id AND i.mtime_ms < ?{next_param})"
+                )
+            }
+            Filter::After(ms) => {
+                params.push(Value::Integer(i64::try_from(*ms).unwrap_or(i64::MAX)));
+                format!(
+                    "AND EXISTS (SELECT 1 FROM instances i \
+                     WHERE i.asset = a.id AND i.mtime_ms > ?{next_param})"
+                )
+            }
+        }
+    }
+
+    /// `Online` clause: empty `ids` short-circuits (no volume can ever be
+    /// "one of zero mounted volumes"), non-empty binds one placeholder per
+    /// id.
+    fn online_clause(
+        ids: &[String],
+        want: bool,
+        next_param: usize,
+        params: &mut Vec<Value>,
+    ) -> String {
+        if ids.is_empty() {
+            return if want {
+                "AND 0=1".to_string()
+            } else {
+                "AND EXISTS (SELECT 1 FROM instances i WHERE i.asset = a.id)".to_string()
+            };
+        }
+        let placeholders: Vec<String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                params.push(Value::Text(id.clone()));
+                format!("?{}", next_param + i)
+            })
+            .collect();
+        let not = if want { "" } else { "NOT " };
+        format!(
+            "AND {not}EXISTS (SELECT 1 FROM instances i \
+             WHERE i.asset = a.id AND i.volume IN ({}))",
+            placeholders.join(", ")
         )
     }
 
-    fn query(&self, sql: &str, param: &str) -> Result<Vec<AssetId>, CatalogError> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([param], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(AssetId(row?));
+    /// Presentation rows for exactly the given asset ids: name (the first
+    /// instance's basename, ordered by volume then path), the distinct
+    /// volumes holding an instance (label falling back to the volume id),
+    /// tags in alphabetical order, and the current PARA assignment.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn asset_summaries(&self, ids: &[AssetId]) -> Result<Vec<AssetSummary>, CatalogError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(AssetSummary {
+                asset: id.clone(),
+                name: self.first_instance_name(id)?,
+                volumes: self.instance_volumes(id)?,
+                tags: self.query_asset_tags(id)?,
+                para: self.query_asset_para(id)?,
+            });
         }
         Ok(out)
+    }
+
+    fn first_instance_name(&self, id: &AssetId) -> Result<String, CatalogError> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM instances WHERE asset = ?1 ORDER BY volume, path LIMIT 1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(path
+            .and_then(|p| p.rsplit('/').next().map(str::to_string))
+            .unwrap_or_default())
+    }
+
+    fn instance_volumes(&self, id: &AssetId) -> Result<Vec<(String, String)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT i.volume, COALESCE(v.label, i.volume) FROM instances i \
+             LEFT JOIN volumes v ON v.id = i.volume WHERE i.asset = ?1 ORDER BY i.volume",
+        )?;
+        let rows = stmt.query_map([&id.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn query_asset_tags(&self, id: &AssetId) -> Result<Vec<String>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM tags WHERE asset = ?1 ORDER BY tag")?;
+        let rows = stmt.query_map([&id.0], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn query_asset_para(&self, id: &AssetId) -> Result<Option<String>, CatalogError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT node FROM asset_para WHERE asset = ?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Every volume the catalog has ever seen: (id, label, `last_seen_ms`),
@@ -583,9 +802,9 @@ impl SqliteCatalog {
     /// # Errors
     /// Returns an error if a query fails.
     pub fn debug_dump(&self) -> Result<String, CatalogError> {
-        let tables: [(&str, &str); 8] = [
+        let tables: [(&str, &str); 9] = [
             ("assets", "id"),
-            ("instances", "asset, volume, path, size, mtime_ms"),
+            ("instances", "asset, volume, path, size, mtime_ms, kind"),
             ("tags", "asset, tag"),
             ("volumes", "id, label, last_seen_ms"),
             ("para_nodes", "id, kind, name, archived"),
@@ -595,6 +814,7 @@ impl SqliteCatalog {
                 "asset, volume, path, algo, value, outcome, hashdate_ms",
             ),
             ("manifests", "volume, generation, mhl_path, roothash"),
+            ("names_fts", "asset, name"),
         ];
         let mut out = String::new();
         for (table, cols) in tables {
@@ -618,19 +838,6 @@ impl SqliteCatalog {
         }
         Ok(out)
     }
-}
-
-/// Escapes `\`, `%`, and `_` so a user-supplied needle is matched as a
-/// literal substring rather than interpreted as SQL `LIKE` wildcards.
-fn escape_like(needle: &str) -> String {
-    let mut escaped = String::with_capacity(needle.len());
-    for c in needle.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
 }
 
 /// The wire string for a `ParaKind`. Matches `Op::ParaNodeCreate`'s
@@ -662,12 +869,21 @@ impl CatalogStore for SqliteCatalog {
         Self::rebuild(self, projection).map_err(|e| PortError::new("catalog store", e))
     }
 
-    fn search_by_tag(&self, tag: &str) -> Result<Vec<AssetId>, PortError> {
-        Self::search_by_tag(self, tag).map_err(|e| PortError::new("catalog store", e))
+    fn assets_matching(&self, filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError> {
+        Self::assets_matching(self, filters).map_err(|e| PortError::new("catalog store", e))
     }
 
-    fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError> {
-        Self::search_by_name(self, needle).map_err(|e| PortError::new("catalog store", e))
+    fn search_names_ranked(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(AssetId, f64)>, PortError> {
+        Self::search_names_ranked(self, terms, limit)
+            .map_err(|e| PortError::new("catalog store", e))
+    }
+
+    fn asset_summaries(&self, ids: &[AssetId]) -> Result<Vec<AssetSummary>, PortError> {
+        Self::asset_summaries(self, ids).map_err(|e| PortError::new("catalog store", e))
     }
 
     fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError> {
@@ -686,8 +902,18 @@ mod tests {
     use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind, VerifyOutcome};
     use majestical_core::projection::Projection;
 
+    /// Canary: the bundled rusqlite build must include FTS5. If this ever
+    /// fails, the `bundled` feature needs an explicit FTS5 flag — every
+    /// other test in this module depends on it.
     #[test]
-    fn rebuild_then_query_by_tag_and_name() {
+    fn bundled_sqlite_has_fts5() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)", [])
+            .expect("bundled sqlite must include FTS5");
+    }
+
+    #[test]
+    fn rebuild_then_query_by_tag() {
         let mut p = Projection::default();
         let a = AssetId("xxh3:aa".into());
         let b = AssetId("xxh3:bb".into());
@@ -703,12 +929,10 @@ mod tests {
                 asset: a.clone(),
                 tag: "topic/drone".into(),
             },
-            // Literal `%` and `_` in a path — these must be matched as literal
-            // characters, not interpreted as SQL LIKE wildcards.
             Op::AssetSeen {
                 asset: b.clone(),
                 volume: "card1".into(),
-                path: "clips/100%_off.mov".into(),
+                path: "clips/other.mov".into(),
                 size: 7,
                 mtime_ms: 0,
             },
@@ -731,32 +955,20 @@ mod tests {
         let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
         db.rebuild(&p).expect("rebuild");
         assert_eq!(
-            db.search_by_tag("topic/drone").expect("tag query"),
-            vec![a.clone()]
+            db.assets_matching(&[Filter::Tag {
+                value: "topic/drone".into(),
+                negated: false,
+            }])
+            .expect("tag query"),
+            BTreeSet::from([a.clone()])
         );
         assert_eq!(
-            db.search_by_name("sunset").expect("name query"),
-            vec![a.clone()]
-        );
-        assert_eq!(
-            db.search_by_name("SUNSET").expect("case-insensitive query"),
-            vec![a.clone()]
-        );
-        assert_eq!(
-            db.search_by_name("nothing").expect("empty query"),
-            Vec::<AssetId>::new()
-        );
-        assert_eq!(
-            db.search_by_name("100%")
-                .expect("literal percent must not act as a wildcard"),
-            vec![b.clone()],
-            "must match only the literal '100%' instance, not clips/sunset.mov"
-        );
-        assert_eq!(
-            db.search_by_name("100%_off")
-                .expect("literal percent and underscore query"),
-            vec![b],
-            "instance with a literal '%' and '_' must be findable by that literal"
+            db.assets_matching(&[Filter::Tag {
+                value: "nothing".into(),
+                negated: false,
+            }])
+            .expect("empty tag query"),
+            BTreeSet::new()
         );
     }
 
@@ -836,9 +1048,12 @@ mod tests {
         store.rebuild(&p).expect("rebuild via trait object");
         assert_eq!(
             store
-                .search_by_tag("topic/drone")
+                .assets_matching(&[Filter::Tag {
+                    value: "topic/drone".into(),
+                    negated: false,
+                }])
                 .expect("tag query via trait object"),
-            vec![a]
+            BTreeSet::from([a])
         );
     }
 
@@ -883,11 +1098,22 @@ mod tests {
         db.rebuild(&p2).expect("rebuild b");
 
         assert_eq!(
-            db.search_by_tag("keep-a").expect("query a"),
-            Vec::<AssetId>::new(),
+            db.assets_matching(&[Filter::Tag {
+                value: "keep-a".into(),
+                negated: false,
+            }])
+            .expect("query a"),
+            BTreeSet::new(),
             "rebuild must discard the previous projection's data"
         );
-        assert_eq!(db.search_by_tag("keep-b").expect("query b"), vec![b]);
+        assert_eq!(
+            db.assets_matching(&[Filter::Tag {
+                value: "keep-b".into(),
+                negated: false,
+            }])
+            .expect("query b"),
+            BTreeSet::from([b])
+        );
     }
 
     /// Applies `ops` in order (each event gets an increasing `wall_ms`, so
@@ -1092,5 +1318,375 @@ mod tests {
             roothashes,
             vec!["xxh64:aa".to_string(), "xxh64:bb".to_string()]
         );
+    }
+
+    #[test]
+    fn fts_name_search_is_unicode_case_insensitive_and_ranked() {
+        let a = AssetId("xxh3:a".into());
+        let b = AssetId("xxh3:b".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v".into(),
+                    path: "clips/Café-sunset.mov".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+                Op::AssetSeen {
+                    asset: b.clone(),
+                    volume: "v".into(),
+                    path: "docs/readme.txt".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+            ],
+        );
+        let hits = db
+            .search_names_ranked(&["cafe".to_string()], 10)
+            .expect("name search");
+        let ids: Vec<AssetId> = hits.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![a],
+            "unicode61 remove_diacritics must fold Café to cafe"
+        );
+    }
+
+    #[test]
+    fn prefix_terms_match() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "clips/beach_day.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+        let hits = db
+            .search_names_ranked(&["beach".to_string()], 10)
+            .expect("prefix search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, a);
+    }
+
+    #[test]
+    fn fts_rows_follow_incremental_asset_updates() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "old_name.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+
+        let mut renamed = Projection::default();
+        renamed.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(2, 0)),
+            hlc: Hlc {
+                wall_ms: 2,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "new_name.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            },
+        });
+        db.apply_touched(&renamed, &BTreeSet::from([Touched::Asset(a.clone())]), &[])
+            .expect("apply touched");
+
+        assert!(
+            db.search_names_ranked(&["old".to_string()], 10)
+                .expect("search old")
+                .is_empty(),
+            "the old name must no longer be indexed"
+        );
+        let hits = db
+            .search_names_ranked(&["new".to_string()], 10)
+            .expect("search new");
+        assert_eq!(
+            hits.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![a]
+        );
+    }
+
+    /// Shared fixture for the `filters_*` tests below: asset `a` is tagged
+    /// "keep", lives on volume v1 ("Card A") as a video, mtime 1000, and is
+    /// assigned to PARA node N1; asset `b` is tagged "rejected", lives on
+    /// volume v2 ("Card B") as a non-media file, mtime 2000, and has no PARA
+    /// assignment.
+    fn filters_fixture(dir: &std::path::Path) -> (SqliteCatalog, AssetId, AssetId) {
+        let a = AssetId("xxh3:a".into());
+        let b = AssetId("xxh3:b".into());
+        let db = rebuild_from_ops(
+            &dir.join("catalog.db"),
+            vec![
+                Op::VolumeSeen {
+                    volume: "v1".into(),
+                    label: "Card A".into(),
+                },
+                Op::VolumeSeen {
+                    volume: "v2".into(),
+                    label: "Card B".into(),
+                },
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v1".into(),
+                    path: "beach.mov".into(),
+                    size: 1,
+                    mtime_ms: 1000,
+                },
+                Op::TagAdd {
+                    asset: a.clone(),
+                    tag: "keep".into(),
+                },
+                Op::ParaNodeCreate {
+                    node: "N1".into(),
+                    kind: ParaKind::Project,
+                    name: "client-x".into(),
+                },
+                Op::AssetParaSet {
+                    asset: a.clone(),
+                    node: "N1".into(),
+                },
+                Op::AssetSeen {
+                    asset: b.clone(),
+                    volume: "v2".into(),
+                    path: "notes.txt".into(),
+                    size: 1,
+                    mtime_ms: 2000,
+                },
+                Op::TagAdd {
+                    asset: b.clone(),
+                    tag: "rejected".into(),
+                },
+            ],
+        );
+        (db, a, b)
+    }
+
+    #[test]
+    fn tag_filters_match_and_negate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, a, b) = filters_fixture(dir.path());
+
+        assert_eq!(
+            db.assets_matching(&[Filter::Tag {
+                value: "keep".into(),
+                negated: false,
+            }])
+            .expect("tag"),
+            BTreeSet::from([a.clone()])
+        );
+        let rejected_negated = db
+            .assets_matching(&[Filter::Tag {
+                value: "rejected".into(),
+                negated: true,
+            }])
+            .expect("negated tag");
+        assert!(rejected_negated.contains(&a));
+        assert!(!rejected_negated.contains(&b));
+    }
+
+    #[test]
+    fn time_filters_bound_by_mtime_and_combine_with_other_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, a, b) = filters_fixture(dir.path());
+
+        assert_eq!(
+            db.assets_matching(&[
+                Filter::Tag {
+                    value: "keep".into(),
+                    negated: false,
+                },
+                Filter::Before(1500),
+            ])
+            .expect("tag and before"),
+            BTreeSet::from([a])
+        );
+        assert!(
+            db.assets_matching(&[Filter::After(1500)])
+                .expect("after")
+                .contains(&b)
+        );
+    }
+
+    #[test]
+    fn kind_and_volume_filters_match_by_id_or_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, a, b) = filters_fixture(dir.path());
+
+        assert_eq!(
+            db.assets_matching(&[Filter::Kind {
+                value: "video".into(),
+                negated: false,
+            }])
+            .expect("kind video"),
+            BTreeSet::from([a.clone()])
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Kind {
+                value: "other".into(),
+                negated: false,
+            }])
+            .expect("kind other"),
+            BTreeSet::from([b])
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Volume {
+                value: "v1".into(),
+                negated: false,
+            }])
+            .expect("volume by id"),
+            BTreeSet::from([a.clone()])
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Volume {
+                value: "Card A".into(),
+                negated: false,
+            }])
+            .expect("volume by label"),
+            BTreeSet::from([a])
+        );
+    }
+
+    #[test]
+    fn para_filter_matches_assigned_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, a, _b) = filters_fixture(dir.path());
+
+        assert_eq!(
+            db.assets_matching(&[Filter::Para {
+                node: "N1".into(),
+                negated: false,
+            }])
+            .expect("para"),
+            BTreeSet::from([a])
+        );
+    }
+
+    #[test]
+    fn online_filter_handles_mounted_ids_and_the_empty_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, a, b) = filters_fixture(dir.path());
+
+        assert_eq!(
+            db.assets_matching(&[Filter::Online {
+                ids: vec!["v1".into()],
+                want: true,
+            }])
+            .expect("online true"),
+            BTreeSet::from([a.clone()])
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Online {
+                ids: vec!["v1".into()],
+                want: false,
+            }])
+            .expect("online false"),
+            BTreeSet::from([b.clone()])
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Online {
+                ids: vec![],
+                want: true,
+            }])
+            .expect("online empty want true"),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Online {
+                ids: vec![],
+                want: false,
+            }])
+            .expect("online empty want false"),
+            BTreeSet::from([a, b])
+        );
+    }
+
+    #[test]
+    fn asset_summaries_carry_name_volumes_tags_para() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::VolumeSeen {
+                    volume: "v1".into(),
+                    label: "Card A".into(),
+                },
+                Op::VolumeSeen {
+                    volume: "v2".into(),
+                    label: "Card B".into(),
+                },
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v1".into(),
+                    path: "clips/beach.mov".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v2".into(),
+                    path: "clips/beach_copy.mov".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+                Op::TagAdd {
+                    asset: a.clone(),
+                    tag: "keep".into(),
+                },
+                Op::TagAdd {
+                    asset: a.clone(),
+                    tag: "topic/drone".into(),
+                },
+                Op::ParaNodeCreate {
+                    node: "N1".into(),
+                    kind: ParaKind::Project,
+                    name: "client-x".into(),
+                },
+                Op::AssetParaSet {
+                    asset: a.clone(),
+                    node: "N1".into(),
+                },
+            ],
+        );
+
+        let summaries = db
+            .asset_summaries(std::slice::from_ref(&a))
+            .expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.asset, a);
+        assert_eq!(
+            s.name, "beach.mov",
+            "name must be the first instance's basename, ordered by volume then path"
+        );
+        assert_eq!(
+            s.volumes,
+            vec![
+                ("v1".to_string(), "Card A".to_string()),
+                ("v2".to_string(), "Card B".to_string()),
+            ]
+        );
+        assert_eq!(s.tags, vec!["keep".to_string(), "topic/drone".to_string()]);
+        assert_eq!(s.para.as_deref(), Some("N1"));
     }
 }

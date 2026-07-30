@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
+use majestical_core::ports::Filter;
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
 use std::collections::{BTreeSet, HashMap};
@@ -221,9 +222,19 @@ pub(crate) fn cmd_search(
     json: bool,
 ) -> Result<()> {
     let (db, _projection) = open_catalog(app, catalog_dir)?;
-    let ids = match (name, tag) {
-        (Some(n), None) => db.search_by_name(&n)?,
-        (None, Some(t)) => db.search_by_tag(&t)?,
+    let ids: Vec<AssetId> = match (name, tag) {
+        (Some(n), None) => db
+            .search_names_ranked(&[n], 200)?
+            .into_iter()
+            .map(|(asset, _rank)| asset)
+            .collect(),
+        (None, Some(t)) => db
+            .assets_matching(&[Filter::Tag {
+                value: t,
+                negated: false,
+            }])?
+            .into_iter()
+            .collect(),
         // The `search_by` ArgGroup (required, mutually exclusive)
         // guarantees clap rejects these combinations before `main`
         // ever runs, so this arm can't be reached.

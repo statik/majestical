@@ -2,6 +2,7 @@
 //! never the concrete adapters behind them.
 use crate::event::{AssetId, Event};
 use crate::projection::Projection;
+use std::collections::BTreeSet;
 
 /// Adapter errors crossing a port boundary keep their message and source
 /// but drop the concrete type, so core-level code never names an adapter.
@@ -62,17 +63,52 @@ pub trait EventLog {
     ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError>;
 }
 
+/// One hard search filter, already resolved to storage terms (para refs are
+/// node ids; `Online` carries the currently-mounted volume ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    Tag { value: String, negated: bool },
+    Volume { value: String, negated: bool },
+    Para { node: String, negated: bool },
+    Kind { value: String, negated: bool },
+    Online { ids: Vec<String>, want: bool },
+    Before(u64),
+    After(u64),
+}
+
+/// Presentation row for one search hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetSummary {
+    pub asset: AssetId,
+    pub name: String,
+    /// (volume id, volume label) pairs holding an instance.
+    pub volumes: Vec<(String, String)>,
+    pub tags: Vec<String>,
+    pub para: Option<String>,
+}
+
 /// Queryable projection storage, disposable and rebuildable.
 pub trait CatalogStore {
     /// # Errors
     /// Returns `PortError` when the store cannot be rebuilt.
     fn rebuild(&mut self, projection: &Projection) -> Result<(), PortError>;
+    /// Assets satisfying every filter (conjunction).
     /// # Errors
     /// Returns `PortError` when the query fails.
-    fn search_by_tag(&self, tag: &str) -> Result<Vec<AssetId>, PortError>;
+    fn assets_matching(&self, filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError>;
+    /// Assets whose name matches any of `terms`, ranked best-first, capped at
+    /// `limit` rows.
     /// # Errors
     /// Returns `PortError` when the query fails.
-    fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError>;
+    fn search_names_ranked(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(AssetId, f64)>, PortError>;
+    /// Presentation rows for exactly the given asset ids.
+    /// # Errors
+    /// Returns `PortError` when the query fails.
+    fn asset_summaries(&self, ids: &[AssetId]) -> Result<Vec<AssetSummary>, PortError>;
     /// Every volume ever seen: (id, label, last-seen wall ms), ordered by id.
     /// # Errors
     /// Returns `PortError` when the query fails.
@@ -141,10 +177,17 @@ mod tests {
                 .collect();
             Ok(())
         }
-        fn search_by_tag(&self, _tag: &str) -> Result<Vec<AssetId>, PortError> {
+        fn assets_matching(&self, _filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError> {
+            Ok(BTreeSet::new())
+        }
+        fn search_names_ranked(
+            &self,
+            _terms: &[String],
+            _limit: usize,
+        ) -> Result<Vec<(AssetId, f64)>, PortError> {
             Ok(Vec::new())
         }
-        fn search_by_name(&self, _needle: &str) -> Result<Vec<AssetId>, PortError> {
+        fn asset_summaries(&self, _ids: &[AssetId]) -> Result<Vec<AssetSummary>, PortError> {
             Ok(Vec::new())
         }
         fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError> {

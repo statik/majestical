@@ -1,4 +1,5 @@
-//! Ingest engine: plan, verified copy, transfer journal, ASC MHL.
+//! Ingest engine: planning and layout templates (verified copy, journal, and
+//! ASC MHL arrive in later tasks).
 pub mod plan;
 pub mod template;
 

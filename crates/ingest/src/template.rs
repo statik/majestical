@@ -18,7 +18,13 @@ pub fn render(template: &str, ctx: &TemplateCtx) -> Result<String, IngestError> 
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
+        let literal = &rest[..open];
+        if literal.contains('}') {
+            return Err(IngestError::Template(format!(
+                "unbalanced '}}' in template '{template}'"
+            )));
+        }
+        out.push_str(literal);
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
             return Err(IngestError::Template(format!(
@@ -42,6 +48,11 @@ pub fn render(template: &str, ctx: &TemplateCtx) -> Result<String, IngestError> 
         }
         out.push_str(value);
         rest = &after[close + 1..];
+    }
+    if rest.contains('}') {
+        return Err(IngestError::Template(format!(
+            "unbalanced '}}' in template '{template}'"
+        )));
     }
     out.push_str(rest);
     for seg in out.split('/') {
@@ -92,6 +103,19 @@ mod tests {
         };
         let err = render("{date", &ctx).expect_err("unbalanced brace must error");
         assert!(err.to_string().contains("unbalanced"), "got: {err}");
+    }
+
+    #[test]
+    fn stray_close_brace_is_an_error() {
+        let ctx = TemplateCtx {
+            date: "2026-07-29".into(),
+            source_label: "card-a".into(),
+        };
+        let err = render("date}", &ctx).expect_err("stray '}' must error");
+        assert!(
+            err.to_string().contains("unbalanced") && err.to_string().contains('}'),
+            "got: {err}"
+        );
     }
 
     #[test]

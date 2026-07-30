@@ -88,6 +88,24 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
 }
 
+/// Reduces `path` to a `/`-separated string relative to `source`. Pure and
+/// filesystem-free so the non-UTF-8 rejection path is unit-testable without
+/// depending on whether the host filesystem permits invalid-UTF-8 names.
+///
+/// # Errors
+/// Returns the rejection reason as `Err(String)` when `path`'s relative
+/// component is not valid UTF-8.
+fn rel_utf8(source: &Path, path: &Path) -> Result<String, String> {
+    let rel_path = path.strip_prefix(source).unwrap_or(path);
+    match rel_path.to_str() {
+        Some(s) => Ok(s.replace('\\', "/")),
+        None => Err(IngestError::NonUtf8Path {
+            path: path.to_path_buf(),
+        }
+        .to_string()),
+    }
+}
+
 /// Walks `source` and decides, per file, whether it is new content, a
 /// confirmed duplicate of something already in the catalog, or rejected.
 ///
@@ -113,24 +131,24 @@ pub fn plan_source(
             continue;
         }
         let path = entry.path();
-        let rel_path = path.strip_prefix(source).unwrap_or(path);
-
-        let Some(rel_utf8) = rel_path.to_str() else {
-            files.push(PlannedFile {
-                source: path.to_path_buf(),
-                rel: rel_path.to_string_lossy().replace('\\', "/"),
-                size: 0,
-                prehash: None,
-                decision: Decision::Rejected {
-                    reason: IngestError::NonUtf8Path {
-                        path: path.to_path_buf(),
-                    }
-                    .to_string(),
-                },
-            });
-            continue;
+        let rel = match rel_utf8(source, path) {
+            Ok(rel) => rel,
+            Err(reason) => {
+                let lossy_rel = path
+                    .strip_prefix(source)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push(PlannedFile {
+                    source: path.to_path_buf(),
+                    rel: lossy_rel,
+                    size: 0,
+                    prehash: None,
+                    decision: Decision::Rejected { reason },
+                });
+                continue;
+            }
         };
-        let rel = rel_utf8.replace('\\', "/");
 
         let size = entry
             .metadata()
@@ -239,6 +257,16 @@ mod tests {
         let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
         assert_eq!(plan.files.len(), 1);
         assert!(matches!(plan.files[0].decision, Decision::Rejected { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rel_utf8_rejects_a_non_utf8_name_without_touching_the_filesystem() {
+        use std::os::unix::ffi::OsStrExt;
+        let source = Path::new("/src");
+        let path = source.join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
+        let err = rel_utf8(source, &path).expect_err("non-UTF-8 name must be rejected");
+        assert!(err.contains("non-UTF-8"), "got: {err}");
     }
 
     #[cfg(unix)]

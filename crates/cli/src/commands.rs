@@ -657,6 +657,9 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         .resume
         .clone()
         .unwrap_or_else(|| ulid::Ulid::generate().to_string());
+    if args.resume.is_some() {
+        check_resume_journal_exists(catalog_dir, &run_id)?;
+    }
     eprintln!("run {run_id} — resume with: --resume {run_id}");
 
     let dests = build_dest_specs(&args.dest, &subdir);
@@ -796,11 +799,34 @@ fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpe
         .collect()
 }
 
+fn journal_path_for(catalog_dir: &Path, run_id: &str) -> PathBuf {
+    catalog_dir.join("runs").join(format!("{run_id}.jsonl"))
+}
+
+/// Guards `--resume <id>`: a run id with no journal on disk is almost always
+/// a typo, not a fresh run someone genuinely wants under that exact id —
+/// silently starting one there would hide the mistake, and would write to
+/// wherever `<id>` interpolates to in the path (a crafted id like
+/// `../../x` would otherwise escape `runs/` entirely the first time
+/// anything opens that path for append). Requiring the journal to already
+/// exist closes both: nothing is created until this check passes.
+fn check_resume_journal_exists(catalog_dir: &Path, run_id: &str) -> Result<()> {
+    let journal_path = journal_path_for(catalog_dir, run_id);
+    anyhow::ensure!(
+        journal_path.is_file(),
+        "no journal for run '{run_id}' — check the id printed at the start of the original run"
+    );
+    Ok(())
+}
+
 /// Opens (or resumes) the run's journal and executes the copy/verify engine.
 /// Always loads the journal before appending, even on a fresh run: loading a
 /// journal that doesn't exist yet returns an empty fold, so a fresh run and
 /// a `--resume` both flow through the same path rather than branching twice
-/// on whether `--resume` was given.
+/// on whether `--resume` was given. Callers resuming an existing run must
+/// call `check_resume_journal_exists` first — this function creates the
+/// journal file if it's missing, which is correct for a fresh run but would
+/// silently paper over a typo'd `--resume` id.
 fn run_ingest_engine(
     catalog_dir: &Path,
     run_id: &str,
@@ -808,7 +834,7 @@ fn run_ingest_engine(
     dests: &[engine::DestSpec],
     jobs: Option<usize>,
 ) -> Result<engine::Outcome> {
-    let journal_path = catalog_dir.join("runs").join(format!("{run_id}.jsonl"));
+    let journal_path = journal_path_for(catalog_dir, run_id);
     let resume_set = journal::Journal::load(&journal_path)
         .with_context(|| format!("loading journal at {}", journal_path.display()))?
         .placed;
@@ -959,6 +985,9 @@ fn manifest_ops(
         .iter()
         .filter_map(|(root, id, _)| {
             let (_, written) = generations.iter().find(|(r, _)| r == root)?;
+            // `file_name()` is never `None` here: `write_generation` always
+            // builds `written.path` as `ascmhl_dir.join(<generated filename>)`
+            // with a non-empty generated filename, never a bare `..` or `/`.
             let mhl_path = format!(
                 "ascmhl/{}",
                 written

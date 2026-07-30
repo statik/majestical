@@ -140,6 +140,17 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
 - **Stale `.maj-partial-*` quarantine files are never garbage-collected** —
   carried forward from the Task 5 review; a failed or corrupted destination
   keeps its partial forever unless a human deletes it.
+- **`--resume` re-renders `{date}` at resume time, not at the original run's
+  time** — carried forward from the Task 7 quality review. `cmd_ingest`
+  recomputes `subdir` (including `{date}`) fresh on every invocation; a run
+  interrupted before midnight and resumed after it targets a new dated
+  subdir, so the resumed invocation re-copies everything there and
+  yesterday's already-placed copies are orphaned under the old subdir (no
+  data loss, but resume stops being a resume for an overnight interruption).
+  The durable fix is to persist the originally rendered subdir in the
+  journal — `Record::RunStarted` already carries `source`/`dests` and could
+  carry `subdir` too — and have a `--resume` load it from there instead of
+  re-rendering.
 
 ## Done in phase 3
 
@@ -237,6 +248,15 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
     mutants, each replaceable with an empty iterator): never called
     anywhere in this crate (only by downstream crates), so each needed a
     direct test.
+
+- **Discretionary polish flagged by the Task 7 quality review, not applied**
+  (none affect behavior): `commands.rs`'s `(PathBuf, String, String)`
+  destination-volume tuples could be a named struct instead of a positional
+  one; `cmd_ingest` could take a single timestamp at the top and derive both
+  `hashdate` and `hashdate_ms` from it rather than computing them where
+  they're first needed; `acceptance.rs`'s per-scenario setup has some
+  duplication a shared step could absorb; `cli_smoke`'s `read_events` hardcodes
+  the `0001.jsonl` segment name instead of globbing `events/*/*.jsonl`.
 
 ## Done in phase 2
 

@@ -1077,6 +1077,45 @@ fn ingest_rejects_a_non_directory_source() {
         .stderr(contains("source must be a directory"));
 }
 
+/// `--resume <id>` for a run id with no journal on disk fails loudly (a
+/// typo'd or fabricated id, not a fresh run under that name) and creates
+/// nothing — no journal file, no copied bytes.
+#[test]
+fn ingest_resume_with_an_unknown_run_id_fails_and_creates_nothing() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let d1 = tempfile::tempdir().unwrap();
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+
+    maj(&root)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .args(["--para", "project/shoot", "--resume", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "no journal for run 'nonexistent' — check the id printed at the start of the original run",
+        ));
+
+    assert!(
+        !root.join("runs").exists(),
+        "an unknown --resume id must not create a runs/ directory"
+    );
+    assert!(
+        !d1.path().join("ascmhl").exists(),
+        "an unknown --resume id must not copy anything"
+    );
+}
+
 /// An archived PARA node is rejected as an ingest target, even when
 /// addressed by raw node id (the one case `resolve_para_node` otherwise
 /// still allows, so a rename can still reach an archived node).

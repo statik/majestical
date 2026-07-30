@@ -9,7 +9,6 @@ use majestical_core::projection::{
     AssetState, ManifestRecord, ParaNodeState, Projection, Touched, VolumeState,
 };
 use rusqlite::{Connection, Transaction};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -26,19 +25,25 @@ pub enum CatalogError {
 /// On-disk format version for the `apply_snapshot` row. Bumped whenever the
 /// serialized shape changes in a way old rows can't deserialize into;
 /// `load_apply_state` treats a mismatch the same as a missing snapshot.
+///
+/// This has never shipped, so an in-place shape change (e.g. serializing
+/// `Projection` directly instead of wrapped in a struct) doesn't need a bump
+/// on its own — an old-format row just fails to deserialize as the new
+/// shape, `load_apply_state` returns `None`, and `open_synced` falls back to
+/// a full rebuild. Self-healing by construction; bump this only when a
+/// future change needs two different versions to coexist across a real
+/// upgrade.
 const SNAPSHOT_VERSION: i64 = 1;
-
-/// The serialized payload of `apply_snapshot.projection`.
-#[derive(Serialize, Deserialize)]
-struct Snapshot {
-    projection: Projection,
-}
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyMode {
-    Incremental { applied: usize },
+    /// Applied `applied` newly-read events on top of the saved snapshot;
+    /// `applied: 0` means the open was a no-op — nothing new was in the log.
+    Incremental {
+        applied: usize,
+    },
     FullRebuild,
 }
 
@@ -80,11 +85,15 @@ impl SqliteCatalog {
 
     /// Opens the catalog at `db_path` and brings it up to date with `log`,
     /// applying only the events past whatever cursor was last saved here —
-    /// or, when there's no usable saved state (first open, a corrupt or
-    /// version-mismatched snapshot, or a stale cursor `log` can no longer
-    /// resume from), rebuilding from scratch. Returns the resulting
-    /// projection alongside the mode actually taken, so a caller (or a test)
-    /// can tell which path ran.
+    /// or, when there's no usable saved state, rebuilding from scratch.
+    /// "No usable saved state" covers: the first-ever open; a missing,
+    /// corrupt, or version-mismatched snapshot; and a resume read that
+    /// fails for any reason, whether that's a stale cursor `log` can no
+    /// longer resume from, or an I/O error reading it — in the latter case
+    /// the retry costs one wasted resume attempt, and the same error
+    /// propagates from the full read that follows if it isn't transient.
+    /// Returns the resulting projection alongside the mode actually taken,
+    /// so a caller (or a test) can tell which path ran.
     ///
     /// Corrupt log lines are skipped rather than failing the read, same as
     /// `EventLog::read_since_reporting`; `on_bad_line` is handed straight
@@ -116,7 +125,7 @@ impl SqliteCatalog {
                     db.apply_touched(&projection, &touched, &new_cursors)?;
                     return Ok((db, projection, ApplyMode::Incremental { applied }));
                 }
-                Err(_stale) => { /* fall through to full rebuild */ }
+                Err(_resume_failed) => { /* fall through to full rebuild */ }
             }
         }
         let (events, cursors) = log.read_since_reporting(&[], on_bad_line)?;
@@ -145,7 +154,7 @@ impl SqliteCatalog {
         if version != SNAPSHOT_VERSION {
             return None;
         }
-        let snapshot: Snapshot = serde_json::from_str(&projection_json).ok()?;
+        let projection: Projection = serde_json::from_str(&projection_json).ok()?;
         let mut stmt = self
             .conn
             .prepare("SELECT machine, segment, offset FROM apply_cursors ORDER BY machine, segment")
@@ -164,7 +173,7 @@ impl SqliteCatalog {
         for row in rows {
             cursors.push(row.ok()?);
         }
-        Some((cursors, snapshot.projection))
+        Some((cursors, projection))
     }
 
     /// Writes `cursors` and `projection` as the new apply-state snapshot, in
@@ -174,9 +183,7 @@ impl SqliteCatalog {
         cursors: &[LogCursor],
         projection: &Projection,
     ) -> Result<(), CatalogError> {
-        let snapshot_json = serde_json::to_string(&Snapshot {
-            projection: projection.clone(),
-        })?;
+        let snapshot_json = serde_json::to_string(projection)?;
         let tx = self.conn.transaction()?;
         Self::write_apply_state(&tx, cursors, &snapshot_json)?;
         tx.commit()?;
@@ -222,9 +229,7 @@ impl SqliteCatalog {
         touched: &BTreeSet<Touched>,
         cursors: &[LogCursor],
     ) -> Result<(), CatalogError> {
-        let snapshot_json = serde_json::to_string(&Snapshot {
-            projection: projection.clone(),
-        })?;
+        let snapshot_json = serde_json::to_string(projection)?;
         let tx = self.conn.transaction()?;
         for t in touched {
             match t {

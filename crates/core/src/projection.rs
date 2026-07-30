@@ -1428,6 +1428,56 @@ mod tests {
         assert_eq!(fwd.manifests("V1").count(), 1);
     }
 
+    /// Every field of `VerificationRecord`/`ManifestRecord` gets a distinct
+    /// value here, so a field-mapping swap inside `from_op` (e.g. `algo` and
+    /// `value` transposed, or `mhl_path` and `roothash` transposed) fails
+    /// this test — a bug otherwise invisible to `majestical-core` itself,
+    /// only ever caught by accident downstream in catalog-sqlite's column
+    /// assertions.
+    #[test]
+    fn verification_and_manifest_records_map_every_field_correctly() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::VerificationRecorded {
+                asset: a.clone(),
+                volume: "vol-v".into(),
+                path: "path-p".into(),
+                algo: "algo-g".into(),
+                value: "value-l".into(),
+                outcome: VerifyOutcome::Failed,
+                hashdate_ms: 111,
+            },
+        ));
+        p.apply(&ev(
+            2,
+            2,
+            "m1",
+            Op::ManifestRecorded {
+                volume: "vol-m".into(),
+                mhl_path: "mhl-path".into(),
+                generation: 7,
+                roothash: "roothash-r".into(),
+            },
+        ));
+
+        let v = p.verifications(&a).next().expect("verification recorded");
+        assert_eq!(v.volume, "vol-v");
+        assert_eq!(v.path, "path-p");
+        assert_eq!(v.algo, "algo-g");
+        assert_eq!(v.value, "value-l");
+        assert_eq!(v.outcome, VerifyOutcome::Failed);
+        assert_eq!(v.hashdate_ms, 111);
+
+        let m = p.manifests("vol-m").next().expect("manifest recorded");
+        assert_eq!(m.generation, 7);
+        assert_eq!(m.mhl_path, "mhl-path");
+        assert_eq!(m.roothash, "roothash-r");
+    }
+
     #[test]
     fn saved_search_set_remove_is_lww_per_name() {
         let mut p = Projection::default();

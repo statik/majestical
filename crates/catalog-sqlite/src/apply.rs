@@ -2,14 +2,14 @@
 //! `open_synced`/`apply_touched`'s incremental resume-from-cursor path, and
 //! the per-entity insert helpers both share.
 //!
-//! `saved_searches` has no `CatalogStore` trait method: the CLI reads saved
-//! searches straight from the `Projection` it already holds (`open_catalog`
-//! returns one alongside the `SqliteCatalog`), so there's no query path that
-//! needs this table today. It exists anyway, kept in sync by `rebuild` and
-//! `apply_touched` like every other entity, for future surfaces (a GUI or an
-//! MCP server) that won't hold a `Projection` in memory, and so `debug_dump`
-//! stays a complete equivalence check between the incremental and rebuild
-//! paths.
+//! `saved_searches` has no `CatalogStore` trait method: the CLI reads and
+//! writes saved searches straight off the event-log projection (`FsApp::
+//! projection`), never through this sqlite catalog, so there's no query
+//! path that needs this table today. It exists anyway, kept in sync by
+//! `rebuild` and `apply_touched` like every other entity, for future
+//! surfaces (a GUI or an MCP server) that read the catalog over SQL rather
+//! than holding a `Projection` in memory, and so `debug_dump` stays a
+//! complete equivalence check between the incremental and rebuild paths.
 use crate::{ApplyMode, CatalogError, SNAPSHOT_VERSION, SqliteCatalog};
 use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
 use majestical_core::media_kind::media_kind;

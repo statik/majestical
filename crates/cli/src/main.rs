@@ -68,7 +68,7 @@ enum Cmd {
         #[arg(long, conflicts_with = "saved")]
         save: Option<String>,
         /// Run a previously saved search instead of a literal query.
-        #[arg(long, conflicts_with = "save")]
+        #[arg(long, conflicts_with_all = ["save", "query"])]
         saved: Option<String>,
     },
     /// Manage saved searches.

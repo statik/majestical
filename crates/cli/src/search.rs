@@ -38,37 +38,40 @@ const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
 /// slice.
 ///
 /// # Errors
-/// Returns an error if the query fails to parse, names an unknown or
-/// malformed filter, or (once parsed) carries neither terms nor filters.
+/// Returns an error if `--save` names an empty string, the query fails to
+/// parse, names an unknown or malformed filter, or (once parsed) carries
+/// neither terms nor filters.
 ///
 /// Resolves `args`' query — a literal string, or a `--saved` name looked up
-/// in the projection — then, if `--save` was given, emits a
-/// `SavedSearchSet` for it before running it. The emit happens before
-/// `run_search` so the newly saved search is part of the projection the
-/// search itself reads (`open_catalog` re-reads the event log fresh).
+/// in the projection — then runs it. Only once `run_search` succeeds does a
+/// `--save` get emitted as a `SavedSearchSet`: an invalid query must never
+/// poison the append-only, replicated event log with a saved search that
+/// can never itself be run. The confirmation goes to stderr, not stdout —
+/// `--json` callers get pure JSON on stdout even when also saving.
 pub(crate) fn cmd_search(app: &mut FsApp, catalog_dir: &Path, args: &SearchArgs) -> Result<()> {
-    let query = match (&args.query, &args.saved) {
-        (Some(q), None) => q.clone(),
-        (None, Some(name)) => {
-            let projection = app.projection()?;
-            projection
-                .saved_search(name)
-                .with_context(|| format!("no saved search named '{name}'"))?
-                .to_string()
-        }
-        (Some(_), Some(_)) => {
-            unreachable!("clap conflicts_with rules out query and --saved together")
-        }
-        (None, None) => bail!("give a query string or --saved <name>"),
+    if let Some(name) = &args.save {
+        anyhow::ensure!(!name.is_empty(), "saved search name must not be empty");
+    }
+    let query = if let Some(q) = &args.query {
+        q.clone()
+    } else if let Some(name) = &args.saved {
+        let projection = app.projection()?;
+        projection
+            .saved_search(name)
+            .with_context(|| format!("no saved search named '{name}'"))?
+            .to_string()
+    } else {
+        bail!("give a query string or --saved <name>");
     };
+    run_search(&*app, catalog_dir, &query, args.limit, args.json)?;
     if let Some(name) = &args.save {
         app.emit(vec![Op::SavedSearchSet {
             name: name.clone(),
             query: query.clone(),
         }])?;
-        println!("saved search '{name}'");
+        eprintln!("saved search '{name}'");
     }
-    run_search(&*app, catalog_dir, &query, args.limit, args.json)
+    Ok(())
 }
 
 /// Resolves filters against the catalog and prints results for `query`.
@@ -308,8 +311,8 @@ fn print_search_results_text(
 /// unlike `cmd_search` this needs no `catalog_dir`.
 ///
 /// # Errors
-/// Returns an error if `Rm` names a search that doesn't exist, or the event
-/// log can't be read or appended to.
+/// Returns an error if `Rm` names an empty string or a search that doesn't
+/// exist, or the event log can't be read or appended to.
 pub(crate) fn cmd_searches(app: &mut FsApp, cmd: SearchesCmd) -> Result<()> {
     match cmd {
         SearchesCmd::List { json } => {
@@ -317,12 +320,11 @@ pub(crate) fn cmd_searches(app: &mut FsApp, cmd: SearchesCmd) -> Result<()> {
             Ok(())
         }
         SearchesCmd::Rm { name } => {
-            {
-                let projection = app.projection()?;
-                projection
-                    .saved_search(&name)
-                    .with_context(|| format!("no saved search named '{name}'"))?;
-            }
+            anyhow::ensure!(!name.is_empty(), "saved search name must not be empty");
+            let projection = app.projection()?;
+            projection
+                .saved_search(&name)
+                .with_context(|| format!("no saved search named '{name}'"))?;
             app.emit(vec![Op::SavedSearchRemove { name: name.clone() }])?;
             println!("removed saved search '{name}'");
             Ok(())

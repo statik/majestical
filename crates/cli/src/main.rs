@@ -2,6 +2,11 @@
 mod app;
 mod commands;
 mod iso8601;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the search rework in the next task")
+)]
+mod query;
 mod state_dir;
 mod volume_identity;
 

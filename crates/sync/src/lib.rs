@@ -1,6 +1,13 @@
 //! File-based event log: `events/<machine-id>/NNNN.jsonl` under a sync
 //! root. Append-only; reading merges every machine's segments. Designed
 //! so dumb transports (Dropbox, rsync, a shuttle drive) can carry it.
+//!
+//! Known divergence: [`FileEventLog::read_all_reporting`] reads each
+//! segment whole with `fs::read_to_string`, so non-UTF-8 bytes anywhere in
+//! a segment fail the whole read, while
+//! [`FileEventLog::read_since_reporting`] decodes line by line and degrades
+//! a non-UTF-8 line to the `on_bad_line` callback instead. Unifying the two
+//! is deferred to a follow-up.
 use majestical_core::clock::MachineId;
 use majestical_core::event::Event;
 use majestical_core::ports::{EventLog, LogCursor, PortError};
@@ -87,9 +94,11 @@ impl FileEventLog {
     /// Append to this machine's current segment (0001.jsonl for phase 1;
     /// segment rotation arrives with sync push/pull in a later phase).
     ///
-    /// No fsync: a crash mid-write may drop the tail of the batch, and
-    /// readers tolerate torn tails by treating the incomplete line as a bad
-    /// line rather than failing the whole read.
+    /// No fsync: a crash mid-write may drop the tail of the batch. Readers
+    /// tolerate this, but differently: [`Self::read_all_reporting`] treats
+    /// the incomplete line as a bad line rather than failing the whole
+    /// read, while [`Self::read_since_reporting`] defers it — the cursor
+    /// stops before the torn tail so it's re-read once the write completes.
     ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized, or
@@ -158,31 +167,7 @@ impl FileEventLog {
             if !is_dir.is_dir() {
                 continue;
             }
-            let segment_entries = fs::read_dir(machine.path()).map_err(|source| LogError::Io {
-                path: machine.path(),
-                source,
-            })?;
-            let mut segments: Vec<PathBuf> = Vec::new();
-            for entry in segment_entries {
-                let entry = entry.map_err(|source| LogError::Io {
-                    path: machine.path(),
-                    source,
-                })?;
-                let file_type = entry.file_type().map_err(|source| LogError::Io {
-                    path: entry.path(),
-                    source,
-                })?;
-                let path = entry.path();
-                if file_type.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
-                    segments.push(path);
-                }
-            }
-            // Lexicographic sort: segment names must stay equal-width
-            // (NNNN.jsonl) for this to also be numeric order. The rotation
-            // implementer must preserve zero-padding or switch to a
-            // numeric-aware sort.
-            segments.sort();
-            for seg in segments {
+            for (_, seg) in Self::list_segments(&machine.path())? {
                 let text = fs::read_to_string(&seg).map_err(|source| LogError::Io {
                     path: seg.clone(),
                     source,
@@ -262,7 +247,7 @@ impl FileEventLog {
                 Err(_) => on_bad_line(&String::from_utf8_lossy(line)),
             }
         }
-        let new_offset = from + u64::try_from(consumed).unwrap_or(u64::MAX);
+        let new_offset = from.saturating_add(u64::try_from(consumed).unwrap_or(u64::MAX));
         Ok((events, new_offset))
     }
 
@@ -538,7 +523,10 @@ mod tests {
             segment: "0001.jsonl".into(),
             offset: 999_999,
         };
-        assert!(log.read_since_reporting(&[stale], |_| {}).is_err());
+        assert!(matches!(
+            log.read_since_reporting(&[stale], |_| {}),
+            Err(LogError::StaleCursor { .. })
+        ));
     }
 
     #[test]
@@ -551,7 +539,56 @@ mod tests {
             segment: "0001.jsonl".into(),
             offset: 1,
         };
-        assert!(log.read_since_reporting(&[stale], |_| {}).is_err());
+        assert!(matches!(
+            log.read_since_reporting(&[stale], |_| {}),
+            Err(LogError::StaleCursor { .. })
+        ));
+    }
+
+    #[test]
+    fn read_since_reports_a_complete_corrupt_line_and_still_advances_past_it() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open");
+        f.write_all(b"not json\n").expect("write corrupt line");
+        let mut bad_lines = Vec::new();
+        let (events, cursors) = log
+            .read_since_reporting(&[], |line| bad_lines.push(line.to_string()))
+            .expect("read");
+        assert_eq!(events.len(), 1, "the valid event still parses");
+        assert_eq!(bad_lines, vec!["not json"], "callback fires exactly once");
+        let len = std::fs::metadata(&seg).expect("meta").len();
+        assert_eq!(
+            cursors[0].offset, len,
+            "cursor advances past the valid event and the corrupt line"
+        );
+    }
+
+    #[test]
+    fn read_since_reports_non_utf8_bytes_as_a_bad_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let log = FileEventLog::init(dir.path(), &m).expect("init");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        std::fs::write(&seg, [0xFF, 0xFE, b'\n']).expect("write non-utf8 line");
+        let mut bad = 0;
+        let (events, cursors) = log.read_since_reporting(&[], |_| bad += 1).expect("read");
+        assert_eq!(events.len(), 0);
+        assert_eq!(
+            bad, 1,
+            "the non-utf8 line is reported through the lossy branch"
+        );
+        assert_eq!(
+            cursors[0].offset, 3,
+            "cursor advances past the complete line"
+        );
     }
 
     #[test]

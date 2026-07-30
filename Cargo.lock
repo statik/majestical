@@ -832,6 +832,8 @@ dependencies = [
 name = "majestical-ingest"
 version = "0.1.0"
 dependencies = [
+ "cucumber",
+ "futures",
  "hostname",
  "majestical-core",
  "proptest",

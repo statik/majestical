@@ -1133,4 +1133,144 @@ mod history_tests {
         assert!(report.new_files.is_empty());
         assert_eq!(report.written.generation, 2);
     }
+
+    /// `verify_scenario_alter_delete_add` only ever exercises the altered,
+    /// missing, and new-file arms of `verify_dir`'s diff (`report.verified`
+    /// is empty there) — no existing test confirms an unchanged file is
+    /// actually re-tagged `Verified` in the new generation, rather than
+    /// silently keeping whatever action `hash_dir` gave it (`Original`).
+    /// This discriminates a mutation that drops the `action:
+    /// HashAction::Verified` override in that arm.
+    #[test]
+    fn unchanged_file_is_tagged_verified_in_the_new_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_fixture(dir.path());
+        let baseline = hash_dir(dir.path(), "2026-07-30T00:00:00Z").expect("hash_dir");
+        write_generation(dir.path(), &baseline).expect("write baseline generation");
+
+        // Nothing changes on disk before the second pass.
+        let report = verify_dir(dir.path(), "2026-07-30T00:01:00Z").expect("verify_dir");
+        assert_eq!(report.verified.len(), 2);
+        assert!(report.altered.is_empty());
+        assert!(report.missing.is_empty());
+        assert!(report.new_files.is_empty());
+
+        let second = read_generation(&report.written.path).expect("read new generation");
+        assert_eq!(second.entries.len(), 2);
+        for entry in &second.entries {
+            assert_eq!(
+                entry.action,
+                HashAction::Verified,
+                "an unchanged file's new-generation entry must be tagged Verified, not {:?}",
+                entry.action
+            );
+        }
+    }
+
+    /// A `<hash>` element must have `<path>` and `<xxh64>` children; a
+    /// self-closed `<hash/>` (parsed as a single `Event::Empty`, not a
+    /// `Start`/`End` pair) has neither and must still be rejected, the same
+    /// as a `<hash></hash>` with no content would be. This discriminates
+    /// deleting the `Event::Empty` match arm in `read_generation`, which
+    /// would otherwise silently ignore the malformed entry instead of
+    /// erroring — turning a truncated/corrupt manifest into a
+    /// shorter-but-valid-looking history.
+    #[test]
+    fn a_self_closed_hash_element_is_rejected_as_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad.mhl");
+        fs::write(
+            &path,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <hashes>
+    <hash/>
+  </hashes>
+</hashlist>
+"#,
+        )
+        .expect("write malformed manifest");
+        let result = read_generation(&path);
+        assert!(
+            result.is_err(),
+            "a <hash> with no children must be rejected, not silently dropped"
+        );
+    }
+
+    /// A hand-crafted manifest exercising the reader's context guards at
+    /// once: our own writer (`build_manifest_xml`) never emits a `<tool>`
+    /// or `<creationdate>`/`<hostname>` outside `<creatorinfo>`, nor a
+    /// `<directoryhash>` (the module doc: this crate never computes one) —
+    /// so no existing round-trip test ever proves those guards actually
+    /// gate on context rather than merely agreeing with the happy path.
+    /// This manifest plants a decoy `<tool>`/`<creationdate>`/`<hostname>`
+    /// outside `<creatorinfo>` and a `<directoryhash>` with its own nested
+    /// `<path>`/`<xxh64>` inside a real file's `<hash>`, then asserts only
+    /// the genuine values win and the directory hash never becomes a second
+    /// entry — discriminating the `in_creatorinfo`/`in_hash`/
+    /// `in_directoryhash` guard mutations (including the `handle_end` reset
+    /// arms that turn each flag back off) in one pass.
+    #[test]
+    fn reader_context_guards_ignore_lookalikes_outside_their_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guards.mhl");
+        fs::write(
+            &path,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <creatorinfo>
+    <creationdate>2026-07-30T00:00:00Z</creationdate>
+    <hostname>real-host</hostname>
+    <tool version="1.2.3">majestical</tool>
+  </creatorinfo>
+  <processinfo>
+    <tool version="decoy-should-be-ignored">not-creatorinfo</tool>
+    <creationdate>decoy-should-not-overwrite</creationdate>
+    <hostname>decoy-host</hostname>
+    <process>in-place</process>
+  </processinfo>
+  <hashes>
+    <hash>
+      <path size="4">real/file.mov</path>
+      <xxh64 action="original" hashdate="2026-07-30T00:00:00Z">0011223344556677</xxh64>
+      <directoryhash>
+        <hash>
+          <path size="0">some/dir</path>
+          <xxh64 action="failed" hashdate="1999-01-01T00:00:00Z">deaddeaddeaddead</xxh64>
+        </hash>
+      </directoryhash>
+    </hash>
+  </hashes>
+</hashlist>
+"#,
+        )
+        .expect("write guard-testing manifest");
+
+        // The real file's path/xxh64 are read BEFORE the directoryhash block
+        // on purpose: if the `in_directoryhash` guards fail to gate the
+        // nested (decoy) path/xxh64/hash-close, those decoys silently
+        // overwrite (or prematurely consume) the already-captured real
+        // values — an ordering that a decoy placed *before* the real values
+        // would never expose, since the real values would simply overwrite
+        // the decoy afterward regardless of whether the guard worked. The
+        // decoy's `action`/`hashdate` attributes are deliberately different
+        // from the real entry's (not just its path/xxh64 text), so a guard
+        // mutation that only leaks the attribute-bearing `<xxh64>` start tag
+        // (not its text content) still changes an assertable field.
+        let hash_list = read_generation(&path).expect("read_generation");
+        assert_eq!(hash_list.creation_date, "2026-07-30T00:00:00Z");
+        assert_eq!(hash_list.hostname, "real-host");
+        assert_eq!(hash_list.tool_version, "1.2.3");
+        assert_eq!(
+            hash_list.entries.len(),
+            1,
+            "the directoryhash's nested hash must not become a second entry"
+        );
+        let entry = &hash_list.entries[0];
+        assert_eq!(entry.rel, "real/file.mov");
+        assert_eq!(entry.size, 4);
+        assert_eq!(entry.xxh64, "0011223344556677");
+        assert_eq!(entry.action, HashAction::Original);
+        assert_eq!(entry.hashdate, "2026-07-30T00:00:00Z");
+    }
 }

@@ -749,6 +749,89 @@ mod tests {
         assert_eq!(fwd.asset_para(&a), Some("N2"));
     }
 
+    /// `para_node_create_rename_archive_are_lww_and_order_independent` only
+    /// ever checks `archived()` after an explicit archive op — no test
+    /// confirms a freshly created node starts non-archived, so a mutation
+    /// hardcoding `archived()` to always return `true` survives unnoticed.
+    #[test]
+    fn a_freshly_created_node_is_not_archived() {
+        let node = "N1".to_string();
+        let create = ev(
+            1,
+            1,
+            "m1",
+            Op::ParaNodeCreate {
+                node: node.clone(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            },
+        );
+        let mut p = Projection::default();
+        p.apply(&create);
+        assert!(!p.para_node(&node).expect("node").archived());
+    }
+
+    /// `Projection::assets`/`para_nodes`/`all_manifests` are never called
+    /// anywhere else in this crate (only by downstream crates, which
+    /// `cargo mutants -p majestical-core` doesn't exercise) — each is
+    /// covered here directly so a mutation replacing any of them with an
+    /// empty iterator is caught within this crate's own test suite.
+    #[test]
+    fn assets_lists_every_asset_with_a_recorded_instance() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "V1".into(),
+                path: "a.mov".into(),
+                size: 4,
+            },
+        ));
+        let ids: Vec<&AssetId> = p.assets().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![&a]);
+    }
+
+    #[test]
+    fn para_nodes_lists_every_created_node() {
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::ParaNodeCreate {
+                node: "N1".into(),
+                kind: ParaKind::Area,
+                name: "client-x".into(),
+            },
+        ));
+        let ids: Vec<&String> = p.para_nodes().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![&"N1".to_string()]);
+    }
+
+    #[test]
+    fn all_manifests_lists_every_recorded_generation_across_volumes() {
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::ManifestRecorded {
+                volume: "V1".into(),
+                mhl_path: "ascmhl/0001_x_2026-07-30_000000Z.mhl".into(),
+                generation: 1,
+                roothash: "c4xxx".into(),
+            },
+        ));
+        let all: Vec<(&String, &ManifestRecord)> = p.all_manifests().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "V1");
+        assert_eq!(all[0].1.generation, 1);
+    }
+
     #[test]
     fn verifications_and_manifests_accumulate_as_sets() {
         let a = asset();

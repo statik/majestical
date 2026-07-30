@@ -133,6 +133,22 @@ mod tests {
         render("{date}/{source-label}", &ctx).expect_err("separator in value must error");
     }
 
+    /// The existing traversal test's "/abs" value contains a forward slash,
+    /// so it also produces an empty path segment once rendered (the final
+    /// per-segment safety check catches it too) — that leaves the value's
+    /// own `contains('/') || contains('\\')` check undiscriminated from a
+    /// `||` -> `&&` mutation. A value with *only* a backslash renders with
+    /// no empty segment (nothing else here would catch it), so this value
+    /// must be rejected by that check directly.
+    #[test]
+    fn a_backslash_only_value_is_rejected_even_without_a_forward_slash() {
+        let ctx = TemplateCtx {
+            date: "2026-07-29".into(),
+            source_label: "a\\b".into(),
+        };
+        render("{date}/{source-label}", &ctx).expect_err("backslash in value must error");
+    }
+
     proptest! {
         #[test]
         fn safe_values_render_to_safe_relative_paths(

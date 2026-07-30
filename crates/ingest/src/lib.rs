@@ -1,5 +1,7 @@
-//! Ingest engine: planning and layout templates (verified copy, journal, and
-//! ASC MHL arrive in later tasks).
+//! Ingest engine: planning, layout templates, the resumable transfer
+//! journal, and the verified copy engine (ASC MHL arrives in a later task).
+pub mod engine;
+pub mod journal;
 pub mod plan;
 pub mod template;
 
@@ -26,4 +28,19 @@ pub enum IngestError {
     NonUtf8Path { path: std::path::PathBuf },
     #[error("template: {0}")]
     Template(String),
+    #[error("journal {path}: {source}")]
+    Journal {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("encoding journal record: {0}")]
+    JournalEncode(#[source] serde_json::Error),
+    #[error(
+        "all destinations must share one subdir this phase: {first:?} != {other:?} \
+         — Task 7's per-destination layout is not wired up yet"
+    )]
+    MismatchedSubdirs { first: String, other: String },
+    #[error("at least one destination required — nothing to copy to")]
+    NoDestinations,
 }

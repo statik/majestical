@@ -57,13 +57,24 @@ enum Cmd {
     Search {
         /// May start with '-' (a leading negated filter, e.g. `-tag:x`) —
         /// `allow_hyphen_values` stops clap from treating the whole query as
-        /// an unrecognized option in that case.
+        /// an unrecognized option in that case. Omit when using `--saved`.
         #[arg(allow_hyphen_values = true)]
-        query: String,
+        query: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Save this query under a name (and run it).
+        #[arg(long, conflicts_with = "saved")]
+        save: Option<String>,
+        /// Run a previously saved search instead of a literal query.
+        #[arg(long, conflicts_with = "save")]
+        saved: Option<String>,
+    },
+    /// Manage saved searches.
+    Searches {
+        #[command(subcommand)]
+        cmd: SearchesCmd,
     },
     /// List every volume the catalog has ever seen.
     Volumes {
@@ -175,6 +186,17 @@ enum MetaCmd {
 }
 
 #[derive(Subcommand)]
+enum SearchesCmd {
+    /// List saved searches.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a saved search.
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum VolumesCmd {
     List {
         #[arg(long)]
@@ -208,10 +230,26 @@ fn main() -> Result<()> {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             commands::cmd_tag(&mut app, cmd)?;
         }
-        Cmd::Search { query, limit, json } => {
-            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            let args = search::SearchArgs { query, limit, json };
-            search::cmd_search(&app, &cli.catalog, &args)?;
+        Cmd::Search {
+            query,
+            limit,
+            json,
+            save,
+            saved,
+        } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            let args = search::SearchArgs {
+                query,
+                limit,
+                json,
+                save,
+                saved,
+            };
+            search::cmd_search(&mut app, &cli.catalog, &args)?;
+        }
+        Cmd::Searches { cmd } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            search::cmd_searches(&mut app, cmd)?;
         }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },

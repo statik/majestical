@@ -51,7 +51,9 @@ pub enum CatalogError {
 /// name index) was added.
 ///
 /// Bumped to 4: `Projection` gained the `saved_searches` field.
-pub(crate) const SNAPSHOT_VERSION: i64 = 4;
+///
+/// Bumped to 5: `create_tables` gained the `saved_searches` table.
+pub(crate) const SNAPSHOT_VERSION: i64 = 5;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.

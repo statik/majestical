@@ -1,6 +1,15 @@
 //! Populating the projection tables: `rebuild`'s full drop/recreate/insert,
 //! `open_synced`/`apply_touched`'s incremental resume-from-cursor path, and
 //! the per-entity insert helpers both share.
+//!
+//! `saved_searches` has no `CatalogStore` trait method: the CLI reads saved
+//! searches straight from the `Projection` it already holds (`open_catalog`
+//! returns one alongside the `SqliteCatalog`), so there's no query path that
+//! needs this table today. It exists anyway, kept in sync by `rebuild` and
+//! `apply_touched` like every other entity, for future surfaces (a GUI or an
+//! MCP server) that won't hold a `Projection` in memory, and so `debug_dump`
+//! stays a complete equivalence check between the incremental and rebuild
+//! paths.
 use crate::{ApplyMode, CatalogError, SNAPSHOT_VERSION, SqliteCatalog};
 use majestical_core::event::{AssetId, ParaKind, VerifyOutcome};
 use majestical_core::media_kind::media_kind;
@@ -84,6 +93,7 @@ impl SqliteCatalog {
         Self::insert_volumes(&tx, projection)?;
         Self::insert_para_nodes(&tx, projection)?;
         Self::insert_manifests(&tx, projection)?;
+        Self::insert_saved_searches(&tx, projection)?;
         tx.commit()?;
 
         Ok(())
@@ -107,8 +117,16 @@ impl SqliteCatalog {
         let tx = self.conn.transaction()?;
         for t in touched {
             match t {
-                // SavedSearch storage lands with the CLI surface (next task).
-                Touched::Nothing | Touched::SavedSearch(_) => {}
+                Touched::Nothing => {}
+                Touched::SavedSearch(name) => {
+                    tx.execute("DELETE FROM saved_searches WHERE name = ?1", [name])?;
+                    if let Some(query) = projection.saved_search(name) {
+                        tx.execute(
+                            "INSERT INTO saved_searches (name, query) VALUES (?1, ?2)",
+                            (name, query),
+                        )?;
+                    }
+                }
                 Touched::Asset(id) => {
                     tx.execute("DELETE FROM tags WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM instances WHERE asset = ?1", [&id.0])?;
@@ -381,6 +399,19 @@ impl SqliteCatalog {
         Ok(())
     }
 
+    /// Populates `saved_searches` from the projection's full set. Shared by
+    /// the bulk `rebuild` path; incremental apply instead deletes and
+    /// reinserts one row at a time per `Touched::SavedSearch`.
+    fn insert_saved_searches(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
+        for (name, query) in projection.saved_searches() {
+            tx.execute(
+                "INSERT INTO saved_searches (name, query) VALUES (?1, ?2)",
+                (name, query),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Dumps every projection table's rows (not `apply_cursors`/
     /// `apply_snapshot` — cursors legitimately differ between an incremental
     /// open and a full rebuild over the same log), each row ordered by its
@@ -391,7 +422,7 @@ impl SqliteCatalog {
     /// # Errors
     /// Returns an error if a query fails.
     pub fn debug_dump(&self) -> Result<String, CatalogError> {
-        let tables: [(&str, &str); 9] = [
+        let tables: [(&str, &str); 10] = [
             ("assets", "id"),
             ("instances", "asset, volume, path, size, mtime_ms, kind"),
             ("tags", "asset, tag"),
@@ -404,6 +435,7 @@ impl SqliteCatalog {
             ),
             ("manifests", "volume, generation, mhl_path, roothash"),
             ("names_fts", "asset, name"),
+            ("saved_searches", "name, query"),
         ];
         let mut out = String::new();
         for (table, cols) in tables {
@@ -883,6 +915,87 @@ pub(crate) mod tests {
         assert_eq!(
             hits.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
             vec![a]
+        );
+    }
+
+    /// A `SavedSearchSet` applied incrementally, then a `SavedSearchRemove`
+    /// applied incrementally on top, must each leave the catalog identical to
+    /// a fresh rebuild from the same op history up to that point.
+    #[test]
+    fn saved_searches_follow_incremental_set_and_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        db.rebuild(&Projection::default()).expect("initial rebuild");
+
+        let mut projection = Projection::default();
+        projection.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(1, 0)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::SavedSearchSet {
+                name: "keepers".into(),
+                query: "tag:keep".into(),
+            },
+        });
+        db.apply_touched(
+            &projection,
+            &BTreeSet::from([Touched::SavedSearch("keepers".into())]),
+            &[],
+        )
+        .expect("apply set");
+
+        let fresh_after_set = rebuild_from_ops(
+            &dir.path().join("fresh1.db"),
+            vec![Op::SavedSearchSet {
+                name: "keepers".into(),
+                query: "tag:keep".into(),
+            }],
+        );
+        assert_eq!(
+            db.debug_dump().expect("dump"),
+            fresh_after_set.debug_dump().expect("dump")
+        );
+
+        projection.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(2, 0)),
+            hlc: Hlc {
+                wall_ms: 2,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::SavedSearchRemove {
+                name: "keepers".into(),
+            },
+        });
+        db.apply_touched(
+            &projection,
+            &BTreeSet::from([Touched::SavedSearch("keepers".into())]),
+            &[],
+        )
+        .expect("apply remove");
+
+        let fresh_after_remove = rebuild_from_ops(
+            &dir.path().join("fresh2.db"),
+            vec![
+                Op::SavedSearchSet {
+                    name: "keepers".into(),
+                    query: "tag:keep".into(),
+                },
+                Op::SavedSearchRemove {
+                    name: "keepers".into(),
+                },
+            ],
+        );
+        let dump = db.debug_dump().expect("dump");
+        assert_eq!(dump, fresh_after_remove.debug_dump().expect("dump"));
+        assert!(
+            !dump.contains("saved_searches|"),
+            "the saved search row must be gone after the incremental remove, got: {dump}"
         );
     }
 }

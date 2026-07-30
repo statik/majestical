@@ -18,6 +18,7 @@ impl SqliteCatalog {
              DROP TABLE IF EXISTS apply_cursors;
              DROP TABLE IF EXISTS apply_snapshot;
              DROP TABLE IF EXISTS names_fts;
+             DROP TABLE IF EXISTS saved_searches;
              CREATE TABLE assets (id TEXT PRIMARY KEY);
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -66,7 +67,8 @@ impl SqliteCatalog {
                id INTEGER PRIMARY KEY CHECK (id = 1),
                version INTEGER NOT NULL,
                projection TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE saved_searches (name TEXT PRIMARY KEY, query TEXT NOT NULL);",
         )
     }
 }

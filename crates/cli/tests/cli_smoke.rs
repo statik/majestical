@@ -1776,3 +1776,88 @@ fn search_text_output_notes_truncation_at_the_limit() {
         "expected no truncation note when the match count falls short of --limit, got: {stdout}"
     );
 }
+
+/// `--save` on one machine syncs to another machine's `searches list` via
+/// the shared event log; `searches rm` on the second machine likewise syncs
+/// back to the first.
+#[test]
+fn saved_searches_sync_between_machines() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state_a = dir.path().join("state-a");
+    let state_b = dir.path().join("state-b");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["search", "tag:keep", "--save", "keepers"])
+        .assert()
+        .success();
+
+    maj_as(&catalog, &state_b, "machine-b")
+        .args(["searches", "list"])
+        .assert()
+        .success()
+        .stdout(contains("keepers"))
+        .stdout(contains("tag:keep"));
+
+    maj_as(&catalog, &state_b, "machine-b")
+        .args(["searches", "rm", "keepers"])
+        .assert()
+        .success();
+
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["searches", "list"])
+        .assert()
+        .success()
+        .stdout(contains("no saved searches"));
+}
+
+/// `--saved` runs a stored query (saving succeeds even with zero hits);
+/// an unknown `--saved` name or `searches rm` target fails with a clear
+/// message; `searches list --json` renders the name/query pairs.
+#[test]
+fn running_and_managing_saved_searches() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "tag:nothing-yet", "--save", "empty"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+
+    maj(&catalog, &state)
+        .args(["search", "--saved", "empty"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+
+    maj(&catalog, &state)
+        .args(["search", "--saved", "missing"])
+        .assert()
+        .failure()
+        .stderr(contains("no saved search"));
+
+    maj(&catalog, &state)
+        .args(["searches", "rm", "missing"])
+        .assert()
+        .failure()
+        .stderr(contains("no saved search"));
+
+    maj(&catalog, &state)
+        .args(["searches", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(diff(
+            "{\"saved\":[{\"name\":\"empty\",\"query\":\"tag:nothing-yet\"}]}\n",
+        ));
+}

@@ -954,6 +954,34 @@ mod history_tests {
         fs::write(root.join("b space.wav"), b"BBBBBB").expect("write b space.wav");
     }
 
+    /// `hash_dir` must record only the one real asset — everything else
+    /// here is something it's specifically supposed to skip: `.DS_Store`,
+    /// an arbitrary dotfile, the copy engine's `.maj-partial-*` quarantine
+    /// naming, and a file living inside the `ascmhl/` history directory
+    /// itself (which would otherwise get hashed as if it were content).
+    #[test]
+    fn hash_dir_skips_quarantine_dot_and_history_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("real.mov"), b"REAL").expect("write real.mov");
+        fs::write(dir.path().join(".DS_Store"), b"junk").expect("write .DS_Store");
+        fs::write(dir.path().join(".hidden"), b"junk").expect("write .hidden");
+        fs::write(dir.path().join(".maj-partial-xyz-a.mov"), b"partial").expect("write partial");
+        fs::create_dir_all(dir.path().join("ascmhl")).expect("mkdir ascmhl");
+        fs::write(
+            dir.path().join("ascmhl/0001_x_2026-07-30_000000Z.mhl"),
+            b"<hashlist/>",
+        )
+        .expect("write history file");
+
+        let hash_list = hash_dir(dir.path(), "2026-07-30T00:00:00Z").expect("hash_dir");
+        let rels: Vec<&str> = hash_list.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["real.mov"],
+            "expected only the real asset, got {rels:?}"
+        );
+    }
+
     #[test]
     fn write_then_read_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");

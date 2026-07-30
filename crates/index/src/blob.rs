@@ -249,4 +249,22 @@ mod tests {
             Err(IndexError::VectorShape { len: 3, .. })
         ));
     }
+
+    /// Replacing a blob is a rename into place, not a rewrite of the target
+    /// file: a reader never sees a half-written blob, and the write succeeds
+    /// even when the existing blob is read-only (rename needs write
+    /// permission on the directory, not on the file being replaced).
+    #[test]
+    fn write_atomic_replaces_a_read_only_blob_by_rename() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let path = store.path_for("cc22", &Derivation::Thumb);
+        store.write_atomic(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        store
+            .write_atomic(&path, b"new")
+            .expect("replace a read-only blob");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+    }
 }

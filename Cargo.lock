@@ -1253,13 +1253,9 @@ dependencies = [
 name = "majestical-index"
 version = "0.1.0"
 dependencies = [
- "dirs",
  "fast_image_resize",
  "image",
  "majestical-core",
- "serde",
- "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "webp",

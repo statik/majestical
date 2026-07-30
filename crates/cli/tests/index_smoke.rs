@@ -123,3 +123,44 @@ fn index_status_reports_needs_model_and_offline_honestly() {
         .success()
         .stdout(contains("thumbs: 0 done, 1 pending, 1 offline"));
 }
+
+/// `--limit` caps how much of the queue one pass works, so a long-running
+/// index can be broken into bounded chunks: two pending thumbnails with
+/// `--limit 1` take two passes, not one.
+#[test]
+fn index_run_limit_caps_one_pass() {
+    let media = tempfile::tempdir().unwrap();
+    write_test_png(&media.path().join("one.png"), 64, 48);
+    write_test_png(&media.path().join("two.png"), 32, 24);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run", "--limit", "1"])
+        .assert()
+        .success()
+        .stdout(contains("1 written"));
+    assert_eq!(
+        walkdir_find(&root, "thumb-320.webp").len(),
+        1,
+        "--limit 1 must leave the second thumbnail for a later pass"
+    );
+
+    maj(&root, &state)
+        .args(["index", "run", "--limit", "1"])
+        .assert()
+        .success()
+        .stdout(contains("1 written"));
+    assert_eq!(walkdir_find(&root, "thumb-320.webp").len(), 2);
+}

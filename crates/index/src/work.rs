@@ -8,9 +8,14 @@ use majestical_core::media_kind::MediaKind;
 
 use crate::blob::{BlobStore, Derivation, asset_hex};
 
-/// Extensions we know we cannot decode yet (RAW family). Planner-level so
-/// status is deterministic instead of discovered by failing forever.
-const UNDECODABLE_EXTS: &[&str] = &["dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"];
+/// Extensions we know we cannot decode yet: the RAW family, plus AVIF (the
+/// `image` crate build we depend on has no AVIF decoder enabled). Planner-
+/// level so status is deterministic instead of discovered by failing
+/// forever — a scanned `.avif` would otherwise retry every pass under
+/// `--watch` with no way to ever succeed.
+const UNDECODABLE_EXTS: &[&str] = &[
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "avif",
+];
 
 /// One kind of derivable work a [`WorkItem`] can carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,9 +190,11 @@ fn plan_image_embed(
 }
 
 /// KEYFRAMES (`MediaKind::Video` only): no model -> `needs_model` (checked
-/// before ffmpeg — a documented precedence, since both gate the same work);
-/// manifest blob exists -> done; no ffmpeg -> `needs_ffmpeg`; no path ->
-/// offline; else pending+item.
+/// before everything else — a documented precedence, since it gates the same
+/// work `needs_ffmpeg`/offline would); manifest blob exists -> done; else
+/// offline (no path) / `needs_ffmpeg` / pending+item, in that order — the
+/// same offline-before-ffmpeg precedence `plan_thumb` and `plan_image_embed`
+/// use, so one offline video classifies consistently across every kind.
 fn plan_keyframes(
     source: &AssetSource,
     hex: &str,
@@ -204,14 +211,14 @@ fn plan_keyframes(
         plan.keyframes.done += 1;
         return;
     }
-    if !caps.ffmpeg {
-        plan.keyframes.needs_ffmpeg += 1;
-        return;
-    }
     let Some(abs_path) = &source.abs_path else {
         plan.keyframes.offline += 1;
         return;
     };
+    if !caps.ffmpeg {
+        plan.keyframes.needs_ffmpeg += 1;
+        return;
+    }
     plan.keyframes.pending += 1;
     plan.items.push(WorkItem {
         asset: source.asset.clone(),
@@ -292,15 +299,62 @@ mod tests {
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/e.cr3".into()),
             },
+            AssetSource {
+                asset: "xxh3:ff66".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/f.avif".into()),
+            },
         ];
         let plan = plan_work(&sources, &store, &caps);
         assert_eq!(plan.thumbs.done, 1);
         assert_eq!(
-            plan.thumbs.unsupported, 1,
-            "RAW is planner-level unsupported"
+            plan.thumbs.unsupported, 2,
+            "RAW and AVIF are both planner-level unsupported"
         );
-        assert_eq!(plan.embeddings.unsupported, 1);
+        assert_eq!(plan.embeddings.unsupported, 2);
         assert_eq!(plan.embeddings.pending, 1, "aa11 embedding is embeddable");
         assert_eq!(plan.items.len(), 1, "one ImageEmbed item for aa11");
+    }
+
+    /// `items` is globally priority-ordered — every thumbnail before every
+    /// image embedding before every keyframe set — not grouped per asset, so
+    /// a run that dies halfway has produced the cheapest, most-visible
+    /// derivations first.
+    #[test]
+    fn items_are_globally_ordered_thumbs_then_embeds_then_keyframes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = Capabilities {
+            model_tag: Some("m1".into()),
+            ffmpeg: true,
+        };
+        let sources = vec![
+            AssetSource {
+                asset: "xxh3:aa11".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/a.png".into()),
+            },
+            AssetSource {
+                asset: "xxh3:cc33".into(),
+                kind: MediaKind::Video,
+                abs_path: Some("/tmp/c.mov".into()),
+            },
+        ];
+        let plan = plan_work(&sources, &store, &caps);
+        let order: Vec<(WorkKind, &str)> = plan
+            .items
+            .iter()
+            .map(|i| (i.kind, i.asset.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (WorkKind::Thumb, "xxh3:aa11"),
+                (WorkKind::Thumb, "xxh3:cc33"),
+                (WorkKind::ImageEmbed, "xxh3:aa11"),
+                (WorkKind::Keyframes, "xxh3:cc33"),
+            ],
+            "both thumbs must precede the embedding, which must precede the keyframes"
+        );
     }
 }

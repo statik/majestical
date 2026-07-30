@@ -51,9 +51,9 @@ fn decode_via_sips(path: &Path) -> Result<image::DynamicImage, IndexError> {
             &tmp_path.to_string_lossy(),
         ])
         .output()
-        .map_err(|source| IndexError::Blob {
+        .map_err(|e| IndexError::Decode {
             path: path.to_path_buf(),
-            source,
+            message: format!("running sips (macOS-only HEIC decoder): {e}"),
         })?;
 
     if !output.status.success() {

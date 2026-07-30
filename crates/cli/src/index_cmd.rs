@@ -146,22 +146,18 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 
 /// Builds the plan for one pass: gathers sources fresh from the projection
 /// (so `--watch` sees newly scanned assets), diffs against the blob store,
-/// then narrows to `kinds` and `limit`.
-fn build_plan(
-    projection: &Projection,
-    catalog_dir: &Path,
-    kinds: &BTreeSet<String>,
-    limit: Option<usize>,
-) -> WorkPlan {
+/// then narrows `items` to `kinds`. Deliberately does not apply `--limit`
+/// here — that happens after `run_once` narrows further to kinds that
+/// actually have an executor (only thumbnails so far), so a mixed-kind plan
+/// never lets non-executable items consume `--limit`'s budget ahead of the
+/// executable ones once embeddings/keyframes gain executors too.
+fn build_plan(projection: &Projection, catalog_dir: &Path, kinds: &BTreeSet<String>) -> WorkPlan {
     let sources = gather_sources(projection);
     let blobs = BlobStore::new(catalog_dir);
     let caps = capabilities();
     let mut plan = work::plan_work(&sources, &blobs, &caps);
     plan.items
         .retain(|item| kinds.contains(workkind_name(item.kind)));
-    if let Some(limit) = limit {
-        plan.items.truncate(limit);
-    }
     plan
 }
 
@@ -181,12 +177,15 @@ fn run_once(
     json: bool,
 ) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
-    let plan = build_plan(&projection, catalog_dir, kinds, limit);
-    let thumb_items: Vec<work::WorkItem> = plan
+    let plan = build_plan(&projection, catalog_dir, kinds);
+    let mut thumb_items: Vec<work::WorkItem> = plan
         .items
         .into_iter()
         .filter(|i| i.kind == WorkKind::Thumb)
         .collect();
+    if let Some(limit) = limit {
+        thumb_items.truncate(limit);
+    }
     let blobs = BlobStore::new(catalog_dir);
     let jobs = threads.unwrap_or_else(default_index_jobs);
     let (written, failed) = run_thumb_items(&blobs, &thumb_items, jobs);
@@ -270,7 +269,7 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-    let plan = build_plan(&projection, catalog_dir, &kinds, None);
+    let plan = build_plan(&projection, catalog_dir, &kinds);
     if json {
         println!(
             "{}",

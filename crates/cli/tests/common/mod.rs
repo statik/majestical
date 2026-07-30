@@ -6,12 +6,17 @@
 use assert_cmd::Command;
 
 #[cfg(test)]
-pub fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
+pub fn maj_as(catalog: &std::path::Path, state: &std::path::Path, machine_id: &str) -> Command {
     let mut c = Command::cargo_bin("maj").unwrap();
     c.env("MAJ_CATALOG", catalog)
-        .env("MAJ_MACHINE_ID", "test-machine")
+        .env("MAJ_MACHINE_ID", machine_id)
         .env("MAJ_STATE_DIR", state);
     c
+}
+
+#[cfg(test)]
+pub fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
+    maj_as(catalog, state, "test-machine")
 }
 
 #[cfg(test)]

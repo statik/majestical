@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
-use majestical_core::ports::Filter;
+use majestical_core::media_kind::MediaKind;
+use majestical_core::ports::{AssetSummary, Filter};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
 use std::collections::{BTreeSet, HashMap};
@@ -49,6 +50,19 @@ pub(crate) fn resolve_volume(dir: &Path, volume: Option<String>) -> (String, Str
     (identity.id, identity.label)
 }
 
+/// A file's real modification time, in milliseconds since the Unix epoch —
+/// `0` (meaning "unknown") if the platform can't report it or it predates
+/// the epoch, rather than failing the whole scan/ingest over one file's
+/// clock oddity.
+pub(crate) fn mtime_ms_of(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
     let (volume_id, volume_label) = resolve_volume(dir, volume);
     let mut ops = Vec::new();
@@ -57,10 +71,10 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
         if !entry.file_type().is_file() {
             continue;
         }
-        let size = entry
+        let metadata = entry
             .metadata()
-            .with_context(|| format!("reading metadata for {}", entry.path().display()))?
-            .len();
+            .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
+        let size = metadata.len();
         let file = std::fs::File::open(entry.path())
             .with_context(|| format!("reading {}", entry.path().display()))?;
         // Stream the hash rather than loading the whole file: media
@@ -94,9 +108,7 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
             volume: volume_id.clone(),
             path: rel,
             size,
-            // Real mtimes arrive with the query-language work (phase 4 task
-            // 8); scans don't read them yet.
-            mtime_ms: 0,
+            mtime_ms: mtime_ms_of(&metadata),
         });
     }
     let n = ops.len();
@@ -214,50 +226,215 @@ pub(crate) fn print_meta_get(
     }
 }
 
-pub(crate) fn cmd_search(
-    app: &FsApp,
-    catalog_dir: &Path,
-    name: Option<String>,
-    tag: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let (db, _projection) = open_catalog(app, catalog_dir)?;
-    let ids: Vec<AssetId> = match (name, tag) {
-        (Some(n), None) => db
-            .search_names_ranked(&[n], 200)?
-            .into_iter()
-            .map(|(asset, _rank)| asset)
-            .collect(),
-        (None, Some(t)) => db
-            .assets_matching(&[Filter::Tag {
-                value: t,
-                negated: false,
-            }])?
-            .into_iter()
-            .collect(),
-        // The `search_by` ArgGroup (required, mutually exclusive)
-        // guarantees clap rejects these combinations before `main`
-        // ever runs, so this arm can't be reached.
-        (Some(_), Some(_)) | (None, None) => {
-            unreachable!("clap's search_by ArgGroup allows exactly one of these")
-        }
-    };
-    if json {
-        let results: Vec<_> = ids
-            .iter()
-            .map(|a| serde_json::json!({ "asset": a.0 }))
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({ "count": ids.len(), "results": results })
-        );
+/// Args for `maj search`, bundled to keep `cmd_search`'s own signature
+/// within the house 5-positional-parameter limit.
+pub(crate) struct SearchArgs {
+    pub(crate) query: String,
+    pub(crate) limit: usize,
+    pub(crate) json: bool,
+}
+
+/// The filter keys `search` understands, listed in error messages so a typo'd
+/// key points straight at the fix instead of a silent zero-result search.
+const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
+
+/// Searches the catalog: bare terms are ranked by `search_names_ranked` (best
+/// match first); `key:value` tokens resolve to hard `Filter`s and narrow the
+/// result to their conjunction. Terms and filters combine by intersection —
+/// a term match that fails a filter is dropped, never re-ranked above it.
+///
+/// # Errors
+/// Returns an error if the query fails to parse, names an unknown or
+/// malformed filter, or (once parsed) carries neither terms nor filters.
+pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> Result<()> {
+    let (db, projection) = open_catalog(app, catalog_dir)?;
+    let parsed = crate::query::parse_query(&args.query)?;
+    let filters = resolve_filters(&projection, &parsed.filters)?;
+    let allowed = if filters.is_empty() {
+        None
     } else {
-        for a in &ids {
-            println!("{}", a.0);
+        Some(db.assets_matching(&filters)?)
+    };
+    let ranked: Vec<(AssetId, f64)> = if parsed.terms.is_empty() {
+        let Some(set) = &allowed else {
+            anyhow::bail!("empty query: give search terms or at least one filter");
+        };
+        set.iter()
+            .map(|a| (a.clone(), 0.0))
+            .take(args.limit)
+            .collect()
+    } else {
+        db.search_names_ranked(&parsed.terms, args.limit.saturating_mul(4))?
+            .into_iter()
+            .filter(|(a, _)| allowed.as_ref().is_none_or(|s| s.contains(a)))
+            .take(args.limit)
+            .collect()
+    };
+    print_search_results(&db, &ranked, args.json)
+}
+
+/// Resolves parsed `key:value` tokens against `majestical_core::ports::Filter`'s
+/// per-variant contracts. `vol`/`volume` both address `Filter::Volume`;
+/// `before`/`after` reject a `-` negation (there's no negated form) rather
+/// than silently ignoring it.
+fn resolve_filters(
+    projection: &Projection,
+    raw: &[crate::query::RawFilter],
+) -> Result<Vec<Filter>> {
+    raw.iter().map(|f| resolve_filter(projection, f)).collect()
+}
+
+fn resolve_filter(projection: &Projection, raw: &crate::query::RawFilter) -> Result<Filter> {
+    let crate::query::RawFilter {
+        key,
+        value,
+        negated,
+    } = raw;
+    let negated = *negated;
+    match key.as_str() {
+        "tag" => Ok(Filter::Tag {
+            value: value.clone(),
+            negated,
+        }),
+        "vol" | "volume" => Ok(Filter::Volume {
+            value: value.clone(),
+            negated,
+        }),
+        "para" => Ok(Filter::Para {
+            node: resolve_para_node(projection, value)?,
+            negated,
+        }),
+        "kind" => {
+            let valid =
+                [MediaKind::Image, MediaKind::Video, MediaKind::Other].map(MediaKind::as_str);
+            anyhow::ensure!(
+                valid.contains(&value.as_str()),
+                "unknown kind '{value}' — one of: {}",
+                valid.join(", ")
+            );
+            Ok(Filter::Kind {
+                value: value.clone(),
+                negated,
+            })
         }
-        println!("{} results", ids.len());
+        "online" => {
+            let want = match value.as_str() {
+                "yes" => true,
+                "no" => false,
+                other => anyhow::bail!("online: expects 'yes' or 'no', got '{other}'"),
+            };
+            Ok(Filter::Online {
+                ids: volume_identity::mounted_volumes().into_keys().collect(),
+                want: want != negated,
+            })
+        }
+        "before" | "after" => {
+            anyhow::ensure!(
+                !negated,
+                "'-{key}:' has no meaning — use '{}:' instead",
+                if key.as_str() == "before" {
+                    "after"
+                } else {
+                    "before"
+                }
+            );
+            let ms = crate::query::parse_date_ms(value)?;
+            if key.as_str() == "before" {
+                Ok(Filter::Before(ms))
+            } else {
+                Ok(Filter::After(ms))
+            }
+        }
+        other => anyhow::bail!("unknown filter '{other}:'; valid filters: {FILTER_KEYS}"),
+    }
+}
+
+/// Renders ranked results: JSON prints one object per hit with its volumes
+/// (online/offline per the currently mounted set) and tags; text prints one
+/// line per hit (`{asset}  {name}  [label●|○,...]`, `tags:` appended when
+/// non-empty) followed by a `"{n} results"` summary line.
+fn print_search_results(db: &SqliteCatalog, ranked: &[(AssetId, f64)], json: bool) -> Result<()> {
+    let ids: Vec<AssetId> = ranked.iter().map(|(a, _)| a.clone()).collect();
+    let summaries = db.asset_summaries(&ids)?;
+    let by_id: HashMap<&AssetId, &AssetSummary> = summaries.iter().map(|s| (&s.asset, s)).collect();
+    let mounted = volume_identity::mounted_volumes();
+
+    if json {
+        print_search_results_json(ranked, &by_id, &mounted);
+    } else {
+        print_search_results_text(ranked, &by_id, &mounted);
     }
     Ok(())
+}
+
+fn print_search_results_json(
+    ranked: &[(AssetId, f64)],
+    by_id: &HashMap<&AssetId, &AssetSummary>,
+    mounted: &std::collections::BTreeMap<String, PathBuf>,
+) {
+    let results: Vec<_> = ranked
+        .iter()
+        .map(|(asset, score)| {
+            let empty = AssetSummary {
+                asset: asset.clone(),
+                name: String::new(),
+                volumes: Vec::new(),
+                tags: Vec::new(),
+                para: None,
+            };
+            let summary = by_id.get(asset).copied().unwrap_or(&empty);
+            let volumes: Vec<_> = summary
+                .volumes
+                .iter()
+                .map(|(id, label)| {
+                    serde_json::json!({ "id": id, "label": label, "online": mounted.contains_key(id) })
+                })
+                .collect();
+            serde_json::json!({
+                "asset": asset.0,
+                "score": score,
+                "name": summary.name,
+                "volumes": volumes,
+                "tags": summary.tags,
+                "para": summary.para,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({ "count": ranked.len(), "results": results })
+    );
+}
+
+fn print_search_results_text(
+    ranked: &[(AssetId, f64)],
+    by_id: &HashMap<&AssetId, &AssetSummary>,
+    mounted: &std::collections::BTreeMap<String, PathBuf>,
+) {
+    for (asset, _score) in ranked {
+        let Some(summary) = by_id.get(asset).copied() else {
+            println!("{}", asset.0);
+            continue;
+        };
+        let volumes: Vec<String> = summary
+            .volumes
+            .iter()
+            .map(|(id, label)| {
+                let dot = if mounted.contains_key(id) {
+                    '\u{25cf}'
+                } else {
+                    '\u{25cb}'
+                };
+                format!("{label}{dot}")
+            })
+            .collect();
+        print!("{}  {}  [{}]", asset.0, summary.name, volumes.join(","));
+        if !summary.tags.is_empty() {
+            print!("  tags:{}", summary.tags.join(","));
+        }
+        println!();
+    }
+    println!("{} results", ranked.len());
 }
 
 /// Cheap phase-2 "is this volume mounted right now" heuristic, not true
@@ -971,15 +1148,16 @@ fn asset_and_para_ops(
     let mut seen_assets: BTreeSet<AssetId> = BTreeSet::new();
     for placed in &outcome.placed {
         let asset = AssetId(format!("xxh3:{}", placed.xxh3));
-        for (_, dest_id, _) in dest_volumes {
+        for (root, dest_id, _) in dest_volumes {
+            let mtime_ms = std::fs::metadata(root.join(&placed.dest_rel))
+                .map(|m| mtime_ms_of(&m))
+                .unwrap_or(0);
             ops.push(Op::AssetSeen {
                 asset: asset.clone(),
                 volume: dest_id.clone(),
                 path: placed.dest_rel.clone(),
                 size: placed.size,
-                // Real mtimes arrive with the query-language work (phase 4
-                // task 8); ingest doesn't read them yet.
-                mtime_ms: 0,
+                mtime_ms,
             });
             ops.push(Op::VerificationRecorded {
                 asset: asset.clone(),

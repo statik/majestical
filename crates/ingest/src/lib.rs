@@ -1,5 +1,6 @@
 //! Ingest engine: planning, layout templates, the resumable transfer
 //! journal, and the verified copy engine (ASC MHL arrives in a later task).
+pub mod engine;
 pub mod journal;
 pub mod plan;
 pub mod template;

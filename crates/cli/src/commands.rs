@@ -936,9 +936,8 @@ fn asset_and_para_ops(
     for placed in &outcome.placed {
         let asset = AssetId(format!("xxh3:{}", placed.xxh3));
         for (root, dest_id, _) in dest_volumes {
-            let mtime_ms = std::fs::metadata(root.join(&placed.dest_rel))
-                .map(|m| mtime_ms_of(&m))
-                .unwrap_or(0);
+            let mtime_ms =
+                std::fs::metadata(root.join(&placed.dest_rel)).map_or(0, |m| mtime_ms_of(&m));
             ops.push(Op::AssetSeen {
                 asset: asset.clone(),
                 volume: dest_id.clone(),

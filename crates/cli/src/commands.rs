@@ -1,6 +1,6 @@
 //! One cmd_* handler per CLI verb. main.rs owns clap definitions and dispatch;
 //! handlers own behavior.
-use crate::app::{FsApp, physical_now_ms};
+use crate::app::{FsApp, physical_now_ms, warn_skipped_corrupt_lines};
 use crate::iso8601::iso8601_ms;
 use crate::volume_identity;
 use crate::{MetaCmd, ParaCmd, TagCmd};
@@ -26,12 +26,7 @@ pub(crate) fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCat
     let (db, projection, _mode) =
         SqliteCatalog::open_synced(&paths.db_path, app.log(), &mut |_line| skipped += 1)
             .context("opening sqlite catalog")?;
-    if skipped > 0 {
-        eprintln!(
-            "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
-            catalog_dir.display()
-        );
-    }
+    warn_skipped_corrupt_lines(skipped, catalog_dir);
     Ok((db, projection))
 }
 

@@ -26,6 +26,19 @@ impl Clock for SystemClock {
     }
 }
 
+/// Warns on stderr when reading an event log skipped corrupt lines. Shared by
+/// `App::events` (a full read) and `commands::open_catalog` (an incremental
+/// or full sqlite sync) so the message can't drift between the two call
+/// sites that both count skipped lines from the same underlying log.
+pub(crate) fn warn_skipped_corrupt_lines(skipped: usize, catalog_root: &Path) {
+    if skipped > 0 {
+        eprintln!(
+            "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
+            catalog_root.display()
+        );
+    }
+}
+
 pub(crate) struct App<L> {
     log: L,
     hlc: HlcClock,
@@ -91,12 +104,7 @@ impl<L: EventLog> App<L> {
             .log
             .read_all_reporting(&mut |_line| skipped += 1)
             .context("reading event log")?;
-        if skipped > 0 {
-            eprintln!(
-                "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
-                self.catalog_root.display()
-            );
-        }
+        warn_skipped_corrupt_lines(skipped, &self.catalog_root);
         Ok(events)
     }
 

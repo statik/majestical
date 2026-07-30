@@ -120,6 +120,23 @@ fn rel_utf8(source: &Path, path: &Path) -> Result<String, NonUtf8Rel> {
     }
 }
 
+/// Builds the `Rejected` record for a non-UTF-8-named source file. Pure and
+/// filesystem-free — this is the single place that decides how such a file
+/// is represented, so tests exercise the same construction `plan_source`
+/// uses instead of a hand-rolled copy of it.
+fn rejected_non_utf8(path: &Path, size: u64, err: NonUtf8Rel) -> PlannedFile {
+    PlannedFile {
+        // Lossy, not `path.to_path_buf()`: serde's `Path` serialization
+        // errors on invalid UTF-8, and this file is Rejected — it is never
+        // reopened, so losing the exact raw bytes here is harmless.
+        source: PathBuf::from(path.to_string_lossy().into_owned()),
+        rel: err.lossy_rel,
+        size,
+        prehash: None,
+        decision: Decision::Rejected { reason: err.reason },
+    }
+}
+
 /// Walks `source` and decides, per file, whether it is new content, a
 /// confirmed duplicate of something already in the catalog, or rejected.
 ///
@@ -158,18 +175,8 @@ pub fn plan_source(
 
         let rel = match rel_utf8(source, path) {
             Ok(rel) => rel,
-            Err(NonUtf8Rel { reason, lossy_rel }) => {
-                files.push(PlannedFile {
-                    // Lossy, not `path.to_path_buf()`: serde's `Path`
-                    // serialization errors on invalid UTF-8, and this file
-                    // is Rejected — it is never reopened, so losing the
-                    // exact raw bytes here is harmless.
-                    source: PathBuf::from(path.to_string_lossy().into_owned()),
-                    rel: lossy_rel,
-                    size,
-                    prehash: None,
-                    decision: Decision::Rejected { reason },
-                });
+            Err(err) => {
+                files.push(rejected_non_utf8(path, size, err));
                 continue;
             }
         };
@@ -293,21 +300,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejected_non_utf8_file_serializes_with_a_lossy_source_path() {
-        // What plan_source records for the rejection arm: a lossy `source`
-        // path, built directly from rel_utf8's Err — no filesystem writes,
-        // so this runs even on filesystems (e.g. APFS) that refuse to
-        // create files with raw-byte names.
+        // Exercises the production `rejected_non_utf8` helper directly —
+        // the same construction plan_source's rejection arm calls — rather
+        // than hand-rolling the lossy conversion in the test. No filesystem
+        // writes, so this runs even on filesystems (e.g. APFS) that refuse
+        // to create files with raw-byte names.
         use std::os::unix::ffi::OsStrExt;
         let source = Path::new("/src");
         let path = source.join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
         let err = rel_utf8(source, &path).expect_err("non-UTF-8 name must be rejected");
-        let planned = PlannedFile {
-            source: PathBuf::from(path.to_string_lossy().into_owned()),
-            rel: err.lossy_rel,
-            size: 3,
-            prehash: None,
-            decision: Decision::Rejected { reason: err.reason },
-        };
+        let planned = rejected_non_utf8(&path, 3, err);
+        assert_eq!(
+            planned.size, 3,
+            "real size must be preserved, not fabricated as 0"
+        );
         let json = serde_json::to_string(&planned).expect("serialize a lossy-path PlannedFile");
         let back: PlannedFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(planned, back);
@@ -333,5 +339,13 @@ mod tests {
             .filter(|f| matches!(f.decision, Decision::Rejected { .. }))
             .collect();
         assert_eq!(rejected.len(), 1, "only the raw-byte name is rejected");
+        assert_eq!(
+            rejected[0].size, 3,
+            "rejection must record the real size, not a fabricated 0"
+        );
+        // Dormant on APFS (which refuses the write above), but free
+        // end-to-end coverage of the lossy-path fix if a Linux runner
+        // (ext4/tmpfs, which allow raw-byte names) ever runs this suite.
+        serde_json::to_string(&plan).expect("a plan with a non-UTF-8 rejection must serialize");
     }
 }

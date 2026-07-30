@@ -4,7 +4,7 @@
 use crate::IngestError;
 use crate::plan::PlannedFile;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -49,26 +49,41 @@ pub struct Journal {
 
 impl Journal {
     /// Opens `path` for append, creating its parent directory and the file
-    /// itself if needed.
+    /// itself if needed. This is also how a resumed run reopens an
+    /// existing journal: the name says `open_append` rather than `create`
+    /// because the common case on a resume is a journal that already has
+    /// records in it.
+    ///
+    /// If the file already ends mid-record — a previous run crashed after
+    /// `write_all` started but before the terminating newline landed — that
+    /// torn tail is repaired here by appending the missing newline before
+    /// this run writes anything. Without that repair, this run's first
+    /// appended record would be glued onto the torn line, becoming
+    /// undecodable itself; `load` stops at the first line it can't decode,
+    /// so every record this run subsequently writes would be invisible on
+    /// the next load, not just the torn one.
     ///
     /// # Errors
     /// Returns `IngestError::Journal` if the parent directory cannot be
-    /// created or the file cannot be opened for append.
-    pub fn create(path: &Path) -> Result<Self, IngestError> {
+    /// created, the file cannot be opened for append, or the torn-tail
+    /// repair's read/write/fsync fails.
+    pub fn open_append(path: &Path) -> Result<Self, IngestError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| IngestError::Journal {
                 path: path.to_path_buf(),
                 source,
             })?;
         }
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(path)
             .map_err(|source| IngestError::Journal {
                 path: path.to_path_buf(),
                 source,
             })?;
+        repair_torn_tail(&mut file, path)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -80,6 +95,11 @@ impl Journal {
     /// A checkpoint is only a checkpoint if it survives the crash that
     /// follows it, so this does not return until the line is durable on
     /// disk — callers rely on that to decide what's safe to resume from.
+    /// The engine serializes every append behind one mutex, so this fsync
+    /// happens on the critical path of every worker thread rather than in
+    /// parallel; that trades throughput for the simplicity of a single
+    /// linearized journal, a tradeoff worth revisiting with benchmarks if
+    /// journal I/O ever shows up as the bottleneck.
     ///
     /// # Errors
     /// Returns `IngestError::JournalEncode` if `record` cannot be
@@ -104,12 +124,11 @@ impl Journal {
 
     /// Reads and folds every complete record in the journal at `path`.
     ///
-    /// A missing file folds to an empty `Folded` (nothing has run yet). A
-    /// torn tail line — the file ends mid-record because a previous run
-    /// crashed between `write_all` and the next line's start — is not an
-    /// error: everything up to that line still counts, so parsing stops at
-    /// the first line that fails to decode rather than failing the whole
-    /// load.
+    /// A missing file folds to an empty `Folded` (nothing has run yet). Any
+    /// line that fails to decode — a torn tail from a crash mid-`write_all`,
+    /// or an old torn line `open_append` has since newline-terminated in
+    /// place — is skipped rather than treated as a fatal error, and folding
+    /// continues with whatever lines follow it.
     ///
     /// # Errors
     /// Returns `IngestError::Journal` if the file exists but cannot be read.
@@ -129,15 +148,43 @@ impl Journal {
         let mut folded = Folded::default();
         for line in contents.lines() {
             let Ok(record) = serde_json::from_str::<Record>(line) else {
-                // Torn tail: a crash mid-write can leave a truncated last
-                // line. Everything decoded so far is a valid checkpoint;
-                // stop folding rather than treating this as a fatal error.
-                break;
+                // An undecodable line is either a genuine torn tail (a
+                // crash mid-`write_all`, before the terminating newline
+                // landed) or — once `open_append`'s repair has terminated
+                // such a line with a newline of its own — an inert garbled
+                // line sitting in the middle of the file's history rather
+                // than at its end. Either way the record is unrecoverable
+                // but not fatal: skip it and keep folding whatever comes
+                // after, rather than stopping the whole load there.
+                continue;
             };
             fold_one(&mut folded, record);
         }
         Ok(folded)
     }
+}
+
+/// Terminates a torn last line left by a crash mid-`write_all`. The file
+/// was opened with `.append(true)`, so this write always lands at the true
+/// end of file regardless of the seek used to read the last byte — append
+/// mode ignores the current position for writes.
+fn repair_torn_tail(file: &mut std::fs::File, path: &Path) -> Result<(), IngestError> {
+    let to_journal_err = |source| IngestError::Journal {
+        path: path.to_path_buf(),
+        source,
+    };
+    let len = file.metadata().map_err(to_journal_err)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last_byte = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).map_err(to_journal_err)?;
+    file.read_exact(&mut last_byte).map_err(to_journal_err)?;
+    if last_byte[0] != b'\n' {
+        file.write_all(b"\n").map_err(to_journal_err)?;
+        file.sync_data().map_err(to_journal_err)?;
+    }
+    Ok(())
 }
 
 fn fold_one(folded: &mut Folded, record: Record) {
@@ -175,7 +222,7 @@ mod tests {
     fn journal_round_trips_and_folds_placed_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("run.jsonl");
-        let mut journal = Journal::create(&path).expect("create");
+        let mut journal = Journal::open_append(&path).expect("open_append");
         journal
             .append(&Record::FilePlanned { file: planned("a") })
             .expect("append a planned");
@@ -209,7 +256,7 @@ mod tests {
     fn corrupt_trailing_line_is_tolerated() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("run.jsonl");
-        let mut journal = Journal::create(&path).expect("create");
+        let mut journal = Journal::open_append(&path).expect("open_append");
         journal
             .append(&Record::FilePlanned { file: planned("a") })
             .expect("append a planned");
@@ -225,6 +272,42 @@ mod tests {
         assert_eq!(folded.planned.len(), 1);
     }
 
+    #[test]
+    fn reopening_after_a_torn_tail_repairs_it_before_appending() {
+        // Without the repair, appending "b" glues it onto the torn line,
+        // producing one undecodable line; `load` would then stop at that
+        // line and see neither "a" (fine, it's the untouched prior line)
+        // nor "b" (the real bug: a resumed run's own new record vanishes).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.jsonl");
+        {
+            let mut journal = Journal::open_append(&path).expect("open_append");
+            journal
+                .append(&Record::FilePlanned { file: planned("a") })
+                .expect("append a planned");
+        }
+        {
+            let mut raw = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopen raw");
+            raw.write_all(b"{\"rec\":\"file_pl")
+                .expect("write torn tail");
+        }
+        {
+            let mut journal = Journal::open_append(&path).expect("reopen repairs torn tail");
+            journal
+                .append(&Record::FilePlanned { file: planned("b") })
+                .expect("append b planned");
+        }
+        let folded = Journal::load(&path).expect("load");
+        assert_eq!(
+            folded.planned.len(),
+            2,
+            "both real records must fold, not just the one before the torn tail"
+        );
+    }
+
     proptest::proptest! {
         /// Any prefix of a journal folds without panicking, and its placed
         /// set is a subset of the full journal's placed set.
@@ -233,7 +316,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("run.jsonl");
             {
-                let mut journal = Journal::create(&path).expect("create");
+                let mut journal = Journal::open_append(&path).expect("open_append");
                 journal.append(&Record::FilePlanned { file: planned("a") }).expect("planned a");
                 journal.append(&Record::FileCopied { rel: "a".into() }).expect("copied a");
                 journal.append(&Record::FileVerified { rel: "a".into() }).expect("verified a");

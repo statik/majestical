@@ -6,6 +6,11 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 
+// These helpers need `#[cfg(test)]` even though this whole file only ever
+// compiles as a test binary: clippy's expect/unwrap-in-tests exemption
+// (clippy.toml's `allow-expect-in-tests`) keys off the literal attribute on
+// each item, not the ambient `cfg(test)` the compiler already applies here
+// — confirmed by removing them and observing `expect_used` reappear.
 #[cfg(test)]
 fn write(dir: &Path, rel: &str, bytes: &[u8]) {
     let p = dir.join(rel);
@@ -51,7 +56,7 @@ fn copies_verifies_and_places_to_every_destination() {
     let (src, d1, d2) = setup(&[("clips/a.mov", b"AAAA"), ("b.wav", b"BBBBBB")]);
     let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
     let jpath = d1.path().join("run.jsonl");
-    let mut journal = Journal::create(&jpath).expect("journal");
+    let mut journal = Journal::open_append(&jpath).expect("journal");
     let outcome = run(
         &plan,
         &dests(d1.path(), d2.path()),
@@ -137,7 +142,7 @@ impl SinkFactory for CorruptingSinks {
 fn corrupted_destination_fails_verification_and_stays_quarantined() {
     let (src, d1, d2) = setup(&[("a.mov", b"AAAA")]);
     let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
-    let mut journal = Journal::create(&d1.path().join("run.jsonl")).expect("journal");
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
     let outcome = run(
         &plan,
         &dests(d1.path(), d2.path()),
@@ -173,7 +178,7 @@ fn resume_skips_placed_files() {
     let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
     let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
     let jpath = d1.path().join("run.jsonl");
-    let mut journal = Journal::create(&jpath).expect("journal");
+    let mut journal = Journal::open_append(&jpath).expect("journal");
     run(
         &plan,
         &dests(d1.path(), d2.path()),
@@ -185,7 +190,7 @@ fn resume_skips_placed_files() {
     .expect("first run");
     let folded = Journal::load(&jpath).expect("fold");
     assert_eq!(folded.placed.len(), 2);
-    let mut journal = Journal::create(&jpath).expect("reopen appends");
+    let mut journal = Journal::open_append(&jpath).expect("reopen appends");
     let outcome = run(
         &plan,
         &dests(d1.path(), d2.path()),
@@ -227,7 +232,8 @@ fn sweep_missing_demotes_a_placed_file_that_vanished_before_the_sweep() {
     // open — so the deletion below always hits a real, already-placed file.
     let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
     let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
-    let mut journal = Journal::create(&d1.path().join("run.jsonl")).expect("journal");
+    let jpath = d1.path().join("run.jsonl");
+    let mut journal = Journal::open_append(&jpath).expect("journal");
     let sinks = DeletingSinks {
         trigger_filename: "b.mov",
         victim_filename: "a.mov",
@@ -250,6 +256,15 @@ fn sweep_missing_demotes_a_placed_file_that_vanished_before_the_sweep() {
         "reason should name the sweep: {}",
         outcome.failed[0].reason
     );
+
+    // The journal must agree with the Outcome: without this, a resumed run
+    // would still see the stale FilePlaced record for "a.mov" and skip
+    // re-copying a file that the sweep just proved is actually gone.
+    let folded = Journal::load(&jpath).expect("load journal");
+    assert!(
+        folded.failed.contains_key("a.mov"),
+        "journal must record the sweep demotion so resume re-copies it"
+    );
 }
 
 #[test]
@@ -260,7 +275,7 @@ fn duplicate_skip_does_not_copy() {
         4,
     )]);
     let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
-    let mut journal = Journal::create(&d1.path().join("run.jsonl")).expect("journal");
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
     let outcome = run(
         &plan,
         &dests(d1.path(), d2.path()),

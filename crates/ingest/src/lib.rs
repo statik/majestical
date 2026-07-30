@@ -41,4 +41,6 @@ pub enum IngestError {
          — Task 7's per-destination layout is not wired up yet"
     )]
     MismatchedSubdirs { first: String, other: String },
+    #[error("at least one destination required — nothing to copy to")]
+    NoDestinations,
 }

@@ -99,6 +99,12 @@ pub struct Outcome {
     pub skipped_duplicates: Vec<String>,
     pub rejected: Vec<FailedFile>,
     pub skipped_resumed: usize,
+    /// Internal engine notes (currently: recovered lock poisoning) that are
+    /// not about any specific file. Kept separate from `failed` so a
+    /// consumer building per-file records (e.g. Task 7's
+    /// `VerificationRecorded` events) never mistakes an engine-internal
+    /// note for a real file failure.
+    pub diagnostics: Vec<String>,
 }
 
 /// Runs the copy/verify/place pipeline for every file in `plan` not already
@@ -117,15 +123,31 @@ pub fn run(
     sinks: &dyn SinkFactory,
     config: &EngineConfig,
 ) -> Result<Outcome, IngestError> {
+    check_at_least_one_dest(dests)?;
     check_shared_subdir(dests)?;
     let (queue, mut outcome) = partition_plan(plan, resume);
-    let (mut placed, mut failed) = run_workers(queue, dests, journal, sinks, config.jobs)?;
-    sweep_missing(dests, &mut placed, &mut failed);
+    let (mut placed, mut failed, diagnostics) =
+        run_workers(queue, dests, journal, sinks, config.jobs)?;
+    sweep_missing(dests, &mut placed, &mut failed, journal)?;
     placed.sort_by(|a, b| a.rel.cmp(&b.rel));
     failed.sort_by(|a, b| a.rel.cmp(&b.rel));
     outcome.placed = placed;
     outcome.failed = failed;
+    outcome.diagnostics = diagnostics;
     Ok(outcome)
+}
+
+/// A run needs somewhere to put files; an empty destination list would
+/// silently do nothing (every file "succeeds" at zero places), which is
+/// worse than a loud error.
+///
+/// # Errors
+/// Returns `IngestError::NoDestinations` if `dests` is empty.
+fn check_at_least_one_dest(dests: &[DestSpec]) -> Result<(), IngestError> {
+    if dests.is_empty() {
+        return Err(IngestError::NoDestinations);
+    }
+    Ok(())
 }
 
 /// `dest_rel_for` and `sweep_missing` both assume every destination in a
@@ -193,8 +215,18 @@ fn partition_plan(
 /// that was later yanked, or a destination whose parent directory got
 /// tampered with, must not stay a silent success. Every file this run
 /// believes it placed is checked at every destination; a miss demotes it
-/// to failed.
-fn sweep_missing(dests: &[DestSpec], placed: &mut Vec<PlacedFile>, failed: &mut Vec<FailedFile>) {
+/// to failed and is journaled as `FileFailed` so the journal and `Outcome`
+/// agree — otherwise a resumed run would still see the stale `FilePlaced`
+/// record and skip re-copying a file that is, in fact, gone.
+///
+/// # Errors
+/// Returns `IngestError` only if the journal write for a demotion fails.
+fn sweep_missing(
+    dests: &[DestSpec],
+    placed: &mut Vec<PlacedFile>,
+    failed: &mut Vec<FailedFile>,
+    journal: &mut Journal,
+) -> Result<(), IngestError> {
     let mut still_placed = Vec::with_capacity(placed.len());
     for file in placed.drain(..) {
         let missing_roots: Vec<String> = dests
@@ -205,16 +237,22 @@ fn sweep_missing(dests: &[DestSpec], placed: &mut Vec<PlacedFile>, failed: &mut 
         if missing_roots.is_empty() {
             still_placed.push(file);
         } else {
+            let reason = format!(
+                "placed but missing at end-of-run sweep: {}",
+                missing_roots.join(", ")
+            );
+            journal.append(&Record::FileFailed {
+                rel: file.rel.clone(),
+                reason: reason.clone(),
+            })?;
             failed.push(FailedFile {
                 rel: file.rel.clone(),
-                reason: format!(
-                    "placed but missing at end-of-run sweep: {}",
-                    missing_roots.join(", ")
-                ),
+                reason,
             });
         }
     }
     *placed = still_placed;
+    Ok(())
 }
 
 /// Collects diagnostic notes raised by recovered lock poisoning so they are
@@ -283,6 +321,11 @@ struct WorkerContext<'a> {
     abort: &'a Mutex<Option<IngestError>>,
 }
 
+/// What the worker pool produced: placed files, failed files, and any
+/// lock-poisoning diagnostics (kept separate from `failed` — see
+/// `Outcome::diagnostics`).
+type WorkerOutput = (Vec<PlacedFile>, Vec<FailedFile>, Vec<String>);
+
 /// Runs `jobs` worker threads over `queue`, each pulling one file at a time
 /// until the queue is empty or a journal I/O error asks everyone to stop.
 fn run_workers(
@@ -291,7 +334,7 @@ fn run_workers(
     journal: &mut Journal,
     sinks: &dyn SinkFactory,
     jobs: usize,
-) -> Result<(Vec<PlacedFile>, Vec<FailedFile>), IngestError> {
+) -> Result<WorkerOutput, IngestError> {
     let queue = Mutex::new(queue);
     let results: Mutex<(Vec<PlacedFile>, Vec<FailedFile>)> = Mutex::new((Vec::new(), Vec::new()));
     let journal_mutex = Mutex::new(journal);
@@ -319,16 +362,10 @@ fn run_workers(
     {
         return Err(err);
     }
-    let (placed, mut failed) = results
+    let (placed, failed) = results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for note in diagnostics.drain() {
-        failed.push(FailedFile {
-            rel: "<engine>".to_string(),
-            reason: note,
-        });
-    }
-    Ok((placed, failed))
+    Ok((placed, failed, diagnostics.drain()))
 }
 
 fn worker_loop(ctx: &WorkerContext<'_>) {
@@ -408,8 +445,11 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
     if let Some(prehash) = &pf.prehash
         && *prehash != stream.xxh3_hex
     {
+        // Every destination already has a full (if now-stale) copy on disk
+        // under its temp name at this point — the hint applies here too.
         let reason = format!(
-            "source changed between planning and copy: expected xxh3 {prehash}, computed {}",
+            "source changed between planning and copy: expected xxh3 {prehash}, computed {}; \
+             delete the partial(s) and re-run",
             stream.xxh3_hex
         );
         return fail(ctx, &pf.rel, reason);
@@ -445,11 +485,11 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
         });
     }
 
-    let reason = format!(
-        "{}; delete the partial(s) and re-run to retry the failed destination(s)",
-        failures.join("; ")
-    );
-    fail(ctx, &pf.rel, reason)
+    // Each failure string already carries its own hint where a partial
+    // genuinely remains (read-back mismatch); sink-open/write/finish
+    // failures and read-back I/O errors have no confirmed partial to point
+    // at, so no blanket suffix is added here.
+    fail(ctx, &pf.rel, failures.join("; "))
 }
 
 fn dest_rel_for(dests: &[DestSpec], rel: &str) -> String {
@@ -602,8 +642,11 @@ fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> V
                 }
             }
             Ok(hex) => {
+                // A partial genuinely remains at `temp_path`, quarantined
+                // under its `.maj-partial-` name — the hint applies.
                 failures.push(format!(
-                    "{}: read-back mismatch (expected {expected_xxh64_hex}, got {hex}); partial kept at {}",
+                    "{}: read-back mismatch (expected {expected_xxh64_hex}, got {hex}); \
+                     partial kept at {}; delete it and re-run to retry this destination",
                     attempt.root.display(),
                     attempt.temp_path.display()
                 ));
@@ -651,5 +694,10 @@ mod tests {
             },
         ];
         assert!(check_shared_subdir(&dests).is_err());
+    }
+
+    #[test]
+    fn no_destinations_is_rejected() {
+        assert!(check_at_least_one_dest(&[]).is_err());
     }
 }

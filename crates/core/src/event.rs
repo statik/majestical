@@ -62,6 +62,10 @@ pub enum Op {
         volume: String,
         path: String,
         size: u64,
+        /// File modification time (ms since epoch). Additive field: events
+        /// written before phase 4 parse as 0 (meaning "unknown").
+        #[serde(default)]
+        mtime_ms: u64,
     },
     /// Physical observation: a volume was present. `volume` is the stable
     /// identity `AssetSeen.volume` refers to; `label` is the human name at
@@ -197,6 +201,16 @@ mod tests {
         let node = "00000000010000000000000002".to_string();
         for (op, want) in [
             (
+                Op::AssetSeen {
+                    asset: AssetId("xxh3:aa".into()),
+                    volume: "uuid:abc".into(),
+                    path: "clips/a.mov".into(),
+                    size: 4,
+                    mtime_ms: 5,
+                },
+                r#"{"type":"asset_seen","asset":"xxh3:aa","volume":"uuid:abc","path":"clips/a.mov","size":4,"mtime_ms":5}"#,
+            ),
+            (
                 Op::ParaNodeCreate {
                     node: node.clone(),
                     kind: ParaKind::Project,
@@ -253,6 +267,16 @@ mod tests {
                 "round trip must reproduce the wire format"
             );
         }
+    }
+
+    #[test]
+    fn asset_seen_without_mtime_still_parses() {
+        let old = r#"{"id":"00000000010000000000000001","hlc":{"wall_ms":1,"counter":0,"machine":"m1"},"author":"elliot","op":{"type":"asset_seen","asset":"xxh3:aa","volume":"uuid:abc","path":"clips/a.mov","size":4}}"#;
+        let event: Event = serde_json::from_str(old).expect("old wire format must parse");
+        let Op::AssetSeen { mtime_ms, .. } = event.op else {
+            panic!("wrong variant");
+        };
+        assert_eq!(mtime_ms, 0);
     }
 
     #[test]

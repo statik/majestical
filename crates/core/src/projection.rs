@@ -20,8 +20,14 @@ pub enum Touched {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetState {
-    /// (volume, path, size) instances observed for this content hash.
-    pub instances: BTreeSet<(String, String, u64)>,
+    /// (volume, path) -> newest observed instance attributes for this
+    /// content hash. HLC-LWW: a rescan of the same (volume, path) updates
+    /// the entry in place rather than duplicating it.
+    ///
+    /// Serialized via `instance_map` as an array of entries: JSON object
+    /// keys must be strings, and `(String, String)` isn't one.
+    #[serde(with = "instance_map")]
+    pub instances: BTreeMap<(String, String), InstanceInfo>,
     /// tag -> live add-event ids; never holds an empty set — `TagRemove`'s
     /// retain drops emptied entries.
     tag_adds: BTreeMap<String, BTreeSet<EventId>>,
@@ -33,6 +39,56 @@ pub struct AssetState {
     para: Option<(Hlc, String)>,
     /// Hash-history facts observed for this asset's instances.
     verifications: BTreeSet<VerificationRecord>,
+}
+
+/// One file instance's LWW attributes. Ord is (hlc, size, `mtime_ms`) so the
+/// derived comparison matches the projection-wide LWW rule (HLC first).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub hlc: Hlc,
+    pub size: u64,
+    pub mtime_ms: u64,
+}
+
+/// Serializes `AssetState::instances` as a JSON array of entries rather than
+/// an object, since `serde_json` rejects non-string map keys.
+mod instance_map {
+    use super::InstanceInfo;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        volume: String,
+        path: String,
+        #[serde(flatten)]
+        info: InstanceInfo,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(String, String), InstanceInfo>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<Entry> = map
+            .iter()
+            .map(|((volume, path), info)| Entry {
+                volume: volume.clone(),
+                path: path.clone(),
+                info: info.clone(),
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(String, String), InstanceInfo>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| ((e.volume, e.path), e.info))
+            .collect())
+    }
 }
 
 /// One verification observation; a plain fact, deduped by full value.
@@ -134,8 +190,14 @@ impl Projection {
                 volume,
                 path,
                 size,
+                mtime_ms,
             } => {
-                self.apply_asset_seen(asset, volume, path, *size);
+                let candidate = InstanceInfo {
+                    hlc: event.hlc.clone(),
+                    size: *size,
+                    mtime_ms: *mtime_ms,
+                };
+                self.apply_asset_seen(asset, volume, path, candidate);
                 Touched::Asset(asset.clone())
             }
             Op::TagAdd { asset, tag } => {
@@ -219,12 +281,27 @@ impl Projection {
         }
     }
 
-    fn apply_asset_seen(&mut self, asset: &AssetId, volume: &str, path: &str, size: u64) {
-        self.assets
-            .entry(asset.clone())
-            .or_default()
-            .instances
-            .insert((volume.to_string(), path.to_string(), size));
+    /// HLC-LWW upsert of one (volume, path) instance: the newer `(hlc, size,
+    /// mtime_ms)` tuple wins, so a rescan of the same instance updates it in
+    /// place instead of duplicating it, regardless of apply order.
+    fn apply_asset_seen(
+        &mut self,
+        asset: &AssetId,
+        volume: &str,
+        path: &str,
+        candidate: InstanceInfo,
+    ) {
+        let st = self.assets.entry(asset.clone()).or_default();
+        match st.instances.entry((volume.to_string(), path.to_string())) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if candidate > *slot.get() {
+                    slot.insert(candidate);
+                }
+            }
+        }
     }
 
     fn apply_tag_add(&mut self, id: EventId, asset: &AssetId, tag: &str) {
@@ -454,6 +531,7 @@ mod tests {
                     volume: "uuid:abc".into(),
                     path: "clips/a.mov".into(),
                     size: 4,
+                    mtime_ms: 5,
                 },
                 Touched::Asset(asset()),
             ),
@@ -587,6 +665,63 @@ mod tests {
         let json = serde_json::to_string(&p).expect("serialize");
         let back: Projection = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(p, back);
+    }
+
+    /// `projection_round_trips_through_serde_json` only ever exercises the
+    /// `instance_map` serde adapter with exactly one entry (via
+    /// `sample_ops`'s single `AssetSeen`). This pins the adapter at both
+    /// remaining shapes it must handle: zero entries (an asset with metadata
+    /// but no physical observation) and multiple entries (two distinct
+    /// (volume, path) instances on one asset).
+    #[test]
+    fn instances_round_trip_through_serde_json_when_empty_and_when_multi_entry() {
+        let mut empty = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        empty.apply(&test_event(
+            1,
+            Op::TagAdd {
+                asset: a.clone(),
+                tag: "t".into(),
+            },
+        ));
+        let json = serde_json::to_string(&empty).expect("serialize empty instances");
+        let back: Projection = serde_json::from_str(&json).expect("deserialize empty instances");
+        assert_eq!(empty, back);
+        assert!(
+            back.assets().next().expect("asset").1.instances.is_empty(),
+            "no AssetSeen observed, so instances must round-trip empty"
+        );
+
+        let mut multi = Projection::default();
+        multi.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v1".into(),
+                path: "a.mov".into(),
+                size: 4,
+                mtime_ms: 5,
+            },
+        ));
+        multi.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v2".into(),
+                path: "b.mov".into(),
+                size: 8,
+                mtime_ms: 9,
+            },
+        ));
+        let json = serde_json::to_string(&multi).expect("serialize multi-entry instances");
+        let back: Projection =
+            serde_json::from_str(&json).expect("deserialize multi-entry instances");
+        assert_eq!(multi, back);
+        assert_eq!(
+            back.assets().next().expect("asset").1.instances.len(),
+            2,
+            "two distinct (volume, path) instances must both round-trip"
+        );
     }
 
     /// Pins the exact `Touched` value for one op of every variant — without
@@ -837,6 +972,104 @@ mod tests {
     }
 
     #[test]
+    fn a_rescan_of_the_same_path_updates_in_place_instead_of_duplicating() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        p.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 3,
+                mtime_ms: 10,
+            },
+        ));
+        p.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 9,
+                mtime_ms: 20,
+            },
+        ));
+        let state = p.assets().find(|(id, _)| **id == a).expect("asset").1;
+        assert_eq!(
+            state.instances.len(),
+            1,
+            "same (volume, path) must not duplicate"
+        );
+        let info = state.instances.values().next().expect("instance");
+        assert_eq!((info.size, info.mtime_ms), (9, 20), "newer HLC wins");
+    }
+
+    #[test]
+    fn instance_lww_is_hlc_ordered_not_arrival_ordered() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        p.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 9,
+                mtime_ms: 20,
+            },
+        ));
+        p.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 3,
+                mtime_ms: 10,
+            },
+        ));
+        let state = p.assets().find(|(id, _)| **id == a).expect("asset").1;
+        let info = state.instances.values().next().expect("instance");
+        assert_eq!((info.size, info.mtime_ms), (9, 20));
+    }
+
+    /// The other two LWW tests both pick payloads where `size` happens to
+    /// rank the same way as the HLC, so a mutation reordering
+    /// `InstanceInfo`'s fields to `(size, mtime_ms, hlc)` — making the
+    /// derived `Ord` compare size first — would still pass them. Here the
+    /// later event carries the smaller size, so only a genuine HLC-first
+    /// comparison picks it.
+    #[test]
+    fn newer_hlc_wins_even_when_size_is_smaller() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        p.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 9,
+                mtime_ms: 99,
+            },
+        ));
+        p.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 1,
+                mtime_ms: 1,
+            },
+        ));
+        let state = p.assets().find(|(id, _)| **id == a).expect("asset").1;
+        let info = state.instances.values().next().expect("instance");
+        assert_eq!((info.size, info.mtime_ms), (1, 1), "HLC must dominate size");
+    }
+
+    #[test]
     fn has_instances_requires_an_asset_seen_observation() {
         let a = asset();
         let mut p = Projection::default();
@@ -863,6 +1096,7 @@ mod tests {
                 volume: "V1".into(),
                 path: "a.mov".into(),
                 size: 1,
+                mtime_ms: 0,
             },
         ));
         assert!(p.has_instances(&a));
@@ -1008,6 +1242,7 @@ mod tests {
                 volume: "V1".into(),
                 path: "a.mov".into(),
                 size: 4,
+                mtime_ms: 0,
             },
         ));
         let ids: Vec<&AssetId> = p.assets().map(|(id, _)| id).collect();

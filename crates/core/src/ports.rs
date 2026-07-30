@@ -2,6 +2,7 @@
 //! never the concrete adapters behind them.
 use crate::event::{AssetId, Event};
 use crate::projection::Projection;
+use std::collections::BTreeSet;
 
 /// Adapter errors crossing a port boundary keep their message and source
 /// but drop the concrete type, so core-level code never names an adapter.
@@ -62,17 +63,75 @@ pub trait EventLog {
     ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError>;
 }
 
+/// One hard search filter, already resolved to storage terms (para refs are
+/// node ids; `Online` carries the currently-mounted volume ids). The
+/// contracts below are what the sqlite adapter implements; other adapters
+/// must match them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// Matches an asset with this exact tag.
+    Tag { value: String, negated: bool },
+    /// Matches an asset with an instance on a volume whose label OR id
+    /// equals `value` — including an instance whose volume has no
+    /// `volumes` row at all (a "ghost" volume, reachable via partial
+    /// cross-machine sync).
+    Volume { value: String, negated: bool },
+    /// Matches an asset currently assigned to this PARA node.
+    Para { node: String, negated: bool },
+    /// Matches an asset with an instance whose kind is `value` — one of
+    /// `core::media_kind::MediaKind::as_str()`'s strings ("image", "video",
+    /// "other").
+    Kind { value: String, negated: bool },
+    /// `want: true` matches an asset with an instance on one of `ids` (the
+    /// currently-mounted volume set); `want: false` matches an asset with an
+    /// instance on none of them. An empty `ids` is the "nothing is mounted"
+    /// case: `want: true` then matches nothing, `want: false` matches any
+    /// asset that has at least one instance.
+    Online { ids: Vec<String>, want: bool },
+    /// Matches an asset with an instance whose `mtime_ms` (wall-clock
+    /// milliseconds) is strictly less than this bound.
+    Before(u64),
+    /// Matches an asset with an instance whose `mtime_ms` (wall-clock
+    /// milliseconds) is strictly greater than this bound.
+    After(u64),
+}
+
+/// Presentation row for one search hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetSummary {
+    pub asset: AssetId,
+    /// The first instance's basename, or empty for a tag-only asset with no
+    /// recorded instance.
+    pub name: String,
+    /// (volume id, volume label) pairs holding an instance.
+    pub volumes: Vec<(String, String)>,
+    pub tags: Vec<String>,
+    pub para: Option<String>,
+}
+
 /// Queryable projection storage, disposable and rebuildable.
 pub trait CatalogStore {
     /// # Errors
     /// Returns `PortError` when the store cannot be rebuilt.
     fn rebuild(&mut self, projection: &Projection) -> Result<(), PortError>;
+    /// Assets satisfying every filter (conjunction).
     /// # Errors
     /// Returns `PortError` when the query fails.
-    fn search_by_tag(&self, tag: &str) -> Result<Vec<AssetId>, PortError>;
+    fn assets_matching(&self, filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError>;
+    /// Assets whose name matches any of `terms`, ranked best-first, capped at
+    /// `limit` rows. One row per asset, at its best-matching name's rank,
+    /// even when several of its instance names match.
     /// # Errors
     /// Returns `PortError` when the query fails.
-    fn search_by_name(&self, needle: &str) -> Result<Vec<AssetId>, PortError>;
+    fn search_names_ranked(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(AssetId, f64)>, PortError>;
+    /// Presentation rows for exactly the given asset ids.
+    /// # Errors
+    /// Returns `PortError` when the query fails.
+    fn asset_summaries(&self, ids: &[AssetId]) -> Result<Vec<AssetSummary>, PortError>;
     /// Every volume ever seen: (id, label, last-seen wall ms), ordered by id.
     /// # Errors
     /// Returns `PortError` when the query fails.
@@ -141,10 +200,17 @@ mod tests {
                 .collect();
             Ok(())
         }
-        fn search_by_tag(&self, _tag: &str) -> Result<Vec<AssetId>, PortError> {
+        fn assets_matching(&self, _filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError> {
+            Ok(BTreeSet::new())
+        }
+        fn search_names_ranked(
+            &self,
+            _terms: &[String],
+            _limit: usize,
+        ) -> Result<Vec<(AssetId, f64)>, PortError> {
             Ok(Vec::new())
         }
-        fn search_by_name(&self, _needle: &str) -> Result<Vec<AssetId>, PortError> {
+        fn asset_summaries(&self, _ids: &[AssetId]) -> Result<Vec<AssetSummary>, PortError> {
             Ok(Vec::new())
         }
         fn volumes(&self) -> Result<Vec<(String, String, u64)>, PortError> {

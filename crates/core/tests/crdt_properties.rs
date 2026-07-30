@@ -22,6 +22,7 @@ enum OpKind {
         volume: String,
         path: String,
         size: u64,
+        mtime_ms: u64,
     },
     VolumeObserved {
         volume: String,
@@ -88,11 +89,17 @@ fn build_events(kinds: &[(u64, OpKind)]) -> Vec<Event> {
                     field: field.clone(),
                     value: value.clone(),
                 },
-                OpKind::Seen { volume, path, size } => Op::AssetSeen {
+                OpKind::Seen {
+                    volume,
+                    path,
+                    size,
+                    mtime_ms,
+                } => Op::AssetSeen {
                     asset: asset.clone(),
                     volume: volume.clone(),
                     path: path.clone(),
                     size: *size,
+                    mtime_ms: *mtime_ms,
                 },
                 OpKind::VolumeObserved { volume, label } => Op::VolumeSeen {
                     volume: volume.clone(),
@@ -188,11 +195,14 @@ fn arb_kind() -> impl Strategy<Value = OpKind> {
             }
         ),
         ("[f-h]{1,2}", "[x-z]{1,3}").prop_map(|(field, value)| OpKind::Set { field, value }),
-        ("[v-w]{1,2}", "[p-r]{1,4}", 0u64..100).prop_map(|(volume, path, size)| OpKind::Seen {
-            volume,
-            path,
-            size
-        }),
+        ("[v-w]{1,2}", "[p-r]{1,4}", 0u64..100, 0u64..100).prop_map(
+            |(volume, path, size, mtime_ms)| OpKind::Seen {
+                volume,
+                path,
+                size,
+                mtime_ms
+            }
+        ),
         ("[v-w]{1,2}", "[a-c]{1,3}")
             .prop_map(|(volume, label)| OpKind::VolumeObserved { volume, label }),
         (arb_node(), arb_para_kind(), "[a-z]{1,8}")

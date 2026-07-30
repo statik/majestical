@@ -2,12 +2,14 @@
 mod app;
 mod commands;
 mod iso8601;
+mod query;
+mod search;
 mod state_dir;
 mod volume_identity;
 
 use anyhow::Result;
 use app::FsApp;
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
 use std::path::PathBuf;
 
@@ -49,15 +51,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
-    /// Search the catalog projection.
-    #[command(group(
-        ArgGroup::new("search_by").args(["name", "tag"]).required(true).multiple(false)
-    ))]
+    /// Search the catalog: bare terms match names; key:value tokens are
+    /// hard filters (tag: vol: para: kind: online: before: after:), '-'
+    /// negates.
     Search {
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        tag: Option<String>,
+        /// May start with '-' (a leading negated filter, e.g. `-tag:x`) —
+        /// `allow_hyphen_values` stops clap from treating the whole query as
+        /// an unrecognized option in that case.
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -204,9 +208,10 @@ fn main() -> Result<()> {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             commands::cmd_tag(&mut app, cmd)?;
         }
-        Cmd::Search { name, tag, json } => {
+        Cmd::Search { query, limit, json } => {
             let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_search(&app, &cli.catalog, name, tag, json)?;
+            let args = search::SearchArgs { query, limit, json };
+            search::cmd_search(&app, &cli.catalog, &args)?;
         }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },

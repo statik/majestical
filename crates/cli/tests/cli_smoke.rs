@@ -103,7 +103,7 @@ fn init_scan_tag_search_round_trip() {
         .stdout(contains("2 assets"));
     // Find the asset id for sunset.mov via name search (json output).
     let out = maj(&root, &state)
-        .args(["search", "--name", "sunset", "--json"])
+        .args(["search", "sunset", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -115,7 +115,7 @@ fn init_scan_tag_search_round_trip() {
         .assert()
         .success();
     let out = maj(&root, &state)
-        .args(["search", "--tag", "topic/drone", "--json"])
+        .args(["search", "tag:topic/drone", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -127,7 +127,7 @@ fn init_scan_tag_search_round_trip() {
         .assert()
         .success();
     let out = maj(&root, &state)
-        .args(["search", "--tag", "topic/drone", "--json"])
+        .args(["search", "tag:topic/drone", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -164,7 +164,7 @@ fn corrupt_log_line_is_skipped_and_reported_on_stderr() {
     std::fs::write(&seg, contents).unwrap();
 
     let assert = maj(&root, &state)
-        .args(["search", "--name", "sunset", "--json"])
+        .args(["search", "sunset", "--json"])
         .assert()
         .success();
     let out = assert.get_output();
@@ -223,6 +223,7 @@ fn far_future_peer_event_triggers_clamp_warning() {
             volume: "peerbad-volume".into(),
             path: "poison.mov".into(),
             size: 1,
+            mtime_ms: 0,
         },
     };
     let line = serde_json::to_string(&poisoned).unwrap();
@@ -268,7 +269,7 @@ fn two_machines_converge_through_shared_catalog_root() {
         .assert()
         .success();
     let out = maj_as(&root, &state, "machine-a")
-        .args(["search", "--name", "clip", "--json"])
+        .args(["search", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
@@ -279,7 +280,7 @@ fn two_machines_converge_through_shared_catalog_root() {
 
     // machine-b, in a separate process, sees machine-a's asset and tag.
     let out = maj_as(&root, &state, "machine-b")
-        .args(["search", "--tag", "tag/a", "--json"])
+        .args(["search", "tag:tag/a", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -299,14 +300,14 @@ fn two_machines_converge_through_shared_catalog_root() {
 
     for machine in ["machine-a", "machine-b"] {
         let out = maj_as(&root, &state, machine)
-            .args(["search", "--tag", "tag/a", "--json"])
+            .args(["search", "tag:tag/a", "--json"])
             .output()
             .unwrap();
         let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(hits["count"], 1, "{machine} should still see tag/a");
 
         let out = maj_as(&root, &state, machine)
-            .args(["search", "--tag", "tag/b", "--json"])
+            .args(["search", "tag:tag/b", "--json"])
             .output()
             .unwrap();
         let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -463,7 +464,7 @@ fn commands_against_an_uninitialized_catalog_fail_with_a_clear_message() {
     let state = catalog.path().join("state");
 
     maj(&root, &state)
-        .args(["search", "--name", "anything", "--json"])
+        .args(["search", "anything", "--json"])
         .assert()
         .failure()
         .stderr(contains("no catalog at"))
@@ -482,7 +483,7 @@ fn commands_succeed_after_catalog_init() {
         .assert()
         .success();
     maj(&root, &state)
-        .args(["search", "--name", "anything", "--json"])
+        .args(["search", "anything", "--json"])
         .assert()
         .success();
 }
@@ -507,7 +508,7 @@ fn tag_add_on_an_unscanned_asset_fails_and_leaves_the_catalog_unchanged() {
         .stderr(contains("unknown asset xxh3:neverseen"));
 
     let out = maj(&root, &state)
-        .args(["search", "--tag", "some/tag", "--json"])
+        .args(["search", "tag:some/tag", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -596,7 +597,7 @@ fn meta_set_get_round_trip() {
         .assert()
         .success();
     let out = maj(&root, &state)
-        .args(["search", "--name", "clip", "--json"])
+        .args(["search", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
@@ -641,7 +642,7 @@ fn meta_get_on_a_missing_field_is_empty_not_an_error() {
         .assert()
         .success();
     let out = maj(&root, &state)
-        .args(["search", "--name", "clip", "--json"])
+        .args(["search", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
@@ -932,7 +933,7 @@ fn meta_set_later_write_wins_across_machines() {
         .assert()
         .success();
     let out = maj_as(&root, &state, "machine-a")
-        .args(["search", "--name", "clip", "--json"])
+        .args(["search", "clip", "--json"])
         .output()
         .unwrap();
     let id = first_asset_id(&out);
@@ -1051,6 +1052,17 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
     // `assert_ingest_event_granularity`.
     assert_ingest_event_granularity(&root, 2);
 
+    // Ingest must stat its own placed files for `AssetSeen.mtime_ms`, same as
+    // `scan` — not leave the phase-1 `0` placeholder in place.
+    let events = read_events(&root);
+    for e in events.iter().filter(|e| e["op"]["type"] == "asset_seen") {
+        let mtime_ms = e["op"]["mtime_ms"].as_u64().unwrap();
+        assert!(
+            mtime_ms > 0,
+            "expected a real mtime_ms on an ingest-placed AssetSeen event, got {e}"
+        );
+    }
+
     for dest in [d1.path(), d2.path()] {
         assert!(
             walkdir_contains(dest, "a.mov"),
@@ -1065,7 +1077,7 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
     }
 
     let out = maj(&root, &state)
-        .args(["search", "--name", "a.mov", "--json"])
+        .args(["search", "a.mov", "--json"])
         .output()
         .unwrap();
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -1295,7 +1307,7 @@ fn catalog_db_lives_in_state_dir_not_sync_root() {
         .assert()
         .success();
     maj(&catalog, &state)
-        .args(["search", "--name", "a.txt"])
+        .args(["search", "a.txt"])
         .assert()
         .success();
     assert!(
@@ -1322,7 +1334,7 @@ fn legacy_catalog_db_in_sync_root_is_removed_on_open() {
         .success();
     std::fs::write(catalog.join("catalog.db"), b"legacy").unwrap();
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
     assert!(
@@ -1346,7 +1358,7 @@ fn legacy_run_journals_move_to_state_dir() {
         .success();
     std::fs::write(catalog.join("runs").join("01OLD.jsonl"), b"{}\n").unwrap();
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
     assert!(
@@ -1387,7 +1399,7 @@ fn legacy_runs_dir_with_non_journal_entries_migrates_the_journal_and_leaves_junk
     .unwrap();
 
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
 
@@ -1409,7 +1421,7 @@ fn legacy_runs_dir_with_non_journal_entries_migrates_the_journal_and_leaves_junk
     // The catalog must still be usable on a second run, even though the
     // legacy runs/ dir can never be fully removed (junk remains in it).
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
 }
@@ -1431,7 +1443,7 @@ fn legacy_journal_migration_does_not_overwrite_an_existing_state_dir_journal() {
         .success();
     // Any command opens the catalog, which creates the state dir's runs/.
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
     let state_runs = walkdir::WalkDir::new(&state)
@@ -1450,7 +1462,7 @@ fn legacy_journal_migration_does_not_overwrite_an_existing_state_dir_journal() {
     .unwrap();
 
     maj(&catalog, &state)
-        .args(["search", "--name", "nothing"])
+        .args(["search", "nothing"])
         .assert()
         .success();
 
@@ -1462,5 +1474,305 @@ fn legacy_journal_migration_does_not_overwrite_an_existing_state_dir_journal() {
     assert!(
         !catalog.join("runs").join("01OLD.jsonl").exists(),
         "the legacy source is still removed so the sync root converges"
+    );
+}
+
+/// A search query combines bare name terms (FTS ranked) with `key:value`
+/// hard filters (AND'd, `-` negated) — `tag:` and `kind:` filters exercised
+/// together against a scanned catalog.
+#[test]
+fn search_combines_terms_and_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("beach_day.mov"), b"aaa").unwrap();
+    std::fs::write(media.join("mountain.jpg"), b"bbb").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+    let out = maj(&catalog, &state)
+        .args(["search", "beach", "--json"])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Pin the JSON contract beyond just `results[].asset`: name, and each
+    // volume's online flag (true here — the scanned tempdir is on the
+    // always-mounted root volume).
+    assert_eq!(hits["results"][0]["name"], "beach_day.mov");
+    assert_eq!(hits["results"][0]["volumes"][0]["online"], true);
+    let asset = first_asset_id(&out);
+    maj(&catalog, &state)
+        .args(["tag", "add", &asset, "status/select"])
+        .assert()
+        .success();
+    maj(&catalog, &state)
+        .args(["search", "beach tag:status/select"])
+        .assert()
+        .success()
+        .stdout(contains("beach_day.mov"));
+    maj(&catalog, &state)
+        .args(["search", "beach -tag:status/select"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+    // A '-' negated filter as the query's very first character — clap must
+    // not mistake the whole query for an unrecognized option.
+    maj(&catalog, &state)
+        .args(["search", "-tag:status/select"])
+        .assert()
+        .success()
+        .stdout(contains("mountain.jpg"));
+    maj(&catalog, &state)
+        .args(["search", "kind:video"])
+        .assert()
+        .success()
+        .stdout(contains("beach_day.mov"));
+    maj(&catalog, &state)
+        .args(["search", "kind:image -tag:status/select"])
+        .assert()
+        .success()
+        .stdout(contains("mountain.jpg"));
+
+    let vol_out = maj(&catalog, &state)
+        .args(["volumes", "list", "--json"])
+        .output()
+        .unwrap();
+    let vols: serde_json::Value = serde_json::from_slice(&vol_out.stdout).unwrap();
+    let vol_label = vols["volumes"][0]["label"].as_str().unwrap();
+    maj(&catalog, &state)
+        .args(["search", &format!("vol:{vol_label}")])
+        .assert()
+        .success()
+        .stdout(contains("beach_day.mov"))
+        .stdout(contains("mountain.jpg"));
+}
+
+/// The search limit applies to the intersection of ranked terms and hard
+/// filters, not to a pre-filter slice of the ranked list — a filter match
+/// that happens to rank outside the first `limit * 4` terms must still be
+/// found.
+#[test]
+fn search_limit_applies_after_filtering_not_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    for n in 0..30 {
+        std::fs::write(media.join(format!("beach_{n:02}.mov")), n.to_string()).unwrap();
+    }
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    let out = maj(&catalog, &state)
+        .args(["search", "beach", "--json", "--limit", "100"])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = hits["results"].as_array().unwrap();
+    assert_eq!(results.len(), 30);
+    // Tag the 4 worst-ranked hits (the tail of the unfiltered ranked list) —
+    // a `--limit 2` search must still find them via intersection, not miss
+    // them because they fall outside a `limit * 4` pre-filter window.
+    for r in results.iter().rev().take(4) {
+        let asset = r["asset"].as_str().unwrap();
+        maj(&catalog, &state)
+            .args(["tag", "add", asset, "status/select"])
+            .assert()
+            .success();
+    }
+
+    let out = maj(&catalog, &state)
+        .args([
+            "search",
+            "beach tag:status/select",
+            "--limit",
+            "2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        hits["count"], 2,
+        "the 4 tagged assets rank last among 30 matches; --limit 2 must still \
+         find them via intersection rather than a pre-filter slice, got: {hits}"
+    );
+}
+
+/// `online:`/`-online:` matches against the currently-mounted volume set.
+/// The scanned tempdir lives on the always-mounted root volume, so its
+/// asset must show up under `online:yes`/`-online:no` and disappear under
+/// `online:no`/`-online:yes`.
+#[test]
+fn search_online_filter_matches_currently_mounted_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("clip.mov"), b"aaa").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "online:yes"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mov"));
+    maj(&catalog, &state)
+        .args(["search", "-online:no"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mov"));
+    maj(&catalog, &state)
+        .args(["search", "online:no"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+    maj(&catalog, &state)
+        .args(["search", "-online:yes"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+}
+
+/// An unknown filter key fails fast, naming the keys that are actually
+/// valid, rather than silently matching nothing.
+#[test]
+fn search_with_unknown_filter_key_lists_valid_keys() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["search", "flavor:salty"])
+        .assert()
+        .failure()
+        .stderr(contains("tag"))
+        .stderr(contains("before"));
+}
+
+/// `before:`/`after:` filters compare against an instance's real recorded
+/// file mtime, not the placeholder `0` scans used to write.
+#[test]
+fn search_mtime_filters_use_real_file_mtimes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("recent.mov"), b"aaa").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "after:1970-01-02"])
+        .assert()
+        .success()
+        .stdout(contains("recent.mov"));
+    maj(&catalog, &state)
+        .args(["search", "before:1970-01-02"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+}
+
+/// A query with no terms and no filters is rejected rather than silently
+/// running an unbounded "everything" search.
+#[test]
+fn empty_query_without_filters_is_an_error() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["search", "   "])
+        .assert()
+        .failure()
+        .stderr(contains("terms"))
+        .stderr(contains("filter"));
+}
+
+/// Text-mode output hints when a result count lands exactly on `--limit` —
+/// almost always meaning more matches exist past the cutoff — so a
+/// truncated list doesn't read as the complete answer.
+#[test]
+fn search_text_output_notes_truncation_at_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("beach_1.mov"), b"a").unwrap();
+    std::fs::write(media.join("beach_2.mov"), b"b").unwrap();
+    std::fs::write(media.join("beach_3.mov"), b"c").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "beach", "--limit", "2"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "note: results truncated at 2; raise --limit to see more",
+        ));
+    let out = maj(&catalog, &state)
+        .args(["search", "beach", "--limit", "10"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("note: results truncated"),
+        "expected no truncation note when the match count falls short of --limit, got: {stdout}"
     );
 }

@@ -38,6 +38,24 @@ pub fn resolve(path: &Path) -> VolumeIdentity {
     }
 }
 
+/// Currently mounted volumes: id → mount point. "/" first so the root volume
+/// wins its id even when /Volumes carries a symlink to it.
+#[must_use]
+pub(crate) fn mounted_volumes() -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut add = |path: std::path::PathBuf| {
+        let identity = resolve(&path);
+        map.entry(identity.id).or_insert(path);
+    };
+    add(std::path::PathBuf::from("/"));
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            add(entry.path());
+        }
+    }
+    map
+}
+
 /// Walks up from `path` until the device id changes; the last path before
 /// the change is the mount point. Falls back to `path` itself if metadata
 /// can't be read (e.g. it doesn't exist).

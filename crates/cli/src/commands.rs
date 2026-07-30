@@ -48,6 +48,19 @@ pub(crate) fn resolve_volume(dir: &Path, volume: Option<String>) -> (String, Str
     (identity.id, identity.label)
 }
 
+/// A file's real modification time, in milliseconds since the Unix epoch —
+/// `0` (meaning "unknown") if the platform can't report it or it predates
+/// the epoch, rather than failing the whole scan/ingest over one file's
+/// clock oddity.
+pub(crate) fn mtime_ms_of(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
     let (volume_id, volume_label) = resolve_volume(dir, volume);
     let mut ops = Vec::new();
@@ -56,10 +69,10 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
         if !entry.file_type().is_file() {
             continue;
         }
-        let size = entry
+        let metadata = entry
             .metadata()
-            .with_context(|| format!("reading metadata for {}", entry.path().display()))?
-            .len();
+            .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
+        let size = metadata.len();
         let file = std::fs::File::open(entry.path())
             .with_context(|| format!("reading {}", entry.path().display()))?;
         // Stream the hash rather than loading the whole file: media
@@ -93,6 +106,7 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
             volume: volume_id.clone(),
             path: rel,
             size,
+            mtime_ms: mtime_ms_of(&metadata),
         });
     }
     let n = ops.len();
@@ -208,42 +222,6 @@ pub(crate) fn print_meta_get(
             println!("{k}\t{v}");
         }
     }
-}
-
-pub(crate) fn cmd_search(
-    app: &FsApp,
-    catalog_dir: &Path,
-    name: Option<String>,
-    tag: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let (db, _projection) = open_catalog(app, catalog_dir)?;
-    let ids = match (name, tag) {
-        (Some(n), None) => db.search_by_name(&n)?,
-        (None, Some(t)) => db.search_by_tag(&t)?,
-        // The `search_by` ArgGroup (required, mutually exclusive)
-        // guarantees clap rejects these combinations before `main`
-        // ever runs, so this arm can't be reached.
-        (Some(_), Some(_)) | (None, None) => {
-            unreachable!("clap's search_by ArgGroup allows exactly one of these")
-        }
-    };
-    if json {
-        let results: Vec<_> = ids
-            .iter()
-            .map(|a| serde_json::json!({ "asset": a.0 }))
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({ "count": ids.len(), "results": results })
-        );
-    } else {
-        for a in &ids {
-            println!("{}", a.0);
-        }
-        println!("{} results", ids.len());
-    }
-    Ok(())
 }
 
 /// Cheap phase-2 "is this volume mounted right now" heuristic, not true
@@ -730,8 +708,8 @@ fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
         let Some(hash) = asset.0.strip_prefix("xxh3:") else {
             continue;
         };
-        for (_, _, size) in &state.instances {
-            pairs.push((hash.to_string(), *size));
+        for info in state.instances.values() {
+            pairs.push((hash.to_string(), info.size));
         }
     }
     plan::KnownAssets::from_pairs(pairs)
@@ -957,12 +935,15 @@ fn asset_and_para_ops(
     let mut seen_assets: BTreeSet<AssetId> = BTreeSet::new();
     for placed in &outcome.placed {
         let asset = AssetId(format!("xxh3:{}", placed.xxh3));
-        for (_, dest_id, _) in dest_volumes {
+        for (root, dest_id, _) in dest_volumes {
+            let mtime_ms =
+                std::fs::metadata(root.join(&placed.dest_rel)).map_or(0, |m| mtime_ms_of(&m));
             ops.push(Op::AssetSeen {
                 asset: asset.clone(),
                 volume: dest_id.clone(),
                 path: placed.dest_rel.clone(),
                 size: placed.size,
+                mtime_ms,
             });
             ops.push(Op::VerificationRecorded {
                 asset: asset.clone(),

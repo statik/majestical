@@ -107,7 +107,8 @@ impl SqliteCatalog {
         let tx = self.conn.transaction()?;
         for t in touched {
             match t {
-                Touched::Nothing => {}
+                // SavedSearch storage lands with the CLI surface (next task).
+                Touched::Nothing | Touched::SavedSearch(_) => {}
                 Touched::Asset(id) => {
                     tx.execute("DELETE FROM tags WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM instances WHERE asset = ?1", [&id.0])?;

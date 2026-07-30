@@ -49,7 +49,9 @@ pub enum CatalogError {
 ///
 /// Bumped to 3: `instances` gained a `kind` column and `names_fts` (the FTS5
 /// name index) was added.
-pub(crate) const SNAPSHOT_VERSION: i64 = 3;
+///
+/// Bumped to 4: `Projection` gained the `saved_searches` field.
+pub(crate) const SNAPSHOT_VERSION: i64 = 4;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.

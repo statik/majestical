@@ -57,6 +57,102 @@ enum OpKind {
         generation: u32,
         roothash: String,
     },
+    SavedSearchSet {
+        name: String,
+        query: String,
+    },
+    SavedSearchRemove {
+        name: String,
+    },
+}
+
+/// Builds the `Op` one `OpKind` describes. Split out of `build_events` purely
+/// to keep that function under the crate's max-function-length lint.
+fn op_from_kind(asset: &AssetId, kind: &OpKind, ids: &[EventId]) -> Op {
+    match kind {
+        OpKind::Add { tag } => Op::TagAdd {
+            asset: asset.clone(),
+            tag: tag.clone(),
+        },
+        OpKind::Remove {
+            tag,
+            observed_indices,
+        } => Op::TagRemove {
+            asset: asset.clone(),
+            tag: tag.clone(),
+            observed: observed_indices
+                .iter()
+                .map(|i| ids[i % ids.len()])
+                .collect(),
+        },
+        OpKind::Set { field, value } => Op::FieldSet {
+            asset: asset.clone(),
+            field: field.clone(),
+            value: value.clone(),
+        },
+        OpKind::Seen {
+            volume,
+            path,
+            size,
+            mtime_ms,
+        } => Op::AssetSeen {
+            asset: asset.clone(),
+            volume: volume.clone(),
+            path: path.clone(),
+            size: *size,
+            mtime_ms: *mtime_ms,
+        },
+        OpKind::VolumeObserved { volume, label } => Op::VolumeSeen {
+            volume: volume.clone(),
+            label: label.clone(),
+        },
+        OpKind::ParaCreate { node, kind, name } => Op::ParaNodeCreate {
+            node: node.clone(),
+            kind: *kind,
+            name: name.clone(),
+        },
+        OpKind::ParaRename { node, name } => Op::ParaNodeRename {
+            node: node.clone(),
+            name: name.clone(),
+        },
+        OpKind::ParaArchive { node } => Op::ParaNodeArchive { node: node.clone() },
+        OpKind::AssetParaSet { node } => Op::AssetParaSet {
+            asset: asset.clone(),
+            node: node.clone(),
+        },
+        OpKind::Verification {
+            volume,
+            path,
+            algo,
+            value,
+            outcome,
+            hashdate_ms,
+        } => Op::VerificationRecorded {
+            asset: asset.clone(),
+            volume: volume.clone(),
+            path: path.clone(),
+            algo: algo.clone(),
+            value: value.clone(),
+            outcome: *outcome,
+            hashdate_ms: *hashdate_ms,
+        },
+        OpKind::Manifest {
+            volume,
+            mhl_path,
+            generation,
+            roothash,
+        } => Op::ManifestRecorded {
+            volume: volume.clone(),
+            mhl_path: mhl_path.clone(),
+            generation: *generation,
+            roothash: roothash.clone(),
+        },
+        OpKind::SavedSearchSet { name, query } => Op::SavedSearchSet {
+            name: name.clone(),
+            query: query.clone(),
+        },
+        OpKind::SavedSearchRemove { name } => Op::SavedSearchRemove { name: name.clone() },
+    }
 }
 
 fn build_events(kinds: &[(u64, OpKind)]) -> Vec<Event> {
@@ -67,96 +163,15 @@ fn build_events(kinds: &[(u64, OpKind)]) -> Vec<Event> {
     kinds
         .iter()
         .enumerate()
-        .map(|(n, (wall, kind))| {
-            let op = match kind {
-                OpKind::Add { tag } => Op::TagAdd {
-                    asset: asset.clone(),
-                    tag: tag.clone(),
-                },
-                OpKind::Remove {
-                    tag,
-                    observed_indices,
-                } => Op::TagRemove {
-                    asset: asset.clone(),
-                    tag: tag.clone(),
-                    observed: observed_indices
-                        .iter()
-                        .map(|i| ids[i % kinds.len()])
-                        .collect(),
-                },
-                OpKind::Set { field, value } => Op::FieldSet {
-                    asset: asset.clone(),
-                    field: field.clone(),
-                    value: value.clone(),
-                },
-                OpKind::Seen {
-                    volume,
-                    path,
-                    size,
-                    mtime_ms,
-                } => Op::AssetSeen {
-                    asset: asset.clone(),
-                    volume: volume.clone(),
-                    path: path.clone(),
-                    size: *size,
-                    mtime_ms: *mtime_ms,
-                },
-                OpKind::VolumeObserved { volume, label } => Op::VolumeSeen {
-                    volume: volume.clone(),
-                    label: label.clone(),
-                },
-                OpKind::ParaCreate { node, kind, name } => Op::ParaNodeCreate {
-                    node: node.clone(),
-                    kind: *kind,
-                    name: name.clone(),
-                },
-                OpKind::ParaRename { node, name } => Op::ParaNodeRename {
-                    node: node.clone(),
-                    name: name.clone(),
-                },
-                OpKind::ParaArchive { node } => Op::ParaNodeArchive { node: node.clone() },
-                OpKind::AssetParaSet { node } => Op::AssetParaSet {
-                    asset: asset.clone(),
-                    node: node.clone(),
-                },
-                OpKind::Verification {
-                    volume,
-                    path,
-                    algo,
-                    value,
-                    outcome,
-                    hashdate_ms,
-                } => Op::VerificationRecorded {
-                    asset: asset.clone(),
-                    volume: volume.clone(),
-                    path: path.clone(),
-                    algo: algo.clone(),
-                    value: value.clone(),
-                    outcome: *outcome,
-                    hashdate_ms: *hashdate_ms,
-                },
-                OpKind::Manifest {
-                    volume,
-                    mhl_path,
-                    generation,
-                    roothash,
-                } => Op::ManifestRecorded {
-                    volume: volume.clone(),
-                    mhl_path: mhl_path.clone(),
-                    generation: *generation,
-                    roothash: roothash.clone(),
-                },
-            };
-            Event {
-                id: ids[n],
-                hlc: Hlc {
-                    wall_ms: *wall,
-                    counter: 0,
-                    machine: MachineId(format!("m{}", n % 3)),
-                },
-                author: "prop".into(),
-                op,
-            }
+        .map(|(n, (wall, kind))| Event {
+            id: ids[n],
+            hlc: Hlc {
+                wall_ms: *wall,
+                counter: 0,
+                machine: MachineId(format!("m{}", n % 3)),
+            },
+            author: "prop".into(),
+            op: op_from_kind(&asset, kind, &ids),
         })
         .collect()
 }
@@ -236,6 +251,8 @@ fn arb_kind() -> impl Strategy<Value = OpKind> {
                 roothash,
             }
         ),
+        ("[a-b]", "[q-r]{1,2}").prop_map(|(name, query)| OpKind::SavedSearchSet { name, query }),
+        "[a-b]".prop_map(|name| OpKind::SavedSearchRemove { name }),
     ]
 }
 

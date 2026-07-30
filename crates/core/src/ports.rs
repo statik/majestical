@@ -97,7 +97,8 @@ pub trait CatalogStore {
     /// Returns `PortError` when the query fails.
     fn assets_matching(&self, filters: &[Filter]) -> Result<BTreeSet<AssetId>, PortError>;
     /// Assets whose name matches any of `terms`, ranked best-first, capped at
-    /// `limit` rows.
+    /// `limit` rows. One row per asset, at its best-matching name's rank,
+    /// even when several of its instance names match.
     /// # Errors
     /// Returns `PortError` when the query fails.
     fn search_names_ranked(

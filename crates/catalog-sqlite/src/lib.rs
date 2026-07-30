@@ -510,7 +510,9 @@ impl SqliteCatalog {
     }
 
     /// Assets whose basename matches any of `terms` by word-prefix, ranked
-    /// best-first (FTS5's `rank`), capped at `limit` rows. Unicode-aware and
+    /// best-first (FTS5's `rank`), capped at `limit` rows — one row per
+    /// asset, at its best-matching basename's rank, even when several of its
+    /// instances have basenames that all match. Unicode-aware and
     /// case-insensitive via the `unicode61 remove_diacritics 2` tokenizer.
     ///
     /// # Errors
@@ -531,9 +533,13 @@ impl SqliteCatalog {
             .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
+        // GROUP BY asset + min(rank): an asset with several matching
+        // basenames (e.g. beach.mov and beach_copy.mov) otherwise comes back
+        // as one row per matching basename. bm25 ranks are negative with
+        // more-negative meaning better, so min() picks the best match.
         let mut stmt = self.conn.prepare(
-            "SELECT asset, rank FROM names_fts WHERE names_fts MATCH ?1
-             ORDER BY rank LIMIT ?2",
+            "SELECT asset, min(rank) FROM names_fts WHERE names_fts MATCH ?1
+             GROUP BY asset ORDER BY min(rank) LIMIT ?2",
         )?;
         let rows = stmt.query_map(
             (&match_expr, i64::try_from(limit).unwrap_or(i64::MAX)),
@@ -1355,6 +1361,35 @@ mod tests {
         );
     }
 
+    /// Pins `remove_diacritics 2` specifically (not the default level 1):
+    /// U+1EC6 (Ệ) carries two combining marks a circumflex and a dot below)
+    /// that level 1's smaller diacritic table doesn't fold away, so this
+    /// only matches under level 2.
+    #[test]
+    fn diacritics_level_2_folds_marks_level_1_does_not() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "clips/Ệlan.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+        let hits = db
+            .search_names_ranked(&["elan".to_string()], 10)
+            .expect("name search");
+        let ids: Vec<AssetId> = hits.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![a],
+            "remove_diacritics 2 must fold Ệ (circumflex + dot below) to e"
+        );
+    }
+
     #[test]
     fn prefix_terms_match() {
         let a = AssetId("xxh3:a".into());
@@ -1373,6 +1408,44 @@ mod tests {
             .search_names_ranked(&["beach".to_string()], 10)
             .expect("prefix search");
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, a);
+    }
+
+    /// An asset with two instances whose basenames both match the search
+    /// term must come back as one row, not one per matching basename — a
+    /// naive `SELECT asset, rank FROM names_fts WHERE ... MATCH` returns one
+    /// row per matching (name, asset) pair in the FTS index.
+    #[test]
+    fn ranked_search_returns_one_row_per_asset_not_per_matching_basename() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v".into(),
+                    path: "clips/beach.mov".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+                Op::AssetSeen {
+                    asset: a.clone(),
+                    volume: "v2".into(),
+                    path: "clips/beach_copy.mov".into(),
+                    size: 1,
+                    mtime_ms: 0,
+                },
+            ],
+        );
+        let hits = db
+            .search_names_ranked(&["beach".to_string()], 10)
+            .expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one row for one asset, got {hits:?}"
+        );
         assert_eq!(hits[0].0, a);
     }
 
@@ -1524,6 +1597,34 @@ mod tests {
             db.assets_matching(&[Filter::After(1500)])
                 .expect("after")
                 .contains(&b)
+        );
+    }
+
+    /// `Before`/`After` are strict inequalities: an instance whose `mtime_ms`
+    /// exactly equals the bound matches neither.
+    #[test]
+    fn before_and_after_are_strict_at_the_exact_boundary() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a,
+                volume: "v".into(),
+                path: "a.mov".into(),
+                size: 1,
+                mtime_ms: 1000,
+            }],
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Before(1000)]).expect("before"),
+            BTreeSet::new(),
+            "Before(1000) must not match an instance with mtime_ms == 1000"
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::After(1000)]).expect("after"),
+            BTreeSet::new(),
+            "After(1000) must not match an instance with mtime_ms == 1000"
         );
     }
 
@@ -1688,5 +1789,45 @@ mod tests {
         );
         assert_eq!(s.tags, vec!["keep".to_string(), "topic/drone".to_string()]);
         assert_eq!(s.para.as_deref(), Some("N1"));
+    }
+
+    /// A "ghost" volume — an instance whose volume id has no `VolumeSeen`
+    /// row — is reachable via partial cross-machine sync (one machine's log
+    /// carries an `AssetSeen` for a volume the reader never observed a
+    /// `VolumeSeen` for). `Filter::Volume` must still match it by instance
+    /// volume id, and `asset_summaries` must fall back to the id as the
+    /// label rather than erroring on a NULL join.
+    #[test]
+    fn ghost_volume_is_findable_and_summarizable_without_a_volume_seen_row() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "ghost".into(),
+                path: "a.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+
+        assert_eq!(
+            db.assets_matching(&[Filter::Volume {
+                value: "ghost".into(),
+                negated: false,
+            }])
+            .expect("volume filter on a ghost volume"),
+            BTreeSet::from([a.clone()])
+        );
+
+        let summaries = db
+            .asset_summaries(std::slice::from_ref(&a))
+            .expect("summaries must not error on a ghost volume");
+        assert_eq!(
+            summaries[0].volumes,
+            vec![("ghost".to_string(), "ghost".to_string())],
+            "label must fall back to the volume id when there's no VolumeSeen row"
+        );
     }
 }

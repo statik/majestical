@@ -1,5 +1,6 @@
 //! End-to-end: init a catalog, scan a folder, tag by name-match, search.
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, diff};
 
 #[cfg(test)]
@@ -1775,4 +1776,189 @@ fn search_text_output_notes_truncation_at_the_limit() {
         !stdout.contains("note: results truncated"),
         "expected no truncation note when the match count falls short of --limit, got: {stdout}"
     );
+}
+
+/// `--save` on one machine syncs to another machine's `searches list` via
+/// the shared event log; `searches rm` on the second machine likewise syncs
+/// back to the first.
+#[test]
+fn saved_searches_sync_between_machines() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state_a = dir.path().join("state-a");
+    let state_b = dir.path().join("state-b");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["search", "tag:keep", "--save", "keepers"])
+        .assert()
+        .success();
+
+    maj_as(&catalog, &state_b, "machine-b")
+        .args(["searches", "list"])
+        .assert()
+        .success()
+        .stdout(contains("keepers"))
+        .stdout(contains("tag:keep"));
+
+    maj_as(&catalog, &state_b, "machine-b")
+        .args(["searches", "rm", "keepers"])
+        .assert()
+        .success();
+
+    maj_as(&catalog, &state_a, "machine-a")
+        .args(["searches", "list"])
+        .assert()
+        .success()
+        .stdout(contains("no saved searches"));
+}
+
+/// `--saved` runs a stored query (saving succeeds even with zero hits);
+/// an unknown `--saved` name or `searches rm` target fails with a clear
+/// message; `searches list --json` renders the name/query pairs.
+#[test]
+fn running_and_managing_saved_searches() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "tag:nothing-yet", "--save", "empty"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+
+    maj(&catalog, &state)
+        .args(["search", "--saved", "empty"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+
+    maj(&catalog, &state)
+        .args(["search", "--saved", "missing"])
+        .assert()
+        .failure()
+        .stderr(contains("no saved search"));
+
+    maj(&catalog, &state)
+        .args(["searches", "rm", "missing"])
+        .assert()
+        .failure()
+        .stderr(contains("no saved search"));
+
+    maj(&catalog, &state)
+        .args(["searches", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(diff(
+            "{\"saved\":[{\"name\":\"empty\",\"query\":\"tag:nothing-yet\"}]}\n",
+        ));
+}
+
+/// A positional query and `--saved` together must be rejected by clap's
+/// arg parsing (a usage error, exit code 2) — not reach `cmd_search`'s
+/// query-resolution match, which used to hit an `unreachable!` there and
+/// abort the process with a panic (exit code 101) instead.
+#[test]
+fn search_query_and_saved_together_is_a_clap_conflict_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "tag:x", "--saved", "keepers"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("cannot be used with"))
+        .stderr(predicates::str::contains("panicked").not());
+}
+
+/// A `--save` on a query that fails to parse must not append anything to
+/// the event log: `searches list` afterward must show no saved search, not
+/// one pointing at an invalid query.
+#[test]
+fn save_of_an_invalid_query_does_not_persist_the_saved_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "bogus:x", "--save", "bad"])
+        .assert()
+        .failure();
+
+    maj(&catalog, &state)
+        .args(["searches", "list"])
+        .assert()
+        .success()
+        .stdout(contains("no saved searches"));
+}
+
+/// `--json` output must be pure JSON on stdout even when `--save` is also
+/// given — the "saved search 'x'" confirmation belongs on stderr, not mixed
+/// into the same stream a scripted consumer parses as JSON.
+#[test]
+fn search_save_with_json_keeps_stdout_pure_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    let out = maj(&catalog, &state)
+        .args(["search", "tag:a", "--save", "x", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .expect("stdout must be parseable as JSON with --save present");
+}
+
+/// An empty saved-search name is rejected outright, for both `--save` and
+/// `searches rm` — an empty `name` primary key is a foot-gun no legitimate
+/// caller wants, not a name worth storing.
+#[test]
+fn empty_saved_search_name_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "tag:a", "--save", ""])
+        .assert()
+        .failure()
+        .stderr(contains("empty"));
+
+    maj(&catalog, &state)
+        .args(["searches", "rm", ""])
+        .assert()
+        .failure()
+        .stderr(contains("empty"));
 }

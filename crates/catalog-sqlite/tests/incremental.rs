@@ -38,6 +38,10 @@ fn arb_node() -> impl Strategy<Value = String> {
     prop_oneof![Just("N1".to_string()), Just("N2".to_string())]
 }
 
+fn arb_saved_search_name() -> impl Strategy<Value = String> {
+    prop_oneof![Just("s1".to_string()), Just("s2".to_string())]
+}
+
 fn arb_para_kind() -> impl Strategy<Value = ParaKind> {
     prop_oneof![
         Just(ParaKind::Project),
@@ -121,6 +125,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
                 roothash,
             }
         ),
+        (arb_saved_search_name(), "[x-z]{1,3}")
+            .prop_map(|(name, query)| Op::SavedSearchSet { name, query }),
+        arb_saved_search_name().prop_map(|name| Op::SavedSearchRemove { name }),
     ]
 }
 

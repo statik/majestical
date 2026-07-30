@@ -16,6 +16,8 @@ pub enum Touched {
     ParaNode(String),
     /// Manifest set for a volume id changed.
     Manifests(String),
+    /// A named saved search was set or removed.
+    SavedSearch(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,12 +104,60 @@ pub struct VerificationRecord {
     pub hashdate_ms: u64,
 }
 
+impl VerificationRecord {
+    /// Builds the record from `op`. Kept off `apply_tracking`'s match arm so
+    /// that function stays under the crate's max-function-length lint.
+    fn from_op(op: &Op) -> Self {
+        let Op::VerificationRecorded {
+            volume,
+            path,
+            algo,
+            value,
+            outcome,
+            hashdate_ms,
+            ..
+        } = op
+        else {
+            unreachable!("from_op is only called for Op::VerificationRecorded")
+        };
+        Self {
+            volume: volume.clone(),
+            path: path.clone(),
+            algo: algo.clone(),
+            value: value.clone(),
+            outcome: *outcome,
+            hashdate_ms: *hashdate_ms,
+        }
+    }
+}
+
 /// One recorded ASC MHL generation; a plain fact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ManifestRecord {
     pub generation: u32,
     pub mhl_path: String,
     pub roothash: String,
+}
+
+impl ManifestRecord {
+    /// Builds the record from `op`. Kept off `apply_tracking`'s match arm so
+    /// that function stays under the crate's max-function-length lint.
+    fn from_op(op: &Op) -> Self {
+        let Op::ManifestRecorded {
+            mhl_path,
+            generation,
+            roothash,
+            ..
+        } = op
+        else {
+            unreachable!("from_op is only called for Op::ManifestRecorded")
+        };
+        Self {
+            generation: *generation,
+            mhl_path: mhl_path.clone(),
+            roothash: roothash.clone(),
+        }
+    }
 }
 
 /// PARA node folded state. `kind` is meant to be immutable in legitimate
@@ -168,6 +218,11 @@ pub struct Projection {
     para_nodes: BTreeMap<String, ParaNodeState>,
     /// volume id -> recorded manifest generations.
     manifests: BTreeMap<String, BTreeSet<ManifestRecord>>,
+    /// name -> (hlc, query); `None` query means an LWW tombstone (removed).
+    /// `#[serde(default)]` lets pre-phase-4 snapshots deserialize — no old
+    /// event can be a saved-search op, so the empty default is still correct.
+    #[serde(default)]
+    saved_searches: BTreeMap<String, (Hlc, Option<String>)>,
 }
 
 impl Projection {
@@ -240,43 +295,21 @@ impl Projection {
                 Self::lww(&mut st.para, event.hlc.clone(), node.clone());
                 Touched::Asset(asset.clone())
             }
-            Op::VerificationRecorded {
-                asset,
-                volume,
-                path,
-                algo,
-                value,
-                outcome,
-                hashdate_ms,
-            } => {
-                self.insert_verification(
-                    asset,
-                    VerificationRecord {
-                        volume: volume.clone(),
-                        path: path.clone(),
-                        algo: algo.clone(),
-                        value: value.clone(),
-                        outcome: *outcome,
-                        hashdate_ms: *hashdate_ms,
-                    },
-                );
+            Op::VerificationRecorded { asset, .. } => {
+                self.insert_verification(asset, VerificationRecord::from_op(&event.op));
                 Touched::Asset(asset.clone())
             }
-            Op::ManifestRecorded {
-                volume,
-                mhl_path,
-                generation,
-                roothash,
-            } => {
-                self.insert_manifest(
-                    volume,
-                    ManifestRecord {
-                        generation: *generation,
-                        mhl_path: mhl_path.clone(),
-                        roothash: roothash.clone(),
-                    },
-                );
+            Op::ManifestRecorded { volume, .. } => {
+                self.insert_manifest(volume, ManifestRecord::from_op(&event.op));
                 Touched::Manifests(volume.clone())
+            }
+            Op::SavedSearchSet { name, query } => {
+                self.apply_saved_search(name, event.hlc.clone(), Some(query.clone()));
+                Touched::SavedSearch(name.clone())
+            }
+            Op::SavedSearchRemove { name } => {
+                self.apply_saved_search(name, event.hlc.clone(), None);
+                Touched::SavedSearch(name.clone())
             }
         }
     }
@@ -374,6 +407,19 @@ impl Projection {
             .or_default()
             .verifications
             .insert(record);
+    }
+
+    /// HLC-LWW upsert of a saved search slot: `query` is `Some` for a Set,
+    /// `None` for a Remove tombstone — either way the higher `(hlc, query)`
+    /// tuple wins, so a later Set revives a name a Remove tombstoned.
+    fn apply_saved_search(&mut self, name: &str, hlc: Hlc, query: Option<String>) {
+        let candidate = (hlc, query);
+        match self.saved_searches.get(name) {
+            Some(current) if *current >= candidate => {}
+            _ => {
+                self.saved_searches.insert(name.to_string(), candidate);
+            }
+        }
     }
 
     /// Grow-only insert: a manifest generation is a plain fact, so this is
@@ -482,6 +528,21 @@ impl Projection {
             .iter()
             .flat_map(|(volume, records)| records.iter().map(move |r| (volume, r)))
     }
+
+    /// Live saved searches (tombstones excluded), name-ordered.
+    pub fn saved_searches(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.saved_searches
+            .iter()
+            .filter_map(|(name, (_, query))| query.as_deref().map(|q| (name.as_str(), q)))
+    }
+
+    /// The current query for `name`, or `None` if never set or tombstoned.
+    #[must_use]
+    pub fn saved_search(&self, name: &str) -> Option<&str> {
+        self.saved_searches
+            .get(name)
+            .and_then(|(_, q)| q.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -523,7 +584,17 @@ mod tests {
     /// wire-format tests in `event.rs`, paired with the `Touched` value
     /// `apply_tracking` must report for it — so both the serde round-trip
     /// and the touched-entity mapping are pinned against the same list.
+    ///
+    /// Split across two functions purely to stay under the crate's
+    /// max-function-length lint; the two lists together are one logical
+    /// sample set.
     fn sample_ops() -> Vec<(Op, Touched)> {
+        let mut ops = sample_ops_facts();
+        ops.extend(sample_ops_saved_search());
+        ops
+    }
+
+    fn sample_ops_facts() -> Vec<(Op, Touched)> {
         vec![
             (
                 Op::AssetSeen {
@@ -613,6 +684,22 @@ mod tests {
                     roothash: "xxh64:8899aabbccddeeff".into(),
                 },
                 Touched::Manifests("uuid:abc".into()),
+            ),
+        ]
+    }
+
+    fn sample_ops_saved_search() -> Vec<(Op, Touched)> {
+        vec![
+            (
+                Op::SavedSearchSet {
+                    name: "n1".into(),
+                    query: "tag:x sunset".into(),
+                },
+                Touched::SavedSearch("n1".into()),
+            ),
+            (
+                Op::SavedSearchRemove { name: "n1".into() },
+                Touched::SavedSearch("n1".into()),
             ),
         ]
     }
@@ -1339,5 +1426,93 @@ mod tests {
         assert_eq!(fwd, rev);
         assert_eq!(fwd.verifications(&a).count(), 2);
         assert_eq!(fwd.manifests("V1").count(), 1);
+    }
+
+    /// Every field of `VerificationRecord`/`ManifestRecord` gets a distinct
+    /// value here, so a field-mapping swap inside `from_op` (e.g. `algo` and
+    /// `value` transposed, or `mhl_path` and `roothash` transposed) fails
+    /// this test — a bug otherwise invisible to `majestical-core` itself,
+    /// only ever caught by accident downstream in catalog-sqlite's column
+    /// assertions.
+    #[test]
+    fn verification_and_manifest_records_map_every_field_correctly() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&ev(
+            1,
+            1,
+            "m1",
+            Op::VerificationRecorded {
+                asset: a.clone(),
+                volume: "vol-v".into(),
+                path: "path-p".into(),
+                algo: "algo-g".into(),
+                value: "value-l".into(),
+                outcome: VerifyOutcome::Failed,
+                hashdate_ms: 111,
+            },
+        ));
+        p.apply(&ev(
+            2,
+            2,
+            "m1",
+            Op::ManifestRecorded {
+                volume: "vol-m".into(),
+                mhl_path: "mhl-path".into(),
+                generation: 7,
+                roothash: "roothash-r".into(),
+            },
+        ));
+
+        let v = p.verifications(&a).next().expect("verification recorded");
+        assert_eq!(v.volume, "vol-v");
+        assert_eq!(v.path, "path-p");
+        assert_eq!(v.algo, "algo-g");
+        assert_eq!(v.value, "value-l");
+        assert_eq!(v.outcome, VerifyOutcome::Failed);
+        assert_eq!(v.hashdate_ms, 111);
+
+        let m = p.manifests("vol-m").next().expect("manifest recorded");
+        assert_eq!(m.generation, 7);
+        assert_eq!(m.mhl_path, "mhl-path");
+        assert_eq!(m.roothash, "roothash-r");
+    }
+
+    #[test]
+    fn saved_search_set_remove_is_lww_per_name() {
+        let mut p = Projection::default();
+        p.apply(&test_event(
+            1,
+            Op::SavedSearchSet {
+                name: "picks".into(),
+                query: "tag:a".into(),
+            },
+        ));
+        p.apply(&test_event(
+            3,
+            Op::SavedSearchSet {
+                name: "picks".into(),
+                query: "tag:b".into(),
+            },
+        ));
+        p.apply(&test_event(
+            2,
+            Op::SavedSearchRemove {
+                name: "picks".into(),
+            },
+        ));
+        assert_eq!(
+            p.saved_search("picks"),
+            Some("tag:b"),
+            "later set beats earlier remove"
+        );
+        p.apply(&test_event(
+            4,
+            Op::SavedSearchRemove {
+                name: "picks".into(),
+            },
+        ));
+        assert_eq!(p.saved_search("picks"), None);
+        assert_eq!(p.saved_searches().count(), 0);
     }
 }

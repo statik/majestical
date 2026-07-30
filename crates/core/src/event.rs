@@ -122,6 +122,10 @@ pub enum Op {
         generation: u32,
         roothash: String,
     },
+    /// Save (or overwrite) a named search query. HLC-LWW per name.
+    SavedSearchSet { name: String, query: String },
+    /// Remove a named search. An LWW tombstone: a later Set revives the name.
+    SavedSearchRemove { name: String },
 }
 
 #[cfg(test)]
@@ -256,6 +260,17 @@ mod tests {
                     roothash: "xxh64:8899aabbccddeeff".into(),
                 },
                 r#"{"type":"manifest_recorded","volume":"uuid:abc","mhl_path":"ascmhl/0001_dest_2026-07-29_120000.mhl","generation":1,"roothash":"xxh64:8899aabbccddeeff"}"#,
+            ),
+            (
+                Op::SavedSearchSet {
+                    name: "n1".into(),
+                    query: "tag:x sunset".into(),
+                },
+                r#"{"type":"saved_search_set","name":"n1","query":"tag:x sunset"}"#,
+            ),
+            (
+                Op::SavedSearchRemove { name: "n1".into() },
+                r#"{"type":"saved_search_remove","name":"n1"}"#,
             ),
         ] {
             let json = golden(op);

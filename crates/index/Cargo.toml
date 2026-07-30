@@ -1,0 +1,23 @@
+[package]
+name = "majestical-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+majestical-core = { path = "../core" }
+image = { workspace = true }
+webp = { workspace = true }
+fast_image_resize = { workspace = true }
+zstd = { workspace = true }
+dirs = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Regular dependency, not dev-only: the HEIC/HEIF decode path shells out to
+# macOS's `sips` and needs a real output file on disk at runtime.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

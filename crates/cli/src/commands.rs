@@ -784,8 +784,7 @@ fn print_ingest_plan(ingest_plan: &plan::IngestPlan, subdir: &str, dests: &[Path
 /// that, and the cap bounds open-file-descriptor use per destination.
 fn default_jobs() -> usize {
     std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
+        .map_or(1, std::num::NonZeroUsize::get)
         .min(8)
 }
 

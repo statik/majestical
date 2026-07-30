@@ -60,14 +60,20 @@ fn arb_verify_outcome() -> impl Strategy<Value = VerifyOutcome> {
 /// `crdt_properties.rs`'s `arb_kind` strategy.
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        (arb_asset(), arb_volume(), "[p-r]{1,3}", 0u64..100).prop_map(
-            |(asset, volume, path, size)| Op::AssetSeen {
+        (
+            arb_asset(),
+            arb_volume(),
+            "[p-r]{1,3}",
+            0u64..100,
+            0u64..100
+        )
+            .prop_map(|(asset, volume, path, size, mtime_ms)| Op::AssetSeen {
                 asset,
                 volume,
                 path,
-                size
-            }
-        ),
+                size,
+                mtime_ms
+            }),
         (arb_volume(), "[a-c]{1,3}").prop_map(|(volume, label)| Op::VolumeSeen { volume, label }),
         (arb_asset(), "[a-c]{1,3}").prop_map(|(asset, tag)| Op::TagAdd { asset, tag }),
         (arb_asset(), "[a-c]{1,3}").prop_map(|(asset, tag)| Op::TagRemove {
@@ -369,6 +375,7 @@ fn incremental_apply_removes_a_row_when_a_later_event_untags_it() {
             volume: "v".into(),
             path: "p".into(),
             size: 1,
+            mtime_ms: 0,
         },
     );
     let tag_add = ev(

@@ -93,6 +93,9 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
             volume: volume_id.clone(),
             path: rel,
             size,
+            // Real mtimes arrive with the query-language work (phase 4 task
+            // 8); scans don't read them yet.
+            mtime_ms: 0,
         });
     }
     let n = ops.len();
@@ -730,8 +733,8 @@ fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
         let Some(hash) = asset.0.strip_prefix("xxh3:") else {
             continue;
         };
-        for (_, _, size) in &state.instances {
-            pairs.push((hash.to_string(), *size));
+        for info in state.instances.values() {
+            pairs.push((hash.to_string(), info.size));
         }
     }
     plan::KnownAssets::from_pairs(pairs)
@@ -963,6 +966,9 @@ fn asset_and_para_ops(
                 volume: dest_id.clone(),
                 path: placed.dest_rel.clone(),
                 size: placed.size,
+                // Real mtimes arrive with the query-language work (phase 4
+                // task 8); ingest doesn't read them yet.
+                mtime_ms: 0,
             });
             ops.push(Op::VerificationRecorded {
                 asset: asset.clone(),

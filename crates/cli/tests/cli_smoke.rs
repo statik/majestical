@@ -223,6 +223,7 @@ fn far_future_peer_event_triggers_clamp_warning() {
             volume: "peerbad-volume".into(),
             path: "poison.mov".into(),
             size: 1,
+            mtime_ms: 0,
         },
     };
     let line = serde_json::to_string(&poisoned).unwrap();

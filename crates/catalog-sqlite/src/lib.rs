@@ -33,7 +33,12 @@ pub enum CatalogError {
 /// a full rebuild. Self-healing by construction; bump this only when a
 /// future change needs two different versions to coexist across a real
 /// upgrade.
-const SNAPSHOT_VERSION: i64 = 1;
+///
+/// Bumped to 2: `AssetState::instances` changed from a `BTreeSet<(volume,
+/// path, size)>` to an HLC-LWW `BTreeMap<(volume, path), InstanceInfo>` (see
+/// `majestical_core::projection`), forcing a full rebuild for any snapshot
+/// written under the old shape.
+const SNAPSHOT_VERSION: i64 = 2;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.
@@ -283,7 +288,14 @@ impl SqliteCatalog {
              CREATE TABLE instances (
                asset TEXT NOT NULL REFERENCES assets(id),
                volume TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
-               PRIMARY KEY (asset, volume, path, size)
+               mtime_ms INTEGER NOT NULL,
+               -- (asset, volume, path) is unique again: the projection's
+               -- instances are now an HLC-LWW map keyed on (volume, path),
+               -- so a rescan updates in place rather than producing a second
+               -- row with a different size. This supersedes the wider
+               -- (asset, volume, path, size) key from PR 2, which existed
+               -- only to work around the old set model's duplication.
+               PRIMARY KEY (asset, volume, path)
              );
              CREATE TABLE tags (
                asset TEXT NOT NULL REFERENCES assets(id),
@@ -343,10 +355,11 @@ impl SqliteCatalog {
         state: &AssetState,
     ) -> rusqlite::Result<()> {
         tx.execute("INSERT INTO assets (id) VALUES (?1)", [&asset.0])?;
-        for (volume, path, size) in &state.instances {
+        for ((volume, path), info) in &state.instances {
             tx.execute(
-                "INSERT INTO instances (asset, volume, path, size) VALUES (?1, ?2, ?3, ?4)",
-                (&asset.0, volume, path, size),
+                "INSERT INTO instances (asset, volume, path, size, mtime_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (&asset.0, volume, path, info.size, info.mtime_ms),
             )?;
         }
         for tag in projection.tags(asset) {
@@ -575,7 +588,7 @@ impl SqliteCatalog {
     pub fn debug_dump(&self) -> Result<String, CatalogError> {
         let tables: [(&str, &str); 8] = [
             ("assets", "id"),
-            ("instances", "asset, volume, path, size"),
+            ("instances", "asset, volume, path, size, mtime_ms"),
             ("tags", "asset, tag"),
             ("volumes", "id, label, last_seen_ms"),
             ("para_nodes", "id, kind, name, archived"),
@@ -687,6 +700,7 @@ mod tests {
                 volume: "card1".into(),
                 path: "clips/sunset.mov".into(),
                 size: 42,
+                mtime_ms: 0,
             },
             Op::TagAdd {
                 asset: a.clone(),
@@ -699,6 +713,7 @@ mod tests {
                 volume: "card1".into(),
                 path: "clips/100%_off.mov".into(),
                 size: 7,
+                mtime_ms: 0,
             },
         ]
         .into_iter()
@@ -763,12 +778,14 @@ mod tests {
                 volume: "card1".into(),
                 path: "clips/a.mov".into(),
                 size: 1,
+                mtime_ms: 0,
             },
             Op::AssetSeen {
                 asset: b.clone(),
                 volume: "card1".into(),
                 path: "clips/b.mov".into(),
                 size: 2,
+                mtime_ms: 0,
             },
         ]
         .into_iter()
@@ -932,6 +949,7 @@ mod tests {
                     volume: "V1".into(),
                     path: "a.mov".into(),
                     size: 1,
+                    mtime_ms: 0,
                 },
                 Op::AssetParaSet {
                     asset: asset.clone(),
@@ -963,6 +981,7 @@ mod tests {
                     volume: "V1".into(),
                     path: "a.mov".into(),
                     size: 1,
+                    mtime_ms: 0,
                 },
                 Op::VerificationRecorded {
                     asset: asset.clone(),

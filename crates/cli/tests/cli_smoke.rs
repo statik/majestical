@@ -1052,6 +1052,17 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
     // `assert_ingest_event_granularity`.
     assert_ingest_event_granularity(&root, 2);
 
+    // Ingest must stat its own placed files for `AssetSeen.mtime_ms`, same as
+    // `scan` — not leave the phase-1 `0` placeholder in place.
+    let events = read_events(&root);
+    for e in events.iter().filter(|e| e["op"]["type"] == "asset_seen") {
+        let mtime_ms = e["op"]["mtime_ms"].as_u64().unwrap();
+        assert!(
+            mtime_ms > 0,
+            "expected a real mtime_ms on an ingest-placed AssetSeen event, got {e}"
+        );
+    }
+
     for dest in [d1.path(), d2.path()] {
         assert!(
             walkdir_contains(dest, "a.mov"),
@@ -1492,6 +1503,12 @@ fn search_combines_terms_and_filters() {
         .args(["search", "beach", "--json"])
         .output()
         .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Pin the JSON contract beyond just `results[].asset`: name, and each
+    // volume's online flag (true here — the scanned tempdir is on the
+    // always-mounted root volume).
+    assert_eq!(hits["results"][0]["name"], "beach_day.mov");
+    assert_eq!(hits["results"][0]["volumes"][0]["online"], true);
     let asset = first_asset_id(&out);
     maj(&catalog, &state)
         .args(["tag", "add", &asset, "status/select"])
@@ -1507,6 +1524,13 @@ fn search_combines_terms_and_filters() {
         .assert()
         .success()
         .stdout(contains("0 results"));
+    // A '-' negated filter as the query's very first character — clap must
+    // not mistake the whole query for an unrecognized option.
+    maj(&catalog, &state)
+        .args(["search", "-tag:status/select"])
+        .assert()
+        .success()
+        .stdout(contains("mountain.jpg"));
     maj(&catalog, &state)
         .args(["search", "kind:video"])
         .assert()
@@ -1517,6 +1541,125 @@ fn search_combines_terms_and_filters() {
         .assert()
         .success()
         .stdout(contains("mountain.jpg"));
+
+    let vol_out = maj(&catalog, &state)
+        .args(["volumes", "list", "--json"])
+        .output()
+        .unwrap();
+    let vols: serde_json::Value = serde_json::from_slice(&vol_out.stdout).unwrap();
+    let vol_label = vols["volumes"][0]["label"].as_str().unwrap();
+    maj(&catalog, &state)
+        .args(["search", &format!("vol:{vol_label}")])
+        .assert()
+        .success()
+        .stdout(contains("beach_day.mov"))
+        .stdout(contains("mountain.jpg"));
+}
+
+/// The search limit applies to the intersection of ranked terms and hard
+/// filters, not to a pre-filter slice of the ranked list — a filter match
+/// that happens to rank outside the first `limit * 4` terms must still be
+/// found.
+#[test]
+fn search_limit_applies_after_filtering_not_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    for n in 0..30 {
+        std::fs::write(media.join(format!("beach_{n:02}.mov")), n.to_string()).unwrap();
+    }
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    let out = maj(&catalog, &state)
+        .args(["search", "beach", "--json", "--limit", "100"])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = hits["results"].as_array().unwrap();
+    assert_eq!(results.len(), 30);
+    // Tag the 4 worst-ranked hits (the tail of the unfiltered ranked list) —
+    // a `--limit 2` search must still find them via intersection, not miss
+    // them because they fall outside a `limit * 4` pre-filter window.
+    for r in results.iter().rev().take(4) {
+        let asset = r["asset"].as_str().unwrap();
+        maj(&catalog, &state)
+            .args(["tag", "add", asset, "status/select"])
+            .assert()
+            .success();
+    }
+
+    let out = maj(&catalog, &state)
+        .args([
+            "search",
+            "beach tag:status/select",
+            "--limit",
+            "2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        hits["count"], 2,
+        "the 4 tagged assets rank last among 30 matches; --limit 2 must still \
+         find them via intersection rather than a pre-filter slice, got: {hits}"
+    );
+}
+
+/// `online:`/`-online:` matches against the currently-mounted volume set.
+/// The scanned tempdir lives on the always-mounted root volume, so its
+/// asset must show up under `online:yes`/`-online:no` and disappear under
+/// `online:no`/`-online:yes`.
+#[test]
+fn search_online_filter_matches_currently_mounted_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("clip.mov"), b"aaa").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "online:yes"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mov"));
+    maj(&catalog, &state)
+        .args(["search", "-online:no"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mov"));
+    maj(&catalog, &state)
+        .args(["search", "online:no"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
+    maj(&catalog, &state)
+        .args(["search", "-online:yes"])
+        .assert()
+        .success()
+        .stdout(contains("0 results"));
 }
 
 /// An unknown filter key fails fast, naming the keys that are actually
@@ -1590,4 +1733,46 @@ fn empty_query_without_filters_is_an_error() {
         .failure()
         .stderr(contains("terms"))
         .stderr(contains("filter"));
+}
+
+/// Text-mode output hints when a result count lands exactly on `--limit` —
+/// almost always meaning more matches exist past the cutoff — so a
+/// truncated list doesn't read as the complete answer.
+#[test]
+fn search_text_output_notes_truncation_at_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = dir.path().join("catalog");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&catalog).unwrap();
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("beach_1.mov"), b"a").unwrap();
+    std::fs::write(media.join("beach_2.mov"), b"b").unwrap();
+    std::fs::write(media.join("beach_3.mov"), b"c").unwrap();
+    maj(&catalog, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+
+    maj(&catalog, &state)
+        .args(["search", "beach", "--limit", "2"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "note: results truncated at 2; raise --limit to see more",
+        ));
+    let out = maj(&catalog, &state)
+        .args(["search", "beach", "--limit", "10"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("note: results truncated"),
+        "expected no truncation note when the match count falls short of --limit, got: {stdout}"
+    );
 }

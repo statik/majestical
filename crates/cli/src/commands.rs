@@ -12,7 +12,7 @@ use majestical_core::media_kind::MediaKind;
 use majestical_core::ports::{AssetSummary, Filter};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -241,7 +241,12 @@ const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
 /// Searches the catalog: bare terms are ranked by `search_names_ranked` (best
 /// match first); `key:value` tokens resolve to hard `Filter`s and narrow the
 /// result to their conjunction. Terms and filters combine by intersection —
-/// a term match that fails a filter is dropped, never re-ranked above it.
+/// a term match that fails a filter is dropped, never re-ranked above it. With
+/// no filters, only the top `limit * 4` ranked terms are ever fetched (cheap,
+/// since nothing downstream can add matches back in); with filters present,
+/// every ranked match is fetched and intersected before `limit` is applied —
+/// a filter-matching asset that ranks outside a small prefetch window must
+/// still be found, not silently dropped by a pre-filter slice.
 ///
 /// # Errors
 /// Returns an error if the query fails to parse, names an unknown or
@@ -249,7 +254,12 @@ const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
 pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> Result<()> {
     let (db, projection) = open_catalog(app, catalog_dir)?;
     let parsed = crate::query::parse_query(&args.query)?;
-    let filters = resolve_filters(&projection, &parsed.filters)?;
+    // Resolved once and shared: `resolve_filter`'s `online:` arm and
+    // `print_search_results`'s per-volume online flag both need the mounted
+    // set, and each call shells out to `diskutil` per mount — computing it
+    // twice would double a search's latency for no benefit.
+    let mounted = volume_identity::mounted_volumes();
+    let filters = resolve_filters(&projection, &parsed.filters, &mounted)?;
     let allowed = if filters.is_empty() {
         None
     } else {
@@ -264,13 +274,18 @@ pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> 
             .take(args.limit)
             .collect()
     } else {
-        db.search_names_ranked(&parsed.terms, args.limit.saturating_mul(4))?
+        let search_limit = if allowed.is_some() {
+            usize::MAX
+        } else {
+            args.limit.saturating_mul(4)
+        };
+        db.search_names_ranked(&parsed.terms, search_limit)?
             .into_iter()
             .filter(|(a, _)| allowed.as_ref().is_none_or(|s| s.contains(a)))
             .take(args.limit)
             .collect()
     };
-    print_search_results(&db, &ranked, args.json)
+    print_search_results(&db, &ranked, &mounted, args)
 }
 
 /// Resolves parsed `key:value` tokens against `majestical_core::ports::Filter`'s
@@ -280,11 +295,18 @@ pub(crate) fn cmd_search(app: &FsApp, catalog_dir: &Path, args: &SearchArgs) -> 
 fn resolve_filters(
     projection: &Projection,
     raw: &[crate::query::RawFilter],
+    mounted: &BTreeMap<String, PathBuf>,
 ) -> Result<Vec<Filter>> {
-    raw.iter().map(|f| resolve_filter(projection, f)).collect()
+    raw.iter()
+        .map(|f| resolve_filter(projection, f, mounted))
+        .collect()
 }
 
-fn resolve_filter(projection: &Projection, raw: &crate::query::RawFilter) -> Result<Filter> {
+fn resolve_filter(
+    projection: &Projection,
+    raw: &crate::query::RawFilter,
+    mounted: &BTreeMap<String, PathBuf>,
+) -> Result<Filter> {
     let crate::query::RawFilter {
         key,
         value,
@@ -305,8 +327,7 @@ fn resolve_filter(projection: &Projection, raw: &crate::query::RawFilter) -> Res
             negated,
         }),
         "kind" => {
-            let valid =
-                [MediaKind::Image, MediaKind::Video, MediaKind::Other].map(MediaKind::as_str);
+            let valid = MediaKind::ALL.map(MediaKind::as_str);
             anyhow::ensure!(
                 valid.contains(&value.as_str()),
                 "unknown kind '{value}' — one of: {}",
@@ -324,7 +345,7 @@ fn resolve_filter(projection: &Projection, raw: &crate::query::RawFilter) -> Res
                 other => anyhow::bail!("online: expects 'yes' or 'no', got '{other}'"),
             };
             Ok(Filter::Online {
-                ids: volume_identity::mounted_volumes().into_keys().collect(),
+                ids: mounted.keys().cloned().collect(),
                 want: want != negated,
             })
         }
@@ -352,17 +373,22 @@ fn resolve_filter(projection: &Projection, raw: &crate::query::RawFilter) -> Res
 /// Renders ranked results: JSON prints one object per hit with its volumes
 /// (online/offline per the currently mounted set) and tags; text prints one
 /// line per hit (`{asset}  {name}  [label●|○,...]`, `tags:` appended when
-/// non-empty) followed by a `"{n} results"` summary line.
-fn print_search_results(db: &SqliteCatalog, ranked: &[(AssetId, f64)], json: bool) -> Result<()> {
+/// non-empty) followed by a `"{n} results"` summary line, plus a truncation
+/// hint when the result count hit `args.limit` exactly.
+fn print_search_results(
+    db: &SqliteCatalog,
+    ranked: &[(AssetId, f64)],
+    mounted: &BTreeMap<String, PathBuf>,
+    args: &SearchArgs,
+) -> Result<()> {
     let ids: Vec<AssetId> = ranked.iter().map(|(a, _)| a.clone()).collect();
     let summaries = db.asset_summaries(&ids)?;
     let by_id: HashMap<&AssetId, &AssetSummary> = summaries.iter().map(|s| (&s.asset, s)).collect();
-    let mounted = volume_identity::mounted_volumes();
 
-    if json {
-        print_search_results_json(ranked, &by_id, &mounted);
+    if args.json {
+        print_search_results_json(ranked, &by_id, mounted);
     } else {
-        print_search_results_text(ranked, &by_id, &mounted);
+        print_search_results_text(ranked, &by_id, mounted, args.limit);
     }
     Ok(())
 }
@@ -370,7 +396,7 @@ fn print_search_results(db: &SqliteCatalog, ranked: &[(AssetId, f64)], json: boo
 fn print_search_results_json(
     ranked: &[(AssetId, f64)],
     by_id: &HashMap<&AssetId, &AssetSummary>,
-    mounted: &std::collections::BTreeMap<String, PathBuf>,
+    mounted: &BTreeMap<String, PathBuf>,
 ) {
     let results: Vec<_> = ranked
         .iter()
@@ -409,7 +435,8 @@ fn print_search_results_json(
 fn print_search_results_text(
     ranked: &[(AssetId, f64)],
     by_id: &HashMap<&AssetId, &AssetSummary>,
-    mounted: &std::collections::BTreeMap<String, PathBuf>,
+    mounted: &BTreeMap<String, PathBuf>,
+    limit: usize,
 ) {
     for (asset, _score) in ranked {
         let Some(summary) = by_id.get(asset).copied() else {
@@ -435,6 +462,12 @@ fn print_search_results_text(
         println!();
     }
     println!("{} results", ranked.len());
+    // A result count exactly at `limit` almost always means more matches
+    // exist past it — say so, rather than letting a truncated list look
+    // like the complete answer.
+    if ranked.len() == limit {
+        println!("note: results truncated at {limit}; raise --limit to see more");
+    }
 }
 
 /// Cheap phase-2 "is this volume mounted right now" heuristic, not true

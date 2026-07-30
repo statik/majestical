@@ -18,6 +18,12 @@ const VIDEO_EXTS: &[&str] = &[
 ];
 
 impl MediaKind {
+    /// Every variant, in declaration order — the single source of truth for
+    /// "which kinds exist" so callers (e.g. the CLI's `kind:` filter) can
+    /// derive their valid-value set instead of hand-listing it and risking
+    /// drift when a variant is added.
+    pub const ALL: [MediaKind; 3] = [MediaKind::Image, MediaKind::Video, MediaKind::Other];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

@@ -54,6 +54,10 @@ enum Cmd {
     /// index lands, image content); key:value tokens are hard filters
     /// (tag: vol: para: kind: online: before: after:), '-' negates.
     Search {
+        /// May start with '-' (a leading negated filter, e.g. `-tag:x`) —
+        /// `allow_hyphen_values` stops clap from treating the whole query as
+        /// an unrecognized option in that case.
+        #[arg(allow_hyphen_values = true)]
         query: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,

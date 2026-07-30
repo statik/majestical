@@ -3,6 +3,7 @@ mod app;
 mod commands;
 mod iso8601;
 mod query;
+mod search;
 mod state_dir;
 mod volume_identity;
 
@@ -209,8 +210,8 @@ fn main() -> Result<()> {
         }
         Cmd::Search { query, limit, json } => {
             let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            let args = commands::SearchArgs { query, limit, json };
-            commands::cmd_search(&app, &cli.catalog, &args)?;
+            let args = search::SearchArgs { query, limit, json };
+            search::cmd_search(&app, &cli.catalog, &args)?;
         }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },

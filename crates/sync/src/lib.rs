@@ -1,9 +1,16 @@
 //! File-based event log: `events/<machine-id>/NNNN.jsonl` under a sync
 //! root. Append-only; reading merges every machine's segments. Designed
 //! so dumb transports (Dropbox, rsync, a shuttle drive) can carry it.
+//!
+//! Known divergence: [`FileEventLog::read_all_reporting`] reads each
+//! segment whole with `fs::read_to_string`, so non-UTF-8 bytes anywhere in
+//! a segment fail the whole read, while
+//! [`FileEventLog::read_since_reporting`] decodes line by line and degrades
+//! a non-UTF-8 line to the `on_bad_line` callback instead. Unifying the two
+//! is deferred to a follow-up.
 use majestical_core::clock::MachineId;
 use majestical_core::event::Event;
-use majestical_core::ports::{EventLog, PortError};
+use majestical_core::ports::{EventLog, LogCursor, PortError};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,6 +29,12 @@ pub enum LogError {
     NotInitialized { path: PathBuf },
     #[error("serializing event: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("cursor for {machine}/{segment} is stale (offset {offset}): full rebuild required")]
+    StaleCursor {
+        machine: String,
+        segment: String,
+        offset: u64,
+    },
 }
 
 pub struct FileEventLog {
@@ -81,9 +94,11 @@ impl FileEventLog {
     /// Append to this machine's current segment (0001.jsonl for phase 1;
     /// segment rotation arrives with sync push/pull in a later phase).
     ///
-    /// No fsync: a crash mid-write may drop the tail of the batch, and
-    /// readers tolerate torn tails by treating the incomplete line as a bad
-    /// line rather than failing the whole read.
+    /// No fsync: a crash mid-write may drop the tail of the batch. Readers
+    /// tolerate this, but differently: [`Self::read_all_reporting`] treats
+    /// the incomplete line as a bad line rather than failing the whole
+    /// read, while [`Self::read_since_reporting`] defers it — the cursor
+    /// stops before the torn tail so it's re-read once the write completes.
     ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized, or
@@ -152,31 +167,7 @@ impl FileEventLog {
             if !is_dir.is_dir() {
                 continue;
             }
-            let segment_entries = fs::read_dir(machine.path()).map_err(|source| LogError::Io {
-                path: machine.path(),
-                source,
-            })?;
-            let mut segments: Vec<PathBuf> = Vec::new();
-            for entry in segment_entries {
-                let entry = entry.map_err(|source| LogError::Io {
-                    path: machine.path(),
-                    source,
-                })?;
-                let file_type = entry.file_type().map_err(|source| LogError::Io {
-                    path: entry.path(),
-                    source,
-                })?;
-                let path = entry.path();
-                if file_type.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
-                    segments.push(path);
-                }
-            }
-            // Lexicographic sort: segment names must stay equal-width
-            // (NNNN.jsonl) for this to also be numeric order. The rotation
-            // implementer must preserve zero-padding or switch to a
-            // numeric-aware sort.
-            segments.sort();
-            for seg in segments {
+            for (_, seg) in Self::list_segments(&machine.path())? {
                 let text = fs::read_to_string(&seg).map_err(|source| LogError::Io {
                     path: seg.clone(),
                     source,
@@ -191,6 +182,161 @@ impl FileEventLog {
         }
         Ok(out)
     }
+
+    /// `.jsonl` segments directly under `machine_dir`, as (file name, path)
+    /// pairs sorted lexicographically — same ordering constraint as
+    /// [`Self::read_all_reporting`]: segment names must stay zero-padded and
+    /// equal-width for lexicographic order to also be numeric order.
+    fn list_segments(machine_dir: &Path) -> Result<Vec<(String, PathBuf)>, LogError> {
+        let entries = fs::read_dir(machine_dir).map_err(|source| LogError::Io {
+            path: machine_dir.to_path_buf(),
+            source,
+        })?;
+        let mut segments = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| LogError::Io {
+                path: machine_dir.to_path_buf(),
+                source,
+            })?;
+            let file_type = entry.file_type().map_err(|source| LogError::Io {
+                path: entry.path(),
+                source,
+            })?;
+            let path = entry.path();
+            if file_type.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
+                segments.push((entry.file_name().to_string_lossy().into_owned(), path));
+            }
+        }
+        segments.sort();
+        Ok(segments)
+    }
+
+    /// Reads one segment from byte offset `from` to its last complete line,
+    /// reporting parse failures through `on_bad_line`. Returns the parsed
+    /// events plus the new offset (`from` plus whole bytes consumed); a torn
+    /// tail after the last `\n` is left unconsumed.
+    fn read_segment_since(
+        seg: &Path,
+        from: u64,
+        mut on_bad_line: impl FnMut(&str),
+    ) -> Result<(Vec<Event>, u64), LogError> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut f = fs::File::open(seg).map_err(|source| LogError::Io {
+            path: seg.to_path_buf(),
+            source,
+        })?;
+        f.seek(SeekFrom::Start(from))
+            .map_err(|source| LogError::Io {
+                path: seg.to_path_buf(),
+                source,
+            })?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).map_err(|source| LogError::Io {
+            path: seg.to_path_buf(),
+            source,
+        })?;
+        let consumed = buf.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let mut events = Vec::new();
+        for line in buf[..consumed].split(|&b| b == b'\n') {
+            match std::str::from_utf8(line) {
+                Ok(text) if text.trim().is_empty() => {}
+                Ok(text) => match serde_json::from_str::<Event>(text) {
+                    Ok(event) => events.push(event),
+                    Err(_) => on_bad_line(text),
+                },
+                Err(_) => on_bad_line(&String::from_utf8_lossy(line)),
+            }
+        }
+        let new_offset = from.saturating_add(u64::try_from(consumed).unwrap_or(u64::MAX));
+        Ok((events, new_offset))
+    }
+
+    /// Reads only events past `cursors`, returning the new events plus
+    /// updated cursors covering every segment seen (unknown segments read
+    /// from 0 and gain a cursor of their own).
+    ///
+    /// Mirrors [`Self::read_all_reporting`]'s directory walk, but seeks each
+    /// segment to its cursor offset instead of reading from the start, and
+    /// stops at the last complete line: a torn tail (a write in progress)
+    /// stays unconsumed so the cursor never advances past it, and it's
+    /// re-read — and only then possibly reported as a bad line — on the
+    /// next call once the write completes.
+    ///
+    /// Cursors are returned sorted by machine then segment, so two calls
+    /// that see no new data produce equal cursor lists.
+    ///
+    /// # Errors
+    /// Returns [`LogError::Io`] if the events directory or a machine's
+    /// segments can't be read, or [`LogError::StaleCursor`] if a cursor
+    /// points past the end of its segment, or names a segment that no
+    /// longer exists.
+    pub fn read_since_reporting(
+        &self,
+        cursors: &[LogCursor],
+        mut on_bad_line: impl FnMut(&str),
+    ) -> Result<(Vec<Event>, Vec<LogCursor>), LogError> {
+        let mut start: std::collections::BTreeMap<(String, String), u64> = cursors
+            .iter()
+            .map(|c| ((c.machine.clone(), c.segment.clone()), c.offset))
+            .collect();
+
+        let events_dir = self.root.join("events");
+        let mut events = Vec::new();
+        let mut out = Vec::new();
+        let machines = fs::read_dir(&events_dir).map_err(|source| LogError::Io {
+            path: events_dir.clone(),
+            source,
+        })?;
+        for machine in machines {
+            let machine = machine.map_err(|source| LogError::Io {
+                path: events_dir.clone(),
+                source,
+            })?;
+            let is_dir = machine.file_type().map_err(|source| LogError::Io {
+                path: machine.path(),
+                source,
+            })?;
+            if !is_dir.is_dir() {
+                continue;
+            }
+            let machine_name = machine.file_name().to_string_lossy().into_owned();
+            for (segment_name, seg) in Self::list_segments(&machine.path())? {
+                let from = start
+                    .remove(&(machine_name.clone(), segment_name.clone()))
+                    .unwrap_or(0);
+                let len = fs::metadata(&seg)
+                    .map_err(|source| LogError::Io {
+                        path: seg.clone(),
+                        source,
+                    })?
+                    .len();
+                if from > len {
+                    return Err(LogError::StaleCursor {
+                        machine: machine_name,
+                        segment: segment_name,
+                        offset: from,
+                    });
+                }
+                let (segment_events, offset) =
+                    Self::read_segment_since(&seg, from, &mut on_bad_line)?;
+                events.extend(segment_events);
+                out.push(LogCursor {
+                    machine: machine_name.clone(),
+                    segment: segment_name,
+                    offset,
+                });
+            }
+        }
+        if let Some(((machine, segment), offset)) = start.into_iter().next() {
+            return Err(LogError::StaleCursor {
+                machine,
+                segment,
+                offset,
+            });
+        }
+        out.sort_by(|a, b| (&a.machine, &a.segment).cmp(&(&b.machine, &b.segment)));
+        Ok((events, out))
+    }
 }
 
 impl EventLog for FileEventLog {
@@ -204,6 +350,15 @@ impl EventLog for FileEventLog {
     ) -> Result<Vec<Event>, PortError> {
         Self::read_all_reporting(self, |line| on_bad_line(line))
             .map_err(|e| PortError::new("event log", e))
+    }
+
+    fn read_since_reporting(
+        &self,
+        cursors: &[LogCursor],
+        on_bad_line: &mut dyn FnMut(&str),
+    ) -> Result<(Vec<Event>, Vec<LogCursor>), PortError> {
+        Self::read_since_reporting(self, cursors, |line| on_bad_line(line))
+            .map_err(|e| PortError::new("reading new events", e))
     }
 }
 
@@ -300,5 +455,183 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].hlc.wall_ms, 1);
         assert_eq!(all[1].hlc.wall_ms, 2);
+    }
+
+    #[test]
+    fn read_since_empty_cursors_returns_everything_with_cursors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1), ev(2)]).expect("append");
+        let (events, cursors) = log.read_since_reporting(&[], |_| {}).expect("read");
+        assert_eq!(events.len(), 2);
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].machine, "m1");
+        assert_eq!(cursors[0].segment, "0001.jsonl");
+        let len = std::fs::metadata(dir.path().join("events/m1/0001.jsonl"))
+            .expect("meta")
+            .len();
+        assert_eq!(cursors[0].offset, len);
+    }
+
+    #[test]
+    fn read_since_returns_only_new_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let (_, cursors) = log.read_since_reporting(&[], |_| {}).expect("read");
+        log.append(&[ev(2), ev(3)]).expect("append");
+        let (events, cursors2) = log.read_since_reporting(&cursors, |_| {}).expect("read");
+        assert_eq!(events.len(), 2);
+        assert!(cursors2[0].offset > cursors[0].offset);
+        let (empty, cursors3) = log.read_since_reporting(&cursors2, |_| {}).expect("read");
+        assert!(empty.is_empty());
+        assert_eq!(cursors2, cursors3);
+    }
+
+    #[test]
+    fn a_torn_tail_is_not_consumed_until_completed() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        let complete_len = std::fs::metadata(&seg).expect("meta").len();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open");
+        f.write_all(b"{\"id\":\"torn").expect("write");
+        let (events, cursors) = log.read_since_reporting(&[], |_| {}).expect("read");
+        assert_eq!(events.len(), 1, "torn tail is deferred, not reported bad");
+        assert_eq!(
+            cursors[0].offset, complete_len,
+            "cursor stops at the last newline"
+        );
+    }
+
+    #[test]
+    fn a_stale_cursor_past_the_end_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let stale = LogCursor {
+            machine: "m1".into(),
+            segment: "0001.jsonl".into(),
+            offset: 999_999,
+        };
+        assert!(matches!(
+            log.read_since_reporting(&[stale], |_| {}),
+            Err(LogError::StaleCursor { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cursor_for_a_vanished_segment_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let log = FileEventLog::init(dir.path(), &m).expect("init");
+        let stale = LogCursor {
+            machine: "mgone".into(),
+            segment: "0001.jsonl".into(),
+            offset: 1,
+        };
+        assert!(matches!(
+            log.read_since_reporting(&[stale], |_| {}),
+            Err(LogError::StaleCursor { .. })
+        ));
+    }
+
+    #[test]
+    fn read_since_reports_a_complete_corrupt_line_and_still_advances_past_it() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open");
+        f.write_all(b"not json\n").expect("write corrupt line");
+        let mut bad_lines = Vec::new();
+        let (events, cursors) = log
+            .read_since_reporting(&[], |line| bad_lines.push(line.to_string()))
+            .expect("read");
+        assert_eq!(events.len(), 1, "the valid event still parses");
+        assert_eq!(bad_lines, vec!["not json"], "callback fires exactly once");
+        let len = std::fs::metadata(&seg).expect("meta").len();
+        assert_eq!(
+            cursors[0].offset, len,
+            "cursor advances past the valid event and the corrupt line"
+        );
+    }
+
+    #[test]
+    fn read_since_reports_non_utf8_bytes_as_a_bad_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let log = FileEventLog::init(dir.path(), &m).expect("init");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        std::fs::write(&seg, [0xFF, 0xFE, b'\n']).expect("write non-utf8 line");
+        let mut bad = 0;
+        let (events, cursors) = log.read_since_reporting(&[], |_| bad += 1).expect("read");
+        assert_eq!(events.len(), 0);
+        assert_eq!(
+            bad, 1,
+            "the non-utf8 line is reported through the lossy branch"
+        );
+        assert_eq!(
+            cursors[0].offset, 3,
+            "cursor advances past the complete line"
+        );
+    }
+
+    #[test]
+    fn a_new_machine_appearing_after_cursors_were_taken_is_read_from_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m1 = MachineId("m1".into());
+        let mut log1 = FileEventLog::init(dir.path(), &m1).expect("init m1");
+        log1.append(&[ev(1)]).expect("append m1");
+        let (_, cursors) = log1.read_since_reporting(&[], |_| {}).expect("read");
+        assert_eq!(cursors.len(), 1);
+
+        let m2 = MachineId("m2".into());
+        let mut log2 = FileEventLog::open(dir.path(), &m2).expect("open m2");
+        log2.append(&[ev(2)]).expect("append m2");
+
+        let (events, cursors2) = log1.read_since_reporting(&cursors, |_| {}).expect("read");
+        assert_eq!(events.len(), 1, "only the new machine's event is new");
+        assert_eq!(cursors2.len(), 2, "the new machine gains a cursor too");
+        let m2_cursor = cursors2
+            .iter()
+            .find(|c| c.machine == "m2")
+            .expect("m2 cursor present");
+        assert_eq!(m2_cursor.segment, "0001.jsonl");
+        let len = std::fs::metadata(dir.path().join("events/m2/0001.jsonl"))
+            .expect("meta")
+            .len();
+        assert_eq!(m2_cursor.offset, len);
+    }
+
+    #[test]
+    fn cursors_are_sorted_across_machines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("zebra".into())).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        for name in ["alpha", "m9", "charlie", "beta", "omega", "m1"] {
+            let mut other =
+                FileEventLog::open(dir.path(), &MachineId(name.into())).expect("open other");
+            other.append(&[ev(2)]).expect("append other");
+        }
+        let (_, cursors) = log.read_since_reporting(&[], |_| {}).expect("read");
+        let names: Vec<&str> = cursors.iter().map(|c| c.machine.as_str()).collect();
+        let mut expected = names.clone();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "cursors must be in canonical sorted order");
     }
 }

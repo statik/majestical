@@ -830,7 +830,11 @@ name = "majestical-catalog-sqlite"
 version = "0.1.0"
 dependencies = [
  "majestical-core",
+ "majestical-sync",
+ "proptest",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "ulid",

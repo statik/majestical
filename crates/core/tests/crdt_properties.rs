@@ -2,7 +2,7 @@
 //! duplication, yields the same projection.
 use majestical_core::clock::{Hlc, MachineId};
 use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind, VerifyOutcome};
-use majestical_core::projection::Projection;
+use majestical_core::projection::{Projection, Touched};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -239,6 +239,11 @@ proptest! {
         // Forward with duplication.
         let mut fwd = Projection::default();
         for e in &events { fwd.apply(e); fwd.apply(e); }
+        // The tracking path shares the same idempotence guard: replaying
+        // every event a further time through it must touch nothing.
+        for e in &events {
+            prop_assert_eq!(fwd.apply_tracking(e), Touched::Nothing);
+        }
         // Reversed.
         let mut rev = Projection::default();
         for e in events.iter().rev() { rev.apply(e); }

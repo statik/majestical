@@ -10,13 +10,15 @@ workspace = true
 [dependencies]
 majestical-core = { path = "../core" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+ulid.workspace = true
 walkdir.workspace = true
-# xxh64 is unused by this task's planner; Task 6's ASC MHL generation hashes
-# the manifest file itself with xxh64 and lives in this same crate.
+# xxh64 backs the journal's ulid-token temp names and (later) ASC MHL; xxh3
+# backs planner dedupe and catalog identity. The engine uses both in one
+# streaming pass per file.
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [dev-dependencies]
 proptest.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true

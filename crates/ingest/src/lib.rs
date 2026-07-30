@@ -1,5 +1,6 @@
-//! Ingest engine: planning and layout templates (verified copy, journal, and
-//! ASC MHL arrive in later tasks).
+//! Ingest engine: planning, layout templates, the resumable transfer
+//! journal, and the verified copy engine (ASC MHL arrives in a later task).
+pub mod journal;
 pub mod plan;
 pub mod template;
 
@@ -26,4 +27,12 @@ pub enum IngestError {
     NonUtf8Path { path: std::path::PathBuf },
     #[error("template: {0}")]
     Template(String),
+    #[error("journal {path}: {source}")]
+    Journal {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("encoding journal record: {0}")]
+    JournalEncode(#[source] serde_json::Error),
 }

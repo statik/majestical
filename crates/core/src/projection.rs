@@ -669,6 +669,63 @@ mod tests {
         assert_eq!(p, back);
     }
 
+    /// `projection_round_trips_through_serde_json` only ever exercises the
+    /// `instance_map` serde adapter with exactly one entry (via
+    /// `sample_ops`'s single `AssetSeen`). This pins the adapter at both
+    /// remaining shapes it must handle: zero entries (an asset with metadata
+    /// but no physical observation) and multiple entries (two distinct
+    /// (volume, path) instances on one asset).
+    #[test]
+    fn instances_round_trip_through_serde_json_when_empty_and_when_multi_entry() {
+        let mut empty = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        empty.apply(&test_event(
+            1,
+            Op::TagAdd {
+                asset: a.clone(),
+                tag: "t".into(),
+            },
+        ));
+        let json = serde_json::to_string(&empty).expect("serialize empty instances");
+        let back: Projection = serde_json::from_str(&json).expect("deserialize empty instances");
+        assert_eq!(empty, back);
+        assert!(
+            back.assets().next().expect("asset").1.instances.is_empty(),
+            "no AssetSeen observed, so instances must round-trip empty"
+        );
+
+        let mut multi = Projection::default();
+        multi.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v1".into(),
+                path: "a.mov".into(),
+                size: 4,
+                mtime_ms: 5,
+            },
+        ));
+        multi.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v2".into(),
+                path: "b.mov".into(),
+                size: 8,
+                mtime_ms: 9,
+            },
+        ));
+        let json = serde_json::to_string(&multi).expect("serialize multi-entry instances");
+        let back: Projection =
+            serde_json::from_str(&json).expect("deserialize multi-entry instances");
+        assert_eq!(multi, back);
+        assert_eq!(
+            back.assets().next().expect("asset").1.instances.len(),
+            2,
+            "two distinct (volume, path) instances must both round-trip"
+        );
+    }
+
     /// Pins the exact `Touched` value for one op of every variant — without
     /// this, a wrong mapping on an untested arm (e.g. `ManifestRecorded`
     /// reporting `Touched::Volume` instead of `Touched::Manifests`) would
@@ -977,6 +1034,41 @@ mod tests {
         let state = p.assets().find(|(id, _)| **id == a).expect("asset").1;
         let info = state.instances.values().next().expect("instance");
         assert_eq!((info.size, info.mtime_ms), (9, 20));
+    }
+
+    /// The other two LWW tests both pick payloads where `size` happens to
+    /// rank the same way as the HLC, so a mutation reordering
+    /// `InstanceInfo`'s fields to `(size, mtime_ms, hlc)` — making the
+    /// derived `Ord` compare size first — would still pass them. Here the
+    /// later event carries the smaller size, so only a genuine HLC-first
+    /// comparison picks it.
+    #[test]
+    fn newer_hlc_wins_even_when_size_is_smaller() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:a".into());
+        p.apply(&test_event(
+            1,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 9,
+                mtime_ms: 99,
+            },
+        ));
+        p.apply(&test_event(
+            2,
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                size: 1,
+                mtime_ms: 1,
+            },
+        ));
+        let state = p.assets().find(|(id, _)| **id == a).expect("asset").1;
+        let info = state.instances.values().next().expect("instance");
+        assert_eq!((info.size, info.mtime_ms), (1, 1), "HLC must dominate size");
     }
 
     #[test]

@@ -7,10 +7,10 @@ use crate::{MetaCmd, ParaCmd, TagCmd};
 use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
-use majestical_core::event::{AssetId, Op, ParaKind};
+use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
 use majestical_core::projection::Projection;
-use majestical_ingest::mhl;
-use std::collections::HashMap;
+use majestical_ingest::{engine, journal, mhl, plan, template};
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -593,4 +593,460 @@ pub(crate) fn cmd_verify(dir: &Path, json: bool) -> Result<()> {
         report.missing.len()
     );
     Ok(())
+}
+
+/// Args for `maj ingest`, bundled into one struct to keep `cmd_ingest`'s own
+/// signature within the house 5-positional-parameter limit.
+pub(crate) struct IngestArgs {
+    pub(crate) source: PathBuf,
+    pub(crate) dest: Vec<PathBuf>,
+    pub(crate) para: String,
+    pub(crate) template: String,
+    pub(crate) dedupe: plan::DedupeMode,
+    pub(crate) jobs: Option<usize>,
+    pub(crate) dry_run: bool,
+    pub(crate) resume: Option<String>,
+    pub(crate) json: bool,
+}
+
+/// Verified copy from `args.source` into every `args.dest` root, PARA-routed
+/// and recorded as catalog events.
+///
+/// Two deliberate scope decisions carry through this run:
+///
+/// - The ASC MHL generation written per destination covers only this run's
+///   placed files (built straight from `Outcome.placed`, not a re-hash of
+///   the whole destination tree — re-hashing terabytes of unrelated content
+///   at a reused destination root on every ingest is the wrong default). A
+///   reused root's pre-existing content is not recorded until the next
+///   `maj verify`, which correctly reports it as new.
+/// - Per-destination copy/verify failures do not produce `VerificationRecorded`
+///   events this phase: the engine's `Outcome::failed` reason joins every
+///   destination's failure into one string with no clean per-destination
+///   attribution, and emitting a Failed record against every destination
+///   would wrongly mark healthy ones failed too. Truthful incompleteness
+///   beats a confidently wrong record; see the phase 3 watchlist.
+///
+/// # Errors
+/// Returns an error if the source isn't a directory, the PARA target can't
+/// be resolved or is archived, or any planning/copy/journal/MHL step fails.
+/// Also returns an error — after printing the outcome — if the run ends
+/// with any failed file, rejected file, or diagnostic.
+pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.source.is_dir(),
+        "source must be a directory: {}",
+        args.source.display()
+    );
+
+    let projection = app.projection()?;
+    let (node_id, kind, name) = resolve_ingest_node(&projection, &args.para)?;
+    let known = known_assets_from_projection(&projection);
+    let ingest_plan = plan::plan_source(&args.source, &known, args.dedupe)
+        .with_context(|| format!("planning ingest from {}", args.source.display()))?;
+
+    let (source_volume_id, source_volume_label) = resolve_volume(&args.source, None);
+    let subdir = render_ingest_subdir(kind, &name, &args.template, &source_volume_label)?;
+
+    if args.dry_run {
+        print_ingest_plan(&ingest_plan, &subdir, &args.dest, args.json);
+        return Ok(());
+    }
+
+    let run_id = args
+        .resume
+        .clone()
+        .unwrap_or_else(|| ulid::Ulid::generate().to_string());
+    eprintln!("run {run_id} — resume with: --resume {run_id}");
+
+    let dests = build_dest_specs(&args.dest, &subdir);
+    let outcome = run_ingest_engine(catalog_dir, &run_id, &ingest_plan, &dests, args.jobs)?;
+
+    let hashdate_ms = physical_now_ms();
+    let hashdate = iso8601_ms(hashdate_ms);
+    let generations = write_ingest_generations(&dests, &outcome, &hashdate)
+        .context("writing ASC MHL generations")?;
+
+    let dest_volumes = dest_volume_identities(&args.dest);
+    let mut ops = volume_seen_ops((&source_volume_id, &source_volume_label), &dest_volumes);
+    ops.extend(asset_and_para_ops(
+        &outcome,
+        &dest_volumes,
+        &node_id,
+        hashdate_ms,
+    ));
+    ops.extend(manifest_ops(&dest_volumes, &generations));
+    app.emit(ops)?;
+
+    print_ingest_outcome(&run_id, &outcome, &generations, args.json);
+
+    anyhow::ensure!(
+        outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
+        "ingest run {run_id}: {} failed, {} rejected, {} diagnostic(s)",
+        outcome.failed.len(),
+        outcome.rejected.len(),
+        outcome.diagnostics.len()
+    );
+    Ok(())
+}
+
+/// Resolves `para` to an active PARA node's (id, kind, name). Ingest targets
+/// must be non-archived even when addressed by a raw node id — unlike
+/// `resolve_para_node`'s general allowance for archived nodes (needed so an
+/// already-archived node can still be renamed by id), silently copying new
+/// content into an archived node would resurrect it as a live destination.
+fn resolve_ingest_node(projection: &Projection, para: &str) -> Result<(String, ParaKind, String)> {
+    let node_id = resolve_para_node(projection, para)?;
+    let state = projection
+        .para_node(&node_id)
+        .context("resolved node vanished from the projection")?;
+    anyhow::ensure!(
+        !state.archived(),
+        "PARA node {node_id} is archived — ingest targets must be active; see `maj para list`"
+    );
+    let kind = state
+        .kind()
+        .with_context(|| format!("PARA node {node_id} has no kind recorded"))?;
+    let name = state
+        .name()
+        .with_context(|| format!("PARA node {node_id} has no name recorded"))?
+        .to_string();
+    Ok((node_id, kind, name))
+}
+
+/// Builds the planner's `KnownAssets` from every instance size recorded
+/// against every asset the catalog knows about. Asset ids are stored as
+/// `xxh3:<hex>` (the only format `scan`/`ingest` ever mint); the planner's
+/// dedupe hashes are bare hex, so the prefix is stripped here.
+fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
+    let mut pairs = Vec::new();
+    for (asset, state) in projection.assets() {
+        let Some(hash) = asset.0.strip_prefix("xxh3:") else {
+            continue;
+        };
+        for (_, _, size) in &state.instances {
+            pairs.push((hash.to_string(), *size));
+        }
+    }
+    plan::KnownAssets::from_pairs(pairs)
+}
+
+/// Renders the destination-relative subdir: `<KindDir>/<name>/<template>`.
+fn render_ingest_subdir(
+    kind: ParaKind,
+    name: &str,
+    template_str: &str,
+    source_label: &str,
+) -> Result<String> {
+    let date = iso8601_ms(physical_now_ms())[..10].to_string();
+    let ctx = template::TemplateCtx {
+        date,
+        source_label: source_label.to_string(),
+    };
+    let rendered =
+        template::render(template_str, &ctx).context("rendering ingest layout template")?;
+    Ok(format!("{}/{name}/{rendered}", kind.dir_name()))
+}
+
+fn decision_label(decision: &plan::Decision) -> &'static str {
+    match decision {
+        plan::Decision::Copy => "COPY",
+        plan::Decision::Duplicate { .. } => "DUPLICATE",
+        plan::Decision::Rejected { .. } => "REJECTED",
+    }
+}
+
+/// `--dry-run` output: the plan only — nothing is copied and no journal is
+/// written.
+fn print_ingest_plan(ingest_plan: &plan::IngestPlan, subdir: &str, dests: &[PathBuf], json: bool) {
+    if json {
+        let dest_strs: Vec<String> = dests.iter().map(|d| d.display().to_string()).collect();
+        println!(
+            "{}",
+            serde_json::json!({ "plan": ingest_plan, "subdir": subdir, "dests": dest_strs })
+        );
+        return;
+    }
+    for file in &ingest_plan.files {
+        println!("{} {}", decision_label(&file.decision), file.rel);
+    }
+    println!("subdir: {subdir}");
+    for dest in dests {
+        println!("dest: {}", dest.display());
+    }
+}
+
+/// Default worker count: available CPU cores, capped at 8 — a card reader or
+/// spinning-disk destination rarely benefits from more parallel streams than
+/// that, and the cap bounds open-file-descriptor use per destination.
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(8)
+}
+
+fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpec> {
+    dest_roots
+        .iter()
+        .map(|root| engine::DestSpec {
+            root: root.clone(),
+            subdir: subdir.to_string(),
+        })
+        .collect()
+}
+
+/// Opens (or resumes) the run's journal and executes the copy/verify engine.
+/// Always loads the journal before appending, even on a fresh run: loading a
+/// journal that doesn't exist yet returns an empty fold, so a fresh run and
+/// a `--resume` both flow through the same path rather than branching twice
+/// on whether `--resume` was given.
+fn run_ingest_engine(
+    catalog_dir: &Path,
+    run_id: &str,
+    ingest_plan: &plan::IngestPlan,
+    dests: &[engine::DestSpec],
+    jobs: Option<usize>,
+) -> Result<engine::Outcome> {
+    let journal_path = catalog_dir.join("runs").join(format!("{run_id}.jsonl"));
+    let resume_set = journal::Journal::load(&journal_path)
+        .with_context(|| format!("loading journal at {}", journal_path.display()))?
+        .placed;
+    let mut journal = journal::Journal::open_append(&journal_path)
+        .with_context(|| format!("opening journal at {}", journal_path.display()))?;
+    let config = engine::EngineConfig {
+        jobs: jobs.unwrap_or_else(default_jobs),
+    };
+    engine::run(
+        ingest_plan,
+        dests,
+        &resume_set,
+        &mut journal,
+        &engine::RealSinks,
+        &config,
+    )
+    .context("running ingest engine")
+}
+
+/// Builds the run's MHL hash list straight from `Outcome.placed` (guidance:
+/// the engine already computed and verified each placed file's xxh64+size
+/// during copy, so re-hashing the destination tree here would redo that work
+/// — and would also sweep in any pre-existing, unrelated content at a reused
+/// destination root). See `cmd_ingest`'s doc comment for the consequence.
+fn build_generation_hash_list(outcome: &engine::Outcome, hashdate: &str) -> mhl::HashList {
+    let entries = outcome
+        .placed
+        .iter()
+        .map(|placed| mhl::MhlEntry {
+            rel: placed.dest_rel.clone(),
+            size: placed.size,
+            xxh64: placed.xxh64.clone(),
+            action: mhl::HashAction::Original,
+            hashdate: hashdate.to_string(),
+        })
+        .collect();
+    mhl::HashList {
+        creation_date: hashdate.to_string(),
+        hostname: mhl::local_hostname(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        entries,
+    }
+}
+
+/// Writes a new generation per destination from this run's placed files —
+/// unless nothing was placed. A dedupe-only or fully-resumed run leaves
+/// `Outcome.placed` empty; writing a generation from an empty hash list
+/// anyway would not merge with the previous one (`write_generation` always
+/// writes exactly the list it's given, unlike `verify_dir`'s diff-and-merge),
+/// so it would make the destination's latest generation forget every file
+/// a prior run genuinely placed and verified there — the next `maj verify`
+/// would then report all of them as "new" instead of leaving them verified.
+/// Skipping the write when there is nothing new keeps history intact.
+fn write_ingest_generations(
+    dests: &[engine::DestSpec],
+    outcome: &engine::Outcome,
+    hashdate: &str,
+) -> Result<Vec<(PathBuf, mhl::WrittenGeneration)>> {
+    if outcome.placed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hash_list = build_generation_hash_list(outcome, hashdate);
+    dests
+        .iter()
+        .map(|dest| {
+            let written = mhl::write_generation(&dest.root, &hash_list).with_context(|| {
+                format!("writing ASC MHL generation at {}", dest.root.display())
+            })?;
+            Ok((dest.root.clone(), written))
+        })
+        .collect()
+}
+
+/// Resolves each destination root's real volume identity (diskutil-backed
+/// on macOS, with `volume_identity`'s documented mount-label fallback
+/// elsewhere) rather than lumping every destination under one root volume.
+fn dest_volume_identities(dest_roots: &[PathBuf]) -> Vec<(PathBuf, String, String)> {
+    dest_roots
+        .iter()
+        .map(|root| {
+            let identity = volume_identity::resolve(root);
+            (root.clone(), identity.id, identity.label)
+        })
+        .collect()
+}
+
+fn volume_seen_ops(
+    source_volume: (&str, &str),
+    dest_volumes: &[(PathBuf, String, String)],
+) -> Vec<Op> {
+    let mut ops = vec![Op::VolumeSeen {
+        volume: source_volume.0.to_string(),
+        label: source_volume.1.to_string(),
+    }];
+    ops.extend(dest_volumes.iter().map(|(_, id, label)| Op::VolumeSeen {
+        volume: id.clone(),
+        label: label.clone(),
+    }));
+    ops
+}
+
+/// `AssetSeen` + `VerificationRecorded` for every placed file at every
+/// destination, plus one `AssetParaSet` per distinct asset actually placed
+/// this run (not one per file — a burst-shot asset placed under several
+/// rels would otherwise mint redundant, identical assignments).
+fn asset_and_para_ops(
+    outcome: &engine::Outcome,
+    dest_volumes: &[(PathBuf, String, String)],
+    node_id: &str,
+    hashdate_ms: u64,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut seen_assets: BTreeSet<AssetId> = BTreeSet::new();
+    for placed in &outcome.placed {
+        let asset = AssetId(format!("xxh3:{}", placed.xxh3));
+        for (_, dest_id, _) in dest_volumes {
+            ops.push(Op::AssetSeen {
+                asset: asset.clone(),
+                volume: dest_id.clone(),
+                path: placed.dest_rel.clone(),
+                size: placed.size,
+            });
+            ops.push(Op::VerificationRecorded {
+                asset: asset.clone(),
+                volume: dest_id.clone(),
+                path: placed.dest_rel.clone(),
+                algo: "xxh64".to_string(),
+                value: placed.xxh64.clone(),
+                outcome: VerifyOutcome::Verified,
+                hashdate_ms,
+            });
+        }
+        if seen_assets.insert(asset.clone()) {
+            ops.push(Op::AssetParaSet {
+                asset,
+                node: node_id.to_string(),
+            });
+        }
+    }
+    ops
+}
+
+fn manifest_ops(
+    dest_volumes: &[(PathBuf, String, String)],
+    generations: &[(PathBuf, mhl::WrittenGeneration)],
+) -> Vec<Op> {
+    dest_volumes
+        .iter()
+        .filter_map(|(root, id, _)| {
+            let (_, written) = generations.iter().find(|(r, _)| r == root)?;
+            let mhl_path = format!(
+                "ascmhl/{}",
+                written
+                    .path
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            );
+            Some(Op::ManifestRecorded {
+                volume: id.clone(),
+                mhl_path,
+                generation: written.generation,
+                roothash: written.roothash.clone(),
+            })
+        })
+        .collect()
+}
+
+fn print_ingest_outcome(
+    run_id: &str,
+    outcome: &engine::Outcome,
+    generations: &[(PathBuf, mhl::WrittenGeneration)],
+    json: bool,
+) {
+    if json {
+        print_ingest_outcome_json(run_id, outcome, generations);
+    } else {
+        print_ingest_outcome_text(run_id, outcome, generations);
+    }
+    for note in &outcome.diagnostics {
+        eprintln!("diagnostic: {note}");
+    }
+}
+
+fn print_ingest_outcome_json(
+    run_id: &str,
+    outcome: &engine::Outcome,
+    generations: &[(PathBuf, mhl::WrittenGeneration)],
+) {
+    let failed: Vec<_> = outcome
+        .failed
+        .iter()
+        .map(|f| serde_json::json!({ "rel": f.rel, "reason": f.reason }))
+        .collect();
+    let rejected: Vec<_> = outcome
+        .rejected
+        .iter()
+        .map(|f| serde_json::json!({ "rel": f.rel, "reason": f.reason }))
+        .collect();
+    let generations_json: Vec<_> = generations
+        .iter()
+        .map(|(root, w)| {
+            serde_json::json!({ "root": root.display().to_string(), "generation": w.generation })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "run": run_id,
+            "placed": outcome.placed.len(),
+            "failed": failed,
+            "skipped_duplicates": outcome.skipped_duplicates.len(),
+            "rejected": rejected,
+            "resumed": outcome.skipped_resumed,
+            "generations": generations_json,
+        })
+    );
+}
+
+fn print_ingest_outcome_text(
+    run_id: &str,
+    outcome: &engine::Outcome,
+    generations: &[(PathBuf, mhl::WrittenGeneration)],
+) {
+    println!(
+        "run {run_id}: placed {}, failed {}, skipped_duplicates {}, rejected {}, resumed {}",
+        outcome.placed.len(),
+        outcome.failed.len(),
+        outcome.skipped_duplicates.len(),
+        outcome.rejected.len(),
+        outcome.skipped_resumed,
+    );
+    for f in &outcome.failed {
+        println!("FAILED {}: {}", f.rel, f.reason);
+    }
+    for r in &outcome.rejected {
+        println!("REJECTED {}: {}", r.rel, r.reason);
+    }
+    for (root, w) in generations {
+        println!("generation {} at {}", w.generation, root.display());
+    }
 }

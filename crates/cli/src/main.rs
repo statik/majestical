@@ -6,7 +6,8 @@ mod volume_identity;
 
 use anyhow::Result;
 use app::FsApp;
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use majestical_ingest::plan::DedupeMode;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -80,6 +81,52 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Verified copy from a source directory into PARA-routed destinations.
+    Ingest {
+        source: PathBuf,
+        /// Destination root(s); each gets an independently verified copy
+        /// and its own ASC MHL history.
+        #[arg(long, required = true)]
+        dest: Vec<PathBuf>,
+        /// Target PARA node (<kind>/<name> or node id).
+        #[arg(long)]
+        para: String,
+        /// Layout inside the node. Tokens: {date}, {source-label}.
+        #[arg(long, default_value = "{date}/{source-label}")]
+        template: String,
+        #[arg(long, value_enum, default_value_t = DedupeArg::Skip)]
+        dedupe: DedupeArg,
+        /// Parallel copy workers (default: CPU cores, max 8).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Print the plan and exit without copying.
+        #[arg(long)]
+        dry_run: bool,
+        /// Resume a previous run's journal (run id printed at start).
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `maj ingest --dedupe` surface: only `skip` and `copy` are exposed this
+/// phase. `DedupeMode::Link` (hard-link mode) needs a per-destination
+/// existing-instance lookup that isn't wired up yet — see the phase 3
+/// deferrals in the watchlist.
+#[derive(Clone, Copy, ValueEnum)]
+enum DedupeArg {
+    Skip,
+    Copy,
+}
+
+impl From<DedupeArg> for DedupeMode {
+    fn from(v: DedupeArg) -> Self {
+        match v {
+            DedupeArg::Skip => Self::Skip,
+            DedupeArg::Copy => Self::CopyAnyway,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -182,6 +229,31 @@ fn main() -> Result<()> {
         // in Task 6's report rather than restructured, since every other
         // subcommand does need them.
         Cmd::Verify { dir, json } => commands::cmd_verify(&dir, json)?,
+        Cmd::Ingest {
+            source,
+            dest,
+            para,
+            template,
+            dedupe,
+            jobs,
+            dry_run,
+            resume,
+            json,
+        } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            let args = commands::IngestArgs {
+                source,
+                dest,
+                para,
+                template,
+                dedupe: dedupe.into(),
+                jobs,
+                dry_run,
+                resume,
+                json,
+            };
+            commands::cmd_ingest(&mut app, &cli.catalog, &args)?;
+        }
     }
     Ok(())
 }

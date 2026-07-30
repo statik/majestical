@@ -856,3 +856,209 @@ fn maj_verify_reports_altered_file_on_second_run() {
         .failure()
         .stdout(contains("ALTERED a.mov"));
 }
+
+#[cfg(test)]
+fn walkdir_contains(root: &std::path::Path, filename: &str) -> bool {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy() == filename)
+}
+
+/// `maj ingest` end to end: a card with one file, ingested to two
+/// destination roots under a PARA project node. Both roots get a verified
+/// copy, an ASC MHL history (`ascmhl/` present), and the catalog can find
+/// the asset by name; `maj verify` passes clean on both roots afterward.
+/// Re-ingesting the identical card copies nothing (content already known)
+/// but still reports the duplicate.
+#[test]
+fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(media.path().join("clips")).unwrap();
+    std::fs::write(media.path().join("clips/a.mov"), b"fake video bytes").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .arg("--dest")
+        .arg(d2.path())
+        .args(["--para", "project/shoot", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["placed"], 1);
+    assert_eq!(parsed["failed"].as_array().unwrap().len(), 0);
+    assert_eq!(parsed["generations"].as_array().unwrap().len(), 2);
+
+    for dest in [d1.path(), d2.path()] {
+        assert!(
+            walkdir_contains(dest, "a.mov"),
+            "expected a.mov placed somewhere under {}",
+            dest.display()
+        );
+        assert!(
+            dest.join("ascmhl").is_dir(),
+            "expected ascmhl/ under {}",
+            dest.display()
+        );
+    }
+
+    let out = maj(&root)
+        .args(["search", "--name", "a.mov", "--json"])
+        .output()
+        .unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(hits["count"], 1);
+
+    maj(&root)
+        .args(["verify"])
+        .arg(d1.path())
+        .assert()
+        .success();
+    maj(&root)
+        .args(["verify"])
+        .arg(d2.path())
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .arg("--dest")
+        .arg(d2.path())
+        .args(["--para", "project/shoot", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["placed"], 0);
+    assert_eq!(parsed["skipped_duplicates"], 1);
+    assert_eq!(
+        parsed["generations"].as_array().unwrap().len(),
+        0,
+        "a dedupe-only run must not write a new (empty) MHL generation"
+    );
+}
+
+/// `--dry-run` prints the plan without copying anything, creating a
+/// journal, or touching the catalog.
+#[test]
+fn ingest_dry_run_places_nothing_and_writes_no_journal() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let d1 = tempfile::tempdir().unwrap();
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+
+    maj(&root)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .args(["--para", "project/shoot", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("COPY a.mov"));
+
+    assert!(
+        !d1.path().join("ascmhl").exists(),
+        "dry run must not copy anything"
+    );
+    let runs_dir = root.join("runs");
+    assert!(
+        !runs_dir.is_dir() || std::fs::read_dir(&runs_dir).unwrap().next().is_none(),
+        "dry run must not write a journal"
+    );
+}
+
+/// A source that isn't a directory is rejected up front, before any
+/// planning, copying, or journal writes.
+#[test]
+fn ingest_rejects_a_non_directory_source() {
+    let media = tempfile::tempdir().unwrap();
+    let file = media.path().join("not-a-dir.mov");
+    std::fs::write(&file, b"AAAA").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let d1 = tempfile::tempdir().unwrap();
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+
+    maj(&root)
+        .args(["ingest"])
+        .arg(&file)
+        .arg("--dest")
+        .arg(d1.path())
+        .args(["--para", "project/shoot"])
+        .assert()
+        .failure()
+        .stderr(contains("source must be a directory"));
+}
+
+/// An archived PARA node is rejected as an ingest target, even when
+/// addressed by raw node id (the one case `resolve_para_node` otherwise
+/// still allows, so a rename can still reach an archived node).
+#[test]
+fn ingest_rejects_an_archived_para_target() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let d1 = tempfile::tempdir().unwrap();
+
+    maj(&root).args(["catalog", "init"]).assert().success();
+    maj(&root)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+    maj(&root)
+        .args(["para", "archive", "project/shoot"])
+        .assert()
+        .success();
+
+    let out = maj(&root)
+        .args(["para", "list", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let node_id = parsed["nodes"][0]["id"].as_str().unwrap().to_string();
+
+    maj(&root)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .args(["--para", &node_id])
+        .assert()
+        .failure()
+        .stderr(contains("is archived"));
+}

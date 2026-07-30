@@ -22,6 +22,54 @@ fn first_asset_id(out: &std::process::Output) -> String {
     hits["results"][0]["asset"].as_str().unwrap().to_string()
 }
 
+/// Reads every event this test's single machine ("test-machine") has
+/// appended so far, in file order.
+#[cfg(test)]
+fn read_events(root: &std::path::Path) -> Vec<serde_json::Value> {
+    let seg = root.join("events/test-machine/0001.jsonl");
+    let contents = std::fs::read_to_string(&seg).unwrap();
+    contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect()
+}
+
+/// Asserts the catalog's raw event log carries exactly one `AssetParaSet`
+/// for the one distinct asset an ingest run placed (not one per
+/// destination — a per-dest emission would mint redundant, identical
+/// assignments), and exactly one `ManifestRecorded` per `dest_count`
+/// destination, each carrying a `c4`-prefixed roothash (the ASC MHL chain
+/// hash, per `WrittenGeneration`).
+#[cfg(test)]
+fn assert_ingest_event_granularity(root: &std::path::Path, dest_count: usize) {
+    let events = read_events(root);
+    let asset_para_set_count = events
+        .iter()
+        .filter(|e| e["op"]["type"] == "asset_para_set")
+        .count();
+    assert_eq!(
+        asset_para_set_count, 1,
+        "expected exactly one AssetParaSet for the one distinct placed asset, got {asset_para_set_count}"
+    );
+    let manifest_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["op"]["type"] == "manifest_recorded")
+        .collect();
+    assert_eq!(
+        manifest_events.len(),
+        dest_count,
+        "expected one ManifestRecorded per destination, got {}",
+        manifest_events.len()
+    );
+    for m in &manifest_events {
+        let roothash = m["op"]["roothash"].as_str().unwrap();
+        assert!(
+            roothash.starts_with("c4"),
+            "expected a c4-prefixed roothash, got {roothash}"
+        );
+    }
+}
+
 #[test]
 fn init_scan_tag_search_round_trip() {
     let media = tempfile::tempdir().unwrap();
@@ -906,6 +954,11 @@ fn ingest_places_verified_copies_with_mhl_and_catalog_events() {
     assert_eq!(parsed["placed"], 1);
     assert_eq!(parsed["failed"].as_array().unwrap().len(), 0);
     assert_eq!(parsed["generations"].as_array().unwrap().len(), 2);
+
+    // Pin the catalog event granularity directly against the raw JSONL log
+    // (not just the CLI's own summary counts) — see
+    // `assert_ingest_event_granularity`.
+    assert_ingest_event_granularity(&root, 2);
 
     for dest in [d1.path(), d2.path()] {
         assert!(

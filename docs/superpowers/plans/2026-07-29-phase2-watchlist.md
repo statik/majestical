@@ -32,6 +32,15 @@ order. Items marked "(Done in phase 2)" are resolved and listed for the record.
 
 ## Phase 3 deferrals
 
+- **`para_nodes()` is inherent-only on `SqliteCatalog`** — the port-lag
+  pattern PR #23 resolved recurred in PR #24; add the trait method when a
+  second adapter or trait-generic caller needs it (phase 3 final review).
+- **`maj verify` appends generations without emitting `ManifestRecorded`** —
+  every verify makes the catalog's newest manifest record stale by one
+  generation, so the future chain-tamper-check consumer must treat "disk
+  generation > catalog generation" as normal; consider catalog emission from
+  `maj verify` when that consumer lands (phase 3 final review).
+
 Recorded during Task 7 (`maj ingest` end to end) and its reviews.
 
 - **`--dedupe link` hard-link mode is not exposed on the CLI.** The planner's
@@ -159,8 +168,10 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
   and the copy engine streams bytes exactly (no text conversion at any point
   in the copy/verify path) (PR #26; task-1 through task-6, `crates/ingest`).
 - **Extract `cmd_*` handlers into a commands module** (PR #23).
-- **CatalogStore port lags the inherent surface** — resolved alongside the
-  commands-module extraction (PR #23).
+- **CatalogStore port lags the inherent surface** — resolved for the volume
+  queries alongside the commands-module extraction (PR #23). NOTE the lag
+  pattern has since recurred: `para_nodes()` (PR #24) is inherent-only on
+  `SqliteCatalog` with no trait counterpart; see Phase 3 deferrals.
 - **`volume_is_online`/internal-disk root-volume lumping revisited for
   ingest** — every `maj ingest` destination root now gets its own real
   volume identity via `volume_identity::resolve` (diskutil `VolumeUUID` on

@@ -107,8 +107,11 @@ pub enum Op {
         outcome: VerifyOutcome,
         hashdate_ms: u64,
     },
-    /// An ASC MHL generation was written for `volume`; `roothash` is the
-    /// xxh64 of the manifest file itself, so on-disk tampering is detectable.
+    /// An ASC MHL generation was written for `volume`; `roothash` is a hash
+    /// of the manifest file's own bytes, so on-disk tampering is detectable.
+    /// The writer chooses the algorithm and self-describes it in the value
+    /// (in practice c4, per the ASC MHL chain-file requirement — see
+    /// `majestical-ingest`'s `mhl` module).
     ManifestRecorded {
         volume: String,
         mhl_path: String,

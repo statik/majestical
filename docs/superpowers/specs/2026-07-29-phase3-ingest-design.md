@@ -185,3 +185,44 @@ independent MHL histories.
 
 Each task runs the mandated loop: fresh implementer subagent → adversarial
 spec-compliance reviewer → code-quality reviewer → fix rounds until APPROVED.
+
+## As-built deviations (recorded 2026-07-30, phase complete)
+
+Where the shipped implementation departs from the text above. Each was a
+reviewed decision; deferrals carry watchlist entries with attribution.
+
+1. **Dedupe `link` mode is not exposed** — the CLI offers `skip|copy` only;
+   hard-linking needs per-destination instance lookup (watchlisted).
+2. **`ManifestRecorded.roothash` is c4, not xxh64** — the ASC MHL reference
+   implementation's chain file requires c4 (SHA-512 → base58); the oracle won,
+   per this spec's own rule. The event field is an opaque string either way.
+3. **ASC MHL details follow the oracle**: verification is `ascmhl-debug
+   verify` (the main CLI has no verify subcommand); `ascmhl_chain.xml` is
+   required and c4-hashed; missing files are dropped from new generations
+   rather than kept as failed entries; roothash/directoryhash are optional and
+   directory hashes are not implemented.
+4. **Ingest generations cover that run's placed files only** — pre-existing
+   content at a destination root appears as "new" on the next `maj verify`
+   (which appends it). Re-hashing terabytes of unrelated content per ingest
+   was rejected; a dedupe-only re-run writes no generation at all (an empty
+   one would erase history).
+5. **No `Failed` verification events are emitted by `maj ingest`** — the
+   engine's outcome cannot yet attribute a failure to one destination, and
+   fabricating per-destination facts would be a lie (watchlisted).
+6. **Archive is a monotone latch** (no unarchive op) and the disk move runs
+   only for roots passed via `--root` — there is no materialization tracking.
+7. **Op field names** shipped as `node`/`asset`/`volume`/`hashdate_ms`
+   (phase-1/2 conventions), not this spec's `node_id`/`asset_hash`/etc.
+8. **Hash-history storage** shipped as the existing `instances` table plus a
+   `verifications` table, not a `file_instances` merge; `para_nodes()` is
+   inherent-only on `SqliteCatalog` (watchlisted port lag).
+9. **Journal location** is `<catalog>/runs/<run-id>.jsonl` inside the sync
+   root — the local-state/sync-root split remains deferred.
+10. **Non-UTF-8 handling** meets this spec's outcome (per-file hard error,
+    counted, run continues) via up-front planner rejection; the engine
+    thereafter carries `String` paths, not `OsString` end to end.
+11. **Cucumber acceptance has 4 scenarios**; non-UTF-8 rejection, dedupe-copy,
+    and multi-destination partial failure are covered by unit/integration
+    tests instead.
+12. **`maj verify` is not read-only** (this spec was self-contradictory): it
+    appends an outcome generation, as §"ASC MHL" specified.

@@ -1,7 +1,9 @@
 //! Ingest engine: planning, layout templates, the resumable transfer
-//! journal, and the verified copy engine (ASC MHL arrives in a later task).
+//! journal, the verified copy engine, and ASC MHL create/verify.
 pub mod engine;
+pub mod hashing;
 pub mod journal;
+pub mod mhl;
 pub mod plan;
 pub mod template;
 
@@ -43,4 +45,15 @@ pub enum IngestError {
     MismatchedSubdirs { first: String, other: String },
     #[error("at least one destination required — nothing to copy to")]
     NoDestinations,
+    #[error("ASC MHL {path}: {msg}")]
+    Mhl {
+        path: std::path::PathBuf,
+        msg: String,
+    },
+    #[error("parsing ASC MHL XML {path}: {source}")]
+    MhlXml {
+        path: std::path::PathBuf,
+        #[source]
+        source: quick_xml::Error,
+    },
 }

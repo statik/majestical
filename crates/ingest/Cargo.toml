@@ -14,10 +14,18 @@ serde_json.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
 walkdir.workspace = true
-# xxh64 backs the journal's ulid-token temp names and (later) ASC MHL; xxh3
-# backs planner dedupe and catalog identity. The engine uses both in one
-# streaming pass per file.
+# xxh64 backs the journal's ulid-token temp names and ASC MHL file hashes;
+# xxh3 backs planner dedupe and catalog identity. The engine uses both in
+# one streaming pass per file.
 xxhash-rust = { workspace = true, features = ["xxh64"] }
+# ASC MHL manifest XML (read + write).
+quick-xml.workspace = true
+# ASC MHL creatorinfo/hostname field.
+hostname.workspace = true
+# ASC MHL chain file c4 hashes (SHA-512 -> base58); the reference
+# implementation always uses c4 for chain integrity regardless of the file
+# hash format in use.
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

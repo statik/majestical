@@ -161,6 +161,20 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
   carry `subdir` too — and have a `--resume` load it from there instead of
   re-rendering.
 
+## Phase 4 deferrals
+
+- **Pre-phase-4 instance rows keep scan-dir-relative paths** — `scan` and
+  `ingest` now store paths relative to the volume's actual mount root
+  (auto-detected volumes only; an explicit `--volume` override still stores
+  scan-dir-relative paths, since the override id has no real mount to
+  re-base against). Instance rows written before this change are stale: the
+  indexer (`maj index run`/`status`, `crates/index/src/work.rs`) can't
+  re-resolve their bytes and reports them offline rather than erroring. A
+  rescan of the same volume overwrites the stale row (HLC-LWW on
+  `(volume, path)`) with a fresh, correctly-rooted one, so this self-heals
+  without any migration step — but until that rescan happens, those rows
+  sit in the queue as permanently offline.
+
 ## Done in phase 3
 
 - **Non-UTF-8 path handling** — the planner rejects a non-UTF-8-named source

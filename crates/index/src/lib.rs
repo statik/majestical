@@ -6,5 +6,6 @@ pub mod blob;
 pub mod error;
 pub mod resize;
 pub mod thumbs;
+pub mod work;
 
 pub use error::IndexError;

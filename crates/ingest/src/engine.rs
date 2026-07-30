@@ -663,18 +663,7 @@ fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> V
 }
 
 fn readback_xxh64(path: &Path) -> std::io::Result<String> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
-    let mut buf = vec![0u8; 1024 * 1024].into_boxed_slice();
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:016x}", hasher.digest()))
+    crate::hashing::xxh64_file(path)
 }
 
 #[cfg(test)]

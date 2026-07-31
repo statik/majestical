@@ -1,7 +1,8 @@
 //! Per-machine, per-catalog describer configuration (`describer.toml` in
 //! the state dir). Never synced: endpoints and API keys are machine-local.
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -86,22 +87,26 @@ impl DescriberConfig {
         Ok(Some(config))
     }
 
-    /// Write config to `path` with 0600 permissions (may hold an API key).
+    /// Write config to `path`, created with 0600 permissions from the start
+    /// (may hold an API key, so it must never exist world/group-readable
+    /// even for the instant between create and chmod).
     ///
     /// # Errors
     /// Returns `ConfigError` when serialization or the write fails.
     pub fn store(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text).map_err(|source| ConfigError::Write {
+        let write_error = |source| ConfigError::Write {
             path: path.display().to_string(),
             source,
-        })?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |source| ConfigError::Write {
-                path: path.display().to_string(),
-                source,
-            },
-        )?;
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(write_error)?;
+        file.write_all(text.as_bytes()).map_err(write_error)?;
         Ok(())
     }
 
@@ -146,6 +151,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml_with_0600_perms() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("describer.toml");
         let config = DescriberConfig {

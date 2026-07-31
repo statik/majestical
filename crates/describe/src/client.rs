@@ -27,13 +27,14 @@ fn tags_prompt(vocab: &[String]) -> String {
     )
 }
 
-fn to_port_error(context: impl Into<String>, error: &DescribeHttpError) -> PortError {
-    PortError::new(context, std::io::Error::other(error.to_string()))
+fn to_port_error(context: impl Into<String>, error: DescribeHttpError) -> PortError {
+    PortError::new(context, error)
 }
 
 /// All three backends accept base64 data URLs on the OpenAI-compatible
 /// endpoint; Ollama accepts ONLY data URLs (never http URLs), which is why
-/// data URLs are the one shared dialect.
+/// data URLs are the one shared dialect. Callers always pass WebP-encoded
+/// bytes, so the data URL's MIME type is hardcoded to `image/webp`.
 fn image_content(image: &[u8], prompt: &str) -> serde_json::Value {
     let encoded = base64::engine::general_purpose::STANDARD.encode(image);
     serde_json::json!([
@@ -162,23 +163,30 @@ impl HttpDescriber {
         self.post_chat(&content)
     }
 
+    fn get_json(&self, url: &str) -> Result<serde_json::Value, DescribeHttpError> {
+        let error_at = |message: String| DescribeHttpError::Request {
+            url: url.to_string(),
+            message,
+        };
+        let request = self.authorize(self.agent.get(url));
+        let mut response = request
+            .call()
+            .map_err(|error| error_at(error.to_string()))?;
+        response
+            .body_mut()
+            .read_json()
+            .map_err(|error| error_at(error.to_string()))
+    }
+
     /// Live probe used by `maj describer test`.
     ///
     /// # Errors
     /// Returns `PortError` when the backend cannot be reached at all.
     pub fn probe(&self) -> Result<ProbeReport, PortError> {
         let url = format!("{}/v1/models", self.config.base_url.trim_end_matches('/'));
-        let request = self.authorize(self.agent.get(&url));
-        let error_at = |message: String| {
-            PortError::new(format!("probe {url}"), std::io::Error::other(message))
-        };
-        let mut response = request
-            .call()
-            .map_err(|error| error_at(error.to_string()))?;
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| error_at(error.to_string()))?;
+        let body = self
+            .get_json(&url)
+            .map_err(|error| to_port_error("probe", error))?;
         let model_listed = body["data"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["id"] == self.config.model));
@@ -196,9 +204,7 @@ impl HttpDescriber {
 
     fn lm_studio_vision(&self, base: &str) -> Option<bool> {
         let url = format!("{}/api/v1/models", base.trim_end_matches('/'));
-        let request = self.authorize(self.agent.get(&url));
-        let mut response = request.call().ok()?;
-        let body: serde_json::Value = response.body_mut().read_json().ok()?;
+        let body = self.get_json(&url).ok()?;
         let entry = body["data"]
             .as_array()?
             .iter()
@@ -212,7 +218,7 @@ impl Describer for HttpDescriber {
         let content = image_content(image, CAPTION_PROMPT);
         let text = self
             .post_chat(&content)
-            .map_err(|error| to_port_error("caption", &error))?;
+            .map_err(|error| to_port_error("caption", error))?;
         Ok(Caption {
             text: text.trim().to_string(),
             model_tag: self.config.model_tag(),
@@ -227,7 +233,7 @@ impl Describer for HttpDescriber {
         let prompt = tags_prompt(existing_vocab);
         let content = self
             .tags_once(&subject, &prompt)
-            .map_err(|error| to_port_error("suggest_tags", &error))?;
+            .map_err(|error| to_port_error("suggest_tags", error))?;
         if let Some(suggestions) = self.parse_tags(&content, existing_vocab) {
             return Ok(suggestions);
         }
@@ -235,7 +241,7 @@ impl Describer for HttpDescriber {
         let retry_prompt = format!("{prompt} Reply with ONLY the JSON object.");
         let retry_content = self
             .tags_once(&subject, &retry_prompt)
-            .map_err(|error| to_port_error("suggest_tags retry", &error))?;
+            .map_err(|error| to_port_error("suggest_tags retry", error))?;
         if let Some(suggestions) = self.parse_tags(&retry_content, existing_vocab) {
             return Ok(suggestions);
         }
@@ -243,7 +249,7 @@ impl Describer for HttpDescriber {
         let snippet: String = retry_content.chars().take(MALFORMED_SNIPPET_LEN).collect();
         Err(to_port_error(
             "suggest_tags",
-            &DescribeHttpError::Malformed { snippet },
+            DescribeHttpError::Malformed { snippet },
         ))
     }
 }

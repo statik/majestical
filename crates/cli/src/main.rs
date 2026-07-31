@@ -231,11 +231,14 @@ enum IndexCmd {
 
 #[derive(Subcommand)]
 enum ModelCmd {
-    /// Download the encoder model (pinned URLs, sha256-verified).
+    /// Fetch model weights (all models unless --only narrows it).
     Fetch {
         /// Re-hash files that already exist.
         #[arg(long)]
         verify: bool,
+        /// Fetch only the named model tags (repeatable).
+        #[arg(long)]
+        only: Vec<String>,
     },
 }
 
@@ -399,8 +402,8 @@ fn main() -> Result<()> {
         // required by clap here (they're top-level, non-Option args with
         // no default) — the same accepted wart as `Verify` above.
         Cmd::Model {
-            cmd: ModelCmd::Fetch { verify },
-        } => index_cmd::cmd_model_fetch(verify)?,
+            cmd: ModelCmd::Fetch { verify, only },
+        } => index_cmd::cmd_model_fetch(verify, &only)?,
         // Deliberately does not open a catalog: describer config lives in
         // the per-machine state dir, not the event log.
         Cmd::Describer { cmd } => dispatch_describer(&cli.catalog, cmd)?,

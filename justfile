@@ -32,7 +32,7 @@ SIGLIP2_TORCH_REVISION := "3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab"
 encoder-conformance:
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         cargo run -p majestical-cli --bin maj -- \
-        --catalog . --machine-id conformance model fetch
+        --catalog . --machine-id conformance model fetch --only siglip2-b16-v1
     uv run conformance/encoder/golden.py \
         --revision {{SIGLIP2_TORCH_REVISION}} --out target/encoder-golden.json
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \

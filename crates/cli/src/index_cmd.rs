@@ -906,19 +906,34 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
     Ok(())
 }
 
-/// Downloads the pinned encoder model into the shared cache
-/// (`MAJ_MODEL_DIR`, or the platform data dir — see
-/// [`majestical_index::model::model_dir`]), verifying every file's sha256
-/// before it's installed.
+/// Downloads model weights into the shared cache (`MAJ_MODEL_DIR`, or the
+/// platform data dir — see [`majestical_index::model::model_dir_for`]),
+/// verifying every file's sha256 before it's installed. Fetches every
+/// registered model unless `only` narrows it to specific tags.
 ///
 /// # Errors
-/// Returns an error if the cache directory can't be resolved, or if any
-/// file fails to download or verify.
-pub(crate) fn cmd_model_fetch(verify: bool) -> Result<()> {
-    let dir = majestical_index::model::model_dir()?;
-    println!("model cache: {}", dir.display());
-    majestical_index::model::fetch(&dir, verify, &mut |line| println!("{line}"))?;
-    println!("model '{}' ready", majestical_index::model::MODEL_TAG);
+/// Returns an error if `only` names an unknown tag, the cache directory
+/// can't be resolved, or any file fails to download or verify.
+pub(crate) fn cmd_model_fetch(verify: bool, only: &[String]) -> Result<()> {
+    use majestical_index::model;
+
+    let known: Vec<&str> = model::ALL_MODELS.iter().map(|m| m.tag).collect();
+    for tag in only {
+        anyhow::ensure!(
+            known.contains(&tag.as_str()),
+            "unknown model tag {tag}; known: {}",
+            known.join(", ")
+        );
+    }
+    for spec in model::ALL_MODELS {
+        if !only.is_empty() && !only.iter().any(|t| t == spec.tag) {
+            continue;
+        }
+        let dir = model::model_dir_for(spec)?;
+        println!("model cache: {}", dir.display());
+        model::fetch_spec(spec, verify, &mut |line| println!("{line}"))?;
+        println!("model '{}' ready", spec.tag);
+    }
     Ok(())
 }
 

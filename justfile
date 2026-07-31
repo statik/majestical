@@ -38,3 +38,21 @@ encoder-conformance:
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         MAJ_GOLDEN="{{justfile_directory()}}/target/encoder-golden.json" \
         cargo test -p majestical-index --test encoder_conformance --test encoder_gated -- --ignored
+
+# Pinned commit of sentence-transformers/all-MiniLM-L6-v2 the Python
+# reference (golden.py) loads. Must stay in sync with MINILM's revision in
+# crates/index/src/model.rs — the reference and our fetch have to load the
+# exact same weights for the conformance gate to mean anything.
+MINILM_TORCH_REVISION := "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+# Text-encoder conformance: pinned sentence-transformers reference vs our
+# ort MiniLM. Downloads ~90MB of model weights on first run.
+text-encoder-conformance:
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        cargo run -p majestical-cli --bin maj -- \
+        --catalog . --machine-id conformance model fetch --only minilm-l6-v2-v1
+    uv run conformance/text-encoder/golden.py \
+        --revision {{MINILM_TORCH_REVISION}} --out target/text-encoder-golden.json
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        MAJ_GOLDEN="{{justfile_directory()}}/target/text-encoder-golden.json" \
+        cargo test -p majestical-index --test text_encoder_conformance --test text_encoder_gated -- --ignored

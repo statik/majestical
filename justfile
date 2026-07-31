@@ -56,3 +56,32 @@ text-encoder-conformance:
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         MAJ_GOLDEN="{{justfile_directory()}}/target/text-encoder-golden.json" \
         cargo test -p majestical-index --test text_encoder_conformance --test text_encoder_gated -- --ignored
+
+# Pinned revision of the reference weights golden.py loads: `faster-whisper`'s
+# "large-v3-turbo" alias resolves to dropbox-dash/faster-whisper-large-v3-turbo
+# (formerly published as mobiuslabsgmbh/faster-whisper-large-v3-turbo, which
+# now redirects there). Verified 2026-07-31 via the HF API's `sha` field — must
+# match what golden.py loads; bump only after re-verifying.
+WHISPER_TORCH_REVISION := "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+
+# Whisper conformance: same synthesized speech through pinned faster-whisper
+# (reference) and our whisper-rs, compared on WER + boundary drift.
+whisper-conformance:
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        cargo run -p majestical-cli --bin maj -- \
+        --catalog . --machine-id conformance model fetch --only whisper-large-v3-turbo-q5-v1
+    mkdir -p target
+    say -o target/whisper-fixture.aiff "The quick brown fox jumps over the lazy dog. \
+        We reviewed the quarterly budget on Tuesday and shipped the release candidate."
+    # 2s leading silence: both faster-whisper and whisper.cpp absorb it into
+    # the first segment rather than reporting a nonzero start, so this alone
+    # does not make the first-boundary assert catch a timestamp-scale bug —
+    # see the module doc on whisper_conformance.rs for what actually does.
+    ffmpeg -y -v error -i target/whisper-fixture.aiff -af "adelay=2000:all=1" -ar 16000 -ac 1 target/whisper-fixture.wav
+    uv run conformance/whisper/golden.py \
+        --revision {{WHISPER_TORCH_REVISION}} \
+        --audio target/whisper-fixture.wav --out target/whisper-golden.json
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        MAJ_AUDIO="{{justfile_directory()}}/target/whisper-fixture.wav" \
+        MAJ_GOLDEN="{{justfile_directory()}}/target/whisper-golden.json" \
+        cargo test -p majestical-index --test whisper_conformance --test whisper_gated -- --ignored --nocapture

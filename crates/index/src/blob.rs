@@ -29,6 +29,10 @@ pub enum Derivation<'a> {
     KeyframeManifest {
         model_tag: &'a str,
     },
+    /// Whisper transcript (JSON, zstd-compressed) for a video/audio asset.
+    Transcript {
+        model_tag: &'a str,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -85,6 +89,7 @@ impl BlobStore {
             Derivation::KeyframeManifest { model_tag } => {
                 dir.join(model_tag).join("keyframes.json")
             }
+            Derivation::Transcript { model_tag } => dir.join(model_tag).join("transcript.json.zst"),
         }
     }
 
@@ -304,6 +309,19 @@ mod tests {
                 .join(hex)
                 .join("siglip2-b16-v1/keyframes.json"),
         );
+    }
+
+    #[test]
+    fn transcript_blob_path_is_model_tagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let path = store.path_for(
+            "aabbccdd",
+            &Derivation::Transcript {
+                model_tag: "whisper-large-v3-turbo-q5-v1",
+            },
+        );
+        assert!(path.ends_with("aa/aabbccdd/whisper-large-v3-turbo-q5-v1/transcript.json.zst"));
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! Greedy transcript chunking for text embedding: windows of at most
 //! `MAX_CHUNK_MS` and `MAX_CHUNK_WORDS`, never splitting a whisper segment
 //! (an oversized single segment becomes one oversized chunk).
+//!
+//! The window is wall-clock span (`segment.end_ms - chunk.start_ms`), not
+//! summed speech duration, so silence gaps between segments count toward
+//! the cap. This is the right semantics: chunk timestamps drive playback
+//! seek, so a chunk's span must reflect the video time it covers, not just
+//! the time its speakers were talking.
 
 use crate::transcribe::TranscriptSegment;
 
@@ -132,6 +138,19 @@ mod tests {
             chunk_segments(&over_cap).len(),
             2,
             "merged word count one over MAX_CHUNK_WORDS (121) must split"
+        );
+    }
+
+    #[test]
+    fn silence_gap_counts_toward_the_duration_cap() {
+        // Speech totals only 10s / 20 words — well under both caps — but the
+        // wall-clock gap between the segments (5s..50s) pushes the merged
+        // window past MAX_CHUNK_MS, so this must still split into 2 chunks.
+        let segments = vec![segment(0, 5_000, 10), segment(50_000, 55_000, 10)];
+        assert_eq!(
+            chunk_segments(&segments).len(),
+            2,
+            "a >45s silence gap between segments must split, even though speech is short"
         );
     }
 

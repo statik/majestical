@@ -32,6 +32,7 @@ pub struct OcrLine {
     pub bbox: [f64; 4],
 }
 
+/// Recognized lines for one image at a pinned Vision revision.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OcrResult {
     pub revision: u32,
@@ -118,4 +119,24 @@ pub fn recognize_text(image: &image::RgbImage) -> Result<OcrResult, IndexError> 
         revision: OCR_REVISION,
         lines,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_vision::VNRecognizeTextRequestRevision3;
+
+    use crate::ocr::{OCR_MODEL_TAG, OCR_REVISION};
+
+    /// A Vision revision bump must not silently keep writing blobs under the
+    /// old revision's model tag — the pinned revision, the binding's
+    /// constant, and the tag must always agree.
+    #[test]
+    fn ocr_revision_matches_the_vision_binding_constant() {
+        let pinned = usize::try_from(OCR_REVISION).expect("u32 fits in NSUInteger");
+        assert_eq!(pinned, VNRecognizeTextRequestRevision3);
+        assert!(
+            OCR_MODEL_TAG.contains(&format!("r{OCR_REVISION}")),
+            "OCR_MODEL_TAG ({OCR_MODEL_TAG}) must encode OCR_REVISION ({OCR_REVISION})"
+        );
+    }
 }

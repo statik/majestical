@@ -3,6 +3,16 @@
 //! field-tested parameters: HSV mean-abs-diff score, rolling-average ratio
 //! threshold 3.0, min content 15.0, 2s min scene, 10-sample uniform fallback
 //! when zero cuts are detected at all, ~150 keyframe cap).
+//!
+//! [`analysis_frames`] decodes and buffers the *entire* clip before
+//! returning rather than streaming frame-by-frame — at [`ANALYSIS_FPS`]/
+//! [`ANALYSIS_W`]x[`ANALYSIS_H`] RGB24 that's roughly 600MB/hour of footage
+//! held in memory at once (ffmpeg's raw stdout plus the copied `Frame`
+//! vec briefly coexist); switching to a streaming decode is a tracked
+//! follow-up, not implemented here. Every ffmpeg/ffprobe call in this
+//! module (`probe`, `analysis_frames`, `extract_frame`) is a blocking
+//! subprocess call that waits for the child to exit — a video on a stalled
+//! or disconnecting volume stalls whichever `index run` pass is working it.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -400,6 +410,17 @@ fn content_score(a: &Frame, b: &Frame) -> f32 {
 
 /// Weights hue, saturation, and value equally (edges are not scored: `PySceneDetect`'s
 /// `AdaptiveDetector` weight for them is 0 in the field-tested preset this ports).
+///
+/// Hue is packed onto the same 0-255 `u8` scale as saturation and value —
+/// not `OpenCV`/`PySceneDetect`'s reference 0-179 scale — so a hue delta here
+/// weighs about 1.42x (255/179) what the same angular difference weighs in
+/// the reference implementation, against the same `MIN_CONTENT`/`RATIO_THRESHOLD`
+/// ported from it rather than re-tuned for this scale; the module's e2e
+/// tests (real ffmpeg clips) validate scene detection still holds up in
+/// practice at this scale. Hue is also circular (0 and 255 are the same
+/// angle) but `content_score`'s `u8::abs_diff` on it doesn't wrap — matching
+/// the reference implementation's own unwrapped hue diff, not a bug unique
+/// to this port.
 fn rgb_to_hsv_u8(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let rf = f32::from(r) / 255.0;
     let gf = f32::from(g) / 255.0;

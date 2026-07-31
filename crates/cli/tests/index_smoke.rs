@@ -610,7 +610,9 @@ fn keyframe_search_resolves_the_correct_segment_and_timestamp() {
         .args(["index", "run"])
         .assert()
         .success()
-        .stdout(contains("1 videos, 3 frames embedded, 0 failed"));
+        .stdout(contains(
+            "1 videos, 3 frames embedded, 0 frame failures, 0 videos failed",
+        ));
 
     maj(&root, &state)
         .args(["index", "status"])

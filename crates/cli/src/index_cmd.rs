@@ -199,13 +199,16 @@ struct EmbedOutcome {
 
 /// One pass's keyframe-kind result: `videos_done` videos whose manifest got
 /// written this pass (the planner's done marker — see [`run_keyframe_items`]),
-/// `keyframes_written` individual frames actually extracted and embedded
-/// (not frames merely recovered from an existing blob whose Lance row was
-/// missing), and per-video `failed` (path, reason).
+/// `keyframes_written` individual frames actually extracted and embedded,
+/// `keyframes_failed` individual timestamps that failed extract/embed
+/// (whether or not their video ended up over the half-failed threshold — see
+/// [`over_half_failed`]), and per-video `failed` (path, reason — for a video
+/// over that threshold, the reason includes the first per-timestamp failure).
 #[derive(Default)]
 struct KeyframeOutcome {
     videos_done: u64,
     keyframes_written: u64,
+    keyframes_failed: u64,
     failed: Vec<(PathBuf, String)>,
 }
 
@@ -540,15 +543,18 @@ fn keyframe_at_timestamp(
 }
 
 /// One video's keyframe work: the timestamps that ended up complete (already
-/// indexed, recovered, or freshly written — this is what the manifest ends
-/// up listing), the new `VectorRow`s to batch into Lance, how many frames
-/// were freshly embedded, and how many timestamps failed outright.
+/// indexed or freshly written — this is what the manifest ends up listing),
+/// the new `VectorRow`s to batch into Lance, how many frames were freshly
+/// embedded, how many timestamps failed outright, and — when at least one
+/// did — the first failure's reason (so a video-level failure message can
+/// say *why*, not just *how many*).
 struct VideoKeyframeResult {
     rows: Vec<VectorRow>,
     succeeded_timestamps: Vec<u64>,
     keyframes_written: u64,
     keyframe_failures: usize,
     total_keyframes: usize,
+    first_failure_reason: Option<String>,
 }
 
 /// Detects `item`'s scenes and works every resulting timestamp.
@@ -557,7 +563,8 @@ struct VideoKeyframeResult {
 /// Returns a human-readable reason if probing or decoding analysis frames
 /// fails — a video-level failure distinct from a single timestamp's
 /// extract/embed failure, which this collects into `keyframe_failures`
-/// instead of aborting the whole video.
+/// (keeping only the first reason, in `first_failure_reason`) instead of
+/// aborting the whole video.
 fn process_video_keyframes(
     blobs: &BlobStore,
     encoder: &mut Encoder,
@@ -572,6 +579,7 @@ fn process_video_keyframes(
     let mut succeeded_timestamps = Vec::new();
     let mut written = 0u64;
     let mut failures = 0usize;
+    let mut first_failure_reason = None;
     for &ts_ms in &timestamps {
         match keyframe_at_timestamp(blobs, encoder, item, ts_ms) {
             Ok(TimestampOutcome::AlreadyComplete) => succeeded_timestamps.push(ts_ms),
@@ -580,7 +588,10 @@ fn process_video_keyframes(
                 written += 1;
                 rows.push(row);
             }
-            Err(_) => failures += 1,
+            Err(reason) => {
+                failures += 1;
+                first_failure_reason.get_or_insert(reason);
+            }
         }
     }
     Ok(VideoKeyframeResult {
@@ -589,6 +600,7 @@ fn process_video_keyframes(
         keyframes_written: written,
         keyframe_failures: failures,
         total_keyframes: timestamps.len(),
+        first_failure_reason,
     })
 }
 
@@ -599,6 +611,24 @@ fn process_video_keyframes(
 /// this threshold (nothing failed).
 fn over_half_failed(failures: usize, total: usize) -> bool {
     total > 0 && failures * 2 > total
+}
+
+/// Builds the video-level failure message for a video [`over_half_failed`]
+/// gave up on: the path (nothing else in this message otherwise carries it —
+/// see the "no path prefix" note on [`print_run_result`]'s stderr loop), the
+/// failure/total counts, and the first per-timestamp failure's reason, so
+/// the message says why at least one keyframe failed, not just how many.
+fn over_half_failed_message(
+    path: &Path,
+    failures: usize,
+    total: usize,
+    first_reason: &str,
+) -> String {
+    format!(
+        "{}: {failures}/{total} keyframes failed to extract/embed (over half) — first \
+         failure: {first_reason} — video skipped, will retry",
+        path.display()
+    )
 }
 
 /// `detected` is the video's full scene-detected keyframe count, even when
@@ -670,19 +700,24 @@ fn run_keyframe_items(
         match process_video_keyframes(blobs, &mut encoder, item) {
             Ok(result) => {
                 outcome.keyframes_written += result.keyframes_written;
+                outcome.keyframes_failed +=
+                    u64::try_from(result.keyframe_failures).unwrap_or(u64::MAX);
                 batch.extend(result.rows);
                 if batch.len() >= 64 {
                     store.add(std::mem::take(&mut batch))?;
                 }
                 if over_half_failed(result.keyframe_failures, result.total_keyframes) {
+                    let first_reason = result
+                        .first_failure_reason
+                        .as_deref()
+                        .unwrap_or("<no reason recorded>");
                     outcome.failed.push((
                         item.abs_path.clone(),
-                        format!(
-                            "{}: {}/{} keyframes failed to extract/embed (over half) — video \
-                             skipped, will retry",
-                            item.abs_path.display(),
+                        over_half_failed_message(
+                            &item.abs_path,
                             result.keyframe_failures,
-                            result.total_keyframes
+                            result.total_keyframes,
+                            first_reason,
                         ),
                     ));
                     continue;
@@ -733,6 +768,7 @@ fn print_run_result(
                 "keyframes": {
                     "videos_done": keyframes.videos_done,
                     "keyframes_written": keyframes.keyframes_written,
+                    "keyframes_failed": keyframes.keyframes_failed,
                     "failed": failed_json(&keyframes.failed),
                 },
             })
@@ -746,9 +782,10 @@ fn print_run_result(
             embed.failed.len()
         );
         println!(
-            "keyframes: {} videos, {} frames embedded, {} failed",
+            "keyframes: {} videos, {} frames embedded, {} frame failures, {} videos failed",
             keyframes.videos_done,
             keyframes.keyframes_written,
+            keyframes.keyframes_failed,
             keyframes.failed.len()
         );
     }
@@ -900,6 +937,28 @@ mod tests {
             "exactly half (1/2) is not OVER half"
         );
         assert!(over_half_failed(2, 3), "2/3 (66%) is over half");
+    }
+
+    #[test]
+    fn over_half_failed_message_includes_path_counts_and_first_reason() {
+        let message = over_half_failed_message(
+            Path::new("/media/clip.mov"),
+            3,
+            5,
+            "ffmpeg failed: no such filter",
+        );
+        assert!(
+            message.contains("/media/clip.mov"),
+            "message must name the video: {message}"
+        );
+        assert!(
+            message.contains("3/5"),
+            "message must carry the failure/total counts: {message}"
+        );
+        assert!(
+            message.contains("ffmpeg failed: no such filter"),
+            "message must carry the first per-timestamp failure reason: {message}"
+        );
     }
 
     /// Opens (creating) a lance store at `lance_dir` and seeds one vector —

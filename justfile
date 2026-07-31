@@ -66,10 +66,14 @@ whisper-conformance:
     mkdir -p target
     say -o target/whisper-fixture.aiff "The quick brown fox jumps over the lazy dog. \
         We reviewed the quarterly budget on Tuesday and shipped the release candidate."
-    ffmpeg -y -v error -i target/whisper-fixture.aiff -ar 16000 -ac 1 target/whisper-fixture.wav
+    # 2s leading silence: without it the fixture's speech starts at ~0ms, so a
+    # bug that scales timestamps wrong (e.g. a dropped x10 unit conversion)
+    # still lands near 0ms and the first-boundary drift assert passes
+    # vacuously. A nonzero first boundary makes that class of bug visible.
+    ffmpeg -y -v error -i target/whisper-fixture.aiff -af "adelay=2000:all=1" -ar 16000 -ac 1 target/whisper-fixture.wav
     uv run conformance/whisper/golden.py \
         --audio target/whisper-fixture.wav --out target/whisper-golden.json
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         MAJ_AUDIO="{{justfile_directory()}}/target/whisper-fixture.wav" \
         MAJ_GOLDEN="{{justfile_directory()}}/target/whisper-golden.json" \
-        cargo test -p majestical-index --test whisper_conformance --test whisper_gated -- --ignored
+        cargo test -p majestical-index --test whisper_conformance --test whisper_gated -- --ignored --nocapture

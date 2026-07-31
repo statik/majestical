@@ -14,9 +14,15 @@
 //! Compared on two axes rather than exact text match: word error rate (WER)
 //! tolerates the reference and whisper.cpp choosing different but equally
 //! valid renderings of the same speech (punctuation, casing, "quarter"
-//! vs "quarterly"), and first-segment boundary drift catches the two
-//! implementations disagreeing about where speech starts without requiring
-//! every segment split at the same words.
+//! vs "quarterly"), and boundary drift (first segment's start, last
+//! segment's end) catches the two implementations disagreeing about where
+//! speech starts/ends without requiring every segment split at the same
+//! words. The fixture leads with ~2s of silence (see the justfile recipe)
+//! so the first boundary is nonzero — otherwise a bug that scales
+//! timestamps wrong (e.g. a dropped x10 unit conversion) still lands near
+//! 0ms and the first-boundary assert passes vacuously; the last-segment-end
+//! assert closes that gap unconditionally, since the fixture runs long
+//! enough that a x10 scale error can't land within tolerance by chance.
 
 use majestical_index::model::{self, WHISPER};
 use majestical_index::transcribe::Transcriber;
@@ -117,6 +123,30 @@ fn whisper_rs_matches_faster_whisper_reference() {
     assert!(
         drift <= MAX_BOUNDARY_DRIFT_MS,
         "first-segment drift {reference_first} vs {ours_first}"
+    );
+
+    let reference_last = golden["segments"]
+        .as_array()
+        .expect("segments")
+        .last()
+        .expect("at least one segment")["end_ms"]
+        .as_i64()
+        .expect("end");
+    let ours_last = i64::try_from(
+        transcript
+            .segments
+            .last()
+            .expect("at least one segment")
+            .end_ms,
+    )
+    .expect("fits");
+    let end_drift = (reference_last - ours_last).abs();
+    report_measurement(&format!(
+        "last-boundary drift {end_drift}ms (max {MAX_BOUNDARY_DRIFT_MS}ms)"
+    ));
+    assert!(
+        end_drift <= MAX_BOUNDARY_DRIFT_MS,
+        "last-segment drift {reference_last} vs {ours_last}"
     );
 }
 

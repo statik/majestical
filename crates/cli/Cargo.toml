@@ -36,6 +36,7 @@ majestical-index = { path = "../index" }
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
+image.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 walkdir.workspace = true
@@ -46,4 +47,3 @@ plist.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
-image.workspace = true

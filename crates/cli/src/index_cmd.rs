@@ -6,7 +6,7 @@ use crate::app::FsApp;
 use crate::commands::open_catalog;
 use crate::volume_identity;
 use anyhow::{Context, Result};
-use majestical_core::media_kind::media_kind;
+use majestical_core::media_kind::{MediaKind, media_kind};
 use majestical_core::projection::Projection;
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::encoder::{Encoder, EncoderOptions};
@@ -31,8 +31,7 @@ pub(crate) struct IndexRunArgs {
 
 /// What this machine can currently produce: the encoder model if it's been
 /// fetched into the cache (see `maj model fetch`) and present at every
-/// file's exact size. ffmpeg detection lands with the video task; until then
-/// keyframes honestly report needs-ffmpeg.
+/// file's exact size, and whether `ffmpeg`/`ffprobe` are on `PATH`.
 fn capabilities() -> Capabilities {
     let model_tag = majestical_index::model::model_dir()
         .ok()
@@ -40,7 +39,7 @@ fn capabilities() -> Capabilities {
         .map(|_| majestical_index::model::MODEL_TAG.to_string());
     Capabilities {
         model_tag,
-        ffmpeg: false,
+        ffmpeg: majestical_index::video::ffmpeg_available(),
     }
 }
 
@@ -93,8 +92,24 @@ fn default_index_jobs() -> usize {
         .min(4)
 }
 
+/// Decodes a source frame for a thumbnail: the image itself for
+/// `MediaKind::Image`, or a frame one-tenth of the way into a video for
+/// `MediaKind::Video` (early enough to usually avoid a black open/fade-in,
+/// late enough to usually avoid a title card).
+fn decode_thumb_source(path: &Path) -> Result<image::RgbImage> {
+    if media_kind(&path.to_string_lossy()) == MediaKind::Video {
+        let info = majestical_index::video::probe(path)?;
+        Ok(majestical_index::video::extract_frame(
+            path,
+            info.duration_ms / 10,
+        )?)
+    } else {
+        Ok(majestical_index::thumbs::decode_image(path)?)
+    }
+}
+
 fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()> {
-    let rgb = majestical_index::thumbs::decode_image(&item.abs_path)?;
+    let rgb = decode_thumb_source(&item.abs_path)?;
     let webp = majestical_index::thumbs::thumbnail_webp(&rgb)?;
     let path = blobs.path_for(&item.asset_hex, &Derivation::Thumb);
     blobs.write_atomic(&path, &webp)?;
@@ -152,11 +167,9 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 /// Builds the plan for one pass: gathers sources fresh from the projection
 /// (so `--watch` sees newly scanned assets), diffs against `blobs`, then
 /// narrows `items` to `kinds`. Deliberately does not apply `--limit` here —
-/// that happens after `run_once` narrows further to kinds that actually
-/// have an executor (thumbnails and embeddings so far; keyframes still
-/// need PR 8's ffmpeg detection), so a mixed-kind plan never lets a
-/// non-executable kind consume `--limit`'s budget ahead of the executable
-/// ones.
+/// that happens after `run_once` splits items by kind, so `--limit` bounds
+/// each kind's own per-pass budget independently rather than one kind
+/// starving another.
 fn build_plan(projection: &Projection, blobs: &BlobStore, kinds: &BTreeSet<String>) -> WorkPlan {
     let sources = gather_sources(projection);
     let caps = capabilities();
@@ -184,9 +197,20 @@ struct EmbedOutcome {
     failed: Vec<(PathBuf, String)>,
 }
 
-/// One `index run` pass: builds the plan, works every thumbnail and
-/// embedding item (keyframes still need PR 8's ffmpeg detection), and
-/// prints the result.
+/// One pass's keyframe-kind result: `videos_done` videos whose manifest got
+/// written this pass (the planner's done marker — see [`run_keyframe_items`]),
+/// `keyframes_written` individual frames actually extracted and embedded
+/// (not frames merely recovered from an existing blob whose Lance row was
+/// missing), and per-video `failed` (path, reason).
+#[derive(Default)]
+struct KeyframeOutcome {
+    videos_done: u64,
+    keyframes_written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// One `index run` pass: builds the plan, works every thumbnail, embedding,
+/// and keyframe item, and prints the result.
 ///
 /// # Errors
 /// Returns an error if the catalog can't be opened/synced, or if the Lance
@@ -203,7 +227,7 @@ fn run_once(
     let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let plan = build_plan(&projection, &blobs, kinds);
-    let (thumb_items, embed_items) = split_and_cap_items(plan.items, limit);
+    let (thumb_items, embed_items, keyframe_items) = split_and_cap_items(plan.items, limit);
 
     let jobs = threads.unwrap_or_else(default_index_jobs);
     let (written, failed) = run_thumb_items(&blobs, &thumb_items, jobs);
@@ -213,33 +237,39 @@ fn run_once(
         coreml_cache_dir: state_dir.join("coreml-cache"),
     };
     let embed_outcome = run_embed_items(&embed_paths, &blobs, &embed_items)?;
+    let keyframe_outcome = run_keyframe_items(&embed_paths, &blobs, &keyframe_items)?;
 
-    print_run_result(written, &failed, &embed_outcome, json);
+    print_run_result(written, &failed, &embed_outcome, &keyframe_outcome, json);
     Ok(())
 }
 
-/// Splits `items` into thumbnail and image-embed items (keyframe items, if
-/// any slip through `kinds`, have no executor yet and are dropped), then
-/// caps each kind independently at `limit` — now that both kinds have
-/// executors, `--limit` bounds each one's per-pass budget the same way.
+/// Splits `items` by kind, then caps each kind independently at `limit` —
+/// every kind has an executor now, so `--limit` bounds each one's own
+/// per-pass budget rather than one kind starving another.
 fn split_and_cap_items(
     items: Vec<work::WorkItem>,
     limit: Option<usize>,
-) -> (Vec<work::WorkItem>, Vec<work::WorkItem>) {
+) -> (
+    Vec<work::WorkItem>,
+    Vec<work::WorkItem>,
+    Vec<work::WorkItem>,
+) {
     let mut thumbs = Vec::new();
     let mut embeds = Vec::new();
+    let mut keyframes = Vec::new();
     for item in items {
         match item.kind {
             WorkKind::Thumb => thumbs.push(item),
             WorkKind::ImageEmbed => embeds.push(item),
-            WorkKind::Keyframes => {}
+            WorkKind::Keyframes => keyframes.push(item),
         }
     }
     if let Some(limit) = limit {
         thumbs.truncate(limit);
         embeds.truncate(limit);
+        keyframes.truncate(limit);
     }
-    (thumbs, embeds)
+    (thumbs, embeds, keyframes)
 }
 
 /// Resolves the encoder model dir only if it's actually present at every
@@ -452,6 +482,240 @@ fn run_embed_items(
     })
 }
 
+/// Keyframe timestamps stay far below `i64::MAX` milliseconds for any real
+/// video; saturating instead of a checked cast keeps this infallible without
+/// it ever mattering in practice.
+fn ts_ms_i64(ts_ms: u64) -> i64 {
+    i64::try_from(ts_ms).unwrap_or(i64::MAX)
+}
+
+/// What happened when working one detected keyframe timestamp.
+enum TimestampOutcome {
+    /// A blob already existed and Lance already had its row — nothing to do.
+    AlreadyComplete,
+    /// A blob already existed but Lance was missing its row — recovered by
+    /// reading the blob back, with zero re-inference.
+    Recovered(VectorRow),
+    /// Freshly extracted, embedded, and written.
+    Written(VectorRow),
+}
+
+/// Works one detected keyframe timestamp: skip if already fully indexed,
+/// recover from an existing blob if Lance is merely missing the row (crash
+/// recovery — see [`run_keyframe_items`]'s doc comment), else extract +
+/// embed + write a fresh blob.
+///
+/// # Errors
+/// Returns a human-readable reason if reading an existing blob, extracting
+/// the frame, running the encoder, or writing the new blob fails.
+fn keyframe_at_timestamp(
+    blobs: &BlobStore,
+    encoder: &mut Encoder,
+    existing_keys: &BTreeSet<(String, String, i64)>,
+    item: &work::WorkItem,
+    ts_ms: u64,
+) -> Result<TimestampOutcome, String> {
+    let model_tag = majestical_index::model::MODEL_TAG;
+    let path = blobs.path_for(
+        &item.asset_hex,
+        &Derivation::KeyframeEmbedding {
+            model_tag,
+            timestamp_ms: ts_ms,
+        },
+    );
+    if path.is_file() {
+        let key = (
+            item.asset_hex.clone(),
+            "keyframe".to_string(),
+            ts_ms_i64(ts_ms),
+        );
+        if existing_keys.contains(&key) {
+            return Ok(TimestampOutcome::AlreadyComplete);
+        }
+        let vector = blobs.read_vector(&path).map_err(|e| e.to_string())?;
+        return Ok(TimestampOutcome::Recovered(VectorRow {
+            asset_hex: item.asset_hex.clone(),
+            kind: "keyframe".to_string(),
+            ts_ms: ts_ms_i64(ts_ms),
+            model_tag: model_tag.to_string(),
+            vector,
+        }));
+    }
+    let frame =
+        majestical_index::video::extract_frame(&item.abs_path, ts_ms).map_err(|e| e.to_string())?;
+    let vector = encoder.embed_image(&frame).map_err(|e| e.to_string())?;
+    blobs
+        .write_vector(&path, &vector)
+        .map_err(|e| e.to_string())?;
+    Ok(TimestampOutcome::Written(VectorRow {
+        asset_hex: item.asset_hex.clone(),
+        kind: "keyframe".to_string(),
+        ts_ms: ts_ms_i64(ts_ms),
+        model_tag: model_tag.to_string(),
+        vector,
+    }))
+}
+
+/// One video's keyframe work: the timestamps that ended up complete (already
+/// indexed, recovered, or freshly written — this is what the manifest ends
+/// up listing), the new `VectorRow`s to batch into Lance, how many frames
+/// were freshly embedded, and how many timestamps failed outright.
+struct VideoKeyframeResult {
+    rows: Vec<VectorRow>,
+    succeeded_timestamps: Vec<u64>,
+    keyframes_written: u64,
+    keyframe_failures: usize,
+    total_keyframes: usize,
+}
+
+/// Detects `item`'s scenes and works every resulting timestamp.
+///
+/// # Errors
+/// Returns a human-readable reason if probing or decoding analysis frames
+/// fails — a video-level failure distinct from a single timestamp's
+/// extract/embed failure, which this collects into `keyframe_failures`
+/// instead of aborting the whole video.
+fn process_video_keyframes(
+    blobs: &BlobStore,
+    encoder: &mut Encoder,
+    existing_keys: &BTreeSet<(String, String, i64)>,
+    item: &work::WorkItem,
+) -> Result<VideoKeyframeResult, String> {
+    let info = majestical_index::video::probe(&item.abs_path).map_err(|e| e.to_string())?;
+    let frames =
+        majestical_index::video::analysis_frames(&item.abs_path).map_err(|e| e.to_string())?;
+    let timestamps = majestical_index::video::detect_scenes(&frames, 2000, info.duration_ms);
+
+    let mut rows = Vec::new();
+    let mut succeeded_timestamps = Vec::new();
+    let mut written = 0u64;
+    let mut failures = 0usize;
+    for &ts_ms in &timestamps {
+        match keyframe_at_timestamp(blobs, encoder, existing_keys, item, ts_ms) {
+            Ok(TimestampOutcome::AlreadyComplete) => succeeded_timestamps.push(ts_ms),
+            Ok(TimestampOutcome::Recovered(row)) => {
+                succeeded_timestamps.push(ts_ms);
+                rows.push(row);
+            }
+            Ok(TimestampOutcome::Written(row)) => {
+                succeeded_timestamps.push(ts_ms);
+                written += 1;
+                rows.push(row);
+            }
+            Err(_) => failures += 1,
+        }
+    }
+    Ok(VideoKeyframeResult {
+        rows,
+        succeeded_timestamps,
+        keyframes_written: written,
+        keyframe_failures: failures,
+        total_keyframes: timestamps.len(),
+    })
+}
+
+/// True once more than half of a video's detected keyframes failed to
+/// extract/embed — the threshold at which [`run_keyframe_items`] gives up on
+/// the video for this pass rather than marking it done with a majority of
+/// its keyframes missing. A video with zero detected keyframes is never over
+/// this threshold (nothing failed).
+fn over_half_failed(failures: usize, total: usize) -> bool {
+    total > 0 && failures * 2 > total
+}
+
+fn keyframes_manifest_json(model_tag: &str, timestamps: &[u64]) -> Vec<u8> {
+    serde_json::json!({ "model_tag": model_tag, "timestamps": timestamps })
+        .to_string()
+        .into_bytes()
+}
+
+/// Works every `Keyframes` item in `items`: per video, detects scenes, then
+/// works each timestamp (extract+embed, or recover a vector for a blob
+/// Lance is missing — see [`keyframe_at_timestamp`]). The manifest blob is
+/// written LAST, only after every timestamp has been attempted: its
+/// existence is `plan_keyframes`'s (in `work.rs`) done marker, so a crash
+/// mid-video simply re-plans the whole video next pass, while the
+/// per-timestamp blob check in `keyframe_at_timestamp` skips whatever
+/// already finished.
+///
+/// A video whose probe or analysis-frame decode fails outright is a
+/// video-level failure. Otherwise, per [`over_half_failed`]: if more than
+/// half a video's keyframes fail to extract/embed, the whole video is
+/// treated as failed for this pass and its manifest is withheld — the
+/// timestamps that did succeed stay as orphaned blobs, picked back up when
+/// the video is retried, rather than being permanently hidden behind a
+/// manifest that would stop the video from ever being revisited. A video at
+/// or under that threshold gets a manifest listing only the timestamps that
+/// actually succeeded; a few permanently-missing keyframes are the accepted
+/// cost of not retrying an entire video forever over one flaky frame.
+///
+/// # Errors
+/// Returns an error if the vector store can't be opened/rebuilt, the encoder
+/// fails to load, or a Lance batch add or manifest write fails.
+fn run_keyframe_items(
+    paths: &EmbedPaths,
+    blobs: &BlobStore,
+    items: &[work::WorkItem],
+) -> Result<KeyframeOutcome> {
+    if items.is_empty() {
+        return Ok(KeyframeOutcome::default());
+    }
+    let Some(model_dir) = model_dir_if_present() else {
+        return Ok(KeyframeOutcome::default());
+    };
+
+    let store = open_or_rebuild(&paths.lance_dir)?;
+    let model_tag = majestical_index::model::MODEL_TAG;
+    let existing_keys = store.existing_keys(model_tag)?;
+    // Loaded separately from `run_embed_items`'s encoder rather than shared
+    // across both: each is only loaded at all when its own kind has pending
+    // items, and a second `CoreML` session load (a second or so, cached
+    // graph) is cheap next to keeping the two executors independently
+    // testable and not threading a shared `&mut Encoder` between them.
+    let mut encoder = Encoder::load(
+        &model_dir,
+        &EncoderOptions {
+            coreml: true,
+            coreml_cache: Some(paths.coreml_cache_dir.clone()),
+        },
+    )?;
+
+    let mut outcome = KeyframeOutcome::default();
+    let mut batch = Vec::new();
+    for item in items {
+        match process_video_keyframes(blobs, &mut encoder, &existing_keys, item) {
+            Ok(result) => {
+                outcome.keyframes_written += result.keyframes_written;
+                batch.extend(result.rows);
+                if batch.len() >= 64 {
+                    store.add(std::mem::take(&mut batch))?;
+                }
+                if over_half_failed(result.keyframe_failures, result.total_keyframes) {
+                    outcome.failed.push((
+                        item.abs_path.clone(),
+                        format!(
+                            "{}/{} keyframes failed to extract/embed (over half) — video \
+                             skipped, will retry",
+                            result.keyframe_failures, result.total_keyframes
+                        ),
+                    ));
+                    continue;
+                }
+                let manifest_path =
+                    blobs.path_for(&item.asset_hex, &Derivation::KeyframeManifest { model_tag });
+                let manifest = keyframes_manifest_json(model_tag, &result.succeeded_timestamps);
+                blobs.write_atomic(&manifest_path, &manifest)?;
+                outcome.videos_done += 1;
+            }
+            Err(reason) => outcome.failed.push((item.abs_path.clone(), reason)),
+        }
+    }
+    if !batch.is_empty() {
+        store.add(batch)?;
+    }
+    Ok(outcome)
+}
+
 fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
     failed
         .iter()
@@ -459,7 +723,13 @@ fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn print_run_result(written: u64, failed: &[(PathBuf, String)], embed: &EmbedOutcome, json: bool) {
+fn print_run_result(
+    written: u64,
+    failed: &[(PathBuf, String)],
+    embed: &EmbedOutcome,
+    keyframes: &KeyframeOutcome,
+    json: bool,
+) {
     if json {
         println!(
             "{}",
@@ -469,6 +739,11 @@ fn print_run_result(written: u64, failed: &[(PathBuf, String)], embed: &EmbedOut
                     "written": embed.written,
                     "loaded_from_blobs": embed.loaded,
                     "failed": failed_json(&embed.failed),
+                },
+                "keyframes": {
+                    "videos_done": keyframes.videos_done,
+                    "keyframes_written": keyframes.keyframes_written,
+                    "failed": failed_json(&keyframes.failed),
                 },
             })
         );
@@ -480,23 +755,44 @@ fn print_run_result(written: u64, failed: &[(PathBuf, String)], embed: &EmbedOut
             embed.loaded,
             embed.failed.len()
         );
+        println!(
+            "keyframes: {} videos, {} frames embedded, {} failed",
+            keyframes.videos_done,
+            keyframes.keyframes_written,
+            keyframes.failed.len()
+        );
     }
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
     // `--json` branch above, for callers that want it out-of-band).
-    for (_, err) in failed.iter().chain(&embed.failed) {
+    for (_, err) in failed.iter().chain(&embed.failed).chain(&keyframes.failed) {
         eprintln!("failed: {err}");
     }
+}
+
+/// True when `--kinds` was passed explicitly and names `keyframes` — the one
+/// case where a missing ffmpeg is a hard error rather than a degrade: an
+/// unqualified `index run` silently reports `needs_ffmpeg` in its kind
+/// status, but asking for keyframes by name and getting nothing back, with
+/// no explanation, is a worse experience than failing loudly.
+fn explicitly_requested_keyframes(kinds: Option<&[String]>) -> bool {
+    kinds.is_some_and(|kinds| kinds.iter().any(|k| k == "keyframes"))
 }
 
 /// Works the derivation queue once, or repeatedly (`--watch`, a 5s poll
 /// loop) so newly scanned assets get picked up without a manual re-run.
 ///
 /// # Errors
-/// Returns an error if `--kinds` names an unknown kind, or the catalog can't
+/// Returns an error if `--kinds` names an unknown kind, if `--kinds`
+/// explicitly names `keyframes` while ffmpeg is absent, or the catalog can't
 /// be opened/synced.
 pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs) -> Result<()> {
     let kinds = parse_kinds(args.kinds.as_deref())?;
+    if explicitly_requested_keyframes(args.kinds.as_deref())
+        && !majestical_index::video::ffmpeg_available()
+    {
+        anyhow::bail!("--kinds keyframes requires ffmpeg/ffprobe on PATH (brew install ffmpeg)");
+    }
     loop {
         run_once(
             app,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/catalog-sqlite", "crates/cli", "crates/core", "crates/index", "crates/ingest", "crates/sync"]
+members = ["crates/catalog-sqlite", "crates/cli", "crates/core", "crates/describe", "crates/index", "crates/ingest", "crates/sync"]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,6 +39,10 @@ arrow-schema = "=58.3.0"
 # Mutex/Notify, so "sync" (and its Send+Sync-bound API surface) adds nothing.
 tokio = { version = "1", features = ["rt"] }
 futures = "0.3"
+ureq = { version = "3.3.0", features = ["json"] }
+base64 = "0.23.0"
+toml = "1.1.4"
+httpmock = "0.8.3"
 
 # WATCHLIST (2026-07-30): a `cli`/`index` dev/test build linking lancedb's
 # dependency graph (lancedb -> datafusion -> arrow, plus ort) hits macOS

@@ -47,3 +47,11 @@ plist.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+# Cucumber acceptance harness, pinned to match crates/core's and
+# crates/ingest's versions.
+cucumber = "0.23"
+futures = "0.3"
+
+[[test]]
+name = "acceptance"
+harness = false

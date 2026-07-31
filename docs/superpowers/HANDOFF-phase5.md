@@ -134,13 +134,12 @@ projections rebuilt from them.
 ## Backlog pointer
 
 `docs/superpowers/plans/2026-07-29-phase2-watchlist.md` — open items plus
-"Phase 3 deferrals", a new "Phase 4 deferrals" section (34 items: state-dir
+"Phase 3 deferrals", a new "Phase 4 deferrals" section (33 items: state-dir
 migration edges, sync's dual read-path divergence, several catalog-sqlite
 mutants-review findings, the two competing "online" definitions, Lance
 corruption/overflow/index-scale notes, video's memory/timeout/hue-scale
 notes), a "Done in phase 4" section, and a `cargo-mutants triage (phase 4)`
-placeholder subsection — filled by the separate mutants-triage commit that
-runs alongside this closing PR.
+section with the full per-package category breakdown.
 
 ## Phase 5 recommendation
 

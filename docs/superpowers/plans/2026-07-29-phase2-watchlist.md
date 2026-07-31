@@ -334,7 +334,8 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
 `majestical-index` (spec §7, index/thumbnail/encoder/video code): 451 mutants
 tested, 285 caught, 139 missed, 26 unviable, 1 timeout, before triage.
 `majestical-catalog-sqlite`: 109 mutants tested, 78 caught, 18 missed, 13
-unviable, before triage.
+unviable, before triage. Every count below is recounted directly against the
+two runs' `missed.txt` (grouped by function), not estimated.
 
 **Structural note.** The gated suites (`encoder_conformance`, `encoder_gated`,
 `video_e2e`, and the model/ffmpeg-gated tests in `crates/cli/tests/
@@ -366,21 +367,35 @@ the mutant, run the relevant suite, confirm failure, revert):
   "covered by a sibling crate's own suite" case, neither a gated-suite gap
   nor a genuine one.
 
+A fifth item, found rather than triaged for: `thumbs.rs:95` (`+` -> `*` in
+`scaled_dimension`) doesn't miss, it **times out** (20s) — the mutated
+numerator can blow up `resize_rgb`'s target dimensions into an enormous
+allocation/resize rather than a fast wrong answer. Same reasoning as phase
+3's `Event::Eof`-deletion timeouts: a hang is a louder CI failure than a
+silently-wrong assertion, so this is treated as effectively caught, not
+chased. (Not counted in the 139 missed — cargo-mutants reports it
+separately as 1 timeout.)
+
 **`majestical-catalog-sqlite` (18 missed, all genuine — closed):**
 
-- **Port-lag, again** (`crates/catalog-sqlite/src/lib.rs:95-114`, 11
-  mutants): `CatalogStore`'s `search_names_ranked`/`asset_summaries`/
-  `volumes`/`volume_asset_counts` are each a one-line delegation to the
-  inherent `SqliteCatalog` method of the same name — the same pattern
-  flagged in phase 3 ("`para_nodes()` is inherent-only on `SqliteCatalog`").
-  Nothing in the workspace ever called these four through `&dyn
-  CatalogStore` (only through the inherent methods directly), so a mutant
-  replacing a delegation body with a hardcoded `Ok(vec![...])` survived
-  unconditionally. Closed by extending the trait-object test:
-  `catalog_store_trait_object_exposes_every_read_query`
-  (`crates/catalog-sqlite/src/lib.rs`) seeds a volume and a named asset,
-  then calls all four through `&mut dyn CatalogStore` and asserts on the
-  real rows.
+- **Port-lag, again** (`crates/catalog-sqlite/src/lib.rs:95-114`, 16
+  mutants: `search_names_ranked` 1, `asset_summaries` 1, `volumes` 9,
+  `volume_asset_counts` 5 — the 9 and 5 are cargo-mutants trying several
+  hardcoded dummy tuples per method, not 9/5 independent bugs):
+  `CatalogStore`'s `search_names_ranked`/`asset_summaries`/`volumes`/
+  `volume_asset_counts` are each a one-line delegation to the inherent
+  `SqliteCatalog` method of the same name — the same pattern flagged in
+  phase 3 ("`para_nodes()` is inherent-only on `SqliteCatalog`"). Nothing in
+  the workspace ever called these four through `&dyn CatalogStore` (only
+  through the inherent methods directly), so a mutant replacing a
+  delegation body with a hardcoded `Ok(vec![...])` survived unconditionally
+  regardless of which dummy values cargo-mutants tried. Closed by extending
+  the trait-object test: `catalog_store_trait_object_exposes_every_read_
+  query` (`crates/catalog-sqlite/src/lib.rs`) seeds a volume and a named
+  asset, then calls all four through `&mut dyn CatalogStore` and asserts on
+  the real rows — since the real seeded values (`"v1"`/`"Card A"`) never
+  match any of cargo-mutants' dummy candidates (`""`/`"xyzzy"`), the same
+  one test discriminates every dummy-value variant it tried.
 - **`debug_dump` is content-blind in every existing test** (`apply.rs:424`,
   2 mutants): every other test comparing two dumps only checks *equality*
   between them (`assert_eq!(dump, fresh.debug_dump())`), which a mutant
@@ -390,18 +405,19 @@ the mutant, run the relevant suite, confirm failure, revert):
   seeds one asset and one tag and asserts the dump contains their actual
   rows.
 
-All 18 mutants (the delegation return-value variants and the two
-`debug_dump` constants) are closed by these two tests — confirmed by hand:
-applied each of `search_names_ranked`/`asset_summaries`/`volumes`/
-`volume_asset_counts` -> `Ok(vec![])` and `debug_dump` -> `Ok(String::new())`
-/ `Ok("xyzzy".into())` one at a time, watched
+16 + 2 = 18: every missed mutant in this crate, closed by these two tests —
+confirmed by hand: applied each of `search_names_ranked`/`asset_summaries`/
+`volumes`/`volume_asset_counts` -> `Ok(vec![])` and `debug_dump` ->
+`Ok(String::new())` / `Ok("xyzzy".into())` one at a time, watched
 `catalog_store_trait_object_exposes_every_read_query`/
 `debug_dump_reflects_real_row_content_not_a_constant` fail, reverted.
 
 **`majestical-index` genuine gaps — closed with new tests:**
 
-- **Planner counting, `work.rs`** (6 mutants across `plan_thumb`/
-  `plan_image_embed`/`plan_keyframes`): the existing planner tests
+- **Planner counting, `work.rs`** (12 mutants: `plan_thumb` 1,
+  `plan_image_embed` 4, `plan_keyframes` 7 — each `+=` counter has both a
+  `-=` and a `*=` variant, which is why the counts are double what a first
+  read of the line numbers suggests): the existing planner tests
   (`plans_missing_thumbs_and_counts_statuses`, `existing_blobs_count_done_
   and_raw_images_are_unsupported`) only asserted *counts*, never which asset
   produced them — a mutant that inverts `plan_thumb`'s `kind == Video`
@@ -409,20 +425,23 @@ applied each of `search_names_ranked`/`asset_summaries`/`volumes`/
   `needs_ffmpeg` vs. `pending`, but the two counts stay `1`/`1` either way.
   Separately, `plan_image_embed`/`plan_keyframes`'s `done`/`offline`/
   `needs_ffmpeg` counters (as opposed to `pending`, which was already
-  covered) had no test touching them at all, so an `+=` -> `*=` mutation
-  (which leaves a counter starting at its default `0` stuck at `0` forever)
-  went unnoticed. Three new tests: `plan_thumb_ffmpeg_gate_applies_only_to_
-  the_video_kind` (asserts *which* asset lands in `items`, not just a
-  count), `plan_image_embed_counts_done_and_offline_assets`, and
+  covered) had no test touching them at all, so an `+=` -> `*=`/`-=`
+  mutation (which leaves a counter starting at its default `0` stuck at `0`,
+  or wraps to `u64::MAX`) went unnoticed. Three new tests:
+  `plan_thumb_ffmpeg_gate_applies_only_to_the_video_kind` (asserts *which*
+  asset lands in `items`, not just a count),
+  `plan_image_embed_counts_done_and_offline_assets`, and
   `plan_keyframes_counts_done_offline_and_needs_ffmpeg` (seed a done blob
-  and an offline/no-ffmpeg asset, assert each counter directly).
-- **Video timing/parsing pure functions, `video.rs`** (23 mutants across
-  `seconds_to_ms`, `frame_timestamp_ms`, `format_timestamp`, `chunk_frames`,
-  `parse_probe_json`, `binary_runs`): none of these had a direct unit test —
-  they were only exercised indirectly (or not at all outside the gated
-  ffmpeg suites) even though every one is pure and needs no subprocess.
-  Six new tests call each directly: `seconds_to_ms_rounds_to_the_nearest_
-  millisecond`, `frame_timestamp_ms_scales_index_by_the_analysis_frame_rate`,
+  and an offline/no-ffmpeg asset, assert each counter directly) — all 12
+  mutants confirmed closed by hand, both the `-=` and `*=` variant of each.
+- **Video timing/parsing pure functions, `video.rs`** (33 mutants, all
+  closed: `seconds_to_ms` 4, `frame_timestamp_ms` 6, `format_timestamp` 6,
+  `chunk_frames` 14, `parse_probe_json` 1, `binary_runs` 2): none of these
+  had a direct unit test — they were only exercised indirectly (or not at
+  all outside the gated ffmpeg suites) even though every one is pure and
+  needs no subprocess. Seven new tests call each directly:
+  `seconds_to_ms_rounds_to_the_nearest_millisecond`,
+  `frame_timestamp_ms_scales_index_by_the_analysis_frame_rate`,
   `format_timestamp_splits_whole_seconds_and_millis`,
   `chunk_frames_slices_ts_and_bytes_per_frame_without_overlap` (a two-frame
   buffer with a distinct fill byte per frame, so a slicing-offset bug shows
@@ -432,9 +451,23 @@ applied each of `search_names_ranked`/`asset_summaries`/`volumes`/
   stream listed before the video one, so matching the wrong `codec_type`
   is visible), and `binary_runs_reports_true_only_for_an_actually_runnable_
   binary` (`true` vs. a nonexistent binary name — no PATH manipulation
-  needed).
-- **Scene-detection internals, `video.rs`** (4 mutants): `detect_scenes`'s
-  `frames.len() < 2` guard had no test at exactly 2 frames (the boundary) —
+  needed). All 33 mutants across these six functions confirmed closed —
+  32 by hand, one mutation at a time; the 33rd (`chunk_frames`'s
+  `173:20` `frame_bytes == 0` -> `!= 0`) was misjudged "equivalent" in an
+  earlier pass of this triage (checked by hand against only one of the two
+  `chunk_frames` tests, the one that expects an error either way, so it
+  couldn't discriminate); the scoped rerun below caught it correctly
+  against the full suite — with the OR's first clause unconditionally
+  `true`, `chunk_frames` errors on *every* input, including the valid
+  two-frame buffer `chunk_frames_slices_ts_and_bytes_per_frame_without_
+  overlap` expects to succeed, so that test's own `.expect("chunk")` fails.
+  Re-confirmed directly afterward: `cargo test -p majestical-index --lib`
+  with the mutation hand-applied fails exactly that one test.
+- **Scene-detection boundary conditions, `video.rs`** (5 mutants,
+  intentionally targeted: `detect_scenes` 1, `raw_candidate_cuts` 2,
+  `neighborhood_average`'s two whole-function constant mutants —
+  `-> 0.0`/`-> 1.0`): `detect_scenes`'s `frames.len() < 2` guard had no test
+  at exactly 2 frames (the boundary) —
   `exactly_two_frames_is_enough_to_run_detection` pins that 2 real,
   differently-colored frames still produce a cut. `raw_candidate_cuts`'s
   `score < MIN_CONTENT` gate had no test at the exact floor value — `min_
@@ -444,78 +477,164 @@ applied each of `search_names_ranked`/`asset_summaries`/`volumes`/
   near-zero neighborhood average (so the ratio check can't mask the gate
   itself), and asserts the cut still fires. `neighborhood_average`'s
   divide-by-`count` guard (`if count == 0 { return 0.0; }`) can be replaced
-  wholesale with `return 0.0;` and every *existing* test still passes,
-  because no clip had a stretch of above-floor motion with a genuinely flat
-  neighborhood — `sustained_above_threshold_motion_does_not_fire_a_cut_on_
-  its_own` builds a 40-frame grayscale zigzag with a constant ±50 step (so
-  every adjacent pair scores identically ~16.67, just above `MIN_CONTENT`,
-  with the neighborhood average settling at the same ~16.67 and the ratio
-  near 1.0, safely under `RATIO_THRESHOLD`), and asserts it falls back to
-  the 10-sample uniform default rather than firing a cut on every frame (a
-  hardcoded-`0.0` neighborhood average turns every above-floor pair's ratio
-  into `score / 0.0 == +inf`, clearing the threshold unconditionally).
-- **NCHW plane-offset math, `preprocess.rs`** (3 mutants): the existing
-  normalization tests only ever checked pixel index `i == 0`, where `plane +
-  i` and `plane - i` are the same index, and used uniform-color images,
-  where `2 * plane + i` landing at the wrong offset is invisible because
-  every pixel writes the same value anyway. `plane_offsets_are_correct_for_
-  a_pixel_past_the_first` uses two adjacent pixels with distinct per-channel
-  colors and checks pixel 1's R/G/B all land at their real NCHW offsets.
+  wholesale with `return 0.0;` (or `1.0`) and every *existing* test still
+  passed before this branch, because no clip had a stretch of above-floor
+  motion with a genuinely flat neighborhood —
+  `sustained_above_threshold_motion_does_not_fire_a_cut_on_its_own` builds
+  a 40-frame grayscale zigzag with a constant ±50 step (so every adjacent
+  pair scores identically ~16.67, just above `MIN_CONTENT`, with the
+  neighborhood average settling at the same ~16.67 and the ratio near 1.0,
+  safely under `RATIO_THRESHOLD`), and asserts it falls back to the
+  10-sample uniform default rather than firing a cut on every frame (a
+  hardcoded `0.0`/`1.0` neighborhood average turns every above-floor pair's
+  ratio into `score / 0.0 == +inf` or a fixed small ratio that still
+  clears the threshold, firing on every frame instead).
 
-**Equivalent / dead-branch-under-current-constants (not chased):**
+  This last test (plus `exactly_two_frames_is_enough_to_run_detection` and
+  `min_content_gate_is_exclusive_a_score_at_the_floor_still_cuts`, both new
+  this round) turned out to **incidentally** close far more than the 5
+  mutants they targeted — the scoped rerun below shows 6 more of
+  `neighborhood_average`'s 9 mutants (`293:17` ×2, `297:24`, `297:15` ×2,
+  `298:17` ×2, `299:19` ×2, `302:14`, `310:9` ×2 — several of these weren't
+  even in the original missed count, meaning some were already caught by
+  pre-existing tests before this triage started) and 5 of `content_score`'s
+  7 mutants now pass, without either function ever being tested directly.
+  Not claimed as deliberate coverage — genuinely incidental, and left
+  exactly that way rather than retrofitted with an explanation.
+- **NCHW plane-offset math, `preprocess.rs`** (3 of `preprocess_rgb`'s 4
+  mutants; the 4th is equivalent, see below): the existing normalization
+  tests only ever checked pixel index `i == 0`, where `plane + i` and
+  `plane - i` are the same index, and used uniform-color images, where
+  `2 * plane + i` landing at the wrong offset is invisible because every
+  pixel writes the same value anyway. `plane_offsets_are_correct_for_a_
+  pixel_past_the_first` uses two adjacent pixels with distinct per-channel
+  colors and checks pixel 1's R/G/B all land at their real NCHW offsets.
+- **Color-space conversion, `video.rs`** (`rgb_to_hsv_u8`, 22 mutants — the
+  single largest survivor cluster in the crate; 11 closed, 11 remain open):
+  never unit-tested directly; only exercised indirectly through full
+  `detect_scenes` runs on synthetic solid-color frames, which never pinned
+  the function's own branch structure or arithmetic against known values.
+  `rgb_to_hsv_u8_matches_known_color_conversions` checks six colors (pure
+  red/green/blue — one per `hue_deg` branch — plus white/black/mid-grey for
+  the zero-delta and zero-saturation guards) against hand-derived expected
+  `(hue, sat, val)` triples on the function's actual 0-255 packed scale.
+  TDD'd against 4 mutants by hand before the scoped rerun: `430:21`
+  (`-` -> `+` in `delta = max - min`), `434:32` (`<=` -> `>` in the
+  zero-delta guard), and `441:22` (`<=` -> `>` in the zero-saturation
+  guard) all fail as expected; `435:27` (`/` -> `%` in the red branch's
+  `(gf - bf) / delta`) survives even this test, because pure red has
+  `gf == bf == 0` on both sides of that branch, so `0 / delta` and `0 %
+  delta` agree — genuinely not discriminated by a primary-color fixture,
+  not a test bug. Rescoped `cargo mutants --package majestical-index --file
+  crates/index/src/video.rs` after adding this test (221 mutants, 25m: 185
+  caught, 30 missed, 6 unviable): 11 of the 22 `rgb_to_hsv_u8` mutants now
+  pass — every branch-selection and zero-guard mutant the six colors
+  exercise, plus a few arithmetic variants beyond the 4 hand-checked above.
+  The remaining 11 (`435:27` both variants, `435:21` both, `437:27` both,
+  `437:21` one, `439:27` both, `439:21` one, `444:15` one) are all in the
+  per-channel `hue_deg`/`sat` arithmetic where the six fixture colors
+  (three pure primaries plus achromatic white/black/grey) don't force a
+  distinguishing value — e.g. `435:27` above. Closing them needs
+  non-primary, non-achromatic colors (an off-hue color where every channel
+  differs); not added this pass, listed under "aggregate-covered
+  arithmetic" below.
+
+**Aggregate-covered arithmetic — open, not chased (22 mutants total,
+recounted against the scoped rerun's actual `missed.txt`, not estimated):**
+
+Several of these functions' end-to-end behavior is pinned by the
+scene-detection and video-timing tests above, but no test asserts anything
+narrow enough to discriminate every individual arithmetic operator inside
+them — some, as noted above, got caught anyway as an incidental side
+effect; these did not:
+
+- `neighborhood_average` (1 of its 9 mutants remains open — 8 close above,
+  see the incidental-closure note): `293:39` (`+` -> `*` in the window's
+  `(i + NEIGHBORHOOD_WINDOW + 1)` upper bound — multiplying by 1 is a
+  silent identity, shrinking the window's right edge by one frame without
+  producing an out-of-range or obviously-wrong result).
+- `content_score` (2 of its 7 mutants remain open — 5 close above,
+  incidentally): `391:20` (`*` -> `/` in the per-pixel index `px * 3`) and
+  `408:11` (`/` -> `*` in the final `total / denom`).
+- `enforce_min_scene_length` (4 mutants, unaffected by anything added this
+  round): the short-scene boundary checks (`334:47`, `334:43`, `335:57`,
+  `335:44`).
+- `thin_to_cap` (3 mutants, unaffected): the even-spacing index math
+  (`380:38`, `380:30` ×2).
+- `uniform_fallback` (1 mutant, unaffected): the sample-spacing
+  multiplication (`368:35`).
+- `rgb_to_hsv_u8`'s remaining 11 mutants (see above): `435:27` ×2, `435:21`
+  ×2, `437:27` ×2, `437:21`, `439:27` ×2, `439:21`, `444:15`.
+
+**Equivalent (not chased, 1 mutant — down from 2 claimed in an earlier
+pass of this triage; see the `chunk_frames` correction above):**
 
 - `preprocess.rs:19` `(rgb.width(), rgb.height()) == (EDGE, EDGE)` mutated
   to `!=` — proven equivalent, not just suspected: `resize_rgb`'s
   antialiased-bilinear-via-convolution resize to the *same* dimensions is
   byte-identical to not resizing at all, confirmed empirically for a full
   256×256 gradient (not just a solid color, which can't tell a real resize
-  apart from a skip). Pinned permanently by `resize_to_matching_dimensions_
-  is_the_identity_even_for_a_non_uniform_image`, so a future resize
-  algorithm change that breaks this invariant fails that test directly
-  rather than being caught by chasing the mutant.
-- `video.rs:173:20` `frame_bytes == 0` mutated to `!= 0` — dead code under
-  the current module constants: `frame_bytes` is always
-  `ANALYSIS_W * ANALYSIS_H * 3` (43,200), never `0`, so no input to
-  `chunk_frames` can ever make this branch's outcome differ between `==`
-  and `!=`. Confirmed by hand (the mutant survives even against
-  `chunk_frames_rejects_a_length_not_a_multiple_of_the_frame_size`, whose
-  actual failure comes entirely from the `is_multiple_of` half of the `||`
-  — separately confirmed live via the `||` -> `&&` and `delete !` mutants,
-  both of which *are* caught). Only a change to `ANALYSIS_W`/`ANALYSIS_H`
-  could ever make this branch reachable.
+  apart from a skip), and re-confirmed against the crate's *full* test
+  suite (`cargo test -p majestical-index --lib`, all 59 tests), not just
+  the `preprocess` module in isolation — the same mistake that produced the
+  `chunk_frames` misjudgment above. Pinned permanently by
+  `resize_to_matching_dimensions_is_the_identity_even_for_a_non_uniform_
+  image`, so a future resize algorithm change that breaks this invariant
+  fails that test directly rather than being caught by chasing the mutant.
 
-**Display/diagnostic-only (not chased):**
+**Display/diagnostic-only (not chased, 2 mutants):**
 
 - `model.rs:215` `file.bytes / 1_000_000` (mutated to `%`/`*`) only feeds
   the `"{name} ({mb} MB): {status}"` progress string passed to the CLI's
-  callback — cosmetic, no behavioral effect.
+  callback — cosmetic, no behavioral effect. (The rest of `fetch`'s 3
+  missed mutants is the `Ok(())` no-op covered by the CLI's own suite, see
+  the structural note above.)
 
-**Gated-coverage (not chased beyond the spot-verifications above), by file:**
+**Not chased, deferred (1 mutant):**
 
-- `encoder.rs` (17 mutants: `embed_image`/`embed_text`/`token_ids`/`pooled`)
-  — needs the real SigLIP2 ONNX model; covered by `encoder_conformance`/
-  `encoder_gated --ignored`.
-- `model.rs` (`model_dir` 1, `fetch` 1) — `model_dir` is pure path logic
-  gated only by needing careful `MAJ_MODEL_DIR` env-var scoping in an
-  in-process test (risk of cross-test races since env vars are
-  process-global); `fetch` is covered by the CLI's own default suite (see
-  the structural note above), not actually gated.
-- `video.rs` ffmpeg subprocess wrappers (`ffmpeg_available`, `probe`,
-  `analysis_frames`, `extract_frame` — 12 mutants): need a real ffmpeg
-  binary and a real clip; covered by `video_e2e --ignored`
-  (`ffmpeg_available`'s own mutants specifically would need PATH
-  manipulation to test the true-and-false cases without relying on the
-  host's real ffmpeg install, which wasn't attempted this pass).
-- `thumbs.rs` `decode_via_sips`/`decode_image`'s HEIC branch (5 mutants) —
-  **found, not just assumed**: no HEIC fixture exists anywhere in this
-  repository, so `decode_via_sips` (the macOS `sips`-shellout HEIC decoder)
-  is untested by *any* suite, gated or not — `decode_image` is only
-  exercised via `encoder_conformance`'s PNG fixtures, which never take the
-  HEIC branch. Since `sips` is real and present on this (and presumably
-  every CI) macOS box, a small real HEIC fixture and a direct test of
-  `decode_via_sips` is buildable without any gating at all — left for a
-  follow-up rather than this pass, given the phase-4 mutants budget was
-  spent on higher-value planner/scene-detection/catalog gaps.
+- `model.rs::model_dir` (1 mutant) — pure path logic, but testing it needs
+  careful `MAJ_MODEL_DIR` env-var scoping in an in-process test (risk of
+  cross-test races, since env vars are process-global and this crate's
+  tests run multi-threaded); not attempted this pass.
+
+**Gated-coverage (spot-verified above, not chased further), by file
+(37 mutants):**
+
+- `encoder.rs` (25 mutants: `embed_image` 4, `embed_text` 4, `token_ids` 5,
+  `pooled` 12) — needs the real SigLIP2 ONNX model; covered by
+  `encoder_conformance`/`encoder_gated --ignored`.
+- `video.rs` ffmpeg subprocess wrappers (8 mutants: `probe` 1,
+  `analysis_frames` 2, `extract_frame` 2, `ffmpeg_available` 3) — need a
+  real ffmpeg binary and a real clip; covered by `video_e2e --ignored`.
+  (`binary_runs`'s own 2 mutants are *not* in this bucket — they're pure
+  and closed above; `ffmpeg_available`'s 3 remain gated because testing its
+  true/false cases without relying on the host's real ffmpeg install would
+  need PATH manipulation, not attempted this pass.)
+- `thumbs.rs` `decode_image`/`decode_via_sips` (4 mutants) — **found, not
+  just assumed**: no HEIC fixture exists anywhere in this repository, so
+  `decode_via_sips` (the macOS `sips`-shellout HEIC decoder) is untested by
+  *any* suite, gated or not — `decode_image` is only exercised via
+  `encoder_conformance`'s PNG fixtures, which never take the HEIC branch.
+  Since `sips` is real and present on this (and presumably every CI) macOS
+  box, a small real HEIC fixture and a direct test of `decode_via_sips` is
+  buildable without any gating at all — left for a follow-up rather than
+  this pass, given the phase-4 mutants budget was spent on higher-value
+  planner/scene-detection/catalog gaps.
+
+Reconciliation, by file (matches missed.txt's totals exactly, and
+`video.rs`'s split is the *measured* scoped-rerun result, not an estimate):
+`majestical-catalog-sqlite`: 18, all closed (16 port-lag + 2 `debug_dump`).
+`majestical-index`: 139 = `work.rs` 12 (closed) + `video.rs` 90 (60 closed:
+33 pure fns + 5 scene-detection, both intentional, + 11 `rgb_to_hsv_u8`,
+intentional, + 11 incidental — 6 more of `neighborhood_average`'s 9 and 5
+of `content_score`'s 7, neither ever tested directly; 22 open:
+aggregate-covered arithmetic including `rgb_to_hsv_u8`'s remaining 11; 8
+gated: `probe`/`analysis_frames`/`extract_frame`/`ffmpeg_available`) +
+`preprocess.rs` 4 (3 closed + 1 equivalent) + `model.rs` 4 (2 display-only +
+1 `fetch`'s `Ok(())` no-op, covered elsewhere by the CLI's own suite + 1
+`model_dir`, deferred) + `thumbs.rs` 4 (gated, no fixture) + `encoder.rs` 25
+(gated). Plus the 1 `thumbs.rs::scaled_dimension` timeout, accounted for
+separately (not in the 139).
 
 ## Done in phase 4
 

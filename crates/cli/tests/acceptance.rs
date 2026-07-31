@@ -181,6 +181,33 @@ fn tag_asset(world: &mut SearchWorld, name: String, tag: String) -> Result<(), S
     Ok(())
 }
 
+/// Scans `name` under an explicit `--volume` id that this test machine never
+/// actually mounts (`mounted_volumes` only ever resolves real `/` and
+/// `/Volumes` entries — see `volume_identity.rs`), so the resulting instance
+/// is offline by construction, with no need to fake a mount or delete
+/// scanned bytes out from under the catalog.
+#[given(expr = "a catalog with an asset {string} on an offline volume")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn catalog_with_an_offline_asset(world: &mut SearchWorld, name: String) -> Result<(), String> {
+    let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let media = root.path().join("media");
+    std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
+    write_asset(&media, &name)?;
+    world.root = Some(root);
+    world.empty_model_dir = Some(tempfile::tempdir().map_err(|e| e.to_string())?);
+
+    world.exec(DEFAULT_MACHINE, &["catalog", "init"])?;
+    let media_str = media.to_string_lossy().into_owned();
+    world.exec(
+        DEFAULT_MACHINE,
+        &["scan", &media_str, "--volume", "never-mounted-vol"],
+    )?;
+    Ok(())
+}
+
 #[given("no encoder model is installed")]
 fn no_encoder_model(_world: &mut SearchWorld) {
     // A no-op: `MAJ_MODEL_DIR` is always pointed at a permanently empty

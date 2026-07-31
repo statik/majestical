@@ -462,7 +462,7 @@ mod tests {
     use super::{
         ANALYSIS_H, ANALYSIS_W, Frame, MAX_KEYFRAMES, VideoInfo, binary_runs, chunk_frames,
         detect_scenes, enforce_min_scene_length, format_timestamp, frame_timestamp_ms,
-        parse_probe_json, raw_candidate_cuts, scene_midpoints, seconds_to_ms,
+        parse_probe_json, raw_candidate_cuts, rgb_to_hsv_u8, scene_midpoints, seconds_to_ms,
     };
     use std::path::Path;
 
@@ -700,6 +700,22 @@ mod tests {
             },
             "must pick the video stream's dimensions, not the audio stream's"
         );
+    }
+
+    /// Hue/saturation/value are all packed onto the same 0-255 `u8` scale
+    /// (not the reference 0-179 hue scale — see the module doc on
+    /// `rgb_to_hsv_u8`). Six known colors pin every branch: the three
+    /// `hue_deg` cases (red takes the `max == r` branch, green `max == g`,
+    /// blue the `else` branch), the `delta <= EPSILON` zero-hue case (white,
+    /// black, grey), and the `max <= EPSILON` zero-saturation case (black).
+    #[test]
+    fn rgb_to_hsv_u8_matches_known_color_conversions() {
+        assert_eq!(rgb_to_hsv_u8(255, 0, 0), (0, 255, 255), "pure red");
+        assert_eq!(rgb_to_hsv_u8(0, 255, 0), (85, 255, 255), "pure green");
+        assert_eq!(rgb_to_hsv_u8(0, 0, 255), (170, 255, 255), "pure blue");
+        assert_eq!(rgb_to_hsv_u8(255, 255, 255), (0, 0, 255), "white");
+        assert_eq!(rgb_to_hsv_u8(0, 0, 0), (0, 0, 0), "black");
+        assert_eq!(rgb_to_hsv_u8(128, 128, 128), (0, 0, 128), "mid grey");
     }
 
     #[cfg(unix)]

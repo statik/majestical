@@ -348,3 +348,27 @@ reviewed decision; deferrals carry watchlist entries with attribution.
 18. CI installs `just` on macOS runners and calls justfile recipes
     throughout (`.github/workflows/ci.yml:27-28,40-41,67-68`) — a user
     directive for a single command source.
+19. `maj model fetch` has no `--json` flag — only `--verify`
+    (`crates/cli/src/main.rs:225-230`) — despite this spec's `maj model
+    fetch [--json]` (line 183). The phase 4 plan's own Task 13 code baked
+    in `--verify` without ever specifying `--json`, so the gap traces to
+    the plan, not a later implementation drift; not caught until this
+    review.
+20. `maj index status` prints no model-cache-state line
+    (`crates/cli/src/index_cmd.rs:887-907`), despite this spec's "per-kind
+    counts... model cache state" (line 181) — the model cache path only
+    ever prints from `maj model fetch`
+    (`crates/cli/src/index_cmd.rs:918-919`). Same root cause as #19: the
+    plan's own `cmd_index_status` sketch never included it.
+21. Task 20's cucumber suite shipped a "kind filter selects by media class"
+    scenario in place of the plan's "Filter-only search over an offline
+    volume still answers" scenario
+    (`crates/cli/tests/features/search.feature`), with no record of the
+    swap at the time. Restored: the offline-volume scenario is back
+    (`crates/cli/tests/features/search.feature:33-36`,
+    `crates/cli/tests/acceptance.rs`'s `catalog_with_an_offline_asset`
+    step) — an asset scanned under an explicit `--volume` id that
+    `volume_identity::mounted_volumes` never resolves is offline by
+    construction, no mount-faking or file-deletion needed, exactly as the
+    plan's own note anticipated. The kind-filter scenario stays too; both
+    now run.

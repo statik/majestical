@@ -28,3 +28,8 @@ Feature: Layered search
     When I search "kind:image"
     Then the results contain "mountain.jpg"
     And the results do not contain "beach_day.mov"
+
+  Scenario: Filter-only search over an offline volume still answers
+    Given a catalog with an asset "archived.mov" on an offline volume
+    When I search "online:no"
+    Then the results contain "archived.mov"

@@ -3,7 +3,10 @@
 //! planner that diffs required derivations against what exists. Everything
 //! here is disposable and regenerable; the event log stays the only truth.
 pub mod blob;
+pub mod encoder;
 pub mod error;
+pub mod model;
+pub mod preprocess;
 pub mod resize;
 pub mod thumbs;
 pub mod work;

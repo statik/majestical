@@ -85,6 +85,9 @@ fn index_status_reports_needs_model_and_offline_honestly() {
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path().join("cat");
     let state = catalog.path().join("state");
+    // An empty model cache: no encoder installed, so embeddings/keyframes
+    // must honestly report needs-model rather than pretending to be pending.
+    let model_dir = tempfile::tempdir().unwrap();
 
     maj(&root, &state)
         .args(["catalog", "init"])
@@ -97,6 +100,7 @@ fn index_status_reports_needs_model_and_offline_honestly() {
         .success();
 
     maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
         .args(["index", "status"])
         .assert()
         .success()
@@ -122,6 +126,40 @@ fn index_status_reports_needs_model_and_offline_honestly() {
         .assert()
         .success()
         .stdout(contains("thumbs: 0 done, 1 pending, 1 offline"));
+}
+
+/// `maj model fetch` skips every file that's already present at its exact
+/// byte size without hitting the network — the presence check is size-only,
+/// so pre-placing correctly-sized dummy files is enough to prove the
+/// already-present path without downloading a real model.
+#[test]
+fn model_fetch_reports_already_present_without_network() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_root = tempfile::tempdir().unwrap();
+    // model_dir() joins MAJ_MODEL_DIR with the model tag, so the pre-placed
+    // files must live one level down from what we set here.
+    let model_dir = model_root.path().join(majestical_index::model::MODEL_TAG);
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    for file in majestical_index::model::MODEL_FILES {
+        let path = model_dir.join(file.name);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(file.bytes).unwrap();
+    }
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["model", "fetch"])
+        .assert()
+        .success()
+        .stdout(contains("already present").count(3));
 }
 
 /// `--limit` caps how much of the queue one pass works, so a long-running

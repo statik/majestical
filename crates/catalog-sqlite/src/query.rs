@@ -110,7 +110,9 @@ impl SqliteCatalog {
     /// one of `terms` by word-prefix, ranked best-first, capped at `limit`
     /// rows — one row per asset, at its best-matching row's rank, optionally
     /// restricted to `sources`. Each hit carries the matching row's source,
-    /// locator, and a highlighted snippet of its text.
+    /// locator, and a highlighted snippet of its text. `Some(sources)` with
+    /// an empty set restricts to no sources, i.e. always returns nothing —
+    /// pass `None` to search every source instead.
     ///
     /// # Errors
     /// Returns an error if the underlying query fails.
@@ -516,6 +518,43 @@ mod tests {
             .expect("prefix search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, a);
+    }
+
+    /// Pins AND semantics (and prefix matching) at the `search_names_ranked`
+    /// surface, not just `search_text_ranked` — `fts_match_expr` is shared by
+    /// both, so a future un-sharing of the helper can't silently revert name
+    /// search back to OR without a test noticing here.
+    #[test]
+    fn multi_term_name_search_requires_every_term_and_supports_prefixes() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "clips/quarterly budget review.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+        let hits = db
+            .search_names_ranked(&["quart".to_string(), "budg".to_string()], 10)
+            .expect("search both prefixes");
+        assert_eq!(
+            hits.len(),
+            1,
+            "both prefixes match the name, so it must be returned"
+        );
+        assert_eq!(hits[0].0, a);
+
+        let none = db
+            .search_names_ranked(&["quarterly".to_string(), "missing".to_string()], 10)
+            .expect("search one missing term");
+        assert!(
+            none.is_empty(),
+            "AND semantics: a term absent from the name must exclude it, got {none:?}"
+        );
     }
 
     /// An asset with two instances whose basenames both match the search

@@ -73,6 +73,10 @@ impl SqliteCatalog {
              -- Populated from blobs (transcripts, captions, OCR, PDF text)
              -- by `maj index run`, never from CRDT events; see
              -- `upsert_text_rows` and `apply_touched`'s `Touched::Asset` arm.
+             -- A full rebuild (this table is dropped and recreated on every
+             -- `SNAPSHOT_VERSION` bump, and whenever the saved snapshot is
+             -- unreadable) empties it: text search returns nothing until the
+             -- next `maj index run` re-heals it from the blobs.
              CREATE VIRTUAL TABLE text_fts USING fts5(
                  content, asset UNINDEXED, source UNINDEXED, locator UNINDEXED,
                  tokenize = 'unicode61 remove_diacritics 2'

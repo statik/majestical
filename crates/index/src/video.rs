@@ -1,8 +1,8 @@
 //! Video probing, analysis-rate frame decoding through ffmpeg, and adaptive
 //! scene detection (a Rust port of `PySceneDetect` `AdaptiveDetector`'s
 //! field-tested parameters: HSV mean-abs-diff score, rolling-average ratio
-//! threshold 3.0, min content 15.0, 2s min scene, uniform fallback below 10
-//! scenes, ~150 keyframe cap).
+//! threshold 3.0, min content 15.0, 2s min scene, 10-sample uniform fallback
+//! when zero cuts are detected at all, ~150 keyframe cap).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -266,10 +266,12 @@ fn raw_candidate_cuts(frames: &[Frame]) -> Vec<u64> {
             continue;
         }
         let avg = neighborhood_average(&scores, i);
-        // A near-zero neighborhood average makes the ratio undefined
-        // (effectively infinite); score clearing MIN_CONTENT is enough on
-        // its own in that case.
-        if avg <= f32::EPSILON || score / avg >= RATIO_THRESHOLD {
+        // A zero (or near-zero) neighborhood average needs no special case:
+        // IEEE float division by 0.0 yields +inf, which clears
+        // RATIO_THRESHOLD on its own — `score` is already >0.0 here (it
+        // cleared MIN_CONTENT above), so `score / avg` can never be the
+        // 0.0/0.0 NaN case.
+        if score / avg >= RATIO_THRESHOLD {
             cuts.push(frames[i + 1].ts_ms);
         }
     }
@@ -436,7 +438,10 @@ fn unit_fractions_to_u8(hue_frac: f32, sat_frac: f32, val_frac: f32) -> (u8, u8,
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, detect_scenes};
+    use super::{
+        Frame, MAX_KEYFRAMES, detect_scenes, enforce_min_scene_length, raw_candidate_cuts,
+        scene_midpoints,
+    };
 
     fn solid(ts_ms: u64, rgb: [u8; 3]) -> Frame {
         let w = 16;
@@ -471,19 +476,11 @@ mod tests {
 
         let keyframes = detect_scenes(&frames, 2000, 9000);
 
-        assert_eq!(keyframes.len(), 3, "expected 3 scenes, got {keyframes:?}");
-        assert!(
-            keyframes[0] < 3000,
-            "first keyframe should be in the red scene: {keyframes:?}"
-        );
-        assert!(
-            (3000..6000).contains(&keyframes[1]),
-            "second keyframe should be in the green scene: {keyframes:?}"
-        );
-        assert!(
-            keyframes[2] >= 6000,
-            "third keyframe should be in the blue scene: {keyframes:?}"
-        );
+        // Exact midpoints, not just "somewhere in the right scene": a range
+        // check here would pass just as well on the scene START timestamps
+        // (0, 3000, 6000), so it can't tell a real midpoint bug apart from a
+        // correct result.
+        assert_eq!(keyframes, vec![1500, 4500, 7500]);
     }
 
     #[test]
@@ -531,32 +528,56 @@ mod tests {
         assert!(*keyframes.last().unwrap() < 60_000);
     }
 
-    #[test]
-    fn keyframes_are_capped_at_150() {
-        // 200 scenes x 4 frames each (2s per scene at 2fps), hue stepped per
-        // scene so every boundary is a hard cut.
+    /// 200 scenes x 4 frames each (2s per scene at 2fps), hue stepped by 71
+    /// (coprime with 255, so consecutive scenes never repeat or land close
+    /// together within a short run) mod 255 per scene, so every scene
+    /// boundary is a genuine hard cut — unlike the old fixed 6-color cycle,
+    /// whose adjacent-color deltas mostly stayed under `MIN_CONTENT` and
+    /// left the test passing on ~34 real keyframes, never actually
+    /// exercising `thin_to_cap`.
+    fn stepped_hue_scenes(scene_count: u64) -> Vec<Frame> {
         let mut frames = Vec::new();
-        for scene in 0..200u64 {
-            let hue_step = (scene % 6) as u8;
-            let color = match hue_step {
-                0 => [255, 0, 0],
-                1 => [255, 255, 0],
-                2 => [0, 255, 0],
-                3 => [0, 255, 255],
-                4 => [0, 0, 255],
-                _ => [255, 0, 255],
-            };
+        for scene in 0..scene_count {
+            // `% 255` bounds the result to 0..=254, which clippy's range
+            // analysis recognizes as always fitting u8 — no truncation
+            // `#[expect]` needed here.
+            let hue = ((scene * 71) % 255) as u8;
+            let color = [hue, 255 - hue, 128];
             for f in 0..4u64 {
                 let ts = scene * 2000 + f * 500;
                 frames.push(solid(ts, color));
             }
         }
+        frames
+    }
 
-        let keyframes = detect_scenes(&frames, 2000, 200 * 2000);
+    #[test]
+    fn keyframes_are_capped_at_150() {
+        let scene_count = 200u64;
+        let duration_ms = scene_count * 2000;
+        let frames = stepped_hue_scenes(scene_count);
 
+        // Pin the fixture actually produces more real scenes than the cap,
+        // not just fewer than or equal to it — a fixture that happened to
+        // detect <=150 scenes would make `keyframes.len() <= 150` pass
+        // without `thin_to_cap` ever running.
+        let raw_cuts = raw_candidate_cuts(&frames);
+        let accepted = enforce_min_scene_length(&raw_cuts, 2000, duration_ms);
+        let pre_cap = scene_midpoints(&accepted, duration_ms).len();
         assert!(
-            keyframes.len() <= 150,
-            "expected cap at 150, got {}",
+            pre_cap > MAX_KEYFRAMES,
+            "fixture must out-scene the cap to exercise thinning, got {pre_cap} pre-cap scenes"
+        );
+
+        let keyframes = detect_scenes(&frames, 2000, duration_ms);
+
+        // Exact, not `<=`: pins the cap actually binds, discriminating a
+        // `thin_to_cap` regression from a fixture that just happens to clear
+        // 150 on its own.
+        assert_eq!(
+            keyframes.len(),
+            MAX_KEYFRAMES,
+            "expected the cap to bind exactly, got {}",
             keyframes.len()
         );
     }

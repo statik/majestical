@@ -491,27 +491,25 @@ fn ts_ms_i64(ts_ms: u64) -> i64 {
 
 /// What happened when working one detected keyframe timestamp.
 enum TimestampOutcome {
-    /// A blob already existed and Lance already had its row — nothing to do.
+    /// A blob already existed for this timestamp. Its vector is already in
+    /// Lance too: `run_embed_items`'s blob↔Lance diff (`load_missing_vectors_from_blobs`)
+    /// runs unconditionally, every pass, before this executor ever gets a
+    /// look — so a keyframe blob written by an earlier pass, or synced in
+    /// from a teammate, is already indexed by the time this check runs.
     AlreadyComplete,
-    /// A blob already existed but Lance was missing its row — recovered by
-    /// reading the blob back, with zero re-inference.
-    Recovered(VectorRow),
     /// Freshly extracted, embedded, and written.
     Written(VectorRow),
 }
 
-/// Works one detected keyframe timestamp: skip if already fully indexed,
-/// recover from an existing blob if Lance is merely missing the row (crash
-/// recovery — see [`run_keyframe_items`]'s doc comment), else extract +
-/// embed + write a fresh blob.
+/// Works one detected keyframe timestamp: skip if a blob already exists for
+/// it, else extract + embed + write a fresh blob.
 ///
 /// # Errors
-/// Returns a human-readable reason if reading an existing blob, extracting
-/// the frame, running the encoder, or writing the new blob fails.
+/// Returns a human-readable reason if extracting the frame, running the
+/// encoder, or writing the new blob fails.
 fn keyframe_at_timestamp(
     blobs: &BlobStore,
     encoder: &mut Encoder,
-    existing_keys: &BTreeSet<(String, String, i64)>,
     item: &work::WorkItem,
     ts_ms: u64,
 ) -> Result<TimestampOutcome, String> {
@@ -524,22 +522,7 @@ fn keyframe_at_timestamp(
         },
     );
     if path.is_file() {
-        let key = (
-            item.asset_hex.clone(),
-            "keyframe".to_string(),
-            ts_ms_i64(ts_ms),
-        );
-        if existing_keys.contains(&key) {
-            return Ok(TimestampOutcome::AlreadyComplete);
-        }
-        let vector = blobs.read_vector(&path).map_err(|e| e.to_string())?;
-        return Ok(TimestampOutcome::Recovered(VectorRow {
-            asset_hex: item.asset_hex.clone(),
-            kind: "keyframe".to_string(),
-            ts_ms: ts_ms_i64(ts_ms),
-            model_tag: model_tag.to_string(),
-            vector,
-        }));
+        return Ok(TimestampOutcome::AlreadyComplete);
     }
     let frame =
         majestical_index::video::extract_frame(&item.abs_path, ts_ms).map_err(|e| e.to_string())?;
@@ -578,7 +561,6 @@ struct VideoKeyframeResult {
 fn process_video_keyframes(
     blobs: &BlobStore,
     encoder: &mut Encoder,
-    existing_keys: &BTreeSet<(String, String, i64)>,
     item: &work::WorkItem,
 ) -> Result<VideoKeyframeResult, String> {
     let info = majestical_index::video::probe(&item.abs_path).map_err(|e| e.to_string())?;
@@ -591,12 +573,8 @@ fn process_video_keyframes(
     let mut written = 0u64;
     let mut failures = 0usize;
     for &ts_ms in &timestamps {
-        match keyframe_at_timestamp(blobs, encoder, existing_keys, item, ts_ms) {
+        match keyframe_at_timestamp(blobs, encoder, item, ts_ms) {
             Ok(TimestampOutcome::AlreadyComplete) => succeeded_timestamps.push(ts_ms),
-            Ok(TimestampOutcome::Recovered(row)) => {
-                succeeded_timestamps.push(ts_ms);
-                rows.push(row);
-            }
             Ok(TimestampOutcome::Written(row)) => {
                 succeeded_timestamps.push(ts_ms);
                 written += 1;
@@ -623,20 +601,24 @@ fn over_half_failed(failures: usize, total: usize) -> bool {
     total > 0 && failures * 2 > total
 }
 
-fn keyframes_manifest_json(model_tag: &str, timestamps: &[u64]) -> Vec<u8> {
-    serde_json::json!({ "model_tag": model_tag, "timestamps": timestamps })
+/// `detected` is the video's full scene-detected keyframe count, even when
+/// `timestamps` (the succeeded subset — see [`run_keyframe_items`]) is
+/// shorter: without it, a video that finished under the over-half-failed
+/// threshold with a few permanently-missing keyframes would look, from the
+/// manifest alone, exactly like one that succeeded at every timestamp.
+fn keyframes_manifest_json(model_tag: &str, detected: usize, timestamps: &[u64]) -> Vec<u8> {
+    serde_json::json!({ "model_tag": model_tag, "detected": detected, "timestamps": timestamps })
         .to_string()
         .into_bytes()
 }
 
 /// Works every `Keyframes` item in `items`: per video, detects scenes, then
-/// works each timestamp (extract+embed, or recover a vector for a blob
-/// Lance is missing — see [`keyframe_at_timestamp`]). The manifest blob is
-/// written LAST, only after every timestamp has been attempted: its
-/// existence is `plan_keyframes`'s (in `work.rs`) done marker, so a crash
-/// mid-video simply re-plans the whole video next pass, while the
-/// per-timestamp blob check in `keyframe_at_timestamp` skips whatever
-/// already finished.
+/// works each timestamp (extract+embed, or skip a blob that already exists —
+/// see [`keyframe_at_timestamp`]). The manifest blob is written LAST, only
+/// after every timestamp has been attempted: its existence is
+/// `plan_keyframes`'s (in `work.rs`) done marker, so a crash mid-video
+/// simply re-plans the whole video next pass, while the per-timestamp blob
+/// check in `keyframe_at_timestamp` skips whatever already finished.
 ///
 /// A video whose probe or analysis-frame decode fails outright is a
 /// video-level failure. Otherwise, per [`over_half_failed`]: if more than
@@ -647,7 +629,10 @@ fn keyframes_manifest_json(model_tag: &str, timestamps: &[u64]) -> Vec<u8> {
 /// manifest that would stop the video from ever being revisited. A video at
 /// or under that threshold gets a manifest listing only the timestamps that
 /// actually succeeded; a few permanently-missing keyframes are the accepted
-/// cost of not retrying an entire video forever over one flaky frame.
+/// cost of not retrying an entire video forever over one flaky frame. The
+/// manifest's `detected` field (see [`keyframes_manifest_json`]) keeps that
+/// gap auditable — the full scene-detected count survives even when
+/// `timestamps` is the smaller succeeded-only subset.
 ///
 /// # Errors
 /// Returns an error if the vector store can't be opened/rebuilt, the encoder
@@ -666,7 +651,6 @@ fn run_keyframe_items(
 
     let store = open_or_rebuild(&paths.lance_dir)?;
     let model_tag = majestical_index::model::MODEL_TAG;
-    let existing_keys = store.existing_keys(model_tag)?;
     // Loaded separately from `run_embed_items`'s encoder rather than shared
     // across both: each is only loaded at all when its own kind has pending
     // items, and a second `CoreML` session load (a second or so, cached
@@ -683,7 +667,7 @@ fn run_keyframe_items(
     let mut outcome = KeyframeOutcome::default();
     let mut batch = Vec::new();
     for item in items {
-        match process_video_keyframes(blobs, &mut encoder, &existing_keys, item) {
+        match process_video_keyframes(blobs, &mut encoder, item) {
             Ok(result) => {
                 outcome.keyframes_written += result.keyframes_written;
                 batch.extend(result.rows);
@@ -694,16 +678,22 @@ fn run_keyframe_items(
                     outcome.failed.push((
                         item.abs_path.clone(),
                         format!(
-                            "{}/{} keyframes failed to extract/embed (over half) — video \
+                            "{}: {}/{} keyframes failed to extract/embed (over half) — video \
                              skipped, will retry",
-                            result.keyframe_failures, result.total_keyframes
+                            item.abs_path.display(),
+                            result.keyframe_failures,
+                            result.total_keyframes
                         ),
                     ));
                     continue;
                 }
                 let manifest_path =
                     blobs.path_for(&item.asset_hex, &Derivation::KeyframeManifest { model_tag });
-                let manifest = keyframes_manifest_json(model_tag, &result.succeeded_timestamps);
+                let manifest = keyframes_manifest_json(
+                    model_tag,
+                    result.total_keyframes,
+                    &result.succeeded_timestamps,
+                );
                 blobs.write_atomic(&manifest_path, &manifest)?;
                 outcome.videos_done += 1;
             }
@@ -897,6 +887,19 @@ mod tests {
             .expect_err("must reject unknown kind");
         assert!(err.to_string().contains("bogus"));
         assert!(err.to_string().contains("thumbs"));
+    }
+
+    #[test]
+    fn over_half_failed_cases() {
+        assert!(
+            !over_half_failed(0, 0),
+            "zero detected keyframes never counts as over half failed"
+        );
+        assert!(
+            !over_half_failed(1, 2),
+            "exactly half (1/2) is not OVER half"
+        );
+        assert!(over_half_failed(2, 3), "2/3 (66%) is over half");
     }
 
     /// Opens (creating) a lance store at `lance_dir` and seeds one vector —

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 majestical-core = { path = "../core" }
+serde = { workspace = true }
 image = { workspace = true }
 webp = { workspace = true }
 fast_image_resize = { workspace = true }
@@ -24,6 +25,7 @@ arrow-schema = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+whisper-rs = { workspace = true }
 
 [lints]
 workspace = true

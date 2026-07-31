@@ -116,14 +116,19 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
     Ok(())
 }
 
+/// One pass's thumbnail-kind result: `written` new thumbnails and per-item
+/// `failed` (path, reason) — mirrors [`EmbedOutcome`]/[`KeyframeOutcome`]'s
+/// shape so every kind's executor returns one outcome value instead of a
+/// bare tuple.
+struct ThumbOutcome {
+    written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
 /// Works every thumbnail item with `jobs` parallel workers sharing one
 /// atomic cursor into `items` — a plain work-stealing pool without pulling in
 /// a thread-pool dependency for one queue.
-fn run_thumb_items(
-    blobs: &BlobStore,
-    items: &[work::WorkItem],
-    jobs: usize,
-) -> (u64, Vec<(PathBuf, String)>) {
+fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> ThumbOutcome {
     let next = AtomicUsize::new(0);
     let written = AtomicU64::new(0);
     let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
@@ -153,7 +158,10 @@ fn run_thumb_items(
     let failed = failed
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    (written.load(Ordering::Relaxed), failed)
+    ThumbOutcome {
+        written: written.load(Ordering::Relaxed),
+        failed,
+    }
 }
 
 fn workkind_name(kind: WorkKind) -> &'static str {
@@ -212,28 +220,30 @@ struct KeyframeOutcome {
     failed: Vec<(PathBuf, String)>,
 }
 
+/// Bundles `run_once`'s per-pass options (everything but `app`/`catalog_dir`)
+/// to keep its own signature within the house 5-positional-parameter limit.
+struct RunOnceArgs<'a> {
+    kinds: &'a BTreeSet<String>,
+    limit: Option<usize>,
+    threads: Option<usize>,
+    json: bool,
+}
+
 /// One `index run` pass: builds the plan, works every thumbnail, embedding,
 /// and keyframe item, and prints the result.
 ///
 /// # Errors
 /// Returns an error if the catalog can't be opened/synced, or if the Lance
 /// vector store can't be opened even after one corruption-recovery retry.
-fn run_once(
-    app: &FsApp,
-    catalog_dir: &Path,
-    kinds: &BTreeSet<String>,
-    limit: Option<usize>,
-    threads: Option<usize>,
-    json: bool,
-) -> Result<()> {
+fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
     let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
-    let plan = build_plan(&projection, &blobs, kinds);
-    let (thumb_items, embed_items, keyframe_items) = split_and_cap_items(plan.items, limit);
+    let plan = build_plan(&projection, &blobs, args.kinds);
+    let (thumb_items, embed_items, keyframe_items) = split_and_cap_items(plan.items, args.limit);
 
-    let jobs = threads.unwrap_or_else(default_index_jobs);
-    let (written, failed) = run_thumb_items(&blobs, &thumb_items, jobs);
+    let jobs = args.threads.unwrap_or_else(default_index_jobs);
+    let thumb_outcome = run_thumb_items(&blobs, &thumb_items, jobs);
 
     let embed_paths = EmbedPaths {
         lance_dir: state_dir.join("lance"),
@@ -242,7 +252,7 @@ fn run_once(
     let embed_outcome = run_embed_items(&embed_paths, &blobs, &embed_items)?;
     let keyframe_outcome = run_keyframe_items(&embed_paths, &blobs, &keyframe_items)?;
 
-    print_run_result(written, &failed, &embed_outcome, &keyframe_outcome, json);
+    print_run_result(&thumb_outcome, &embed_outcome, &keyframe_outcome, args.json);
     Ok(())
 }
 
@@ -749,8 +759,7 @@ fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
 }
 
 fn print_run_result(
-    written: u64,
-    failed: &[(PathBuf, String)],
+    thumbs: &ThumbOutcome,
     embed: &EmbedOutcome,
     keyframes: &KeyframeOutcome,
     json: bool,
@@ -759,7 +768,7 @@ fn print_run_result(
         println!(
             "{}",
             serde_json::json!({
-                "thumbnails": { "written": written, "failed": failed_json(failed) },
+                "thumbnails": { "written": thumbs.written, "failed": failed_json(&thumbs.failed) },
                 "embeddings": {
                     "written": embed.written,
                     "loaded_from_blobs": embed.loaded,
@@ -774,7 +783,11 @@ fn print_run_result(
             })
         );
     } else {
-        println!("thumbnails: {written} written, {} failed", failed.len());
+        println!(
+            "thumbnails: {} written, {} failed",
+            thumbs.written,
+            thumbs.failed.len()
+        );
         println!(
             "embeddings: {} written, {} loaded from blobs, {} failed",
             embed.written,
@@ -792,7 +805,12 @@ fn print_run_result(
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
     // `--json` branch above, for callers that want it out-of-band).
-    for (_, err) in failed.iter().chain(&embed.failed).chain(&keyframes.failed) {
+    for (_, err) in thumbs
+        .failed
+        .iter()
+        .chain(&embed.failed)
+        .chain(&keyframes.failed)
+    {
         eprintln!("failed: {err}");
     }
 }
@@ -820,15 +838,14 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
     {
         anyhow::bail!("--kinds keyframes requires ffmpeg/ffprobe on PATH (brew install ffmpeg)");
     }
+    let run_once_args = RunOnceArgs {
+        kinds: &kinds,
+        limit: args.limit,
+        threads: args.threads,
+        json: args.json,
+    };
     loop {
-        run_once(
-            app,
-            catalog_dir,
-            &kinds,
-            args.limit,
-            args.threads,
-            args.json,
-        )?;
+        run_once(app, catalog_dir, &run_once_args)?;
         if !args.watch {
             break;
         }

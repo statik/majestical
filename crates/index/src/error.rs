@@ -19,4 +19,6 @@ pub enum IndexError {
     Encoder(String),
     #[error("vector store: {0}")]
     VectorStore(String),
+    #[error("video {path}: {message}")]
+    Video { path: PathBuf, message: String },
 }

@@ -467,3 +467,172 @@ fn index_run_limit_caps_one_pass() {
         .stdout(contains("1 written"));
     assert_eq!(walkdir_find(&root, "thumb-320.webp").len(), 2);
 }
+
+/// `index status` on a catalog with a scanned video reports a real keyframes
+/// row — ffmpeg detection (`video::ffmpeg_available()`) is live, not the
+/// placeholder `false` PR 8 replaces. Only the row's presence and command
+/// success are pinned here: whether it lands in `needs_ffmpeg` or `pending`
+/// depends on whether this machine actually has ffmpeg installed, which this
+/// test doesn't control.
+#[test]
+fn index_status_reports_a_real_keyframes_row_for_a_scanned_video() {
+    let media = tempfile::tempdir().unwrap();
+    // Not a real decodable video: `index status` only diffs against the blob
+    // store, never decodes.
+    std::fs::write(media.path().join("clip.mov"), b"not a real mov").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("keyframes:"));
+}
+
+/// An explicit `--kinds keyframes` is a hard ask, not a best-effort one: with
+/// ffmpeg absent from `PATH`, `index run --kinds keyframes` must fail loudly
+/// with install guidance, rather than silently reporting 0 done the way the
+/// default all-kinds run degrades.
+#[test]
+fn index_run_explicit_keyframes_without_ffmpeg_hard_errors() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"not a real mov").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        // Stock macOS bin dirs only — ffmpeg is never preinstalled there, and
+        // the maj binary itself runs by absolute path so it doesn't need
+        // PATH to launch.
+        .env("PATH", "/usr/bin:/bin")
+        .args(["index", "run", "--kinds", "keyframes"])
+        .assert()
+        .failure()
+        .stderr(contains("install ffmpeg"));
+}
+
+/// Builds the same 9s, 320x180 three-segment (red/green/blue) clip
+/// `video_e2e.rs` uses, at `path`.
+#[cfg(test)]
+fn generate_three_segment_clip(path: &std::path::Path) {
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=320x180:d=3:r=25,format=yuv420p",
+        ])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=320x180:d=3:r=25,format=yuv420p",
+        ])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:d=3:r=25,format=yuv420p",
+        ])
+        .args(["-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]"])
+        .args(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+        .arg(path)
+        .status()
+        .expect("running ffmpeg to generate the test clip");
+    assert!(status.success(), "ffmpeg clip generation failed");
+}
+
+/// Full pipeline through the real CLI, with a real fetched model and real
+/// ffmpeg: scan a three-segment color clip, `index run` it (video
+/// thumbnail + scene-detected keyframes + embeddings), then confirm
+/// semantic search resolves each segment's color to a keyframe timestamp
+/// inside that segment — the plumbing `video::detect_scenes` ->
+/// `Encoder::embed_image` -> the Lance store -> `search.rs`'s `@MmSSs`
+/// rendering, end to end.
+///
+///     MAJ_MODEL_DIR=<model cache dir> \
+///         cargo test -p majestical-cli --test index_smoke -- --ignored keyframe_search
+#[test]
+#[ignore = "needs a fetched model and ffmpeg on PATH"]
+fn keyframe_search_resolves_the_correct_segment_and_timestamp() {
+    assert!(
+        majestical_index::video::ffmpeg_available(),
+        "ffmpeg/ffprobe must be on PATH for this test"
+    );
+    let model_dir = majestical_index::model::model_dir().expect("resolve model dir");
+    assert!(
+        majestical_index::model::model_present(&model_dir),
+        "model not present at {}; run `maj model fetch`",
+        model_dir.display()
+    );
+
+    let media = tempfile::tempdir().unwrap();
+    generate_three_segment_clip(&media.path().join("clip.mp4"));
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "1 videos, 3 frames embedded, 0 frame failures, 0 videos failed",
+        ));
+
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("keyframes: 1 done"));
+
+    // The red segment spans 0-3s; its detected keyframe midpoint is 1.5s.
+    maj(&root, &state)
+        .args(["search", "solid red"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mp4"))
+        .stdout(contains("@0m01s"));
+
+    // The blue segment spans 6-9s; its detected keyframe midpoint is 7.5s.
+    maj(&root, &state)
+        .args(["search", "solid blue color"])
+        .assert()
+        .success()
+        .stdout(contains("clip.mp4"))
+        .stdout(contains("@0m07s"));
+}

@@ -358,4 +358,133 @@ mod tests {
             "both thumbs must precede the embedding, which must precede the keyframes"
         );
     }
+
+    /// The `MediaKind::Video` check in `plan_thumb`'s ffmpeg gate must gate
+    /// the video asset, not merely produce the right *counts*: a prior
+    /// version of this test only checked `plan.thumbs.pending`/
+    /// `needs_ffmpeg` counts, which stay `1`/`1` even if the gate is
+    /// inverted (`kind != Video`) — the image and video assets simply trade
+    /// places in the two buckets. Asserting which asset lands in `items`
+    /// (identity, not count) is what actually pins the gate to the video
+    /// kind.
+    #[test]
+    fn plan_thumb_ffmpeg_gate_applies_only_to_the_video_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = Capabilities {
+            model_tag: None,
+            ffmpeg: false,
+        };
+        let sources = vec![
+            AssetSource {
+                asset: "xxh3:img1".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/img1.png".into()),
+            },
+            AssetSource {
+                asset: "xxh3:vid1".into(),
+                kind: MediaKind::Video,
+                abs_path: Some("/tmp/vid1.mov".into()),
+            },
+        ];
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.asset == "xxh3:img1" && matches!(i.kind, WorkKind::Thumb)),
+            "an image thumb must be queued even with no ffmpeg installed"
+        );
+        assert!(
+            !plan
+                .items
+                .iter()
+                .any(|i| i.asset == "xxh3:vid1" && matches!(i.kind, WorkKind::Thumb)),
+            "a video thumb must not be queued without ffmpeg"
+        );
+    }
+
+    #[test]
+    fn plan_image_embed_counts_done_and_offline_assets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = Capabilities {
+            model_tag: Some("m1".into()),
+            ffmpeg: false,
+        };
+        let done_blob = store.path_for("aa11", &Derivation::ImageEmbedding { model_tag: "m1" });
+        store
+            .write_atomic(&done_blob, b"x")
+            .expect("seed embedding blob");
+        let sources = vec![
+            AssetSource {
+                asset: "xxh3:aa11".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/a.png".into()),
+            },
+            AssetSource {
+                asset: "xxh3:bb22".into(),
+                kind: MediaKind::Image,
+                abs_path: None,
+            },
+        ];
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(
+            plan.embeddings.done, 1,
+            "aa11 already has an embedding blob"
+        );
+        assert_eq!(plan.embeddings.offline, 1, "bb22 has no readable path");
+        assert!(
+            !plan
+                .items
+                .iter()
+                .any(|i| matches!(i.kind, WorkKind::ImageEmbed)),
+            "no embed item should be queued: {:?}",
+            plan.items
+        );
+    }
+
+    #[test]
+    fn plan_keyframes_counts_done_offline_and_needs_ffmpeg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = Capabilities {
+            model_tag: Some("m1".into()),
+            ffmpeg: false,
+        };
+        let done_blob = store.path_for("aa11", &Derivation::KeyframeManifest { model_tag: "m1" });
+        store
+            .write_atomic(&done_blob, b"[]")
+            .expect("seed manifest blob");
+        let sources = vec![
+            AssetSource {
+                asset: "xxh3:aa11".into(),
+                kind: MediaKind::Video,
+                abs_path: Some("/tmp/a.mov".into()),
+            },
+            AssetSource {
+                asset: "xxh3:bb22".into(),
+                kind: MediaKind::Video,
+                abs_path: None,
+            },
+            AssetSource {
+                asset: "xxh3:cc33".into(),
+                kind: MediaKind::Video,
+                abs_path: Some("/tmp/c.mov".into()),
+            },
+        ];
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(
+            plan.keyframes.done, 1,
+            "aa11 already has a keyframe manifest"
+        );
+        assert_eq!(plan.keyframes.offline, 1, "bb22 has no readable path");
+        assert_eq!(
+            plan.keyframes.needs_ffmpeg, 1,
+            "cc33 has no manifest and no ffmpeg"
+        );
+        assert_eq!(plan.items.len(), 0, "no asset should be queued");
+    }
 }

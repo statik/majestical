@@ -23,8 +23,6 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]

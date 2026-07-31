@@ -102,6 +102,40 @@ mod tests {
     }
 
     #[test]
+    fn duration_boundary_45000_merges_45001_splits() {
+        let at_cap = vec![segment(0, 20_000, 10), segment(20_000, 45_000, 10)];
+        assert_eq!(
+            chunk_segments(&at_cap).len(),
+            1,
+            "merged window exactly at MAX_CHUNK_MS (45_000) must merge"
+        );
+
+        let over_cap = vec![segment(0, 20_000, 10), segment(20_000, 45_001, 10)];
+        assert_eq!(
+            chunk_segments(&over_cap).len(),
+            2,
+            "merged window one ms over MAX_CHUNK_MS (45_001) must split"
+        );
+    }
+
+    #[test]
+    fn word_boundary_120_merges_121_splits() {
+        let at_cap = vec![segment(0, 1_000, 60), segment(1_000, 2_000, 60)];
+        assert_eq!(
+            chunk_segments(&at_cap).len(),
+            1,
+            "merged word count exactly at MAX_CHUNK_WORDS (120) must merge"
+        );
+
+        let over_cap = vec![segment(0, 1_000, 60), segment(1_000, 2_000, 61)];
+        assert_eq!(
+            chunk_segments(&over_cap).len(),
+            2,
+            "merged word count one over MAX_CHUNK_WORDS (121) must split"
+        );
+    }
+
+    #[test]
     fn one_oversized_segment_is_still_one_chunk() {
         // A single segment over both caps must never be split.
         let segments = vec![segment(0, 90_000, 300)];

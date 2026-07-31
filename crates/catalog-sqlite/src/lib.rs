@@ -2,8 +2,10 @@
 //! recreates it wholesale from a `Projection`; `open_synced` instead applies
 //! only the log events past a stored cursor, falling back to a full rebuild
 //! when there's no usable snapshot to resume from. Includes an FTS5 name
-//! index (`names_fts`); the vector index for semantic search lives outside
-//! this crate per the phase 4 design.
+//! index (`names_fts`) and an FTS5 text index (`text_fts`, populated from
+//! blobs by `maj index run` rather than from events — see `apply_touched`);
+//! the vector index for semantic search lives outside this crate per the
+//! phase 4 design.
 use majestical_core::event::AssetId;
 use majestical_core::ports::{AssetSummary, CatalogStore, Filter, PortError};
 use majestical_core::projection::Projection;
@@ -53,7 +55,9 @@ pub enum CatalogError {
 /// Bumped to 4: `Projection` gained the `saved_searches` field.
 ///
 /// Bumped to 5: `create_tables` gained the `saved_searches` table.
-pub(crate) const SNAPSHOT_VERSION: i64 = 5;
+///
+/// Bumped to 6: `create_tables` gained the `text_fts` table.
+pub(crate) const SNAPSHOT_VERSION: i64 = 6;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.

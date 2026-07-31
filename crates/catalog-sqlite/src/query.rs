@@ -1,17 +1,50 @@
-//! Read-side queries: name search, filter-driven asset lookup, presentation
-//! summaries, and the small volume/PARA listing queries.
+//! Read-side queries: name search, indexed-text search, filter-driven asset
+//! lookup, presentation summaries, and the small volume/PARA listing
+//! queries. `upsert_text_rows` is the one write here — it lives alongside
+//! `search_text_ranked`/`text_assets` since all three share the `text_fts`
+//! table, rather than in `apply.rs`, which owns writes driven by CRDT
+//! events; `text_fts` is driven by blobs instead (see its doc comment).
 use crate::{CatalogError, SqliteCatalog};
 use majestical_core::event::AssetId;
 use majestical_core::ports::{AssetSummary, Filter};
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, params_from_iter};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
+
+/// One `search_text_ranked` hit: the asset, its bm25 rank (same convention as
+/// `search_names_ranked` — negative, more-negative is better), which text
+/// source matched, that row's locator, and a highlighted snippet of the
+/// matching text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextHit {
+    pub asset: AssetId,
+    pub score: f64,
+    pub source: String,
+    /// ms timestamp for transcript/OCR rows, 1-based page number for PDF
+    /// rows, -1 when no locator applies (captions, still-image OCR).
+    pub locator: i64,
+    pub snippet: String,
+}
 
 impl SqliteCatalog {
-    /// Assets whose basename matches any of `terms` by word-prefix, ranked
-    /// best-first (FTS5's `rank`), capped at `limit` rows — one row per
-    /// asset, at its best-matching basename's rank, even when several of its
-    /// instances have basenames that all match. Unicode-aware and
+    /// Builds an FTS5 MATCH expression: each term quoted (embedded quotes
+    /// doubled) with a prefix star, AND-joined so every term must match —
+    /// "beach", "sunset" -> "beach"* AND "sunset"* — FTS5 string syntax,
+    /// immune to operator injection. Shared by `search_names_ranked` and
+    /// `search_text_ranked`.
+    fn fts_match_expr(terms: &[String]) -> String {
+        terms
+            .iter()
+            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    /// Assets whose basename matches every one of `terms` by word-prefix,
+    /// ranked best-first (FTS5's `rank`), capped at `limit` rows — one row
+    /// per asset, at its best-matching basename's rank, even when several of
+    /// its instances have basenames that all match. Unicode-aware and
     /// case-insensitive via the `unicode61 remove_diacritics 2` tokenizer.
     ///
     /// # Errors
@@ -24,14 +57,7 @@ impl SqliteCatalog {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        // Each term quoted (embedded quotes doubled) with a prefix star,
-        // OR-joined: beach -> "beach"* — FTS5 string syntax, immune to
-        // operator injection.
-        let match_expr = terms
-            .iter()
-            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let match_expr = Self::fts_match_expr(terms);
         // GROUP BY asset + min(rank): an asset with several matching
         // basenames (e.g. beach.mov and beach_copy.mov) otherwise comes back
         // as one row per matching basename. bm25 ranks are negative with
@@ -47,6 +73,121 @@ impl SqliteCatalog {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Replaces every `text_fts` row for `(asset, source)` with `rows`
+    /// (locator, content pairs). Rows come from blobs (transcripts,
+    /// captions, OCR, PDF text) during `maj index run`, never from CRDT
+    /// events — see `apply_touched`'s `Touched::Asset` arm, which
+    /// deliberately leaves `text_fts` alone.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying transaction fails.
+    pub fn upsert_text_rows(
+        &mut self,
+        asset: &AssetId,
+        source: &str,
+        rows: &[(i64, &str)],
+    ) -> Result<(), CatalogError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM text_fts WHERE asset = ?1 AND source = ?2",
+            (&asset.0, source),
+        )?;
+        for (locator, content) in rows {
+            tx.execute(
+                "INSERT INTO text_fts (content, asset, source, locator) VALUES (?1, ?2, ?3, ?4)",
+                (content, &asset.0, source, locator),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Assets whose indexed text (transcript/caption/OCR/PDF) matches every
+    /// one of `terms` by word-prefix, ranked best-first, capped at `limit`
+    /// rows — one row per asset, at its best-matching row's rank, optionally
+    /// restricted to `sources`. Each hit carries the matching row's source,
+    /// locator, and a highlighted snippet of its text. `Some(sources)` with
+    /// an empty set restricts to no sources, i.e. always returns nothing —
+    /// pass `None` to search every source instead.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn search_text_ranked(
+        &self,
+        terms: &[String],
+        sources: Option<&BTreeSet<String>>,
+        limit: usize,
+    ) -> Result<Vec<TextHit>, CatalogError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_expr = Self::fts_match_expr(terms);
+        let mut sql = String::from(
+            "SELECT asset, rank, source, locator, \
+             snippet(text_fts, 0, '', '', '…', 12) \
+             FROM text_fts WHERE text_fts MATCH ?",
+        );
+        let mut params: Vec<Value> = vec![Value::Text(match_expr)];
+        if let Some(sources) = sources {
+            let placeholders: Vec<&str> = sources
+                .iter()
+                .map(|s| {
+                    params.push(Value::Text(s.clone()));
+                    "?"
+                })
+                .collect();
+            let _ = write!(sql, " AND source IN ({})", placeholders.join(", "));
+        }
+        // No GROUP BY: FTS5 forbids auxiliary functions like snippet() in an
+        // aggregate query ("unable to use function snippet in the requested
+        // context"), so the search_names_ranked min(rank)-grouping trick
+        // can't extend here. Instead, fetch every matching row ordered
+        // best-rank-first (unlike names_fts, an asset can have many matching
+        // text rows) and keep the first — i.e. best — row per asset below;
+        // each kept row is an actual queried row, so its snippet/source/
+        // locator are trivially self-consistent, no bare-column rule needed.
+        sql.push_str(" ORDER BY rank");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |r| {
+            Ok(TextHit {
+                asset: AssetId(r.get(0)?),
+                score: r.get(1)?,
+                source: r.get(2)?,
+                locator: r.get(3)?,
+                snippet: r.get(4)?,
+            })
+        })?;
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for row in rows {
+            if out.len() >= limit {
+                break;
+            }
+            let hit = row?;
+            if seen.insert(hit.asset.clone()) {
+                out.push(hit);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every asset with at least one `text_fts` row for `source`.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub fn text_assets(&self, source: &str) -> Result<BTreeSet<AssetId>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT asset FROM text_fts WHERE source = ?1")?;
+        let rows = stmt.query_map([source], |r| r.get::<_, String>(0))?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(AssetId(row?));
         }
         Ok(out)
     }
@@ -377,6 +518,43 @@ mod tests {
             .expect("prefix search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, a);
+    }
+
+    /// Pins AND semantics (and prefix matching) at the `search_names_ranked`
+    /// surface, not just `search_text_ranked` — `fts_match_expr` is shared by
+    /// both, so a future un-sharing of the helper can't silently revert name
+    /// search back to OR without a test noticing here.
+    #[test]
+    fn multi_term_name_search_requires_every_term_and_supports_prefixes() {
+        let a = AssetId("xxh3:a".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "clips/quarterly budget review.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            }],
+        );
+        let hits = db
+            .search_names_ranked(&["quart".to_string(), "budg".to_string()], 10)
+            .expect("search both prefixes");
+        assert_eq!(
+            hits.len(),
+            1,
+            "both prefixes match the name, so it must be returned"
+        );
+        assert_eq!(hits[0].0, a);
+
+        let none = db
+            .search_names_ranked(&["quarterly".to_string(), "missing".to_string()], 10)
+            .expect("search one missing term");
+        assert!(
+            none.is_empty(),
+            "AND semantics: a term absent from the name must exclude it, got {none:?}"
+        );
     }
 
     /// An asset with two instances whose basenames both match the search
@@ -746,6 +924,144 @@ mod tests {
             summaries[0].volumes,
             vec![("ghost".to_string(), "ghost".to_string())],
             "label must fall back to the volume id when there's no VolumeSeen row"
+        );
+    }
+
+    #[test]
+    fn text_rows_upsert_and_search_ranked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let aa = AssetId("xxh3:aa11".into());
+        let bb = AssetId("xxh3:bb22".into());
+        db.upsert_text_rows(
+            &aa,
+            "transcript",
+            &[
+                (0, "we discussed the quarterly budget"),
+                (45_000, "then we talked about cats"),
+            ],
+        )
+        .expect("upsert");
+        db.upsert_text_rows(&bb, "caption", &[(-1, "a red barn at dusk")])
+            .expect("upsert");
+
+        let hits = db
+            .search_text_ranked(&["budget".to_string()], None, 10)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].asset.0, "xxh3:aa11");
+        assert_eq!(hits[0].source, "transcript");
+        assert_eq!(hits[0].locator, 0);
+        assert!(hits[0].snippet.contains("budget"));
+    }
+
+    #[test]
+    fn text_search_filters_by_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let aa = AssetId("xxh3:aa".into());
+        let bb = AssetId("xxh3:bb".into());
+        db.upsert_text_rows(&aa, "transcript", &[(0, "a red barn at dusk")])
+            .expect("upsert transcript");
+        db.upsert_text_rows(&bb, "caption", &[(-1, "a red barn at dusk")])
+            .expect("upsert caption");
+
+        let sources = BTreeSet::from(["caption".to_string()]);
+        let hits = db
+            .search_text_ranked(&["barn".to_string()], Some(&sources), 10)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "expected only the caption row, got {hits:?}");
+        assert_eq!(hits[0].asset, bb);
+        assert_eq!(hits[0].source, "caption");
+    }
+
+    #[test]
+    fn upsert_replaces_rows_for_same_asset_and_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let a = AssetId("xxh3:a".into());
+        db.upsert_text_rows(&a, "transcript", &[(0, "old words")])
+            .expect("first upsert");
+        db.upsert_text_rows(&a, "transcript", &[(0, "new words")])
+            .expect("second upsert");
+
+        assert!(
+            db.search_text_ranked(&["old".to_string()], None, 10)
+                .expect("search old")
+                .is_empty(),
+            "old content must be gone after the second upsert replaces it"
+        );
+        let hits = db
+            .search_text_ranked(&["new".to_string()], None, 10)
+            .expect("search new");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].asset, a);
+    }
+
+    #[test]
+    fn upsert_does_not_touch_other_sources_of_same_asset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let a = AssetId("xxh3:a".into());
+        db.upsert_text_rows(&a, "transcript", &[(0, "quarterly budget")])
+            .expect("transcript upsert");
+        db.upsert_text_rows(&a, "caption", &[(-1, "a red barn")])
+            .expect("caption upsert");
+
+        // Re-upserting transcript rows for the same asset must not disturb
+        // the caption rows already indexed for it.
+        db.upsert_text_rows(&a, "transcript", &[(0, "annual report")])
+            .expect("transcript re-upsert");
+
+        let hits = db
+            .search_text_ranked(&["barn".to_string()], None, 10)
+            .expect("search caption still there");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "caption");
+    }
+
+    #[test]
+    fn text_assets_reports_per_source_coverage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let a = AssetId("xxh3:a".into());
+        db.upsert_text_rows(&a, "transcript", &[(0, "hello world")])
+            .expect("upsert");
+
+        assert_eq!(
+            db.text_assets("transcript").expect("transcript coverage"),
+            BTreeSet::from([a])
+        );
+        assert!(
+            db.text_assets("ocr").expect("ocr coverage").is_empty(),
+            "no rows were ever indexed under source ocr"
+        );
+    }
+
+    #[test]
+    fn text_search_multi_term_and_prefix_semantics_match_names_fts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = rebuild_from_ops(&dir.path().join("catalog.db"), vec![]);
+        let a = AssetId("xxh3:a".into());
+        db.upsert_text_rows(&a, "transcript", &[(0, "quarterly budget review")])
+            .expect("upsert");
+
+        let hits = db
+            .search_text_ranked(&["quart".to_string(), "budg".to_string()], None, 10)
+            .expect("search both prefixes");
+        assert_eq!(
+            hits.len(),
+            1,
+            "both prefixes match the row, so it must be returned"
+        );
+        assert_eq!(hits[0].asset, a);
+
+        let none = db
+            .search_text_ranked(&["quarterly".to_string(), "missing".to_string()], None, 10)
+            .expect("search one missing term");
+        assert!(
+            none.is_empty(),
+            "AND semantics: a term absent from the row must exclude it, got {none:?}"
         );
     }
 }

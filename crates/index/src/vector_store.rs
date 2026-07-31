@@ -425,9 +425,331 @@ fn batches_to_keys(batches: &[RecordBatch]) -> Result<BTreeSet<(String, String, 
     Ok(keys)
 }
 
+/// Embedding dimension for text-chunk embeddings, pinned to the `MiniLM`
+/// encoder's sentence-embedding output. Distinct from [`DIM`] (768, image
+/// embeddings) — the two tables never mix vectors of different width.
+pub const TEXT_DIM: usize = 384;
+
+// TEXT_DIM (384) is a small, fixed compile-time constant — casting it to
+// `i32` for Arrow's `FixedSizeList` width can neither truncate nor wrap.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "TEXT_DIM (384) fits i32"
+)]
+const TEXT_DIM_I32: i32 = TEXT_DIM as i32;
+
+const TEXT_TABLE_NAME: &str = "text_chunks";
+
+/// One text-chunk embedding to add to the [`TextVectorStore`].
+pub struct TextChunkRow {
+    pub asset_hex: String,
+    pub source: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub model_tag: String,
+    pub text: String,
+    pub vector: Vec<f32>,
+}
+
+/// One nearest-neighbor result from [`TextVectorStore::search`].
+pub struct TextChunkHit {
+    pub asset_hex: String,
+    pub source: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub distance: f32,
+}
+
+/// Sync wrapper around a local `LanceDB` `text_chunks` table — a second,
+/// 384-d table living alongside [`VectorStore`]'s 768-d `vectors` table in
+/// the same Lance dataset directory (different table names, so both
+/// coexist). Stores chunk text alongside the vector for snippet display,
+/// unlike `VectorStore`, which stores no display text at all.
+pub struct TextVectorStore {
+    rt: tokio::runtime::Runtime,
+    table: Table,
+}
+
+impl TextVectorStore {
+    /// Opens the Lance dataset at `dir`, creating an empty `text_chunks`
+    /// table if none exists yet. Write paths (indexing transcript/caption
+    /// chunks) use this; read-only callers should use
+    /// [`open_existing`](Self::open_existing) instead, which never
+    /// materializes state.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if the tokio runtime cannot
+    /// start, the connection fails, or the table cannot be opened or
+    /// created.
+    pub fn open(dir: &Path) -> Result<Self, IndexError> {
+        let rt = new_runtime()?;
+        let uri = dir.to_string_lossy().into_owned();
+        let table = rt.block_on(async {
+            let db = connect_local(&uri).await?;
+            match db.open_table(TEXT_TABLE_NAME).execute().await {
+                Ok(table) => Ok(table),
+                Err(lancedb::Error::TableNotFound { .. }) => db
+                    .create_empty_table(TEXT_TABLE_NAME, text_schema())
+                    .execute()
+                    .await
+                    .map_err(|e| IndexError::VectorStore(format!("create table: {e}"))),
+                Err(e) => Err(IndexError::VectorStore(format!(
+                    "open table {TEXT_TABLE_NAME}: {e}"
+                ))),
+            }
+        })?;
+        Ok(Self { rt, table })
+    }
+
+    /// Opens the Lance dataset at `dir` only if one already exists there —
+    /// unlike [`open`](Self::open), never creates it. Returns `Ok(None)`
+    /// when `dir` doesn't exist yet, or exists but holds no `text_chunks`
+    /// table.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if the tokio runtime cannot
+    /// start, the connection fails, or opening an existing table fails for a
+    /// reason other than "table not found".
+    pub fn open_existing(dir: &Path) -> Result<Option<Self>, IndexError> {
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let rt = new_runtime()?;
+        let uri = dir.to_string_lossy().into_owned();
+        let table = rt.block_on(async {
+            let db = connect_local(&uri).await?;
+            match db.open_table(TEXT_TABLE_NAME).execute().await {
+                Ok(table) => Ok(Some(table)),
+                Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
+                Err(e) => Err(IndexError::VectorStore(format!(
+                    "open table {TEXT_TABLE_NAME}: {e}"
+                ))),
+            }
+        })?;
+        Ok(table.map(|table| Self { rt, table }))
+    }
+
+    /// Appends `rows` to the table. A no-op for an empty slice.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if any row's vector is not
+    /// [`TEXT_DIM`] elements long, or if the underlying write fails.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "ownership signals the batch is consumed"
+    )]
+    pub fn add(&self, rows: Vec<TextChunkRow>) -> Result<(), IndexError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in &rows {
+            if row.vector.len() != TEXT_DIM {
+                return Err(IndexError::VectorStore(format!(
+                    "row {}: vector has {} elements, expected {TEXT_DIM}",
+                    row.asset_hex,
+                    row.vector.len()
+                )));
+            }
+        }
+        let count = rows.len();
+        let batch = text_rows_to_batch(&rows)?;
+        self.rt.block_on(async {
+            self.table
+                .add(batch)
+                .execute()
+                .await
+                .map_err(|e| IndexError::VectorStore(format!("add {count} rows: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// Returns the `limit` nearest rows to `vector` within `model_tag`,
+    /// nearest first.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if `vector` is not [`TEXT_DIM`]
+    /// elements long, or if the query fails.
+    pub fn search(
+        &self,
+        vector: &[f32],
+        model_tag: &str,
+        limit: usize,
+    ) -> Result<Vec<TextChunkHit>, IndexError> {
+        if vector.len() != TEXT_DIM {
+            return Err(IndexError::VectorStore(format!(
+                "search vector has {} elements, expected {TEXT_DIM}",
+                vector.len()
+            )));
+        }
+        let query_vector = vector.to_vec();
+        let predicate = tag_predicate(model_tag);
+        // Column projection: a hit only ever needs `asset_hex`/`source`/
+        // `start_ms`/`end_ms`/`text` (plus the query's own `_distance`,
+        // which `nearest_to` attaches regardless of this projection) —
+        // without it, every search materializes the 384-float `vector`
+        // column for every hit, dead weight per row at catalog scale.
+        let select = Select::Columns(
+            ["asset_hex", "source", "start_ms", "end_ms", "text"]
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+        );
+        let batches = self.rt.block_on(async {
+            self.table
+                .query()
+                .nearest_to(query_vector)
+                .map_err(|e| IndexError::VectorStore(format!("build vector query: {e}")))?
+                .distance_type(DistanceType::Dot)
+                .only_if(predicate)
+                .select(select)
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(|e| IndexError::VectorStore(format!("execute search: {e}")))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| IndexError::VectorStore(format!("collect search results: {e}")))
+        })?;
+        text_batches_to_hits(&batches)
+    }
+
+    /// Returns the `(asset_hex, start_ms)` keys already present for
+    /// `model_tag`. This is the Lance side of the blob-versus-Lance diff
+    /// used to work out what still needs adding; a full scan is fine at
+    /// catalog scale. `source` is absent from the key: this table only ever
+    /// holds `"transcript"` chunks — captions, OCR, and PDF text land in
+    /// `SQLite`'s `text_fts` instead, so there's nothing for `source` to
+    /// disambiguate here.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if the scan fails.
+    pub fn existing_keys(&self, model_tag: &str) -> Result<BTreeSet<(String, i64)>, IndexError> {
+        let batches = self.scan(model_tag, &["asset_hex", "start_ms"])?;
+        text_batches_to_keys(&batches)
+    }
+
+    /// Returns the distinct asset hexes present for `model_tag`.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if the scan fails.
+    pub fn distinct_assets(&self, model_tag: &str) -> Result<BTreeSet<String>, IndexError> {
+        let batches = self.scan(model_tag, &["asset_hex"])?;
+        let mut assets = BTreeSet::new();
+        for batch in &batches {
+            let asset_hex = string_column(batch, "asset_hex")?;
+            for i in 0..batch.num_rows() {
+                assets.insert(asset_hex.value(i).to_string());
+            }
+        }
+        Ok(assets)
+    }
+
+    fn scan(&self, model_tag: &str, columns: &[&str]) -> Result<Vec<RecordBatch>, IndexError> {
+        let predicate = tag_predicate(model_tag);
+        let select = Select::Columns(columns.iter().map(|c| (*c).to_string()).collect());
+        self.rt.block_on(async {
+            self.table
+                .query()
+                .only_if(predicate)
+                .select(select)
+                .execute()
+                .await
+                .map_err(|e| IndexError::VectorStore(format!("scan: {e}")))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| IndexError::VectorStore(format!("collect scan results: {e}")))
+        })
+    }
+}
+
+fn text_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("asset_hex", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("start_ms", DataType::Int64, false),
+        Field::new("end_ms", DataType::Int64, false),
+        Field::new("model_tag", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                TEXT_DIM_I32,
+            ),
+            true,
+        ),
+    ]))
+}
+
+fn text_rows_to_batch(rows: &[TextChunkRow]) -> Result<RecordBatch, IndexError> {
+    let asset_hex = StringArray::from_iter_values(rows.iter().map(|r| r.asset_hex.as_str()));
+    let source = StringArray::from_iter_values(rows.iter().map(|r| r.source.as_str()));
+    let start_ms = Int64Array::from_iter_values(rows.iter().map(|r| r.start_ms));
+    let end_ms = Int64Array::from_iter_values(rows.iter().map(|r| r.end_ms));
+    let model_tag = StringArray::from_iter_values(rows.iter().map(|r| r.model_tag.as_str()));
+    let text = StringArray::from_iter_values(rows.iter().map(|r| r.text.as_str()));
+    let vector = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        rows.iter()
+            .map(|r| Some(r.vector.iter().copied().map(Some).collect::<Vec<_>>())),
+        TEXT_DIM_I32,
+    );
+    RecordBatch::try_new(
+        text_schema(),
+        vec![
+            Arc::new(asset_hex),
+            Arc::new(source),
+            Arc::new(start_ms),
+            Arc::new(end_ms),
+            Arc::new(model_tag),
+            Arc::new(text),
+            Arc::new(vector),
+        ],
+    )
+    .map_err(|e| IndexError::VectorStore(format!("build record batch: {e}")))
+}
+
+fn text_batches_to_hits(batches: &[RecordBatch]) -> Result<Vec<TextChunkHit>, IndexError> {
+    let mut hits = Vec::new();
+    for batch in batches {
+        let asset_hex = string_column(batch, "asset_hex")?;
+        let source = string_column(batch, "source")?;
+        let start_ms = i64_column(batch, "start_ms")?;
+        let end_ms = i64_column(batch, "end_ms")?;
+        let text = string_column(batch, "text")?;
+        let distance = f32_column(batch, "_distance")?;
+        for i in 0..batch.num_rows() {
+            hits.push(TextChunkHit {
+                asset_hex: asset_hex.value(i).to_string(),
+                source: source.value(i).to_string(),
+                start_ms: start_ms.value(i),
+                end_ms: end_ms.value(i),
+                text: text.value(i).to_string(),
+                distance: distance.value(i),
+            });
+        }
+    }
+    Ok(hits)
+}
+
+fn text_batches_to_keys(batches: &[RecordBatch]) -> Result<BTreeSet<(String, i64)>, IndexError> {
+    let mut keys = BTreeSet::new();
+    for batch in batches {
+        let asset_hex = string_column(batch, "asset_hex")?;
+        let start_ms = i64_column(batch, "start_ms")?;
+        for i in 0..batch.num_rows() {
+            keys.insert((asset_hex.value(i).to_string(), start_ms.value(i)));
+        }
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DIM, VectorRow, VectorStore, catch_corruption};
+    use super::{
+        DIM, TEXT_DIM, TextChunkRow, TextVectorStore, VectorRow, VectorStore, catch_corruption,
+    };
     use crate::encoder::EMBED_DIM;
     use crate::error::IndexError;
 
@@ -632,5 +954,212 @@ mod tests {
                     .expect("corrupt manifest");
             }
         }
+    }
+
+    fn text_unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; TEXT_DIM];
+        v[i] = 1.0;
+        v
+    }
+
+    #[test]
+    fn text_store_add_search_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TextVectorStore::open(dir.path()).expect("open");
+        let mut a = vec![0.0_f32; TEXT_DIM];
+        a[0] = 1.0;
+        let mut b = vec![0.0_f32; TEXT_DIM];
+        b[1] = 1.0;
+        store
+            .add(vec![
+                TextChunkRow {
+                    asset_hex: "aa11".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 45_000,
+                    model_tag: "minilm-l6-v2-v1".into(),
+                    text: "budget discussion".into(),
+                    vector: a.clone(),
+                },
+                TextChunkRow {
+                    asset_hex: "bb22".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 30_000,
+                    model_tag: "minilm-l6-v2-v1".into(),
+                    text: "cat video".into(),
+                    vector: b,
+                },
+                TextChunkRow {
+                    asset_hex: "cc33".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 10_000,
+                    model_tag: "other-model".into(),
+                    text: "unrelated model".into(),
+                    vector: a.clone(),
+                },
+            ])
+            .expect("add");
+        let hits = store.search(&a, "minilm-l6-v2-v1", 10).expect("search");
+        assert_eq!(hits[0].asset_hex, "aa11");
+        assert_eq!(hits[0].text, "budget discussion");
+        assert_eq!(hits[0].start_ms, 0);
+        assert!(
+            hits.iter().all(|h| h.asset_hex != "cc33"),
+            "model_tag filter applies"
+        );
+    }
+
+    #[test]
+    fn text_store_search_ranks_closer_vector_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TextVectorStore::open(dir.path()).expect("open");
+        store
+            .add(vec![
+                TextChunkRow {
+                    asset_hex: "aa11".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    model_tag: "m1".into(),
+                    text: "near".into(),
+                    vector: text_unit(0),
+                },
+                TextChunkRow {
+                    asset_hex: "bb22".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    model_tag: "m1".into(),
+                    text: "far".into(),
+                    vector: text_unit(1),
+                },
+            ])
+            .expect("add");
+
+        let hits = store.search(&text_unit(0), "m1", 10).expect("search");
+        assert_eq!(hits[0].asset_hex, "aa11", "nearest by dot product");
+        assert_eq!(hits[1].asset_hex, "bb22");
+    }
+
+    #[test]
+    fn text_store_rejects_wrong_dim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TextVectorStore::open(dir.path()).expect("open");
+        let row = TextChunkRow {
+            asset_hex: "aa".into(),
+            source: "transcript".into(),
+            start_ms: 0,
+            end_ms: 1,
+            model_tag: "m".into(),
+            text: "t".into(),
+            vector: vec![0.0; 3],
+        };
+        assert!(store.add(vec![row]).is_err());
+    }
+
+    #[test]
+    fn text_store_existing_keys_and_distinct_assets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TextVectorStore::open(dir.path()).expect("open");
+        store
+            .add(vec![TextChunkRow {
+                asset_hex: "aa11".into(),
+                source: "transcript".into(),
+                start_ms: 5,
+                end_ms: 6,
+                model_tag: "m1".into(),
+                text: "t".into(),
+                vector: vec![0.0; TEXT_DIM],
+            }])
+            .expect("add");
+        let keys = store.existing_keys("m1").expect("keys");
+        assert!(keys.contains(&("aa11".to_string(), 5)));
+        assert!(store.existing_keys("other").expect("keys").is_empty());
+        assert_eq!(store.distinct_assets("m1").expect("assets").len(), 1);
+    }
+
+    #[test]
+    fn text_store_coexists_with_image_store_in_same_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image_store = VectorStore::open(dir.path()).expect("image open");
+        let text_store = TextVectorStore::open(dir.path()).expect("text open");
+        drop(image_store);
+        drop(text_store);
+        let reopened = TextVectorStore::open_existing(dir.path()).expect("reopen");
+        assert!(reopened.is_some());
+    }
+
+    #[test]
+    fn text_store_open_existing_returns_none_on_truly_empty_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            TextVectorStore::open_existing(dir.path())
+                .expect("open_existing on an empty dir")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn text_store_open_existing_returns_none_when_only_image_table_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        VectorStore::open(dir.path())
+            .expect("image open")
+            .add(vec![VectorRow {
+                asset_hex: "aa11".into(),
+                kind: "image".into(),
+                ts_ms: -1,
+                model_tag: "m1".into(),
+                vector: unit(0),
+            }])
+            .expect("image add");
+
+        assert!(
+            TextVectorStore::open_existing(dir.path())
+                .expect("open_existing")
+                .is_none(),
+            "a dir holding only the image vectors table has no text_chunks table"
+        );
+    }
+
+    #[test]
+    fn text_store_reopen_persists_and_empty_add_is_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let store = TextVectorStore::open(dir.path()).expect("open");
+            store
+                .add(vec![TextChunkRow {
+                    asset_hex: "aa11".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    model_tag: "m1".into(),
+                    text: "t".into(),
+                    vector: text_unit(0),
+                }])
+                .expect("add");
+
+            // Lance versions every write that reaches the table, even an
+            // empty one (see `Table::version`'s doc comment: "Every
+            // operation that modifies the table increases version") — so a
+            // real short-circuit and a deleted one are both silently
+            // `Ok(())` by row count alone. Pinning the version number too
+            // is what actually catches a mutant that deletes the
+            // `is_empty` guard.
+            let version_before = store.rt.block_on(store.table.version()).expect("version");
+            store.add(vec![]).expect("empty add is a noop");
+            let version_after = store.rt.block_on(store.table.version()).expect("version");
+            assert_eq!(
+                version_before, version_after,
+                "an empty add must short-circuit before ever reaching the table, \
+                 not commit a spurious empty write"
+            );
+        }
+
+        let store = TextVectorStore::open(dir.path()).expect("reopen");
+        let keys = store.existing_keys("m1").expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&("aa11".to_string(), 0)));
     }
 }

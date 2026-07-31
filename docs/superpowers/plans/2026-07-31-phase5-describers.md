@@ -1604,10 +1604,18 @@ ci.yml: add a `text-encoder-conformance` job copied from the `encoder-conformanc
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: ~/.cache/huggingface
-          key: hf-reference-${{ hashFiles('justfile') }}
+          key: hf-reference-st-${{ hashFiles('justfile') }}
       - run: brew install just
       - run: just text-encoder-conformance
 ```
+
+Give this job its own `hf-reference-st-` prefix, distinct from `encoder-conformance`'s
+`hf-reference-`: both jobs write to `~/.cache/huggingface` but populate different
+contents (different oracle downloads), GH Actions caches are immutable per key, and
+the two jobs run in parallel — an identical key means whichever job's post-job save
+runs second always fails (key already exists) and that job re-downloads its oracle on
+every run. Each job keeps its own key, both still keyed on `hashFiles('justfile')` so
+either job's cache invalidates when its pinned revision in the justfile changes.
 
 Run `actionlint .github/workflows/` and `uvx zizmor .github/workflows/` locally before committing.
 

@@ -41,6 +41,15 @@ fn rust_encoder_matches_sentence_transformers_reference() {
             .expect("parse golden");
     let fixtures = golden["fixtures"].as_array().expect("fixtures");
     let vectors = golden["vectors"].as_array().expect("vectors");
+    assert!(
+        !fixtures.is_empty(),
+        "golden json has no fixtures — the gate would vacuously pass"
+    );
+    assert_eq!(
+        fixtures.len(),
+        vectors.len(),
+        "fixtures and vectors must be the same length, or the zip below silently drops entries"
+    );
     let dir = model::model_dir_for(&MINILM).expect("model dir");
     let mut encoder = TextEncoder::load(&dir).expect("load");
     for (fixture, reference) in fixtures.iter().zip(vectors) {

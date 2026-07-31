@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["sentence-transformers==5.6.1"]
+# dependencies = ["sentence-transformers==5.6.1", "torch==2.13.0"]
 # ///
 """Golden embeddings from the pinned sentence-transformers reference.
 
@@ -8,12 +8,16 @@ Usage: uv run conformance/text-encoder/golden.py --revision <sha> --out golden.j
 
 sentence-transformers is the pinned oracle for all-MiniLM-L6-v2 (mean-pooled,
 L2-normalized 384-d embeddings) — the exact behavior our Rust `TextEncoder`
-must match.
+must match. torch is pinned too (not left to float) so a fresh CI runner
+resolving it for the first time can't silently drift the oracle; both
+versions are recorded in the output metadata as a cross-check.
 """
 
 import argparse
 import json
 
+import sentence_transformers
+import torch
 from sentence_transformers import SentenceTransformer
 
 FIXTURES = [
@@ -31,13 +35,22 @@ def main() -> None:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    model = SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2", revision=args.revision
-    )
+    model_id = "sentence-transformers/all-MiniLM-L6-v2"
+    model = SentenceTransformer(model_id, revision=args.revision)
     print(f"model.max_seq_length = {model.max_seq_length}")
     vectors = model.encode(FIXTURES, normalize_embeddings=True).tolist()
+    out = {
+        "meta": {
+            "model": model_id,
+            "revision": args.revision,
+            "sentence_transformers": sentence_transformers.__version__,
+            "torch": torch.__version__,
+        },
+        "fixtures": FIXTURES,
+        "vectors": vectors,
+    }
     with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump({"fixtures": FIXTURES, "vectors": vectors}, handle)
+        json.dump(out, handle)
     print(f"golden embeddings -> {args.out}")
 
 

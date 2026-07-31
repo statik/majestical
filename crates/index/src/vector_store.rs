@@ -987,12 +987,25 @@ mod tests {
                     text: "cat video".into(),
                     vector: b,
                 },
+                TextChunkRow {
+                    asset_hex: "cc33".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 10_000,
+                    model_tag: "other-model".into(),
+                    text: "unrelated model".into(),
+                    vector: a.clone(),
+                },
             ])
             .expect("add");
         let hits = store.search(&a, "minilm-l6-v2-v1", 10).expect("search");
         assert_eq!(hits[0].asset_hex, "aa11");
         assert_eq!(hits[0].text, "budget discussion");
         assert_eq!(hits[0].start_ms, 0);
+        assert!(
+            hits.iter().all(|h| h.asset_hex != "cc33"),
+            "model_tag filter applies"
+        );
     }
 
     #[test]

@@ -618,7 +618,10 @@ impl TextVectorStore {
     /// Returns the `(asset_hex, start_ms)` keys already present for
     /// `model_tag`. This is the Lance side of the blob-versus-Lance diff
     /// used to work out what still needs adding; a full scan is fine at
-    /// catalog scale.
+    /// catalog scale. `source` is absent from the key: this table only ever
+    /// holds `"transcript"` chunks — captions, OCR, and PDF text land in
+    /// `SQLite`'s `text_fts` instead, so there's nothing for `source` to
+    /// disambiguate here.
     ///
     /// # Errors
     /// Returns [`IndexError::VectorStore`] if the scan fails.
@@ -1096,5 +1099,67 @@ mod tests {
                 .expect("open_existing on an empty dir")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn text_store_open_existing_returns_none_when_only_image_table_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        VectorStore::open(dir.path())
+            .expect("image open")
+            .add(vec![VectorRow {
+                asset_hex: "aa11".into(),
+                kind: "image".into(),
+                ts_ms: -1,
+                model_tag: "m1".into(),
+                vector: unit(0),
+            }])
+            .expect("image add");
+
+        assert!(
+            TextVectorStore::open_existing(dir.path())
+                .expect("open_existing")
+                .is_none(),
+            "a dir holding only the image vectors table has no text_chunks table"
+        );
+    }
+
+    #[test]
+    fn text_store_reopen_persists_and_empty_add_is_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let store = TextVectorStore::open(dir.path()).expect("open");
+            store
+                .add(vec![TextChunkRow {
+                    asset_hex: "aa11".into(),
+                    source: "transcript".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    model_tag: "m1".into(),
+                    text: "t".into(),
+                    vector: text_unit(0),
+                }])
+                .expect("add");
+
+            // Lance versions every write that reaches the table, even an
+            // empty one (see `Table::version`'s doc comment: "Every
+            // operation that modifies the table increases version") — so a
+            // real short-circuit and a deleted one are both silently
+            // `Ok(())` by row count alone. Pinning the version number too
+            // is what actually catches a mutant that deletes the
+            // `is_empty` guard.
+            let version_before = store.rt.block_on(store.table.version()).expect("version");
+            store.add(vec![]).expect("empty add is a noop");
+            let version_after = store.rt.block_on(store.table.version()).expect("version");
+            assert_eq!(
+                version_before, version_after,
+                "an empty add must short-circuit before ever reaching the table, \
+                 not commit a spurious empty write"
+            );
+        }
+
+        let store = TextVectorStore::open(dir.path()).expect("reopen");
+        let keys = store.existing_keys("m1").expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&("aa11".to_string(), 0)));
     }
 }

@@ -10,6 +10,7 @@ pub mod preprocess;
 pub mod resize;
 pub mod text_encoder;
 pub mod thumbs;
+pub mod transcribe;
 pub mod vector_store;
 pub mod video;
 pub mod work;

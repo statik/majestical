@@ -43,6 +43,7 @@ ureq = { version = "3.3.0", features = ["json"] }
 base64 = "0.23.0"
 toml = "1.1.4"
 httpmock = "0.8.3"
+whisper-rs = { version = "0.16.0", features = ["metal"] }
 
 # WATCHLIST (2026-07-30): a `cli`/`index` dev/test build linking lancedb's
 # dependency graph (lancedb -> datafusion -> arrow, plus ort) hits macOS

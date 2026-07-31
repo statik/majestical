@@ -15,7 +15,8 @@
 //! or disconnecting volume stalls whichever `index run` pass is working it.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::IndexError;
 
@@ -244,6 +245,101 @@ fn format_timestamp(ts_ms: u64) -> String {
     format!("{whole_seconds}.{millis:03}")
 }
 
+/// Run a command with a hard timeout, killing the child on expiry.
+///
+/// std-only: polls `try_wait` at 100ms intervals. Stdout/stderr are drained
+/// on a reader thread via piped output, so a chatty child can't deadlock on
+/// a full pipe while this thread is busy waiting.
+///
+/// # Errors
+///
+/// Returns an error message if spawning fails, waiting fails, the reader
+/// thread panics, or the child is still running once `timeout` elapses (in
+/// which case it is killed rather than waited on further).
+pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    use std::io::Read as _;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| format!("spawn: {error}"))?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        (stdout, stderr)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|error| format!("wait: {error}"))? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let (stdout, stderr) = reader
+        .join()
+        .map_err(|_| "reader thread panicked".to_string())?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Timeout for audio extraction: a fixed 60s floor plus 1s per source
+/// second, so a long clip isn't starved by a floor sized for short ones.
+pub(crate) fn audio_timeout(duration_ms: u64) -> Duration {
+    Duration::from_secs(60 + duration_ms / 1000)
+}
+
+/// Extracts mono 16kHz `f32` PCM (whisper's native input format) from any
+/// av file's audio track through ffmpeg, hard-timed out by [`audio_timeout`]
+/// so a stalled/hung ffmpeg process can't block an `index run` pass
+/// indefinitely the way the other ffmpeg calls in this module can (see the
+/// module doc).
+///
+/// # Errors
+///
+/// Returns [`IndexError::Video`] if ffmpeg can't run, times out, or exits
+/// with a failure status.
+pub fn extract_audio_pcm(path: &Path, duration_ms: u64) -> Result<Vec<f32>, IndexError> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ar", "16000", "-ac", "1", "-f", "f32le", "-"]);
+
+    let output = run_with_timeout(command, audio_timeout(duration_ms))
+        .map_err(|message| video_err(path, format!("audio extract: {message}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(video_err(
+            path,
+            format!("ffmpeg audio extract failed: {stderr}"),
+        ));
+    }
+
+    let mut pcm = Vec::with_capacity(output.stdout.len() / 4);
+    for chunk in output.stdout.chunks_exact(4) {
+        pcm.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(pcm)
+}
+
 /// Adaptive scene detection over pre-decoded analysis frames.
 ///
 /// Returns keyframe timestamps (ms): one per detected scene's midpoint, or,
@@ -460,9 +556,10 @@ fn unit_fractions_to_u8(hue_frac: f32, sat_frac: f32, val_frac: f32) -> (u8, u8,
 #[cfg(test)]
 mod tests {
     use super::{
-        ANALYSIS_H, ANALYSIS_W, Frame, MAX_KEYFRAMES, VideoInfo, binary_runs, chunk_frames,
-        detect_scenes, enforce_min_scene_length, format_timestamp, frame_timestamp_ms,
-        parse_probe_json, raw_candidate_cuts, rgb_to_hsv_u8, scene_midpoints, seconds_to_ms,
+        ANALYSIS_H, ANALYSIS_W, Frame, MAX_KEYFRAMES, VideoInfo, audio_timeout, binary_runs,
+        chunk_frames, detect_scenes, enforce_min_scene_length, extract_audio_pcm, ffmpeg_available,
+        format_timestamp, frame_timestamp_ms, parse_probe_json, raw_candidate_cuts, rgb_to_hsv_u8,
+        run_with_timeout, scene_midpoints, seconds_to_ms,
     };
     use std::path::Path;
 
@@ -795,6 +892,56 @@ mod tests {
             cuts,
             vec![1500],
             "a content score exactly at MIN_CONTENT must still be treated as clearing it"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_hung_process() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+
+        let result = run_with_timeout(command, std::time::Duration::from_millis(300));
+
+        assert!(result.is_err(), "hung process must error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must not wait for sleep 30"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_output_of_fast_process() {
+        let mut command = std::process::Command::new("echo");
+        command.arg("ok");
+
+        let output = run_with_timeout(command, std::time::Duration::from_secs(5)).expect("fast");
+
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    }
+
+    #[test]
+    fn audio_timeout_scales_with_duration() {
+        assert_eq!(audio_timeout(0), std::time::Duration::from_mins(1));
+        assert_eq!(audio_timeout(3_600_000), std::time::Duration::from_mins(61));
+    }
+
+    /// Gated on ffmpeg being installed (like the other subprocess tests
+    /// here): a real ffmpeg run over a nonexistent input exits non-zero,
+    /// and the error message must name the extraction step.
+    #[test]
+    fn extract_audio_pcm_reports_ffmpeg_or_audio_extract_failure() {
+        if !ffmpeg_available() {
+            return;
+        }
+
+        let path = Path::new("/nonexistent/definitely-not-a-real-clip-9f3c2.mp4");
+        let error = extract_audio_pcm(path, 0).expect_err("nonexistent input must fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("audio extract") || message.contains("ffmpeg"),
+            "error should mention audio extraction or ffmpeg: {message}"
         );
     }
 }

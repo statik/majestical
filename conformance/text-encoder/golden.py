@@ -11,6 +11,13 @@ L2-normalized 384-d embeddings) — the exact behavior our Rust `TextEncoder`
 must match. torch is pinned too (not left to float) so a fresh CI runner
 resolving it for the first time can't silently drift the oracle; both
 versions are recorded in the output metadata as a cross-check.
+
+The oracle is pinned to CPU: SentenceTransformer otherwise auto-selects
+MPS on Apple silicon, and torch's MPS backend has a history of silently
+wrong inference (e.g. sentence-transformers#3507) — on GitHub's macOS
+runners it corrupted these very embeddings (cosine 0.738 vs the correct
+vector) while the same versions on CPU are exact. Our Rust encoder runs
+ort on CPU, so CPU is also the semantics this gate is meant to pin.
 """
 
 import argparse
@@ -36,8 +43,9 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     model_id = "sentence-transformers/all-MiniLM-L6-v2"
-    model = SentenceTransformer(model_id, revision=args.revision)
+    model = SentenceTransformer(model_id, revision=args.revision, device="cpu")
     print(f"model.max_seq_length = {model.max_seq_length}")
+    print(f"model.device = {model.device}")
     vectors = model.encode(FIXTURES, normalize_embeddings=True).tolist()
     out = {
         "meta": {
@@ -45,6 +53,7 @@ def main() -> None:
             "revision": args.revision,
             "sentence_transformers": sentence_transformers.__version__,
             "torch": torch.__version__,
+            "device": str(model.device),
         },
         "fixtures": FIXTURES,
         "vectors": vectors,

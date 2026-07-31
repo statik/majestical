@@ -17,4 +17,6 @@ pub enum IndexError {
     Model(String),
     #[error("encoder: {0}")]
     Encoder(String),
+    #[error("vector store: {0}")]
+    VectorStore(String),
 }

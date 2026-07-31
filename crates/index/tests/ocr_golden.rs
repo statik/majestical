@@ -23,6 +23,28 @@ fn recognizes_rendered_text_in_fixture() {
     assert!(joined.contains("MAJESTICAL"), "got: {joined}");
     assert!(joined.contains("42"), "got: {joined}");
     assert!(result.lines.iter().all(|l| l.confidence > 0.0));
+
+    // Loose orientation pins on the recognized line: Vision reports
+    // normalized [x, y, w, h] with a bottom-left origin, and the fixture's
+    // single centered line measures x≈0.04, w≈0.93. An x/y swap would put
+    // ≈0.44 in bbox[0]; a w/h swap would put ≈0.11 in bbox[2] — both fail
+    // here while staying robust to small drift across macOS versions.
+    let line = result
+        .lines
+        .iter()
+        .find(|l| l.text.to_uppercase().contains("MAJESTICAL"))
+        .expect("line with fixture text");
+    assert!(
+        line.bbox.iter().all(|c| (0.0..=1.0).contains(c)),
+        "bbox normalized, got: {:?}",
+        line.bbox
+    );
+    assert!(line.bbox[0] < 0.2, "left margin, got bbox: {:?}", line.bbox);
+    assert!(
+        line.bbox[2] > 0.5,
+        "width dominant, got bbox: {:?}",
+        line.bbox
+    );
 }
 
 #[test]

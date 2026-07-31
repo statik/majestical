@@ -430,4 +430,105 @@ mod tests {
         let describer = HttpDescriber::new(config, None);
         assert!(describer.probe().is_err());
     }
+
+    #[test]
+    // f64::clamp returns the bound itself (no arithmetic), so 1.0/0.0 here
+    // are exact, not the result of computation clippy::float_cmp guards against.
+    #[expect(
+        clippy::float_cmp,
+        reason = "clamp returns the exact bound, not a computed float"
+    )]
+    fn suggest_tags_clamps_confidence_to_unit_interval() {
+        let server = MockServer::start();
+        let response = serde_json::json!({
+            "tags": [
+                {"tag": "over", "confidence": 1.5},
+                {"tag": "under", "confidence": -0.2}
+            ]
+        });
+        let content = serde_json::to_string(&response).expect("serialize");
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": content}}]
+            }));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let suggestions = describer
+            .suggest_tags(TagSubject::Image(b"fake-image-bytes"), &[])
+            .expect("suggest_tags");
+
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].confidence, 1.0, "1.5 must clamp down to 1.0");
+        assert_eq!(suggestions[1].confidence, 0.0, "-0.2 must clamp up to 0.0");
+        mock.assert_calls(1);
+    }
+
+    #[test]
+    fn trailing_slash_base_url_still_hits_chat_path() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(caption_body());
+        });
+
+        let mut config = config_for(&server, BackendKind::Ollama, None);
+        config.base_url = format!("{}/", server.base_url());
+        let describer = HttpDescriber::new(config, None);
+        let caption = describer.caption(b"fake-image-bytes").expect("caption");
+
+        assert_eq!(caption.text, "a red barn at dusk");
+        mock.assert_calls(1);
+    }
+
+    #[test]
+    fn suggest_tags_malformed_error_truncates_snippet() {
+        let server = MockServer::start();
+        let tail_marker = "TAIL_MARKER_BEYOND_LIMIT";
+        let snippet_prefix = "A".repeat(MALFORMED_SNIPPET_LEN);
+        let content = format!("{snippet_prefix}{tail_marker}");
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": content}}]
+            }));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .suggest_tags(TagSubject::Image(b"fake-image-bytes"), &[])
+            .expect_err("expected malformed JSON error");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&snippet_prefix),
+            "error must contain the truncated snippet"
+        );
+        assert!(
+            !message.contains(tail_marker),
+            "error must not contain text past the snippet bound"
+        );
+        mock.assert_calls(2);
+    }
+
+    #[test]
+    fn caption_trims_whitespace() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "  a red barn at dusk  \n"}}]
+            }));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let caption = describer.caption(b"fake-image-bytes").expect("caption");
+
+        assert_eq!(caption.text, "a red barn at dusk");
+        mock.assert_calls(1);
+    }
 }

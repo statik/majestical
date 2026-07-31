@@ -18,15 +18,14 @@
       <div class="wrap hero-content">
         <p class="eyebrow">Majestical · media catalog for macOS</p>
         <h1>
-          Verified ingest.<br />
-          Offline search.<br />
-          Local&nbsp;AI.
+          Verified going in.<br />
+          Findable coming&nbsp;back.
         </h1>
         <p class="lead">
-          Majestical keeps your footage above water. It checksums every byte on
-          the way in, keeps thumbnails and metadata after the drive goes back
-          on the shelf, and finds “the sunset drone shot” without sending a
-          byte to anyone’s cloud.
+          Majestical keeps your footage above water, checksumming every byte on
+          the way in. Thumbnails and metadata stay in the catalog after the
+          drive goes back on the shelf. Search for “the sunset drone shot” and
+          the answer comes off your own disk rather than a server.
         </p>
         <div class="cta-row">
           <a class="button primary" id="download-btn" href="https://github.com/statik/majestical/releases">
@@ -49,16 +48,14 @@
           <h2 id="problem-title">Your footage is on eleven drives in a drawer.</h2>
           <p>
             Every shoot ends the same way: cards offloaded to whichever drive
-            had room, a folder name you meant to fix later, and a growing shelf
-            of disks only you can navigate — until you can’t. The tools that
-            offload carefully don’t search. The tools that search well want your
-            library uploaded, indexed on someone else’s hardware, and rented
-            back to you by the seat.
+            had room, under a folder name you meant to fix later. The shelf
+            grows until only you can navigate it. The tools that offload
+            carefully were never built to search. The ones built for search
+            want the library on their hardware, rented back to you by the seat.
           </p>
           <p>
-            Majestical is built on a different assumption: the drives stay
-            yours, the index stays on your Mac, and losing the app should never
-            mean losing the work.
+            Majestical does the opposite. The drives stay yours and the catalog
+            stays on your Mac, where losing the app never costs you the work.
           </p>
         </div>
       </section>
@@ -70,43 +67,46 @@
             <hr class="chain" aria-hidden="true" />
           </div>
           <p class="eyebrow">What it does</p>
-          <h2 id="pillars-title">Four things, done properly.</h2>
+          <h2 id="pillars-title">Four things, and none of them cost extra.</h2>
           <div class="grid">
             <article class="card">
               <h3>Proven intact</h3>
               <p>
-                Ingest verifies every byte — source read, destination read-back,
-                xxHash checksums — and writes industry-standard ASC&nbsp;MHL
-                manifests that travel with the media. Chain of custody isn’t a
-                paid tier.
+                Ingest hashes every byte with xxHash, once on the source read
+                and again on the destination read-back. It then writes
+                spec-compliant ASC&nbsp;MHL manifests that ride on the drive
+                with the media. Netflix recommends the same format for camera
+                originals.
               </p>
             </article>
             <article class="card">
               <h3>Searchable on the shelf</h3>
               <p>
-                The catalog keeps thumbnails, metadata, and checksums for every
-                volume it has ever seen. Search a drive that’s in a drawer, in
-                another city, or in a pelican case in someone’s trunk — and know
-                exactly which disk to plug in.
+                The catalog keeps thumbnails and checksums for every volume it
+                has ever seen. The metadata stays too, long after the drive is
+                unplugged. Search a drive sitting in a drawer or in a pelican
+                case two states away, and the result tells you which disk to
+                fetch.
               </p>
             </article>
             <article class="card">
               <h3>Semantic search, at home</h3>
               <p>
                 Image and keyframe embeddings run on your Mac’s neural engine.
-                Type what you remember — “red boat at golden hour” — and get
-                clips with timestamps. Point it at Ollama, LM&nbsp;Studio, or
-                OpenRouter for captions and tag suggestions; each catalog
-                chooses its own privacy line.
+                Type what you remember, something like “red boat at golden
+                hour,” and the clips come back with timestamps. Captions and tag
+                suggestions come from Ollama, LM&nbsp;Studio, or OpenRouter.
+                Each catalog draws its own privacy line, so one project can stay
+                fully local.
               </p>
             </article>
             <article class="card">
               <h3>Team sync, no server</h3>
               <p>
                 The catalog is an append-only event log that merges cleanly in
-                any order. Sync it through a NAS folder, Dropbox, or the shuttle
-                drive itself — plug in at the far end and both catalogs
-                converge. Nobody runs infrastructure.
+                any order. Sync it through a NAS folder, through Dropbox, or on
+                the shuttle drive itself. Plug in at the far end and both
+                catalogs converge, without anyone running a service.
               </p>
             </article>
           </div>
@@ -124,15 +124,14 @@
           <div class="split">
             <div>
               <p>
-                Ingest files everything into a PARA layout — Projects, Areas,
-                Resources, Archives — so the disk stays legible with or without
-                the app. Everything else is folksonomy: tag what matters, in
-                your own words, and the app suggests the vocabulary your team
-                already uses instead of enforcing one.
+                Ingest files everything into a PARA layout (Projects, Areas,
+                Resources, Archives), so the disk stays legible with or without
+                the app. Everything else is folksonomy. Tag in your own words,
+                and the app suggests the vocabulary your team already uses.
               </p>
               <p>
-                Existing drives are cataloged exactly as they are. Nothing gets
-                reorganized without you asking.
+                Existing drives are cataloged exactly as they are, with nothing
+                moved until you ask.
               </p>
             </div>
             <pre class="tree" aria-label="Example folder layout"><code>Projects/
@@ -155,12 +154,12 @@ Archives/
             <hr class="chain" aria-hidden="true" />
           </div>
           <p class="eyebrow">For people and agents</p>
-          <h2 id="agents-title">Everything the app can do, the terminal can do.</h2>
+          <h2 id="agents-title">The terminal reaches everything the app does.</h2>
           <p>
             The GUI, the <code>maj</code> CLI, and a built-in MCP server share
-            one engine. Ask Claude to find the selects, tag an ingest, or check
-            a shelf of drives — every outcome a person can reach, an agent can
-            reach, with destructive steps gated behind confirmation.
+            one engine. Ask Claude to find the selects or tag an ingest, and it
+            goes through the same core service the GUI uses. Destructive steps
+            stay gated behind a confirmation.
           </p>
           <pre class="terminal" aria-label="Example CLI session"><code><span class="prompt">$</span> maj search "tag:topic/drone" --json
 <span class="dim">{"count":3,"results":[{"asset":"xxh3:9f2a…","name":"drone_flyover_01.mov","para":null,"score":0.0,"tags":["topic/drone"],"volumes":[{"id":"uuid:2FBE…","label":"reef-cards","online":false}]},…]}</span>
@@ -179,8 +178,9 @@ uuid:2FBE…  reef-cards  2026-07-12T18:40:11Z  offline  4182</span></code></pre
           <p class="eyebrow">End of the road</p>
           <h2 id="download-title">Get Majestical.</h2>
           <p>
-            Free and open source under Apache-2.0. Built in Rust, native on
-            Apple silicon, updates itself from GitHub releases.
+            Majestical is free and open source under Apache-2.0. Written in
+            Rust, it runs natively on Apple silicon. Updates arrive through
+            GitHub releases.
           </p>
           <div class="cta-row">
             <a class="button primary" id="download-btn-2" href="https://github.com/statik/majestical/releases">

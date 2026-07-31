@@ -275,6 +275,16 @@ async fn connect_local(uri: &str) -> Result<lancedb::Connection, IndexError> {
 /// `lance::Dataset`'s manifest-loading code), which this crate has no way to
 /// prevent short of catching it at the call boundary.
 ///
+/// KNOWN GAP: callers typically pass a cheap probe scan (e.g.
+/// `existing_keys`/`distinct_assets`, column-projected to skip `vector`) as
+/// part of `f`, to force corruption discovery immediately rather than
+/// later. That probe reads every column EXCEPT `vector` — so corruption
+/// confined to the vector column's on-disk bytes specifically (data intact
+/// for `asset_hex`/`kind`/`ts_ms`) would pass the probe silently and only
+/// surface later, at an actual `search()` call. Not yet reproduced or
+/// tested against; noted here so the next investigation starts from this,
+/// not from zero.
+///
 /// # Errors
 /// Returns `Err` with a human-readable reason if `f` returns an `Err` or
 /// panics.

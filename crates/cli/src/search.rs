@@ -177,6 +177,14 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
     // ranked match is fetched (mirroring the filter-only path's own
     // fetch-everything-then-intersect rule) since a small prefetch window
     // could miss a filter-matching asset that ranks outside it.
+    //
+    // The semantic side gets `usize::MAX >> 1`, not `usize::MAX`:
+    // `lancedb` 0.33.0 casts our `usize` limit to `i64` with a raw `as`
+    // (`table/query.rs`: `query.base.limit.map(|limit| limit as i64)`), and
+    // `usize::MAX >> 1 == i64::MAX` exactly on a 64-bit target — halving it
+    // is what keeps that cast lossless instead of silently wrapping to a
+    // negative `i64` (verified against the vendored `lancedb` source, not
+    // guessed).
     let (fts_limit, semantic_limit) = if args.allowed.is_some() {
         (usize::MAX, usize::MAX >> 1)
     } else {
@@ -241,10 +249,11 @@ fn eligible_asset_count(projection: &Projection) -> u64 {
 }
 
 /// Reciprocal Rank Fusion: merges ranked `lists` into one ranking by
-/// `1/(k+rank)` summed across every list `k=60` (the standard RRF constant —
-/// large enough that rank 1 and rank 2 contribute nearly the same score, so
-/// fusion isn't dominated by whichever single list happens to rank one
-/// asset first). Ties are broken by asset id for deterministic output.
+/// `1/(k+rank)` summed across every list. `k=60` is the standard RRF
+/// constant — large enough that rank 1 and rank 2 contribute nearly the
+/// same score, so fusion isn't dominated by whichever single list happens
+/// to rank one asset first. Ties are broken by asset id for deterministic
+/// output.
 fn rrf_merge(lists: &[Vec<AssetId>], limit: usize) -> Vec<(AssetId, f64)> {
     const K: f64 = 60.0;
     let mut scores: BTreeMap<AssetId, f64> = BTreeMap::new();
@@ -306,9 +315,12 @@ impl SemanticMiss {
 /// one embedding for `MODEL_TAG`. All of this (model presence, opening,
 /// probing) resolves fully before any caller ever loads the text encoder,
 /// so a search against an empty or nonexistent index degrades without
-/// paying for a model load at all. The open and the probe scan both run
-/// under `catch_corruption`, since lance's own manifest reader can panic on
-/// a corrupt manifest rather than erroring.
+/// paying for a model load at all. The open AND the `distinct_assets` count
+/// both run inside the same `catch_corruption` closure — not open-then-
+/// probe-then-a-second-separate-scan — so a read error from counting rows
+/// is caught as `Unreadable` too, rather than being silently swallowed into
+/// `embedded == 0` (indistinguishable from a genuinely empty index) by a
+/// `.ok()`/`map_or` outside the guard.
 fn open_semantic_index(state_dir: &Path) -> Result<(PathBuf, VectorStore, u64), SemanticMiss> {
     let model_dir = majestical_index::model::model_dir()
         .ok()
@@ -320,18 +332,16 @@ fn open_semantic_index(state_dir: &Path) -> Result<(PathBuf, VectorStore, u64), 
         let Some(store) = VectorStore::open_existing(&lance_dir)? else {
             return Ok(None);
         };
-        store.existing_keys(majestical_index::model::MODEL_TAG)?;
-        Ok(Some(store))
+        let embedded = store
+            .distinct_assets(majestical_index::model::MODEL_TAG)?
+            .len();
+        Ok(Some((store, embedded)))
     });
-    let store = match opened {
-        Ok(Some(store)) => store,
+    let (store, embedded) = match opened {
+        Ok(Some(opened)) => opened,
         Ok(None) => return Err(SemanticMiss::EmptyIndex),
         Err(reason) => return Err(SemanticMiss::Unreadable(reason)),
     };
-
-    let embedded = store
-        .distinct_assets(majestical_index::model::MODEL_TAG)
-        .map_or(0, |s| s.len());
     if embedded == 0 {
         return Err(SemanticMiss::EmptyIndex);
     }
@@ -403,9 +413,19 @@ fn semantic_candidates(
         eprintln!("{}", SemanticMiss::NoModel.note());
         return (Vec::new(), HashMap::new(), None);
     };
-    let Ok(hits) = store.search(&vector, majestical_index::model::MODEL_TAG, limit) else {
-        eprintln!("{}", SemanticMiss::EmptyIndex.note());
-        return (Vec::new(), HashMap::new(), None);
+    let hits = match store.search(&vector, majestical_index::model::MODEL_TAG, limit) {
+        Ok(hits) => hits,
+        Err(err) => {
+            // A real read failure here, not "nothing indexed" — the store
+            // passed `open_semantic_index`'s probe, so this is either a
+            // transient I/O error or the known gap in that probe's
+            // coverage (see `catch_corruption`'s doc comment: it never
+            // reads the `vector` column, only `search` does). Either way
+            // it's `Unreadable`, not `EmptyIndex` — discarding `err` here
+            // would silently relabel "unreadable" as "empty".
+            eprintln!("{}", SemanticMiss::Unreadable(err.to_string()).note());
+            return (Vec::new(), HashMap::new(), None);
+        }
     };
     let (ranked, keyframe_ts) = dedupe_hits(hits);
     (ranked, keyframe_ts, Some(embedded))

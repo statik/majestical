@@ -411,7 +411,10 @@ fn load_missing_vectors_from_blobs(store: &VectorStore, blobs: &BlobStore) -> Re
 
 /// Works every `ImageEmbed` item in `items` (encoding only if the model is
 /// present), then always performs the blob↔Lance diff — see
-/// [`load_missing_vectors_from_blobs`].
+/// [`load_missing_vectors_from_blobs`]. The diff runs every pass regardless
+/// of `--kinds` — even `--kinds thumbs`, which leaves `items` with zero
+/// `ImageEmbed` entries — since `--kinds` bounds embedding *work*, not the
+/// cheap self-heal/teammate-sync safety net this diff provides.
 ///
 /// # Errors
 /// Returns an error if the vector store can't be opened, or if a batch add

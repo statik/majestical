@@ -33,6 +33,11 @@ pub enum Derivation<'a> {
     Transcript {
         model_tag: &'a str,
     },
+    /// Text embedding for one transcript chunk (see `crate::chunk`).
+    TranscriptChunk {
+        model_tag: &'a str,
+        start_ms: u64,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -49,7 +54,7 @@ pub struct BlobStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorBlobRef {
     pub asset_hex: String,
-    pub kind: String, // "image" | "keyframe"
+    pub kind: String, // "image" | "keyframe" | "chunk"
     pub ts_ms: i64,
     pub path: PathBuf,
 }
@@ -61,8 +66,12 @@ fn classify_vector_file(name: &str) -> Option<(&'static str, i64)> {
     if name == "image.f32le.zst" {
         return Some(("image", -1));
     }
-    let ms = name.strip_prefix("kf-")?.strip_suffix(".f32le.zst")?;
-    Some(("keyframe", ms.parse().ok()?))
+    if let Some(rest) = name.strip_prefix("kf-") {
+        let ms = rest.strip_suffix(".f32le.zst")?;
+        return Some(("keyframe", ms.parse().ok()?));
+    }
+    let ms = name.strip_prefix("chunk-")?.strip_suffix(".f32le.zst")?;
+    Some(("chunk", ms.parse().ok()?))
 }
 
 impl BlobStore {
@@ -90,6 +99,12 @@ impl BlobStore {
                 dir.join(model_tag).join("keyframes.json")
             }
             Derivation::Transcript { model_tag } => dir.join(model_tag).join("transcript.json.zst"),
+            Derivation::TranscriptChunk {
+                model_tag,
+                start_ms,
+            } => dir
+                .join(model_tag)
+                .join(format!("chunk-{start_ms}.f32le.zst")),
         }
     }
 
@@ -322,6 +337,43 @@ mod tests {
             },
         );
         assert!(path.ends_with("aa/aabbccdd/whisper-large-v3-turbo-q5-v1/transcript.json.zst"));
+    }
+
+    #[test]
+    fn transcript_chunk_blob_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let path = store.path_for(
+            "aabb",
+            &Derivation::TranscriptChunk {
+                model_tag: "minilm-l6-v2-v1",
+                start_ms: 45_000,
+            },
+        );
+        assert!(path.ends_with("aa/aabb/minilm-l6-v2-v1/chunk-45000.f32le.zst"));
+    }
+
+    #[test]
+    fn iter_vectors_finds_transcript_chunk_vectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let chunk_path = store.path_for(
+            "cc33cc33cc33cc33cc33cc33cc33cc33",
+            &Derivation::TranscriptChunk {
+                model_tag: "minilm-l6-v2-v1",
+                start_ms: 45_000,
+            },
+        );
+        store
+            .write_vector(&chunk_path, &[0.7, 0.8])
+            .expect("write chunk vector");
+
+        let refs = store.iter_vectors("minilm-l6-v2-v1").expect("iter_vectors");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].asset_hex, "cc33cc33cc33cc33cc33cc33cc33cc33");
+        assert_eq!(refs[0].kind, "chunk");
+        assert_eq!(refs[0].ts_ms, 45_000);
+        assert_eq!(refs[0].path, chunk_path);
     }
 
     #[test]

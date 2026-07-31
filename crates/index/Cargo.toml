@@ -27,5 +27,8 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 whisper-rs = { workspace = true }
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

@@ -4493,6 +4493,7 @@ dependencies = [
  "lancedb",
  "majestical-core",
  "ort",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

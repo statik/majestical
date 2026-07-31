@@ -97,6 +97,33 @@ jobs:
           key: hf-reference-st-${{ hashFiles('justfile') }}
       - run: brew install just
       - run: just text-encoder-conformance
+  whisper-conformance:
+    name: Whisper conformance (pinned faster-whisper reference)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable (branch tip 2026-07-29)
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      - name: Install protoc (lance build dependency)
+        run: brew install protobuf
+      - run: brew install ffmpeg  # say ships with macOS; only ffmpeg needs installing
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: .model-cache
+          key: model-whisper-large-v3-turbo-q5-v1
+      # Per-job HF cache key prefix (hf-whisper-reference-), same rationale
+      # as text-encoder-conformance's hf-reference-st-: GH Actions caches are
+      # immutable per key, and a shared prefix across parallel jobs means
+      # whichever job saves second always fails and re-downloads forever.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/huggingface
+          key: hf-whisper-reference-${{ hashFiles('justfile') }}
+      - run: brew install just
+      - run: just whisper-conformance
   actions-lint:
     name: Workflow lint and audit
     runs-on: ubuntu-latest

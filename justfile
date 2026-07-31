@@ -56,3 +56,20 @@ text-encoder-conformance:
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         MAJ_GOLDEN="{{justfile_directory()}}/target/text-encoder-golden.json" \
         cargo test -p majestical-index --test text_encoder_conformance --test text_encoder_gated -- --ignored
+
+# Whisper conformance: same synthesized speech through pinned faster-whisper
+# (reference) and our whisper-rs, compared on WER + boundary drift.
+whisper-conformance:
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        cargo run -p majestical-cli --bin maj -- \
+        --catalog . --machine-id conformance model fetch --only whisper-large-v3-turbo-q5-v1
+    mkdir -p target
+    say -o target/whisper-fixture.aiff "The quick brown fox jumps over the lazy dog. \
+        We reviewed the quarterly budget on Tuesday and shipped the release candidate."
+    ffmpeg -y -v error -i target/whisper-fixture.aiff -ar 16000 -ac 1 target/whisper-fixture.wav
+    uv run conformance/whisper/golden.py \
+        --audio target/whisper-fixture.wav --out target/whisper-golden.json
+    MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
+        MAJ_AUDIO="{{justfile_directory()}}/target/whisper-fixture.wav" \
+        MAJ_GOLDEN="{{justfile_directory()}}/target/whisper-golden.json" \
+        cargo test -p majestical-index --test whisper_conformance --test whisper_gated -- --ignored

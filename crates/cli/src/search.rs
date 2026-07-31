@@ -161,53 +161,65 @@ type TermSearchResult = (
 );
 
 /// Runs a terms-bearing search: FTS name-ranked hits fused with semantic
-/// (embedding) hits via [`rrf_merge`], both intersected against `allowed`
-/// first. Falls back to FTS-only — exactly today's ranking and truncation —
-/// when the semantic layer contributes nothing (no model installed, nothing
-/// indexed yet, or a query that simply matched nothing there).
+/// (embedding) hits via [`fuse_ranked`]. Falls back to FTS-only — exactly
+/// today's ranking and truncation — when the semantic layer contributes
+/// nothing (no model installed, nothing indexed yet, or a query that simply
+/// matched nothing there).
 ///
 /// # Errors
 /// Returns an error if the FTS query or the local state dir can't be
 /// resolved.
 fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSearchResult> {
-    let fts_search_limit = if args.allowed.is_some() {
-        usize::MAX
-    } else {
-        args.limit
-    };
-    let fts_hits: Vec<(AssetId, f64)> = db
-        .search_names_ranked(args.terms, fts_search_limit)?
-        .into_iter()
-        .filter(|(a, _)| args.allowed.is_none_or(|s| s.contains(a)))
-        .collect();
-
-    // A wider net than `limit` for each ranking source: fusing two rankings
+    // A wider net than `limit` for both ranking sources: fusing two rankings
     // needs headroom past the final cut, or an asset either source ranks
     // just outside its own top `limit` — but that would rank first once
-    // fused — never gets the chance to.
-    let semantic_limit = if args.allowed.is_some() {
-        usize::MAX >> 1
+    // fused — never gets the chance to. With a hard filter present, every
+    // ranked match is fetched (mirroring the filter-only path's own
+    // fetch-everything-then-intersect rule) since a small prefetch window
+    // could miss a filter-matching asset that ranks outside it.
+    let (fts_limit, semantic_limit) = if args.allowed.is_some() {
+        (usize::MAX, usize::MAX >> 1)
     } else {
-        args.limit.saturating_mul(4)
+        let widened = args.limit.saturating_mul(4);
+        (widened, widened)
     };
+
+    let fts_hits = db.search_names_ranked(args.terms, fts_limit)?;
+
     let state_dir = crate::state_dir::state_dir_for(args.catalog_dir)?;
     let query_text = args.terms.join(" ");
     let (semantic_ids, keyframe_ts, embedded) =
         semantic_candidates(&state_dir, &query_text, semantic_limit);
-    let semantic_ids: Vec<AssetId> = semantic_ids
-        .into_iter()
-        .filter(|a| args.allowed.is_none_or(|s| s.contains(a)))
-        .collect();
 
-    let ranked = if semantic_ids.is_empty() {
-        fts_hits.into_iter().take(args.limit).collect()
-    } else {
-        let fts_ids: Vec<AssetId> = fts_hits.into_iter().map(|(a, _)| a).collect();
-        rrf_merge(&[fts_ids, semantic_ids], args.limit)
-    };
+    let ranked = fuse_ranked(fts_hits, semantic_ids, args.allowed, args.limit);
 
     let coverage = embedded.map(|embedded| (embedded, eligible_asset_count(args.projection)));
     Ok((ranked, keyframe_ts, coverage))
+}
+
+/// Intersects both ranking sources against `allowed` — a hard filter, not a
+/// ranking hint, so a semantic hit outside the filter set must never survive
+/// fusion — then fuses them via [`rrf_merge`]. With no semantic hits this is
+/// FTS-only: the original bm25 scores and order, truncated at `limit`.
+fn fuse_ranked(
+    fts: Vec<(AssetId, f64)>,
+    semantic: Vec<AssetId>,
+    allowed: Option<&BTreeSet<AssetId>>,
+    limit: usize,
+) -> Vec<(AssetId, f64)> {
+    let fts: Vec<(AssetId, f64)> = fts
+        .into_iter()
+        .filter(|(a, _)| allowed.is_none_or(|s| s.contains(a)))
+        .collect();
+    let semantic: Vec<AssetId> = semantic
+        .into_iter()
+        .filter(|a| allowed.is_none_or(|s| s.contains(a)))
+        .collect();
+    if semantic.is_empty() {
+        return fts.into_iter().take(limit).collect();
+    }
+    let fts_ids: Vec<AssetId> = fts.into_iter().map(|(a, _)| a).collect();
+    rrf_merge(&[fts_ids, semantic], limit)
 }
 
 /// Counts catalog assets eligible for semantic embedding: any asset whose
@@ -259,32 +271,64 @@ fn rrf_merge(lists: &[Vec<AssetId>], limit: usize) -> Vec<(AssetId, f64)> {
 
 /// Why the semantic layer couldn't run this search. Each variant carries its
 /// own actionable stderr note — the fix differs (fetch the model vs. index
-/// the catalog), so a single generic "unavailable" message would send half
-/// of readers to the wrong command.
+/// the catalog vs. rebuild a corrupt index), so a single generic
+/// "unavailable" message would send readers to the wrong command.
 enum SemanticMiss {
     NoModel,
     EmptyIndex,
+    /// The local Lance store exists but couldn't be read — a corrupt
+    /// dataset (see `majestical_index::vector_store::catch_corruption`'s
+    /// doc comment for why that's even possible). Distinct from
+    /// `EmptyIndex`: the fix is the same command (`maj index run`), but
+    /// framed as a rebuild rather than a first run, since those read very
+    /// differently to an operator. `search` never repairs this itself —
+    /// only `index run` writes, so only it may delete and rebuild.
+    Unreadable(String),
 }
 
 impl SemanticMiss {
-    fn note(&self) -> &'static str {
+    fn note(&self) -> String {
         match self {
-            SemanticMiss::NoModel => "semantic search unavailable — run `maj model fetch`",
-            SemanticMiss::EmptyIndex => "semantic index is empty — run `maj index run`",
+            SemanticMiss::NoModel => {
+                "semantic search unavailable — run `maj model fetch`".to_string()
+            }
+            SemanticMiss::EmptyIndex => "semantic index is empty — run `maj index run`".to_string(),
+            SemanticMiss::Unreadable(reason) => {
+                format!("semantic index unreadable ({reason}) — run `maj index run` to rebuild")
+            }
         }
     }
 }
 
-/// Resolves the model, opens the local Lance store, and confirms it holds at
-/// least one embedding for `MODEL_TAG` — the three preconditions for a
-/// semantic query to mean anything.
+/// Resolves the model (cheap: file-size checks only), then opens the local
+/// Lance store READ-ONLY — never creating one, since a search must not
+/// materialize local state just by running — and confirms it holds at least
+/// one embedding for `MODEL_TAG`. All of this (model presence, opening,
+/// probing) resolves fully before any caller ever loads the text encoder,
+/// so a search against an empty or nonexistent index degrades without
+/// paying for a model load at all. The open and the probe scan both run
+/// under `catch_corruption`, since lance's own manifest reader can panic on
+/// a corrupt manifest rather than erroring.
 fn open_semantic_index(state_dir: &Path) -> Result<(PathBuf, VectorStore, u64), SemanticMiss> {
     let model_dir = majestical_index::model::model_dir()
         .ok()
         .filter(|dir| majestical_index::model::model_present(dir))
         .ok_or(SemanticMiss::NoModel)?;
-    let store =
-        VectorStore::open(&state_dir.join("lance")).map_err(|_| SemanticMiss::EmptyIndex)?;
+
+    let lance_dir = state_dir.join("lance");
+    let opened = majestical_index::vector_store::catch_corruption(move || {
+        let Some(store) = VectorStore::open_existing(&lance_dir)? else {
+            return Ok(None);
+        };
+        store.existing_keys(majestical_index::model::MODEL_TAG)?;
+        Ok(Some(store))
+    });
+    let store = match opened {
+        Ok(Some(store)) => store,
+        Ok(None) => return Err(SemanticMiss::EmptyIndex),
+        Err(reason) => return Err(SemanticMiss::Unreadable(reason)),
+    };
+
     let embedded = store
         .distinct_assets(majestical_index::model::MODEL_TAG)
         .map_or(0, |s| s.len());
@@ -306,11 +350,18 @@ fn embed_query(model_dir: &Path, query: &str) -> Option<Vec<f32>> {
     encoder.embed_text(query).ok()
 }
 
-/// Maps Lance hits to catalog asset ids, deduped preserving nearest-first
-/// order — an asset can appear as both its whole-image embedding and one or
-/// more keyframe hits, and only the nearest counts for ranking. Also
-/// collects each asset's nearest keyframe timestamp (keyframe hits only; a
-/// whole-image hit has none).
+/// Collapses Lance hits to one entry per asset, keeping only the first
+/// (nearest, since hits arrive nearest-first) occurrence. An asset can hit
+/// more than once — its whole-image embedding plus one or more keyframe
+/// hits once video keyframing lands — and feeding every raw hit into
+/// `rrf_merge` verbatim would inflate that asset's score by how many times
+/// it happened to hit, not by how well it actually matched: `rrf_merge`'s
+/// scoring map accumulates one contribution per list occurrence, so it does
+/// nothing to prevent that on its own (the final ranking is unique per
+/// asset either way, since the map is keyed by asset id — that part is
+/// redundant with what's built here; the score would still be wrong without
+/// this). Also collects each asset's nearest keyframe timestamp (keyframe
+/// hits only; a whole-image hit has none).
 fn dedupe_hits(hits: Vec<VectorHit>) -> (Vec<AssetId>, HashMap<AssetId, i64>) {
     let mut ranked = Vec::new();
     let mut seen = HashSet::new();
@@ -629,7 +680,12 @@ fn print_saved_searches(projection: &Projection, json: bool) {
 
 #[cfg(test)]
 mod semantic_tests {
-    use super::{AssetId, format_ts, rrf_merge};
+    use super::{AssetId, dedupe_hits, eligible_asset_count, format_ts, fuse_ranked, rrf_merge};
+    use majestical_core::clock::{Hlc, MachineId};
+    use majestical_core::event::{Event, EventId, Op};
+    use majestical_core::projection::Projection;
+    use majestical_index::vector_store::VectorHit;
+    use std::collections::BTreeSet;
 
     #[test]
     fn rrf_merge_ranks_an_asset_present_in_both_lists_above_a_single_list_hit() {
@@ -668,6 +724,141 @@ mod semantic_tests {
         let b = AssetId("xxh3:b".into());
         let merged = rrf_merge(&[vec![a, b]], 1);
         assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn fuse_ranked_drops_semantic_hits_outside_the_filter_set() {
+        let kept = AssetId("xxh3:aaa".into());
+        let excluded = AssetId("xxh3:bbb".into());
+        let allowed: BTreeSet<AssetId> = [kept.clone()].into_iter().collect();
+        // `excluded` is the top semantic hit and absent from FTS entirely —
+        // exactly the shape a `-tag:x` exclusion produces.
+        let merged = fuse_ranked(
+            vec![(kept.clone(), 1.0)],
+            vec![excluded, kept.clone()],
+            Some(&allowed),
+            10,
+        );
+        let ids: Vec<&AssetId> = merged.iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![&kept],
+            "a hard filter must survive semantic fusion"
+        );
+    }
+
+    #[test]
+    fn fuse_ranked_drops_fts_hits_outside_the_filter_set() {
+        let kept = AssetId("xxh3:aaa".into());
+        let excluded = AssetId("xxh3:bbb".into());
+        let allowed: BTreeSet<AssetId> = [kept.clone()].into_iter().collect();
+        let merged = fuse_ranked(
+            vec![(excluded, 2.0), (kept.clone(), 1.0)],
+            vec![kept.clone()],
+            Some(&allowed),
+            10,
+        );
+        let ids: Vec<&AssetId> = merged.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![&kept]);
+    }
+
+    #[test]
+    fn fuse_ranked_without_semantic_hits_is_fts_scores_and_order() {
+        let a = AssetId("xxh3:aaa".into());
+        let b = AssetId("xxh3:bbb".into());
+        let merged = fuse_ranked(vec![(b.clone(), 9.0), (a, 1.0)], Vec::new(), None, 1);
+        assert_eq!(
+            merged,
+            vec![(b, 9.0)],
+            "fts-only keeps bm25 scores and order"
+        );
+    }
+
+    #[test]
+    fn dedupe_hits_keeps_a_multi_hit_asset_at_a_single_rank_not_inflated() {
+        let repeated = "aa11".to_string();
+        let hits = vec![
+            VectorHit {
+                asset_hex: repeated.clone(),
+                kind: "keyframe".into(),
+                ts_ms: 1000,
+                distance: 0.1,
+            },
+            VectorHit {
+                asset_hex: repeated.clone(),
+                kind: "keyframe".into(),
+                ts_ms: 2000,
+                distance: 0.2,
+            },
+            VectorHit {
+                asset_hex: repeated.clone(),
+                kind: "keyframe".into(),
+                ts_ms: 3000,
+                distance: 0.3,
+            },
+        ];
+        let (ranked, keyframe_ts) = dedupe_hits(hits);
+        let asset = AssetId(format!("xxh3:{repeated}"));
+        assert_eq!(
+            ranked,
+            vec![asset.clone()],
+            "three hits for one asset must collapse to one entry — feeding all three into \
+             rrf_merge would inflate this asset's score threefold, not reflect how well it \
+             actually matched"
+        );
+        assert_eq!(
+            keyframe_ts.get(&asset),
+            Some(&1000),
+            "the nearest (first-encountered) hit's timestamp wins"
+        );
+    }
+
+    #[test]
+    fn dedupe_hits_on_no_hits_is_empty() {
+        let (ranked, keyframe_ts) = dedupe_hits(Vec::new());
+        assert!(ranked.is_empty());
+        assert!(keyframe_ts.is_empty());
+    }
+
+    fn seen_event(n: u64, asset: &str, path: &str) -> Event {
+        Event {
+            id: EventId(ulid::Ulid::from_parts(1, n.into())),
+            hlc: Hlc {
+                wall_ms: n,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::AssetSeen {
+                asset: AssetId(asset.to_string()),
+                volume: "v1".into(),
+                path: path.to_string(),
+                size: 10,
+                mtime_ms: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn eligible_asset_count_counts_only_image_and_video_kinds() {
+        let mut projection = Projection::default();
+        for (n, asset, path) in [
+            (1u64, "xxh3:a", "photo.jpg"),
+            (2, "xxh3:b", "clip.mov"),
+            (3, "xxh3:c", "notes.txt"),
+        ] {
+            projection.apply(&seen_event(n, asset, path));
+        }
+        assert_eq!(
+            eligible_asset_count(&projection),
+            2,
+            "only the image and video assets are embedding-eligible"
+        );
+    }
+
+    #[test]
+    fn eligible_asset_count_of_an_empty_projection_is_zero() {
+        assert_eq!(eligible_asset_count(&Projection::default()), 0);
     }
 
     #[test]

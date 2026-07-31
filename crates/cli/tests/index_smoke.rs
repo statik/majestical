@@ -243,6 +243,190 @@ fn search_without_model_degrades_with_notice() {
         .stderr(contains("maj model fetch"));
 }
 
+/// Fake-size model files at the exact byte sizes `model_present()` checks —
+/// same precedent as `model_fetch_reports_already_present_without_network`.
+/// Passes the (size-only) presence check without a real, loadable model, so
+/// any test using this must never actually reach `Encoder::load`.
+#[cfg(test)]
+fn seed_fake_model_files(model_root: &std::path::Path) {
+    let model_dir = model_root.join(majestical_index::model::MODEL_TAG);
+    std::fs::create_dir_all(&model_dir).unwrap();
+    for file in majestical_index::model::MODEL_FILES {
+        let f = std::fs::File::create(model_dir.join(file.name)).unwrap();
+        f.set_len(file.bytes).unwrap();
+    }
+}
+
+/// `index run`'s blob↔Lance diff must run in the MODEL-PRESENT path too, not
+/// just when the model is absent (`embeddings_loaded_from_blobs_without_model`
+/// pins that path already). An empty catalog (zero embed items in the plan)
+/// alongside a hand-written vector blob proves the diff runs even when
+/// `run_embed_items` takes the "model present" branch — the branch is
+/// skipped only because there's nothing to embed, not because the model is
+/// unavailable, so the encoder is never asked to load the fake (unloadable)
+/// model files this test seeds.
+#[test]
+fn embeddings_loaded_from_blobs_with_model_present_and_no_pending_items() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_root = tempfile::tempdir().unwrap();
+    seed_fake_model_files(model_root.path());
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    // No scan at all: an empty catalog, so the plan has zero ImageEmbed
+    // items.
+
+    let hex = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+    let vector = vec![0.1f32; majestical_index::vector_store::DIM];
+    let path = blobs.path_for(
+        &hex,
+        &majestical_index::blob::Derivation::ImageEmbedding {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    blobs.write_vector(&path, &vector).unwrap();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "run"])
+        .assert()
+        .success()
+        .stdout(contains("1 loaded from blobs"));
+}
+
+/// A query-time model presence check (size-only) can pass without the model
+/// actually being loadable. Searching against an index that simply has
+/// nothing in it yet must resolve to "index is empty" without ever trying
+/// to load that unloadable model — which would otherwise surface as a
+/// crash, or the wrong (`model fetch`) notice, instead of the right one.
+#[test]
+fn search_reports_empty_index_without_loading_an_unloadable_model() {
+    let media = tempfile::tempdir().unwrap();
+    write_test_png(&media.path().join("photo.png"), 8, 8);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_root = tempfile::tempdir().unwrap();
+    seed_fake_model_files(model_root.path());
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    // Deliberately never run `index run`: no lance store exists yet.
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["search", "photo"])
+        .assert()
+        .success()
+        .stdout(contains("results"))
+        .stderr(contains("semantic index is empty"));
+}
+
+/// A corrupt local Lance store degrades `search` to FTS-only with a
+/// distinct, rebuild-framed notice — and, critically, `search` never
+/// repairs it itself: only `index run` writes, so only it may delete and
+/// rebuild. Proven by checking the corrupt manifest bytes are byte-for-byte
+/// unchanged after `search` runs.
+#[test]
+fn search_degrades_on_a_corrupt_lance_store_and_never_touches_it() {
+    let media = tempfile::tempdir().unwrap();
+    write_test_png(&media.path().join("photo.png"), 8, 8);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    // Model absent for this pass: only the blob↔Lance diff runs, which is
+    // enough to materialize a real, empty lance dataset at a discoverable
+    // path — the corruption recipe below needs real manifest files to
+    // corrupt, not a directory that doesn't exist yet.
+    let empty_model_dir = tempfile::tempdir().unwrap();
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", empty_model_dir.path())
+        .args(["index", "run"])
+        .assert()
+        .success();
+
+    let lance_dirs = walkdir_find(&state, "lance");
+    assert_eq!(
+        lance_dirs.len(),
+        1,
+        "exactly one lance store under the state dir"
+    );
+    let lance_dir = &lance_dirs[0];
+
+    // Seed a real vector directly (bypassing the CLI/encoder entirely) so
+    // there's real manifest data on disk to corrupt.
+    majestical_index::vector_store::VectorStore::open(lance_dir)
+        .unwrap()
+        .add(vec![majestical_index::vector_store::VectorRow {
+            asset_hex: "aa11".into(),
+            kind: "image".into(),
+            ts_ms: -1,
+            model_tag: majestical_index::model::MODEL_TAG.into(),
+            vector: vec![0.1f32; majestical_index::vector_store::DIM],
+        }])
+        .unwrap();
+
+    let versions_dir = lance_dir.join("vectors.lance/_versions");
+    let manifest_paths: Vec<_> = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "manifest"))
+        .collect();
+    assert!(
+        !manifest_paths.is_empty(),
+        "seeded store must have manifest files"
+    );
+    for path in &manifest_paths {
+        std::fs::write(path, b"GARBAGE-NOT-A-REAL-MANIFEST").unwrap();
+    }
+    let corrupted_bytes: Vec<Vec<u8>> = manifest_paths
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+
+    let model_root = tempfile::tempdir().unwrap();
+    seed_fake_model_files(model_root.path());
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["search", "photo"])
+        .assert()
+        .success()
+        .stdout(contains("results"))
+        .stderr(contains("semantic index unreadable"));
+
+    for (path, before) in manifest_paths.iter().zip(&corrupted_bytes) {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            before,
+            "search must never modify the corrupt store — only `index run` may repair it"
+        );
+    }
+}
+
 /// `--limit` caps how much of the queue one pass works, so a long-running
 /// index can be broken into bounded chunks: two pending thumbnails with
 /// `--limit 1` take two passes, not one.

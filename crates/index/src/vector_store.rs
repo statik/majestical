@@ -59,23 +59,19 @@ pub struct VectorStore {
 
 impl VectorStore {
     /// Opens the Lance dataset at `dir`, creating an empty `vectors` table
-    /// if none exists yet.
+    /// if none exists yet. Write paths (`index run`'s embed executor) use
+    /// this; read-only callers should use [`open_existing`](Self::open_existing)
+    /// instead, which never materializes state.
     ///
     /// # Errors
     /// Returns [`IndexError::VectorStore`] if the tokio runtime cannot
     /// start, the connection fails, or the table cannot be opened or
     /// created.
     pub fn open(dir: &Path) -> Result<Self, IndexError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| IndexError::VectorStore(format!("start runtime: {e}")))?;
+        let rt = new_runtime()?;
         let uri = dir.to_string_lossy().into_owned();
         let table = rt.block_on(async {
-            let db = connect(&uri)
-                .execute()
-                .await
-                .map_err(|e| IndexError::VectorStore(format!("connect {uri}: {e}")))?;
+            let db = connect_local(&uri).await?;
             match db.open_table(TABLE_NAME).execute().await {
                 Ok(table) => Ok(table),
                 Err(lancedb::Error::TableNotFound { .. }) => db
@@ -89,6 +85,36 @@ impl VectorStore {
             }
         })?;
         Ok(Self { rt, table })
+    }
+
+    /// Opens the Lance dataset at `dir` only if one already exists there —
+    /// unlike [`open`](Self::open), never creates it. A read-only query (the
+    /// search command's semantic layer) must not materialize local state
+    /// just by running; only `index run`'s write path should ever create the
+    /// dataset. Returns `Ok(None)` when `dir` doesn't exist yet, or exists
+    /// but holds no `vectors` table.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::VectorStore`] if the tokio runtime cannot
+    /// start, the connection fails, or opening an existing table fails for a
+    /// reason other than "table not found".
+    pub fn open_existing(dir: &Path) -> Result<Option<Self>, IndexError> {
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let rt = new_runtime()?;
+        let uri = dir.to_string_lossy().into_owned();
+        let table = rt.block_on(async {
+            let db = connect_local(&uri).await?;
+            match db.open_table(TABLE_NAME).execute().await {
+                Ok(table) => Ok(Some(table)),
+                Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
+                Err(e) => Err(IndexError::VectorStore(format!(
+                    "open table {TABLE_NAME}: {e}"
+                ))),
+            }
+        })?;
+        Ok(table.map(|table| Self { rt, table }))
     }
 
     /// Appends `rows` to the table. A no-op for an empty slice.
@@ -147,6 +173,17 @@ impl VectorStore {
         }
         let query_vector = vector.to_vec();
         let predicate = tag_predicate(model_tag);
+        // Column projection: a hit only ever needs `asset_hex`/`kind`/`ts_ms`
+        // (plus the query's own `_distance`, which `nearest_to` attaches
+        // regardless of this projection) — without it, every search
+        // materializes the 768-float `vector` column for every hit, ~3 KB
+        // of dead weight per row at catalog scale.
+        let select = Select::Columns(
+            ["asset_hex", "kind", "ts_ms"]
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+        );
         let batches = self.rt.block_on(async {
             self.table
                 .query()
@@ -154,6 +191,7 @@ impl VectorStore {
                 .map_err(|e| IndexError::VectorStore(format!("build vector query: {e}")))?
                 .distance_type(DistanceType::Dot)
                 .only_if(predicate)
+                .select(select)
                 .limit(limit)
                 .execute()
                 .await
@@ -212,6 +250,58 @@ impl VectorStore {
                 .map_err(|e| IndexError::VectorStore(format!("collect scan results: {e}")))
         })
     }
+}
+
+fn new_runtime() -> Result<tokio::runtime::Runtime, IndexError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| IndexError::VectorStore(format!("start runtime: {e}")))
+}
+
+async fn connect_local(uri: &str) -> Result<lancedb::Connection, IndexError> {
+    connect(uri)
+        .execute()
+        .await
+        .map_err(|e| IndexError::VectorStore(format!("connect {uri}: {e}")))
+}
+
+/// Runs `f`, catching both an ordinary `Err` and an unwinding panic, and
+/// reporting either as one human-readable reason — callers get a single
+/// failure path instead of two. This exists because lance's own dataset
+/// reader panics rather than returning an `Err` on some corrupt input (an
+/// unchecked subtraction while parsing a garbage `.manifest` file; verified
+/// against `lance` 9.0.0 — `attempt to subtract with overflow` at
+/// `lance::Dataset`'s manifest-loading code), which this crate has no way to
+/// prevent short of catching it at the call boundary.
+///
+/// # Errors
+/// Returns `Err` with a human-readable reason if `f` returns an `Err` or
+/// panics.
+pub fn catch_corruption<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, IndexError> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.to_string()),
+        // `&*panic`, not `&panic`: `Box<dyn Any + Send>` itself implements
+        // `Any` too (the blanket `impl<T: 'static> Any for T` covers it), so
+        // an implicit `&panic` coercion at the call boundary can wrap the
+        // BOX as the trait object instead of deref'ing to the payload
+        // inside it — `downcast_ref::<&str>()` would then always miss even
+        // though the real payload is a `&str`. The explicit deref forces
+        // the reference to point at the actual panic payload.
+        Err(panic) => Err(panic_message(&*panic)),
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Builds the SQL filter restricting a query to one embedding model. Our
@@ -327,8 +417,9 @@ fn batches_to_keys(batches: &[RecordBatch]) -> Result<BTreeSet<(String, String, 
 
 #[cfg(test)]
 mod tests {
-    use super::{DIM, VectorRow, VectorStore};
+    use super::{DIM, VectorRow, VectorStore, catch_corruption};
     use crate::encoder::EMBED_DIM;
+    use crate::error::IndexError;
 
     #[test]
     fn dim_matches_encoder_embed_dim() {
@@ -430,5 +521,106 @@ mod tests {
             hits.is_empty(),
             "escaping holds: no rows match the literal tag"
         );
+    }
+
+    #[test]
+    fn open_existing_returns_none_without_creating_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lance_dir = dir.path().join("lance");
+        assert!(
+            VectorStore::open_existing(&lance_dir)
+                .expect("open_existing on a missing dir")
+                .is_none()
+        );
+        assert!(
+            !lance_dir.exists(),
+            "a read-only open must never materialize the dataset directory"
+        );
+    }
+
+    #[test]
+    fn open_existing_finds_a_dataset_created_by_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lance_dir = dir.path().join("lance");
+        VectorStore::open(&lance_dir)
+            .expect("open")
+            .add(vec![VectorRow {
+                asset_hex: "aa11".into(),
+                kind: "image".into(),
+                ts_ms: -1,
+                model_tag: "m1".into(),
+                vector: unit(0),
+            }])
+            .expect("add");
+
+        let store = VectorStore::open_existing(&lance_dir)
+            .expect("open_existing")
+            .expect("dataset exists");
+        assert_eq!(store.existing_keys("m1").expect("keys").len(), 1);
+    }
+
+    #[test]
+    fn catch_corruption_passes_through_ok_and_err() {
+        assert_eq!(catch_corruption(|| Ok(1)), Ok(1));
+        let err = catch_corruption(|| Err::<i32, _>(IndexError::VectorStore("boom".into())));
+        assert_eq!(err, Err("vector store: boom".to_string()));
+    }
+
+    #[test]
+    fn catch_corruption_turns_a_panic_into_an_err() {
+        let result = catch_corruption(|| -> Result<i32, IndexError> {
+            panic!("simulated lance manifest panic");
+        });
+        assert_eq!(result, Err("simulated lance manifest panic".to_string()));
+    }
+
+    /// Pins the actual failure mode a garbage `.manifest` produces (a panic
+    /// deep inside lance's own dataset reader, not an `Err` — see
+    /// `catch_corruption`'s doc comment; verified by hand against real
+    /// `lance` 9.0.0: `attempt to subtract with overflow`) and confirms
+    /// `catch_corruption` turns it into an ordinary `Err` instead of
+    /// unwinding out of the caller.
+    #[test]
+    fn catch_corruption_recovers_from_a_garbage_manifest_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lance_dir = dir.path().join("lance");
+        VectorStore::open(&lance_dir)
+            .expect("open")
+            .add(vec![VectorRow {
+                asset_hex: "aa11".into(),
+                kind: "image".into(),
+                ts_ms: -1,
+                model_tag: "m1".into(),
+                vector: unit(0),
+            }])
+            .expect("add");
+        corrupt_all_manifests(&lance_dir);
+
+        let owned = lance_dir.clone();
+        let result = catch_corruption(move || VectorStore::open(&owned));
+        assert!(
+            result.is_err(),
+            "a garbage manifest must not panic past catch_corruption"
+        );
+    }
+
+    /// Overwrites every manifest file with garbage bytes — the corruption
+    /// recipe that makes lance's own manifest reader panic (see
+    /// `catch_corruption`'s doc comment). Corrupting all of them (rather than
+    /// guessing which one lance treats as "latest") keeps this independent
+    /// of lance's internal version-file naming scheme.
+    fn corrupt_all_manifests(lance_dir: &std::path::Path) {
+        let versions_dir = lance_dir.join("vectors.lance/_versions");
+        let entries = std::fs::read_dir(&versions_dir).expect("read _versions dir");
+        for entry in entries.filter_map(Result::ok) {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "manifest")
+            {
+                std::fs::write(entry.path(), b"GARBAGE-NOT-A-REAL-MANIFEST")
+                    .expect("corrupt manifest");
+            }
+        }
     }
 }

@@ -4365,6 +4365,7 @@ dependencies = [
  "image",
  "majestical-catalog-sqlite",
  "majestical-core",
+ "majestical-describe",
  "majestical-index",
  "majestical-ingest",
  "majestical-sync",

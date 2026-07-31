@@ -1,6 +1,7 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
 mod app;
 mod commands;
+mod describer_cmd;
 mod index_cmd;
 mod iso8601;
 mod query;
@@ -86,6 +87,11 @@ enum Cmd {
     Model {
         #[command(subcommand)]
         cmd: ModelCmd,
+    },
+    /// Configure the caption/tag-suggestion backend for this machine.
+    Describer {
+        #[command(subcommand)]
+        cmd: DescriberCmd,
     },
     /// List every volume the catalog has ever seen.
     Volumes {
@@ -233,6 +239,42 @@ enum ModelCmd {
     },
 }
 
+#[derive(clap::Subcommand)]
+enum DescriberCmd {
+    /// Set the backend for this catalog on this machine.
+    Set {
+        #[arg(long, value_enum)]
+        backend: DescriberBackendArg,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Show the current configuration (key redacted).
+    Show,
+    /// Probe the backend: connectivity, model presence, vision capability.
+    Test,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DescriberBackendArg {
+    Ollama,
+    LmStudio,
+    OpenRouter,
+}
+
+impl From<DescriberBackendArg> for majestical_describe::BackendKind {
+    fn from(arg: DescriberBackendArg) -> Self {
+        match arg {
+            DescriberBackendArg::Ollama => Self::Ollama,
+            DescriberBackendArg::LmStudio => Self::LmStudio,
+            DescriberBackendArg::OpenRouter => Self::OpenRouter,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum SearchesCmd {
     /// List saved searches.
@@ -287,6 +329,30 @@ fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
     }
 }
 
+/// Dispatches `maj describer`'s subcommands. Split out of `main` purely to
+/// stay under the crate's max-function-length lint, matching
+/// [`dispatch_index`].
+fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
+    match cmd {
+        DescriberCmd::Set {
+            backend,
+            model,
+            base_url,
+            api_key,
+        } => describer_cmd::cmd_set(
+            catalog,
+            &describer_cmd::SetArgs {
+                backend: backend.into(),
+                model,
+                base_url,
+                api_key,
+            },
+        ),
+        DescriberCmd::Show => describer_cmd::cmd_show(catalog),
+        DescriberCmd::Test => describer_cmd::cmd_test(catalog),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let author = cli.author.clone().unwrap_or_else(|| cli.machine_id.clone());
@@ -335,6 +401,9 @@ fn main() -> Result<()> {
         Cmd::Model {
             cmd: ModelCmd::Fetch { verify },
         } => index_cmd::cmd_model_fetch(verify)?,
+        // Deliberately does not open a catalog: describer config lives in
+        // the per-machine state dir, not the event log.
+        Cmd::Describer { cmd } => dispatch_describer(&cli.catalog, cmd)?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {

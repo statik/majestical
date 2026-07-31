@@ -28,3 +28,20 @@ pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBu
         .map(walkdir::DirEntry::into_path)
         .collect()
 }
+
+// Not every integration-test binary that pulls in this module calls
+// `walkdir_find` directly (describer_smoke.rs uses only `maj`), and each
+// `tests/*.rs` file is its own crate, so dead-code reachability is judged
+// per binary. This in-module test gives every binary a real caller so the
+// helper never trips `dead_code`, without reaching for `#[allow]` (denied)
+// or `#[expect]` (would itself fail wherever the helper IS otherwise used).
+#[cfg(test)]
+mod tests {
+    use super::walkdir_find;
+
+    #[test]
+    fn walkdir_find_returns_empty_when_name_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(walkdir_find(dir.path(), "no-such-file").is_empty());
+    }
+}

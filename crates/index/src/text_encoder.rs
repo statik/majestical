@@ -87,6 +87,7 @@ impl TextEncoder {
 
         let mut embedding = mean_pool(hidden, attention_mask, TEXT_EMBED_DIM);
         l2_normalize(&mut embedding);
+        check_unit_norm(&embedding)?;
         Ok(embedding)
     }
 }
@@ -140,9 +141,40 @@ fn mean_pool(hidden: &[f32], mask: &[u32], dim: usize) -> Vec<f32> {
     pooled
 }
 
+/// Validates that `embedding` is either unit-norm (within `1e-3`) or exactly
+/// all-zero — the only two shapes `mean_pool` followed by `l2_normalize` can
+/// produce (all-masked input pools to zeros, which `l2_normalize` leaves
+/// unchanged; everything else should land on the unit sphere). A non-finite
+/// value (NaN/inf) fails both checks below since `x == 0.0` and the norm
+/// comparison are both false for NaN, so it's rejected explicitly first
+/// rather than silently slipping through as "close enough" to 1.0.
+///
+/// # Errors
+/// Returns [`IndexError::Encoder`] if `embedding` contains a non-finite
+/// value, or its norm is neither ~1.0 nor exactly 0.
+fn check_unit_norm(embedding: &[f32]) -> Result<(), IndexError> {
+    if embedding.iter().any(|x| !x.is_finite()) {
+        return Err(IndexError::Encoder(
+            "text embedding contains a non-finite value (NaN/inf)".to_string(),
+        ));
+    }
+    if embedding.iter().all(|&x| x == 0.0) {
+        return Ok(());
+    }
+    let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if (norm - 1.0).abs() > 1e-3 {
+        return Err(IndexError::Encoder(format!(
+            "text embedding failed to normalize: norm {norm} not within 1e-3 of 1.0 (and not \
+             all-zero) — Lance ranking assumes unit-normalized embeddings"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::mean_pool;
+    use super::{check_unit_norm, mean_pool};
+    use crate::error::IndexError;
 
     #[test]
     fn mean_pool_respects_attention_mask() {
@@ -159,5 +191,27 @@ mod tests {
         let mask = [0_u32];
         let pooled = mean_pool(&hidden, &mask, 2);
         assert_eq!(pooled, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn check_unit_norm_accepts_a_unit_vector() {
+        assert!(check_unit_norm(&[0.6, 0.8]).is_ok());
+    }
+
+    #[test]
+    fn check_unit_norm_accepts_an_all_zero_vector() {
+        assert!(check_unit_norm(&[0.0, 0.0]).is_ok());
+    }
+
+    #[test]
+    fn check_unit_norm_rejects_a_non_unit_norm_vector() {
+        let err = check_unit_norm(&[0.5, 0.0]).expect_err("0.5 norm must fail");
+        assert!(matches!(err, IndexError::Encoder(_)));
+    }
+
+    #[test]
+    fn check_unit_norm_rejects_nan() {
+        let err = check_unit_norm(&[f32::NAN, 0.0]).expect_err("NaN must fail, not pass silently");
+        assert!(matches!(err, IndexError::Encoder(_)));
     }
 }

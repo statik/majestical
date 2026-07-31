@@ -34,7 +34,8 @@ fn related_sentences_score_higher_than_unrelated() {
     let related = majestical_index::encoder::cosine(&budget, &money);
     let unrelated = majestical_index::encoder::cosine(&budget, &cats);
     assert!(
-        related > unrelated,
-        "related {related} must beat unrelated {unrelated}"
+        related > unrelated + 0.3,
+        "related {related} must beat unrelated {unrelated} by a wide margin \
+         (measured ~0.905 vs ~0.078; a degenerate encoder must not pass by luck)"
     );
 }

@@ -926,13 +926,9 @@ mod tests {
         assert_eq!(audio_timeout(3_600_000), std::time::Duration::from_mins(61));
     }
 
-    /// No ffmpeg fixture needed: a nonexistent input path fails either way
-    /// ffmpeg can fail on it — a missing `ffmpeg` binary trips
-    /// `run_with_timeout`'s spawn error (message prefixed "audio extract:"
-    /// by `extract_audio_pcm`), while an installed ffmpeg instead runs and
-    /// exits non-zero over the missing input (message prefixed "ffmpeg
-    /// audio extract failed:") — both land in the same `Err` and both
-    /// mention ffmpeg or the extraction step, which is all this test pins.
+    /// Gated on ffmpeg being installed (like the other subprocess tests
+    /// here): a real ffmpeg run over a nonexistent input exits non-zero,
+    /// and the error message must name the extraction step.
     #[test]
     fn extract_audio_pcm_reports_ffmpeg_or_audio_extract_failure() {
         if !ffmpeg_available() {

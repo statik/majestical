@@ -19,6 +19,7 @@ use crate::preprocess::{EDGE, preprocess_rgb};
 
 pub const EMBED_DIM: usize = 768;
 const TEXT_LEN: usize = 64;
+const TEXT_LEN_I64: i64 = 64;
 
 /// Options for [`Encoder::load`].
 pub struct EncoderOptions {
@@ -109,9 +110,7 @@ impl Encoder {
     /// Returns [`IndexError::Encoder`] if tokenization or inference fails.
     pub fn embed_text(&mut self, text: &str) -> Result<Vec<f32>, IndexError> {
         let ids = self.token_ids(text)?;
-        let text_len = i64::try_from(TEXT_LEN)
-            .map_err(|e| IndexError::Encoder(format!("TEXT_LEN overflow: {e}")))?;
-        let tensor = Tensor::from_array(([1_i64, text_len], ids))
+        let tensor = Tensor::from_array(([1_i64, TEXT_LEN_I64], ids))
             .map_err(|e| IndexError::Encoder(format!("building input_ids tensor: {e}")))?;
         let outputs = self
             .text

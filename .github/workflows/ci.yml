@@ -53,12 +53,13 @@ jobs:
           key: model-siglip2-b16-v1
       # The torch-side reference model (golden.py's AutoModel.from_pretrained)
       # downloads into HF's default cache, separate from .model-cache (our
-      # own ONNX artifacts) — cached by the pinned revision so a bump there
-      # invalidates it automatically.
+      # own ONNX artifacts) — keyed on the justfile's contents so a bump to
+      # SIGLIP2_TORCH_REVISION there invalidates this cache automatically,
+      # with no revision literal duplicated here to drift out of sync.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: ~/.cache/huggingface
-          key: hf-reference-3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab
+          key: hf-reference-${{ hashFiles('justfile') }}
       - run: brew install just
       - run: just encoder-conformance
   actions-lint:

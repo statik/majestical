@@ -16,7 +16,9 @@ import argparse
 import json
 import pathlib
 
+import PIL
 import torch
+import transformers
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
@@ -25,7 +27,12 @@ TEXTS = [
     "portrait of a golden retriever",
     "city skyline at night",
 ]
-FIXTURES = pathlib.Path("crates/index/tests/fixtures")
+# Anchored to this file, not the cwd: `uv run` from outside the repo root
+# would otherwise glob nothing and silently write a golden.json with an
+# empty "images" map — a gate that trivially "passes" because it checks
+# nothing.
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+FIXTURES = REPO_ROOT / "crates/index/tests/fixtures"
 
 
 def main() -> None:
@@ -41,15 +48,22 @@ def main() -> None:
         "meta": {
             "model": model_id,
             "revision": args.revision,
-            "transformers": __import__("transformers").__version__,
+            "transformers": transformers.__version__,
             "torch": torch.__version__,
+            "pillow": PIL.__version__,
         },
         "images": {},
         "texts": {},
         "token_ids": {},
     }
+    pngs = sorted(FIXTURES.glob("*.png"))
+    if not pngs:
+        raise FileNotFoundError(
+            f"no *.png fixtures found in {FIXTURES} — "
+            "run `cargo run -p majestical-index --example gen_fixtures` first"
+        )
     with torch.no_grad():
-        for png in sorted(FIXTURES.glob("*.png")):
+        for png in pngs:
             image = Image.open(png).convert("RGB")
             inputs = processor(images=image, return_tensors="pt")
             feats = model.get_image_features(**inputs)

@@ -50,6 +50,10 @@ struct Golden {
     token_ids: BTreeMap<String, Vec<i64>>,
 }
 
+fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
 fn require_golden() -> Golden {
     let path = std::env::var("MAJ_GOLDEN")
         .expect("MAJ_GOLDEN must point to golden.json produced by conformance/encoder/golden.py");
@@ -79,10 +83,45 @@ fn require_golden() -> Golden {
         })
         .collect();
 
-    Golden {
+    let golden = Golden {
         images,
         texts,
         token_ids,
+    };
+    assert_golden_covers_every_fixture(&golden);
+    golden
+}
+
+/// A golden json with fewer image entries than fixtures on disk is a
+/// vacuous gate: the per-image loops in the tests below simply iterate
+/// fewer times and every assertion still trivially "passes". This catches
+/// that at the door — e.g. `golden.py` run from the wrong cwd (glob finds
+/// nothing) or a fixture added without regenerating golden.json.
+fn assert_golden_covers_every_fixture(golden: &Golden) {
+    let dir = fixtures_dir();
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()))
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+        .collect();
+    on_disk.sort();
+    assert!(
+        !on_disk.is_empty(),
+        "no *.png fixtures found in {} — the gate would vacuously pass",
+        dir.display()
+    );
+    for name in &on_disk {
+        assert!(
+            golden.images.contains_key(name),
+            "golden json has no entry for fixture {name:?} (found in {}) — \
+             regenerate golden.json with `uv run conformance/encoder/golden.py`",
+            dir.display()
+        );
     }
 }
 
@@ -156,7 +195,7 @@ fn cpu_embeddings_match_reference() {
     )
     .expect("load encoder");
 
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixtures = fixtures_dir();
     let mut worst_vision = f32::MAX;
     for (name, expected) in &golden.images {
         let path = fixtures.join(name);
@@ -193,7 +232,7 @@ fn coreml_vision_is_close_to_reference() {
     )
     .expect("load encoder with CoreML vision tower");
 
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixtures = fixtures_dir();
     let mut worst = f32::MAX;
     for (name, expected) in &golden.images {
         let path = fixtures.join(name);

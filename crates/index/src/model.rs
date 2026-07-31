@@ -130,7 +130,16 @@ fn already_present(spec: &FetchSpec<'_>, dest: &Path) -> Result<bool, IndexError
     if !spec.verify {
         return Ok(true);
     }
-    Ok(sha256_file(dest)? == spec.sha256)
+    if sha256_file(dest)? == spec.sha256 {
+        return Ok(true);
+    }
+    // Right size, wrong hash: remove it now. Otherwise, if the redownload
+    // below also fails, this corrupt file would stay behind at `dest` and
+    // `model_present`'s size-only check would wrongly accept it later.
+    std::fs::remove_file(dest).map_err(|source| {
+        IndexError::Model(format!("removing corrupt {}: {source}", dest.display()))
+    })?;
+    Ok(false)
 }
 
 /// Downloads one file into `spec.dir` via system `curl`, verifying its
@@ -155,7 +164,7 @@ pub fn fetch_one(spec: &FetchSpec<'_>) -> Result<FetchOutcome, IndexError> {
     let temp_path = spec.dir.join(format!(".fetch-{}", spec.name));
 
     let status = Command::new("curl")
-        .args(["--fail", "--location", "--silent", "--show-error"])
+        .args(["--fail", "--location", "--progress-bar", "--show-error"])
         .arg("--output")
         .arg(&temp_path)
         .arg(spec.url)
@@ -171,7 +180,13 @@ pub fn fetch_one(spec: &FetchSpec<'_>) -> Result<FetchOutcome, IndexError> {
         )));
     }
 
-    let actual_sha = sha256_file(&temp_path)?;
+    let actual_sha = match sha256_file(&temp_path) {
+        Ok(sha) => sha,
+        Err(source) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(source);
+        }
+    };
     if actual_sha != spec.sha256 {
         let _ = std::fs::remove_file(&temp_path);
         return Err(IndexError::Model(format!(
@@ -322,6 +337,75 @@ mod tests {
         assert_eq!(
             std::fs::read(dest_dir.join("weights.bin")).expect("read"),
             b"correct-bytes"
+        );
+    }
+
+    #[test]
+    fn a_right_sized_but_wrong_hash_dest_is_removed_even_if_the_redownload_also_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+        let dest = dest_dir.join("weights.bin");
+        std::fs::write(&dest, b"corrupt-byte").expect("seed corrupt file");
+
+        // The redownload source is also wrong (doesn't match `sha256`
+        // below), so this must fail — proving the original corrupt file at
+        // `dest` was removed proactively by `already_present`, not merely
+        // overwritten by a successful download.
+        let src = dir.path().join("bad-source.bin");
+        std::fs::write(&src, b"also-corrupt").expect("write bad source");
+        let url = format!("file://{}", src.display());
+
+        let err = fetch_one(&FetchSpec {
+            dir: &dest_dir,
+            name: "weights.bin",
+            url: &url,
+            sha256: &"f".repeat(64),
+            bytes: 12,
+            verify: true,
+        })
+        .expect_err("redownload must fail its own hash check");
+
+        assert!(err.to_string().contains("hash mismatch"));
+        assert!(
+            !dest.exists(),
+            "corrupt original must be gone even though the redownload also failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_temp_file_is_removed_before_the_error_is_returned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("weights.bin");
+        std::fs::write(&src, b"some-bytes").expect("write source");
+        let url = format!("file://{}", src.display());
+        let dest_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&dest_dir).expect("mkdir");
+
+        // Pre-seed the temp path write-only: curl can still open and
+        // truncate it (write permission), but the post-download
+        // `sha256_file` read fails (no read permission).
+        let temp_path = dest_dir.join(".fetch-weights.bin");
+        std::fs::write(&temp_path, b"").expect("seed temp");
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o200))
+            .expect("chmod write-only");
+
+        let _ = fetch_one(&FetchSpec {
+            dir: &dest_dir,
+            name: "weights.bin",
+            url: &url,
+            sha256: &"0".repeat(64),
+            bytes: 10,
+            verify: false,
+        })
+        .expect_err("unreadable temp file must surface as an error");
+
+        assert!(
+            !temp_path.exists(),
+            "unreadable temp file must be removed, not left behind"
         );
     }
 

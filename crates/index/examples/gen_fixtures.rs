@@ -3,20 +3,23 @@
 
 use std::path::Path;
 
-fn gradient() -> image::RgbImage {
+fn gradient() -> Result<image::RgbImage, std::num::TryFromIntError> {
     let (width, height) = (300u32, 200u32);
     let mut img = image::RgbImage::new(width, height);
     for (x, y, px) in img.enumerate_pixels_mut() {
-        let red = (x * 255 / 299) % 256;
-        let green = (y * 255 / 199) % 256;
+        // x < 300, so x*255/299 <= 255, and y < 200, so y*255/199 <= 255 —
+        // both already fit in u8 with no wraparound needed. (x+y) can reach
+        // 498, so it still needs `% 256` to fit.
+        let red = x * 255 / 299;
+        let green = y * 255 / 199;
         let blue = (x + y) % 256;
         *px = image::Rgb([
-            u8::try_from(red).unwrap_or(u8::MAX),
-            u8::try_from(green).unwrap_or(u8::MAX),
-            u8::try_from(blue).unwrap_or(u8::MAX),
+            u8::try_from(red)?,
+            u8::try_from(green)?,
+            u8::try_from(blue)?,
         ]);
     }
-    img
+    Ok(img)
 }
 
 fn blocks() -> image::RgbImage {
@@ -34,7 +37,7 @@ fn blocks() -> image::RgbImage {
     img
 }
 
-fn wide() -> image::RgbImage {
+fn wide() -> Result<image::RgbImage, std::num::TryFromIntError> {
     // 500x61: non-integer resize ratios on both axes against the 256x256
     // target (unlike the old 512x64, an exact 2x downscale most filters
     // agree on) — this is what actually pins the resize filter choice.
@@ -43,27 +46,16 @@ fn wide() -> image::RgbImage {
     for (x, y, px) in img.enumerate_pixels_mut() {
         let red = x % 256;
         let green = (y * 4) % 256;
-        *px = image::Rgb([
-            u8::try_from(red).unwrap_or(u8::MAX),
-            u8::try_from(green).unwrap_or(u8::MAX),
-            90,
-        ]);
+        *px = image::Rgb([u8::try_from(red)?, u8::try_from(green)?, 90]);
     }
-    img
+    Ok(img)
 }
 
-// clippy::print_stdout/print_stderr are workspace-denied and allow_attributes
-// forbids a local #[allow], so failures abort silently rather than printing
-// a diagnostic — acceptable for a one-shot fixture regenerator run by hand.
-fn save(img: &image::RgbImage, dir: &Path, name: &str) {
-    let path = dir.join(name);
-    img.save(&path).unwrap_or_else(|_| std::process::abort());
-}
-
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&dir).unwrap_or_else(|_| std::process::abort());
-    save(&gradient(), &dir, "gradient.png");
-    save(&blocks(), &dir, "blocks.png");
-    save(&wide(), &dir, "wide.png");
+    std::fs::create_dir_all(&dir)?;
+    gradient()?.save(dir.join("gradient.png"))?;
+    blocks().save(dir.join("blocks.png"))?;
+    wide()?.save(dir.join("wide.png"))?;
+    Ok(())
 }

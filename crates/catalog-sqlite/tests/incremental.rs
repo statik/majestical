@@ -423,3 +423,69 @@ fn incremental_apply_removes_a_row_when_a_later_event_untags_it() {
         SqliteCatalog::open_synced(&fresh_db_path, &log, &mut |_| {}).expect("open fresh");
     assert_eq!(dump(&db), dump(&db_fresh));
 }
+
+/// `text_fts` rows come from blobs (`maj index run`), never from CRDT
+/// events, so an incremental apply touching an asset (here, tagging it)
+/// must leave that asset's indexed text alone — unlike `names_fts`, which
+/// `Touched::Asset` does delete and reinsert.
+#[test]
+fn incremental_apply_preserves_text_fts_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("cat");
+    let m1 = MachineId("m1".into());
+    let mut log = FileEventLog::init(&root, &m1).expect("init");
+    let asset = AssetId("xxh3:a".into());
+    log.append(&[ev(
+        1,
+        "m1",
+        Op::AssetSeen {
+            asset: asset.clone(),
+            volume: "v".into(),
+            path: "clip.mov".into(),
+            size: 1,
+            mtime_ms: 0,
+        },
+    )])
+    .expect("append seen");
+
+    let db_path = dir.path().join("catalog.db");
+    let (mut db, _p1, mode1) =
+        SqliteCatalog::open_synced(&db_path, &log, &mut |_| {}).expect("open 1");
+    assert_eq!(mode1, ApplyMode::FullRebuild);
+
+    db.upsert_text_rows(
+        &asset,
+        "transcript",
+        &[(0, "we discussed the quarterly budget")],
+    )
+    .expect("upsert text row");
+    drop(db);
+
+    log.append(&[ev(
+        2,
+        "m1",
+        Op::TagAdd {
+            asset: asset.clone(),
+            tag: "keep".into(),
+        },
+    )])
+    .expect("append tag");
+
+    let (db2, _p2, mode2) =
+        SqliteCatalog::open_synced(&db_path, &log, &mut |_| {}).expect("open 2");
+    assert_eq!(
+        mode2,
+        ApplyMode::Incremental { applied: 1 },
+        "this test is vacuous unless the second open takes the incremental path"
+    );
+
+    let hits = db2
+        .search_text_ranked(&["budget".to_string()], None, 10)
+        .expect("search after incremental apply");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the text row must survive an incremental apply that touches its asset"
+    );
+    assert_eq!(hits[0].asset, asset);
+}

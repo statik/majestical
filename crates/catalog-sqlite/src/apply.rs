@@ -128,6 +128,10 @@ impl SqliteCatalog {
                     }
                 }
                 Touched::Asset(id) => {
+                    // Deliberately does NOT touch `text_fts`: those rows come
+                    // from blobs via `maj index run`, not from events — an
+                    // event about this asset (a tag, a rename, ...) doesn't
+                    // invalidate its indexed transcript/caption/OCR text.
                     tx.execute("DELETE FROM tags WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM instances WHERE asset = ?1", [&id.0])?;
                     tx.execute("DELETE FROM names_fts WHERE asset = ?1", [&id.0])?;
@@ -422,7 +426,7 @@ impl SqliteCatalog {
     /// # Errors
     /// Returns an error if a query fails.
     pub fn debug_dump(&self) -> Result<String, CatalogError> {
-        let tables: [(&str, &str); 10] = [
+        let tables: [(&str, &str); 11] = [
             ("assets", "id"),
             ("instances", "asset, volume, path, size, mtime_ms, kind"),
             ("tags", "asset, tag"),
@@ -436,6 +440,7 @@ impl SqliteCatalog {
             ("manifests", "volume, generation, mhl_path, roothash"),
             ("names_fts", "asset, name"),
             ("saved_searches", "name, query"),
+            ("text_fts", "asset, source, locator, content"),
         ];
         let mut out = String::new();
         for (table, cols) in tables {

@@ -39,7 +39,8 @@ pub struct DescriberConfig {
     pub base_url: String,
     pub model: String,
     /// `OpenRouter` key. `MAJ_OPENROUTER_KEY` (passed in by the caller as
-    /// `env_key`) overrides so the file can stay keyless.
+    /// `env_key`) overrides so the file can stay keyless — but only when
+    /// `backend` is `OpenRouter`; see `effective_api_key`.
     pub api_key: Option<String>,
 }
 
@@ -110,10 +111,17 @@ impl DescriberConfig {
         Ok(())
     }
 
-    /// The key to send: environment override first, then the file's.
+    /// The key to send: the environment override wins, but only for
+    /// `OpenRouter` — `MAJ_OPENROUTER_KEY` naming that host explicitly, so it
+    /// must never leak as a Bearer header to an Ollama/LM Studio `base_url`
+    /// a user has pointed at a non-local host. Every other backend always
+    /// uses the file's key (or none).
     #[must_use]
     pub fn effective_api_key(&self, env_key: Option<String>) -> Option<String> {
-        env_key.or_else(|| self.api_key.clone())
+        if self.backend == BackendKind::OpenRouter {
+            return env_key.or_else(|| self.api_key.clone());
+        }
+        self.api_key.clone()
     }
 
     /// Blob derivation tag for this backend model, filesystem-safe:
@@ -192,6 +200,31 @@ mod tests {
             Some("env-key")
         );
         assert_eq!(config.effective_api_key(None).as_deref(), Some("file-key"));
+    }
+
+    #[test]
+    fn env_key_ignored_for_non_openrouter_backends() {
+        let config = DescriberConfig {
+            backend: BackendKind::Ollama,
+            base_url: "u".into(),
+            model: "m".into(),
+            api_key: Some("file-key".into()),
+        };
+        assert_eq!(
+            config.effective_api_key(Some("env-key".into())).as_deref(),
+            Some("file-key"),
+            "env key must not override for non-OpenRouter backends"
+        );
+
+        let keyless = DescriberConfig {
+            api_key: None,
+            ..config
+        };
+        assert_eq!(
+            keyless.effective_api_key(Some("env-key".into())),
+            None,
+            "non-OpenRouter backend with no file key must stay keyless, never fall back to env"
+        );
     }
 
     #[test]

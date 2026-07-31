@@ -320,7 +320,24 @@ mod tests {
 
 #[cfg(test)]
 mod describer_tests {
-    use super::{Caption, TagSubject, TagSuggestion};
+    use super::{Caption, Describer, PortError, TagSubject, TagSuggestion};
+
+    struct StubDescriber;
+    impl Describer for StubDescriber {
+        fn caption(&self, _image: &[u8]) -> Result<Caption, PortError> {
+            Ok(Caption {
+                text: "stub".into(),
+                model_tag: "stub".into(),
+            })
+        }
+        fn suggest_tags(
+            &self,
+            _subject: TagSubject<'_>,
+            _existing_vocab: &[String],
+        ) -> Result<Vec<TagSuggestion>, PortError> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn tag_suggestion_serializes_round_trip() {
@@ -331,9 +348,9 @@ mod describer_tests {
             model_tag: "describe-qwen3-vl-8b".into(),
         };
         let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains("\"in_vocab\":true"));
         let back: TagSuggestion = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.tag, "person/dana");
-        assert!((back.confidence - 0.87).abs() < f64::EPSILON);
+        assert_eq!(back, s);
     }
 
     #[test]
@@ -343,8 +360,9 @@ mod describer_tests {
             model_tag: "describe-x".into(),
         };
         let json = serde_json::to_string(&c).expect("serialize");
+        assert!(json.contains("\"model_tag\":"));
         let back: Caption = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.text, "a red barn at dusk");
+        assert_eq!(back, c);
     }
 
     #[test]
@@ -355,5 +373,16 @@ mod describer_tests {
             panic!("wrong variant")
         };
         assert_eq!(inner.len(), 2);
+    }
+
+    #[test]
+    fn describer_port_is_object_safe() {
+        let describer: Box<dyn Describer> = Box::new(StubDescriber);
+        let caption = describer.caption(b"bytes").expect("caption");
+        assert_eq!(caption.text, "stub");
+        let tags = describer
+            .suggest_tags(TagSubject::Image(b"bytes"), &[])
+            .expect("suggest_tags");
+        assert!(tags.is_empty());
     }
 }

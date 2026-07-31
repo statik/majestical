@@ -41,6 +41,26 @@ pub struct BlobStore {
     root: PathBuf,
 }
 
+/// One vector blob found on disk by [`BlobStore::iter_vectors`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorBlobRef {
+    pub asset_hex: String,
+    pub kind: String, // "image" | "keyframe"
+    pub ts_ms: i64,
+    pub path: PathBuf,
+}
+
+/// Classifies one filename under a `<hex>/<model_tag>/` dir as a vector, or
+/// `None` for anything else (notably `keyframes.json`, the manifest that
+/// lives alongside real vectors under the same dir).
+fn classify_vector_file(name: &str) -> Option<(&'static str, i64)> {
+    if name == "image.f32le.zst" {
+        return Some(("image", -1));
+    }
+    let ms = name.strip_prefix("kf-")?.strip_suffix(".f32le.zst")?;
+    Some(("keyframe", ms.parse().ok()?))
+}
+
 impl BlobStore {
     #[must_use]
     pub fn new(sync_root: &Path) -> Self {
@@ -150,6 +170,75 @@ impl BlobStore {
             .collect();
         Ok(vector)
     }
+
+    /// Walks `blobs/` for every vector belonging to `model_tag` — the blob
+    /// side of the blob↔Lance diff (this is how a teammate's synced vectors
+    /// get indexed into this machine's local Lance store without
+    /// re-inference). A missing `blobs/` root, or a missing per-asset
+    /// `model_tag` subdirectory, yields an empty result rather than an
+    /// error — the walk is over a tree that mostly doesn't exist yet on a
+    /// fresh catalog.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::Blob`] if a directory entry can't be read once
+    /// the walk has started (a transient I/O error mid-walk).
+    pub fn iter_vectors(&self, model_tag: &str) -> Result<Vec<VectorBlobRef>, IndexError> {
+        let mut refs = Vec::new();
+        let Ok(prefixes) = std::fs::read_dir(&self.root) else {
+            return Ok(refs);
+        };
+        for prefix_entry in prefixes {
+            let prefix_entry = prefix_entry.map_err(|source| IndexError::Blob {
+                path: self.root.clone(),
+                source,
+            })?;
+            if prefix_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                iter_vectors_under_prefix(&prefix_entry.path(), model_tag, &mut refs)?;
+            }
+        }
+        Ok(refs)
+    }
+}
+
+fn iter_vectors_under_prefix(
+    prefix_dir: &Path,
+    model_tag: &str,
+    refs: &mut Vec<VectorBlobRef>,
+) -> Result<(), IndexError> {
+    let Ok(asset_dirs) = std::fs::read_dir(prefix_dir) else {
+        return Ok(());
+    };
+    for asset_entry in asset_dirs {
+        let asset_entry = asset_entry.map_err(|source| IndexError::Blob {
+            path: prefix_dir.to_path_buf(),
+            source,
+        })?;
+        if !asset_entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let hex = asset_entry.file_name().to_string_lossy().into_owned();
+        let model_dir = asset_entry.path().join(model_tag);
+        let Ok(files) = std::fs::read_dir(&model_dir) else {
+            continue;
+        };
+        for file_entry in files {
+            let file_entry = file_entry.map_err(|source| IndexError::Blob {
+                path: model_dir.clone(),
+                source,
+            })?;
+            let name = file_entry.file_name();
+            let Some((kind, ts_ms)) = classify_vector_file(&name.to_string_lossy()) else {
+                continue;
+            };
+            refs.push(VectorBlobRef {
+                asset_hex: hex.clone(),
+                kind: kind.to_string(),
+                ts_ms,
+                path: file_entry.path(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -241,6 +330,71 @@ mod tests {
     fn asset_hex_strips_the_hash_prefix() {
         assert_eq!(asset_hex("xxh3:abc123"), Some("abc123"));
         assert_eq!(asset_hex("sha1:abc123"), None);
+    }
+
+    #[test]
+    fn iter_vectors_walks_only_the_requested_model_tags_vectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+
+        let image_path = store.path_for(
+            "aa11aa11aa11aa11aa11aa11aa11aa11",
+            &Derivation::ImageEmbedding { model_tag: "m1" },
+        );
+        store
+            .write_vector(&image_path, &[0.1, 0.2])
+            .expect("write image vector");
+
+        let kf_path = store.path_for(
+            "bb22bb22bb22bb22bb22bb22bb22bb22",
+            &Derivation::KeyframeEmbedding {
+                model_tag: "m1",
+                timestamp_ms: 4500,
+            },
+        );
+        store
+            .write_vector(&kf_path, &[0.3, 0.4])
+            .expect("write keyframe vector");
+
+        // Same asset as the image vector, but a different model tag — must
+        // not show up in an `m1` walk.
+        let other_model_path = store.path_for(
+            "aa11aa11aa11aa11aa11aa11aa11aa11",
+            &Derivation::ImageEmbedding { model_tag: "m2" },
+        );
+        store
+            .write_vector(&other_model_path, &[0.5, 0.6])
+            .expect("write other-model vector");
+
+        // The keyframe manifest lives alongside real vectors under the same
+        // model_tag dir — must be ignored, not misclassified as a vector.
+        let manifest_path = store.path_for(
+            "bb22bb22bb22bb22bb22bb22bb22bb22",
+            &Derivation::KeyframeManifest { model_tag: "m1" },
+        );
+        store
+            .write_atomic(&manifest_path, b"[]")
+            .expect("write manifest");
+
+        let mut refs = store.iter_vectors("m1").expect("iter_vectors");
+        refs.sort_by(|a, b| (&a.asset_hex, &a.kind).cmp(&(&b.asset_hex, &b.kind)));
+
+        assert_eq!(refs.len(), 2, "exactly the two m1 vectors, nothing else");
+        assert_eq!(refs[0].asset_hex, "aa11aa11aa11aa11aa11aa11aa11aa11");
+        assert_eq!(refs[0].kind, "image");
+        assert_eq!(refs[0].ts_ms, -1);
+        assert_eq!(refs[0].path, image_path);
+        assert_eq!(refs[1].asset_hex, "bb22bb22bb22bb22bb22bb22bb22bb22");
+        assert_eq!(refs[1].kind, "keyframe");
+        assert_eq!(refs[1].ts_ms, 4500);
+        assert_eq!(refs[1].path, kf_path);
+    }
+
+    #[test]
+    fn iter_vectors_on_a_store_with_no_blobs_yet_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        assert_eq!(store.iter_vectors("m1").expect("iter_vectors"), Vec::new());
     }
 
     #[test]

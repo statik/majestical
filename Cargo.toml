@@ -31,6 +31,33 @@ fast_image_resize = "6.1.0"
 zstd = "0.13.3"
 ort = "=2.0.0-rc.13"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+lancedb = "=0.33.0"      # build requires protoc: brew install protobuf
+arrow-array = "=58.3.0"  # lockstep with lancedb — do not bump independently
+arrow-schema = "=58.3.0"
+# Only "rt": the sync VectorStore wrapper drives everything through one
+# current-thread runtime's block_on, never spawning or using channels/
+# Mutex/Notify, so "sync" (and its Send+Sync-bound API surface) adds nothing.
+tokio = { version = "1", features = ["rt"] }
+futures = "0.3"
+
+# WATCHLIST (2026-07-30): a `cli`/`index` dev/test build linking lancedb's
+# dependency graph (lancedb -> datafusion -> arrow, plus ort) hits macOS
+# ld64's 16MB compact-unwind-table cap and prints a linker warning
+# ("__eh_frame section too large ... compact unwind table"). Two fixes were
+# tried and rejected:
+#   - [profile.dev.package."*"] debug = "line-tables-only" (or `false`): no
+#     effect — unwind-table emission is tied to the panic strategy
+#     (`-C force-unwind-tables`, on for the default `panic = "unwind"`), not
+#     to DWARF debug verbosity.
+#   - `-C link-args=-Wl,-no_compact_unwind` (forcing the non-compact unwind
+#     format to sidestep the cap): DO NOT USE — verified locally that it
+#     makes real panics abort the process ("failed to initiate panic, error
+#     5") instead of unwinding, which breaks `catch_unwind`-based recovery
+#     (`majestical_index::vector_store::catch_corruption`) outright.
+# The warning is otherwise harmless (ld64 falls back to slower non-compact
+# entries for the functions that don't fit) and release builds don't hit it
+# (LTO + codegen-units=1 shrinks the graph well under the cap). Left
+# unresolved rather than risk runtime correctness for a cosmetic warning.
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

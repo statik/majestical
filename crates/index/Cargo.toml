@@ -18,6 +18,11 @@ tokenizers = { workspace = true }
 # Regular dependency, not dev-only: the HEIC/HEIF decode path shells out to
 # macOS's `sips` and needs a real output file on disk at runtime.
 tempfile = { workspace = true }
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

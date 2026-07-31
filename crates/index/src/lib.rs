@@ -9,6 +9,7 @@ pub mod model;
 pub mod preprocess;
 pub mod resize;
 pub mod thumbs;
+pub mod vector_store;
 pub mod work;
 
 pub use error::IndexError;

@@ -49,6 +49,19 @@ pub(crate) fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
     })
 }
 
+/// The local per-machine state dir for `catalog_root` — the same directory
+/// [`catalog_paths`] derives `db_path` under, exposed directly for callers
+/// (the index queue's Lance store and `CoreML` cache, the search command's
+/// semantic layer) that need the directory itself rather than a path inside
+/// it.
+pub(crate) fn state_dir_for(catalog_root: &Path) -> Result<PathBuf> {
+    let paths = catalog_paths(catalog_root)?;
+    Ok(paths
+        .db_path
+        .parent()
+        .map_or_else(|| catalog_root.to_path_buf(), Path::to_path_buf))
+}
+
 fn migrate_legacy(catalog_root: &Path, state_runs: &Path) -> Result<()> {
     let legacy_db = catalog_root.join("catalog.db");
     if legacy_db.is_file() {

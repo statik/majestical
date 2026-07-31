@@ -22,9 +22,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: brew install just
+      - run: just check
+      - run: just test
   mhl-conformance:
     name: ASC MHL conformance (Python reference)
     runs-on: macos-latest
@@ -35,14 +35,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable (branch tip 2026-07-29)
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-      - run: uv venv --allow-existing .ascmhl-venv
-      - run: uv pip install --quiet --python .ascmhl-venv/bin/python ascmhl==1.2
-      # Absolute paths: `cargo test` runs test binaries with the package
-      # directory (crates/ingest), not the workspace root, as the CWD.
-      - run: |
-          ASCMHL_BIN="$GITHUB_WORKSPACE/.ascmhl-venv/bin/ascmhl" \
-          ASCMHL_DEBUG_BIN="$GITHUB_WORKSPACE/.ascmhl-venv/bin/ascmhl-debug" \
-          cargo test -p majestical-ingest --test conformance -- --ignored
+      - run: brew install just
+      - run: just conformance
+  encoder-conformance:
+    name: Encoder conformance (pinned transformers reference)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable (branch tip 2026-07-29)
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: .model-cache
+          key: model-siglip2-b16-v1
+      - run: brew install just
+      - run: just encoder-conformance
   actions-lint:
     name: Workflow lint and audit
     runs-on: ubuntu-latest

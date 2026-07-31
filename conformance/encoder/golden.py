@@ -1,0 +1,75 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["transformers==5.14.1", "torch", "pillow"]
+# ///
+"""Golden embeddings from the reference SigLIP 2 implementation.
+
+Usage: uv run conformance/encoder/golden.py --revision <sha> --out golden.json
+transformers is the pinned oracle (v5 resizes with torchvision's antialiased
+bilinear — the exact behavior our Rust preprocessing must match); torch floats
+free and its version is recorded in the output metadata.
+"""
+
+import argparse
+import json
+import pathlib
+
+import torch
+from PIL import Image
+from transformers import AutoModel, AutoProcessor
+
+TEXTS = [
+    "a photo of a beach at sunset",
+    "portrait of a golden retriever",
+    "city skyline at night",
+]
+FIXTURES = pathlib.Path("crates/index/tests/fixtures")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args()
+    model_id = "google/siglip2-base-patch16-256"
+    processor = AutoProcessor.from_pretrained(model_id, revision=args.revision)
+    model = AutoModel.from_pretrained(model_id, revision=args.revision)
+    model.eval()
+    out = {
+        "meta": {
+            "model": model_id,
+            "revision": args.revision,
+            "transformers": __import__("transformers").__version__,
+            "torch": torch.__version__,
+        },
+        "images": {},
+        "texts": {},
+        "token_ids": {},
+    }
+    with torch.no_grad():
+        for png in sorted(FIXTURES.glob("*.png")):
+            image = Image.open(png).convert("RGB")
+            inputs = processor(images=image, return_tensors="pt")
+            feats = model.get_image_features(**inputs)
+            feats = feats.pooler_output if hasattr(feats, "pooler_output") else feats
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            out["images"][png.name] = feats[0].tolist()
+        for text in TEXTS:
+            inputs = processor(
+                text=text,
+                padding="max_length",
+                max_length=64,
+                truncation=True,
+                return_tensors="pt",
+            )
+            out["token_ids"][text] = inputs["input_ids"][0].tolist()
+            feats = model.get_text_features(**inputs)
+            feats = feats.pooler_output if hasattr(feats, "pooler_output") else feats
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            out["texts"][text] = feats[0].tolist()
+    pathlib.Path(args.out).write_text(json.dumps(out))
+    print(f"golden embeddings -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()

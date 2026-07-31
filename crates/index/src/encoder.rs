@@ -149,10 +149,18 @@ fn build_vision_session(path: &Path, options: &EncoderOptions) -> Result<Session
     let builder = Session::builder()
         .map_err(|e| IndexError::Encoder(format!("creating vision session builder: {e}")))?;
     let mut builder = if options.coreml {
+        // `ModelFormat::MLProgram` fails to compile this model: ort's
+        // ONNX->ML Program converter can't translate the patch embedding
+        // Conv node ("Required param 'pad' is missing"). NeuralNetwork is
+        // CoreML's older format but still runs on the ANE via
+        // `ComputeUnits::CPUAndNeuralEngine`, and matches the reference
+        // encoder within 0.9999+ cosine (see the conformance gate).
         let mut ep = CoreML::default()
-            .with_model_format(ModelFormat::MLProgram)
+            .with_model_format(ModelFormat::NeuralNetwork)
             .with_compute_units(ComputeUnits::CPUAndNeuralEngine);
         if let Some(cache) = &options.coreml_cache {
+            std::fs::create_dir_all(cache)
+                .map_err(|e| IndexError::Encoder(format!("creating CoreML cache dir: {e}")))?;
             ep = ep.with_model_cache_dir(cache.to_string_lossy().into_owned());
         }
         builder

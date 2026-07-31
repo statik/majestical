@@ -1509,6 +1509,7 @@ dependencies = [
  "image",
  "majestical-core",
  "ort",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

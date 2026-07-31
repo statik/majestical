@@ -19,5 +19,8 @@ tokenizers = { workspace = true }
 # macOS's `sips` and needs a real output file on disk at runtime.
 tempfile = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

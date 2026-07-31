@@ -1,0 +1,21 @@
+[package]
+name = "majestical-describe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+majestical-core = { path = "../core" }
+ureq = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+httpmock = { workspace = true }
+tempfile = { workspace = true }

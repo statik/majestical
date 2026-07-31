@@ -460,9 +460,11 @@ fn unit_fractions_to_u8(hue_frac: f32, sat_frac: f32, val_frac: f32) -> (u8, u8,
 #[cfg(test)]
 mod tests {
     use super::{
-        Frame, MAX_KEYFRAMES, detect_scenes, enforce_min_scene_length, raw_candidate_cuts,
-        scene_midpoints,
+        ANALYSIS_H, ANALYSIS_W, Frame, MAX_KEYFRAMES, VideoInfo, binary_runs, chunk_frames,
+        detect_scenes, enforce_min_scene_length, format_timestamp, frame_timestamp_ms,
+        parse_probe_json, raw_candidate_cuts, rgb_to_hsv_u8, scene_midpoints, seconds_to_ms,
     };
+    use std::path::Path;
 
     fn solid(ts_ms: u64, rgb: [u8; 3]) -> Frame {
         let w = 16;
@@ -607,5 +609,192 @@ mod tests {
     fn empty_frames_yield_no_keyframes() {
         let keyframes = detect_scenes(&[], 2000, 10_000);
         assert!(keyframes.is_empty());
+    }
+
+    /// `frames.len() < 2` is the "too few frames to compare" guard — exactly
+    /// 2 frames is the minimum that must still run detection, not be turned
+    /// away by it. A `<` -> `<=` mutation on that guard would treat 2 frames
+    /// the same as 0 or 1.
+    #[test]
+    fn exactly_two_frames_is_enough_to_run_detection() {
+        let frames = vec![solid(0, [255, 0, 0]), solid(2000, [0, 0, 255])];
+        let keyframes = detect_scenes(&frames, 500, 4000);
+        assert_eq!(
+            keyframes,
+            vec![1000, 3000],
+            "2 frames with an obvious color change must still detect the cut between them"
+        );
+    }
+
+    #[test]
+    fn seconds_to_ms_rounds_to_the_nearest_millisecond() {
+        assert_eq!(seconds_to_ms(0.0), 0);
+        assert_eq!(seconds_to_ms(9.125), 9125);
+    }
+
+    #[test]
+    fn frame_timestamp_ms_scales_index_by_the_analysis_frame_rate() {
+        // At ANALYSIS_FPS (2.0), index 1 is 500ms and index 3 is 1500ms —
+        // two data points, since a `*` -> `+` mutation on the numerator
+        // happens to agree with the correct answer at index 1 alone.
+        assert_eq!(frame_timestamp_ms(0), 0);
+        assert_eq!(frame_timestamp_ms(1), 500);
+        assert_eq!(frame_timestamp_ms(3), 1500);
+    }
+
+    #[test]
+    fn format_timestamp_splits_whole_seconds_and_millis() {
+        assert_eq!(format_timestamp(0), "0.000");
+        assert_eq!(format_timestamp(1234), "1.234");
+        assert_eq!(format_timestamp(60_500), "60.500");
+    }
+
+    #[test]
+    fn chunk_frames_slices_ts_and_bytes_per_frame_without_overlap() {
+        let frame_bytes = usize::try_from(ANALYSIS_W * ANALYSIS_H * 3).expect("fits");
+        let mut raw = vec![0u8; frame_bytes * 2];
+        // Frame 1 is filled with a distinct byte so a slicing-offset bug
+        // (wrong `start`, or `start..start+frame_bytes` reading into frame
+        // 0's region) shows up as a byte-value mismatch, not just a length
+        // mismatch.
+        for b in &mut raw[frame_bytes..] {
+            *b = 7;
+        }
+        let frames = chunk_frames(Path::new("clip.mp4"), &raw).expect("chunk");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].ts_ms, 0);
+        assert_eq!(
+            frames[1].ts_ms, 500,
+            "frame 1 at 2fps analysis rate lands at 500ms"
+        );
+        assert!(frames[0].rgb.iter().all(|&b| b == 0));
+        assert!(
+            frames[1].rgb.iter().all(|&b| b == 7),
+            "frame 1 must slice the second chunk, not overlap frame 0"
+        );
+    }
+
+    #[test]
+    fn chunk_frames_rejects_a_length_not_a_multiple_of_the_frame_size() {
+        let frame_bytes = usize::try_from(ANALYSIS_W * ANALYSIS_H * 3).expect("fits");
+        let raw = vec![0u8; frame_bytes + 1];
+        assert!(chunk_frames(Path::new("clip.mp4"), &raw).is_err());
+    }
+
+    #[test]
+    fn parse_probe_json_finds_the_video_stream_and_ignores_others() {
+        let json = br#"{
+            "streams": [
+                {"codec_type": "audio", "width": 999, "height": 999},
+                {"codec_type": "video", "width": 320, "height": 180}
+            ],
+            "format": {"duration": "9.500"}
+        }"#;
+        let info = parse_probe_json(Path::new("clip.mp4"), json).expect("parse");
+        assert_eq!(
+            info,
+            VideoInfo {
+                duration_ms: 9500,
+                width: 320,
+                height: 180
+            },
+            "must pick the video stream's dimensions, not the audio stream's"
+        );
+    }
+
+    /// Hue/saturation/value are all packed onto the same 0-255 `u8` scale
+    /// (not the reference 0-179 hue scale — see the module doc on
+    /// `rgb_to_hsv_u8`). Six known colors pin every branch: the three
+    /// `hue_deg` cases (red takes the `max == r` branch, green `max == g`,
+    /// blue the `else` branch), the `delta <= EPSILON` zero-hue case (white,
+    /// black, grey), and the `max <= EPSILON` zero-saturation case (black).
+    #[test]
+    fn rgb_to_hsv_u8_matches_known_color_conversions() {
+        assert_eq!(rgb_to_hsv_u8(255, 0, 0), (0, 255, 255), "pure red");
+        assert_eq!(rgb_to_hsv_u8(0, 255, 0), (85, 255, 255), "pure green");
+        assert_eq!(rgb_to_hsv_u8(0, 0, 255), (170, 255, 255), "pure blue");
+        assert_eq!(rgb_to_hsv_u8(255, 255, 255), (0, 0, 255), "white");
+        assert_eq!(rgb_to_hsv_u8(0, 0, 0), (0, 0, 0), "black");
+        assert_eq!(rgb_to_hsv_u8(128, 128, 128), (0, 0, 128), "mid grey");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_runs_reports_true_only_for_an_actually_runnable_binary() {
+        assert!(
+            binary_runs("true"),
+            "the POSIX `true` utility must be runnable via PATH"
+        );
+        assert!(
+            !binary_runs("definitely-not-a-real-binary-9f3c2"),
+            "a nonexistent binary must report false, not true"
+        );
+    }
+
+    /// Every adjacent frame pair here scores content ~16.67 (comfortably
+    /// above `MIN_CONTENT`'s 15.0) but *identically* across the whole clip,
+    /// so a real neighborhood average also settles near 16.67 and the fire
+    /// ratio stays near 1.0 — well under `RATIO_THRESHOLD` (3.0). No cut
+    /// should ever fire; the clip must fall back to uniform sampling.
+    /// `neighborhood_average` returning a bogus `0.0` (e.g. a dropped
+    /// divide-by-count guard) turns every one of these above-floor pairs
+    /// into `score / 0.0 == +inf`, which clears the ratio threshold
+    /// unconditionally — this is the regression that guards against that.
+    #[test]
+    fn sustained_above_threshold_motion_does_not_fire_a_cut_on_its_own() {
+        let mut frames = Vec::new();
+        let mut val: i32 = 0;
+        let mut step: i32 = 50;
+        for i in 0..40u64 {
+            let v = u8::try_from(val).expect("stays within 0..=255 by construction");
+            frames.push(solid(i * 500, [v, v, v]));
+            if val + step > 255 || val + step < 0 {
+                step = -step;
+            }
+            val += step;
+        }
+
+        let keyframes = detect_scenes(&frames, 2000, 20_000);
+
+        assert_eq!(
+            keyframes.len(),
+            10,
+            "sustained above-threshold motion with a flat neighborhood must fall back to \
+             uniform sampling, not fire a cut at every frame: {keyframes:?}"
+        );
+    }
+
+    /// Isolates the `<` in `raw_candidate_cuts`'s `MIN_CONTENT` gate from
+    /// the ratio check that follows it: five flat frames (content score 0
+    /// for every pair) surround one jump whose score lands exactly on
+    /// `MIN_CONTENT` (a single gray pixel, val jumping by 45 — hue and
+    /// saturation are both 0 for grayscale, so `45 / 3 == 15.0` exactly).
+    /// The near-zero neighborhood average on both sides means the ratio
+    /// clears `RATIO_THRESHOLD` trivially once the score clears the gate at
+    /// all, so whether a cut fires here depends only on the gate itself.
+    #[test]
+    fn min_content_gate_is_exclusive_a_score_at_the_floor_still_cuts() {
+        let gray = |ts_ms: u64, v: u8| Frame {
+            ts_ms,
+            w: 1,
+            h: 1,
+            rgb: vec![v, v, v],
+        };
+        let frames = vec![
+            gray(0, 100),
+            gray(500, 100),
+            gray(1000, 100),
+            gray(1500, 145), // |145-100| = 45 -> content_score 45/3 = 15.0 exactly
+            gray(2000, 145),
+            gray(2500, 145),
+        ];
+
+        let cuts = raw_candidate_cuts(&frames);
+
+        assert_eq!(
+            cuts,
+            vec![1500],
+            "a content score exactly at MIN_CONTENT must still be treated as clearing it"
+        );
     }
 }

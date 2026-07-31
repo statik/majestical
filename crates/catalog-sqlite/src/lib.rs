@@ -151,4 +151,82 @@ mod tests {
             BTreeSet::from([a])
         );
     }
+
+    /// `CatalogStore`'s `search_names_ranked`/`asset_summaries`/`volumes`/
+    /// `volume_asset_counts` are each a one-line delegation to the inherent
+    /// `SqliteCatalog` method of the same name — the port-lag pattern
+    /// recorded in the phase 3/4 watchlist. Nothing else in the workspace
+    /// ever calls these four through `&dyn CatalogStore` (only through the
+    /// inherent methods directly), so a mutant that replaces a delegation
+    /// body with a hardcoded `Ok(vec![...])` survives unless a test actually
+    /// goes through the trait object, as this one does.
+    #[test]
+    fn catalog_store_trait_object_exposes_every_read_query() {
+        let mut p = Projection::default();
+        let a = AssetId("xxh3:aa".into());
+        p.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(1, 0)),
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::VolumeSeen {
+                volume: "v1".into(),
+                label: "Card A".into(),
+            },
+        });
+        p.apply(&Event {
+            id: EventId(ulid::Ulid::from_parts(1, 1)),
+            hlc: Hlc {
+                wall_ms: 2,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op: Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v1".into(),
+                path: "beach.mov".into(),
+                size: 1,
+                mtime_ms: 1000,
+            },
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut owned = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        let store: &mut dyn CatalogStore = &mut owned;
+        store.rebuild(&p).expect("rebuild via trait object");
+
+        assert_eq!(
+            store
+                .search_names_ranked(&["beach".to_string()], 10)
+                .expect("search via trait object")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![a.clone()],
+            "search_names_ranked must actually query, not return a constant"
+        );
+        assert_eq!(
+            store
+                .asset_summaries(std::slice::from_ref(&a))
+                .expect("asset_summaries via trait object")
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["beach.mov".to_string()]
+        );
+        assert_eq!(
+            store.volumes().expect("volumes via trait object"),
+            vec![("v1".to_string(), "Card A".to_string(), 1)],
+            "last_seen_ms must be the VolumeSeen event's own HLC wall_ms (1)"
+        );
+        assert_eq!(
+            store
+                .volume_asset_counts()
+                .expect("volume_asset_counts via trait object"),
+            vec![("v1".to_string(), 1)]
+        );
+    }
 }

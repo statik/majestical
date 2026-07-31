@@ -998,4 +998,33 @@ pub(crate) mod tests {
             "the saved search row must be gone after the incremental remove, got: {dump}"
         );
     }
+
+    /// Every other `debug_dump` test only compares two independently-built
+    /// dumps for equality — a mutant that replaces the whole function body
+    /// with a hardcoded constant string still passes those, since both
+    /// sides of the comparison call the same mutated function. This test
+    /// pins the dump's actual content against a known fixture instead, so a
+    /// constant-string mutant (or an empty one) has something concrete to
+    /// disagree with.
+    #[test]
+    fn debug_dump_reflects_real_row_content_not_a_constant() {
+        let asset = AssetId("xxh3:aa".into());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rebuild_from_ops(
+            &dir.path().join("catalog.db"),
+            vec![Op::TagAdd {
+                asset: asset.clone(),
+                tag: "topic/drone".into(),
+            }],
+        );
+        let dump = db.debug_dump().expect("dump");
+        assert!(
+            dump.contains("assets|Text(\"xxh3:aa\")"),
+            "dump must include the seeded asset row, got: {dump}"
+        );
+        assert!(
+            dump.contains("tags|Text(\"xxh3:aa\")|Text(\"topic/drone\")"),
+            "dump must include the seeded tag row, got: {dump}"
+        );
+    }
 }

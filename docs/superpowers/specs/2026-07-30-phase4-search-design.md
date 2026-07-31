@@ -271,3 +271,104 @@ claims.
 
 Each task runs the mandated loop: fresh implementer subagent → adversarial
 spec-compliance reviewer → code-quality reviewer → fix rounds until APPROVED.
+
+## As-built deviations (recorded 2026-07-31, phase complete)
+
+Where the shipped implementation departs from the text above. Each was a
+reviewed decision; deferrals carry watchlist entries with attribution.
+
+1. `open_synced` gained an `on_bad_line` callback parameter
+   (`crates/catalog-sqlite/src/apply.rs:46-50`) — the plan dropped bad-line
+   surfacing; the CLI's corrupt-line warning
+   (`crates/cli/src/commands.rs:27-29`, `crates/cli/src/app.rs:33-40`)
+   depends on it.
+2. The `instances` table's `PRIMARY KEY` briefly widened to `(asset, volume,
+   path, size)` in PR 2 (`c4ec4f4`) — a workaround for the then-set-based
+   projection legitimately holding two same-path, different-size facts at
+   once, which otherwise hit a `UNIQUE` violation. PR 3's instance-LWW
+   change (`dfdede5`) re-narrowed it to `(asset, volume, path)` once
+   instances became an HLC-LWW map keyed on `(volume, path)`, making a
+   same-path-different-size row impossible by construction; the schema
+   comment at the PK explains the narrowing.
+3. The plan's `Snapshot` wrapper struct was dropped — snapshots serialize
+   the `Projection` directly (`serde_json::to_string(projection)`,
+   `crates/catalog-sqlite/src/apply.rs:209`); the version lives in its own
+   `apply_snapshot.version` column, read separately (`:169-172`).
+4. The tuple-keyed `instances` map needs a serde adapter —
+   `serde_json` rejects non-string map keys, so `AssetState::instances` uses
+   a custom `with` module (`crates/core/src/projection.rs:55-56`) that
+   (de)serializes it as a JSON array of `{volume, path, ...}` entries; the
+   plan missed this.
+5. `--name`/`--tag` semantics were deliberately replaced by the FTS switch
+   mid-phase — basename word-prefix matching plus bm25 ranking
+   (`crates/catalog-sqlite/src/query.rs:19-41`), not path substring
+   matching.
+6. The `Volume` filter uses a `LEFT JOIN` plus instance-id match
+   (`crates/catalog-sqlite/src/query.rs:90-98`), reaching "ghost" volumes
+   with no `VolumeSeen` row — an improvement on the plan's inner join.
+7. The plan's `limit*4` prefetch starved filtered results — replaced with
+   fetch-everything-then-intersect whenever a hard filter is present
+   (`crates/cli/src/search.rs:176-186`); the `limit*4` window survives only
+   for the no-filter case.
+8. `--save` emits *after* a successful run (`crates/cli/src/search.rs:52-75`)
+   — the plan's emit-first would have persisted invalid queries to the
+   replicated event log.
+9. `arrow-array`/`arrow-schema` are pinned exactly to `58.3.0`
+   (`Cargo.toml:35-36`), in lockstep with lancedb's own arrow requirement.
+10. The semantic/FTS/filter fusion is a pure `fuse_ranked` function
+    (`crates/cli/src/search.rs:208-222`) — the plan's inline intersection was
+    untestable without the encoder model; a reviewer extracted it as a
+    standalone, model-free unit.
+11. Search's read path uses `VectorStore::open_existing`
+    (`crates/index/src/vector_store.rs:101`), which never creates a
+    dataset — the plan's `open()` created one on read.
+12. The semantic limit sentinel `usize::MAX >> 1`
+    (`crates/cli/src/search.rs:181-188`) pins lancedb 0.33.0's raw `as i64`
+    cast of the query limit, where `usize::MAX >> 1 == i64::MAX` on a
+    64-bit target.
+13. `detect_scenes`' merged-to-nothing flicker case (all raw cuts removed by
+    the minimum-scene-length merge) yields a single whole-span midpoint
+    (`crates/index/src/video.rs:256-266,358-364`) — distinct from the
+    zero-raw-cuts uniform fallback.
+14. The uniform sampling fallback fires on zero raw cuts only
+    (`crates/index/src/video.rs:260-262`) — the plan's below-10-scenes
+    branches were byte-identical, so the threshold constant was dropped.
+15. `ModelFormat::NeuralNetwork`, not `MLProgram`
+    (`crates/index/src/encoder.rs:151-158`) — ort's CoreML converter fails
+    on the patch-embed `Conv` under `MLProgram`; conformance floors prove
+    ANE execution still holds under `NeuralNetwork`.
+16. `maj model fetch` shells out to system `curl`
+    (`crates/index/src/model.rs:166`) rather than pulling in an HTTP client
+    dependency; the vision tower is fp32, the text tower fp16
+    (`crates/index/src/model.rs:23-24,30,36`).
+17. `tokenizers` uses the `fancy-regex` backend, not `onig`
+    (`Cargo.toml:33`, `default-features = false, features =
+    ["fancy-regex"]`) — avoids onig's C++ build; exact golden-token parity
+    is proven by conformance.
+18. CI installs `just` on macOS runners and calls justfile recipes
+    throughout (`.github/workflows/ci.yml:27-28,40-41,67-68`) — a user
+    directive for a single command source.
+19. `maj model fetch` has no `--json` flag — only `--verify`
+    (`crates/cli/src/main.rs:225-230`) — despite this spec's `maj model
+    fetch [--json]` (line 183). The phase 4 plan's own Task 13 code baked
+    in `--verify` without ever specifying `--json`, so the gap traces to
+    the plan, not a later implementation drift; not caught until this
+    review.
+20. `maj index status` prints no model-cache-state line
+    (`crates/cli/src/index_cmd.rs:887-907`), despite this spec's "per-kind
+    counts... model cache state" (line 181) — the model cache path only
+    ever prints from `maj model fetch`
+    (`crates/cli/src/index_cmd.rs:918-919`). Same root cause as #19: the
+    plan's own `cmd_index_status` sketch never included it.
+21. Task 20's cucumber suite shipped a "kind filter selects by media class"
+    scenario in place of the plan's "Filter-only search over an offline
+    volume still answers" scenario
+    (`crates/cli/tests/features/search.feature`), with no record of the
+    swap at the time. Restored: the offline-volume scenario is back
+    (`crates/cli/tests/features/search.feature:33-36`,
+    `crates/cli/tests/acceptance.rs`'s `catalog_with_an_offline_asset`
+    step) — an asset scanned under an explicit `--volume` id that
+    `volume_identity::mounted_volumes` never resolves is offline by
+    construction, no mount-faking or file-deletion needed, exactly as the
+    plan's own note anticipated. The kind-filter scenario stays too; both
+    now run.

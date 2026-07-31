@@ -17,12 +17,17 @@
 //! vs "quarterly"), and boundary drift (first segment's start, last
 //! segment's end) catches the two implementations disagreeing about where
 //! speech starts/ends without requiring every segment split at the same
-//! words. The fixture leads with ~2s of silence (see the justfile recipe)
-//! so the first boundary is nonzero — otherwise a bug that scales
-//! timestamps wrong (e.g. a dropped x10 unit conversion) still lands near
-//! 0ms and the first-boundary assert passes vacuously; the last-segment-end
-//! assert closes that gap unconditionally, since the fixture runs long
-//! enough that a x10 scale error can't land within tolerance by chance.
+//! words.
+//!
+//! Both boundaries are asserted, not just one: the fixture leads with ~2s of
+//! silence (see the justfile recipe), but both engines absorb that silence
+//! into the first segment rather than reporting a nonzero start — so the
+//! first-boundary assert only catches gross start disagreement (e.g. an
+//! engine trimming or offsetting leading audio), not a uniform timestamp
+//! scale bug (a dropped x10 unit conversion still lands at 0ms either way).
+//! The last-segment-end assert is what actually defends against that class
+//! of bug: the fixture runs long enough (~9.5s) that a x10 scale error
+//! can't land within tolerance by chance.
 
 use majestical_index::model::{self, WHISPER};
 use majestical_index::transcribe::Transcriber;
@@ -106,7 +111,7 @@ fn whisper_rs_matches_faster_whisper_reference() {
     let reference = normalize(&reference_text);
     let hypothesis = normalize(&transcript.text);
     let wer = word_error_rate(&reference, &hypothesis);
-    // Print the measured value on success too (sibling gates report floors).
+    // Sibling gates only assert against floors; this one also prints the measured values.
     report_measurement(&format!("WER {wer:.4} (max {MAX_WER})"));
     assert!(
         wer <= MAX_WER,
@@ -114,7 +119,7 @@ fn whisper_rs_matches_faster_whisper_reference() {
         transcript.text
     );
 
-    let reference_first = golden["segments"][0]["start_ms"].as_i64().expect("start");
+    let reference_first = reference_segments[0]["start_ms"].as_i64().expect("start");
     let ours_first = i64::try_from(transcript.segments[0].start_ms).expect("fits");
     let drift = (reference_first - ours_first).abs();
     report_measurement(&format!(
@@ -125,11 +130,7 @@ fn whisper_rs_matches_faster_whisper_reference() {
         "first-segment drift {reference_first} vs {ours_first}"
     );
 
-    let reference_last = golden["segments"]
-        .as_array()
-        .expect("segments")
-        .last()
-        .expect("at least one segment")["end_ms"]
+    let reference_last = reference_segments.last().expect("at least one segment")["end_ms"]
         .as_i64()
         .expect("end");
     let ours_last = i64::try_from(

@@ -12,7 +12,7 @@ text-encoder oracle on CI's virtualized Metal in this phase's PR 2 — but
 `device="cpu"` is set anyway (CTranslate2 also has a CoreML/GPU path) to pin
 the oracle's execution device explicitly rather than rely on its default.
 
-Usage: uv run conformance/whisper/golden.py --audio fixture.wav --out golden.json
+Usage: uv run conformance/whisper/golden.py --revision <sha> --audio fixture.wav --out golden.json
 """
 
 import argparse
@@ -24,10 +24,16 @@ from faster_whisper import WhisperModel
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--revision", required=True)
     parser.add_argument("--audio", required=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    model = WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")  # pin device, see module docstring
+    model = WhisperModel(
+        "large-v3-turbo",
+        device="cpu",  # pin device, see module docstring
+        compute_type="int8",
+        revision=args.revision,
+    )
     segments, info = model.transcribe(args.audio)
     rows = [
         {"start_ms": int(s.start * 1000), "end_ms": int(s.end * 1000), "text": s.text}
@@ -38,6 +44,7 @@ def main() -> None:
     out = {
         "meta": {
             "model": "large-v3-turbo",
+            "revision": args.revision,
             "faster_whisper": faster_whisper.__version__,
             "device": "cpu",
             "compute_type": "int8",

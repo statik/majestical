@@ -1,6 +1,7 @@
-//! Encoder model artifacts: pinned URLs + sha256, fetched with system curl
-//! into a shared cache. Every artifact is verified before it is placed;
-//! nothing unverified ever sits at a final path.
+//! Model artifacts (encoder, transcriber, text embedder): pinned URLs +
+//! sha256 digests + cache resolution, fetched with system curl into a
+//! shared cache. Every artifact is verified before it is placed; nothing
+//! unverified ever sits at a final path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -290,8 +291,7 @@ pub fn fetch_one(spec: &FetchSpec<'_>) -> Result<FetchOutcome, IndexError> {
 
 /// Fetches every file of `spec` into `dir`, reporting each file's name, size
 /// in MB, and outcome via `progress`. Libraries never print — all progress
-/// rendering happens in the CLI callback. Shared by [`fetch`] and
-/// [`fetch_spec`].
+/// rendering happens in the CLI callback.
 ///
 /// # Errors
 /// Returns the first [`IndexError::Model`] hit fetching any file.
@@ -333,16 +333,6 @@ pub fn fetch_spec(
 ) -> Result<(), IndexError> {
     let dir = model_dir_for(spec)?;
     fetch_into(spec, &dir, verify, progress)
-}
-
-/// Fetches every [`MODEL_FILES`] entry into `dir`. Kept for existing callers
-/// that already resolved [`model_dir`] themselves; delegates to
-/// [`fetch_into`] for [`SIGLIP`].
-///
-/// # Errors
-/// Returns the first [`IndexError::Model`] hit fetching any file.
-pub fn fetch(dir: &Path, verify: bool, progress: &mut dyn FnMut(&str)) -> Result<(), IndexError> {
-    fetch_into(&SIGLIP, dir, verify, progress)
 }
 
 #[cfg(test)]

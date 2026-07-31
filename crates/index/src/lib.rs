@@ -7,6 +7,7 @@ pub mod chunk;
 pub mod encoder;
 pub mod error;
 pub mod model;
+pub mod ocr;
 pub mod preprocess;
 pub mod resize;
 pub mod text_encoder;

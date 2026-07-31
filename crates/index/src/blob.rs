@@ -38,6 +38,15 @@ pub enum Derivation<'a> {
         model_tag: &'a str,
         start_ms: u64,
     },
+    /// Recognized text (JSON, zstd-compressed) for a still image.
+    OcrImage {
+        model_tag: &'a str,
+    },
+    /// Recognized text (JSON, zstd-compressed) for one video keyframe.
+    OcrKeyframe {
+        model_tag: &'a str,
+        timestamp_ms: u64,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -105,6 +114,13 @@ impl BlobStore {
             } => dir
                 .join(model_tag)
                 .join(format!("chunk-{start_ms}.f32le.zst")),
+            Derivation::OcrImage { model_tag } => dir.join(model_tag).join("image.json.zst"),
+            Derivation::OcrKeyframe {
+                model_tag,
+                timestamp_ms,
+            } => dir
+                .join(model_tag)
+                .join(format!("kf-{timestamp_ms}.json.zst")),
         }
     }
 
@@ -354,6 +370,27 @@ mod tests {
     }
 
     #[test]
+    fn ocr_blob_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let image = store.path_for(
+            "aabb",
+            &Derivation::OcrImage {
+                model_tag: "applevision-r3-v1",
+            },
+        );
+        assert!(image.ends_with("aa/aabb/applevision-r3-v1/image.json.zst"));
+        let kf = store.path_for(
+            "aabb",
+            &Derivation::OcrKeyframe {
+                model_tag: "applevision-r3-v1",
+                timestamp_ms: 7_000,
+            },
+        );
+        assert!(kf.ends_with("aa/aabb/applevision-r3-v1/kf-7000.json.zst"));
+    }
+
+    #[test]
     fn iter_vectors_finds_transcript_chunk_vectors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
@@ -445,6 +482,21 @@ mod tests {
         store
             .write_atomic(&manifest_path, b"[]")
             .expect("write manifest");
+
+        // A keyframe OCR blob (`kf-<ts>.json.zst`) shares the `kf-` prefix
+        // with keyframe embedding vectors — the `.f32le.zst` suffix check
+        // must keep it out of the vector walk even if the tags ever shared
+        // a dir.
+        let ocr_kf_path = store.path_for(
+            "bb22bb22bb22bb22bb22bb22bb22bb22",
+            &Derivation::OcrKeyframe {
+                model_tag: "m1",
+                timestamp_ms: 7_000,
+            },
+        );
+        store
+            .write_atomic(&ocr_kf_path, b"{}")
+            .expect("write ocr keyframe blob");
 
         let mut refs = store.iter_vectors("m1").expect("iter_vectors");
         refs.sort_by(|a, b| (&a.asset_hex, &a.kind).cmp(&(&b.asset_hex, &b.kind)));

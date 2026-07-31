@@ -44,6 +44,20 @@ base64 = "0.23.0"
 toml = "1.1.4"
 httpmock = "0.8.3"
 whisper-rs = { version = "0.16.0", features = ["metal"] }
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+# Vision's default features pull in AVFoundation/CoreML/CoreMedia/CoreVideo
+# binding crates the OCR module never touches; enable only the text-
+# recognition surface (objc2-core-foundation is for CGRect bounding boxes).
+objc2-vision = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "VNTypes",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "objc2-core-foundation",
+] }
 
 # WATCHLIST (2026-07-30): a `cli`/`index` dev/test build linking lancedb's
 # dependency graph (lancedb -> datafusion -> arrow, plus ort) hits macOS

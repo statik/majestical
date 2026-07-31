@@ -142,6 +142,56 @@ pub trait CatalogStore {
     fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, PortError>;
 }
 
+/// A model-produced caption for one asset (or one video keyframe).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Caption {
+    pub text: String,
+    /// Derivation model tag, e.g. `describe-qwen3-vl-8b`.
+    pub model_tag: String,
+}
+
+/// One suggested tag, pending human confirmation. Never written to the
+/// event log — confirmation emits a plain `TagAdd`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TagSuggestion {
+    pub tag: String,
+    /// Model-reported confidence in [0, 1].
+    pub confidence: f64,
+    /// True when `tag` was already in the catalog's folksonomy.
+    pub in_vocab: bool,
+    pub model_tag: String,
+}
+
+/// What tag suggestion looks at: the image itself for stills, the pooled
+/// keyframe captions (text-only call) for video.
+#[derive(Debug)]
+pub enum TagSubject<'a> {
+    Image(&'a [u8]),
+    Captions(&'a [String]),
+}
+
+/// Captions + open-vocabulary tag suggestion via a configured backend.
+/// Implementations live outside core (`crates/describe`).
+pub trait Describer {
+    /// Caption one image (encoded bytes, e.g. WebP).
+    ///
+    /// # Errors
+    /// Returns `PortError` when the backend is unreachable, the model
+    /// rejects the request, or the response cannot be parsed.
+    fn caption(&self, image: &[u8]) -> Result<Caption, PortError>;
+
+    /// Suggest tags for a subject, classified against `existing_vocab`.
+    ///
+    /// # Errors
+    /// Returns `PortError` when the backend is unreachable, the model
+    /// rejects the request, or the response cannot be parsed.
+    fn suggest_tags(
+        &self,
+        subject: TagSubject<'_>,
+        existing_vocab: &[String],
+    ) -> Result<Vec<TagSuggestion>, PortError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +315,45 @@ mod tests {
         let mut bad = 0;
         let all = log.read_all_reporting(&mut |_| bad += 1).expect("read");
         assert_eq!((all.len(), bad), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod describer_tests {
+    use super::{Caption, TagSubject, TagSuggestion};
+
+    #[test]
+    fn tag_suggestion_serializes_round_trip() {
+        let s = TagSuggestion {
+            tag: "person/dana".into(),
+            confidence: 0.87,
+            in_vocab: true,
+            model_tag: "describe-qwen3-vl-8b".into(),
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: TagSuggestion = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tag, "person/dana");
+        assert!((back.confidence - 0.87).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn caption_serializes_round_trip() {
+        let c = Caption {
+            text: "a red barn at dusk".into(),
+            model_tag: "describe-x".into(),
+        };
+        let json = serde_json::to_string(&c).expect("serialize");
+        let back: Caption = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.text, "a red barn at dusk");
+    }
+
+    #[test]
+    fn tag_subject_borrows_without_clone() {
+        let captions = vec!["a".to_string(), "b".to_string()];
+        let subject = TagSubject::Captions(&captions);
+        let TagSubject::Captions(inner) = subject else {
+            panic!("wrong variant")
+        };
+        assert_eq!(inner.len(), 2);
     }
 }

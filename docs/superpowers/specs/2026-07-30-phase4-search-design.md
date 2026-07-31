@@ -271,3 +271,72 @@ claims.
 
 Each task runs the mandated loop: fresh implementer subagent → adversarial
 spec-compliance reviewer → code-quality reviewer → fix rounds until APPROVED.
+
+## As-built deviations (recorded 2026-07-31, phase complete)
+
+Where the shipped implementation departs from the text above. Each was a
+reviewed decision; deferrals carry watchlist entries with attribution.
+
+1. `open_synced` gained an `on_bad_line` callback parameter
+   (`crates/catalog-sqlite/src/apply.rs:46-50`) — the plan dropped bad-line
+   surfacing; the CLI's corrupt-line warning
+   (`crates/cli/src/commands.rs:27-29`, `crates/cli/src/app.rs:33-40`)
+   depends on it.
+2. The plan's `Snapshot` wrapper struct was dropped — snapshots serialize
+   the `Projection` directly (`serde_json::to_string(projection)`,
+   `crates/catalog-sqlite/src/apply.rs:209`); the version lives in its own
+   `apply_snapshot.version` column, read separately (`:169-172`).
+3. The tuple-keyed `instances` map needs a serde adapter —
+   `serde_json` rejects non-string map keys, so `AssetState::instances` uses
+   a custom `with` module (`crates/core/src/projection.rs:55-56`) that
+   (de)serializes it as a JSON array of `{volume, path, ...}` entries; the
+   plan missed this.
+4. `--name`/`--tag` semantics were deliberately replaced by the FTS switch
+   mid-phase — basename word-prefix matching plus bm25 ranking
+   (`crates/catalog-sqlite/src/query.rs:19-41`), not path substring
+   matching.
+5. The `Volume` filter uses a `LEFT JOIN` plus instance-id match
+   (`crates/catalog-sqlite/src/query.rs:90-98`), reaching "ghost" volumes
+   with no `VolumeSeen` row — an improvement on the plan's inner join.
+6. The plan's `limit*4` prefetch starved filtered results — replaced with
+   fetch-everything-then-intersect whenever a hard filter is present
+   (`crates/cli/src/search.rs:176-186`); the `limit*4` window survives only
+   for the no-filter case.
+7. `--save` emits *after* a successful run (`crates/cli/src/search.rs:52-75`)
+   — the plan's emit-first would have persisted invalid queries to the
+   replicated event log.
+8. `arrow-array`/`arrow-schema` are pinned exactly to `58.3.0`
+   (`Cargo.toml:35-36`), in lockstep with lancedb's own arrow requirement.
+9. The semantic/FTS/filter fusion is a pure `fuse_ranked` function
+   (`crates/cli/src/search.rs:208-222`) — the plan's inline intersection was
+   untestable without the encoder model; a reviewer extracted it as a
+   standalone, model-free unit.
+10. Search's read path uses `VectorStore::open_existing`
+    (`crates/index/src/vector_store.rs:101`), which never creates a
+    dataset — the plan's `open()` created one on read.
+11. The semantic limit sentinel `usize::MAX >> 1`
+    (`crates/cli/src/search.rs:181-188`) pins lancedb 0.33.0's raw `as i64`
+    cast of the query limit, where `usize::MAX >> 1 == i64::MAX` on a
+    64-bit target.
+12. `detect_scenes`' merged-to-nothing flicker case (all raw cuts removed by
+    the minimum-scene-length merge) yields a single whole-span midpoint
+    (`crates/index/src/video.rs:256-266,358-364`) — distinct from the
+    zero-raw-cuts uniform fallback.
+13. The uniform sampling fallback fires on zero raw cuts only
+    (`crates/index/src/video.rs:260-262`) — the plan's below-10-scenes
+    branches were byte-identical, so the threshold constant was dropped.
+14. `ModelFormat::NeuralNetwork`, not `MLProgram`
+    (`crates/index/src/encoder.rs:151-158`) — ort's CoreML converter fails
+    on the patch-embed `Conv` under `MLProgram`; conformance floors prove
+    ANE execution still holds under `NeuralNetwork`.
+15. `maj model fetch` shells out to system `curl`
+    (`crates/index/src/model.rs:166`) rather than pulling in an HTTP client
+    dependency; the vision tower is fp32, the text tower fp16
+    (`crates/index/src/model.rs:23-24,30,36`).
+16. `tokenizers` uses the `fancy-regex` backend, not `onig`
+    (`Cargo.toml:33`, `default-features = false, features =
+    ["fancy-regex"]`) — avoids onig's C++ build; exact golden-token parity
+    is proven by conformance.
+17. CI installs `just` on macOS runners and calls justfile recipes
+    throughout (`.github/workflows/ci.yml:27-28,40-41,67-68`) — a user
+    directive for a single command source.

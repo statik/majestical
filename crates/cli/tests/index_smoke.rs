@@ -162,6 +162,87 @@ fn model_fetch_reports_already_present_without_network() {
         .stdout(contains("already present").count(3));
 }
 
+/// `index run` always performs the blob↔Lance diff — even with no model
+/// installed and zero embed items in the plan — because that diff is how a
+/// teammate's synced vectors (or a lance dir just rebuilt after corruption)
+/// get indexed with zero re-inference. A hand-written vector blob (as if
+/// synced in) must get picked up without the encoder ever loading.
+#[test]
+fn embeddings_loaded_from_blobs_without_model() {
+    let media = tempfile::tempdir().unwrap();
+    let png_path = media.path().join("photo.png");
+    write_test_png(&png_path, 8, 8);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    // Empty model cache: the encoder must never load on this path.
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    // Same content hash `scan` computes: a one-shot xxh3-128 digest of the
+    // file's bytes (streaming vs. one-shot makes no difference to the
+    // digest for a file this small).
+    let bytes = std::fs::read(&png_path).unwrap();
+    let hex = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&bytes));
+
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+    let vector = vec![0.1f32; majestical_index::vector_store::DIM];
+    let path = blobs.path_for(
+        &hex,
+        &majestical_index::blob::Derivation::ImageEmbedding {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    blobs.write_vector(&path, &vector).unwrap();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run"])
+        .assert()
+        .success()
+        .stdout(contains("1 loaded from blobs"));
+}
+
+/// With no model installed, `search` degrades to name-only matching and
+/// reports the specific fix on stderr — never a hard failure just because
+/// the semantic layer can't run.
+#[test]
+fn search_without_model_degrades_with_notice() {
+    let media = tempfile::tempdir().unwrap();
+    write_test_png(&media.path().join("photo.png"), 8, 8);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["search", "photo"])
+        .assert()
+        .success()
+        .stdout(contains("results"))
+        .stderr(contains("maj model fetch"));
+}
+
 /// `--limit` caps how much of the queue one pass works, so a long-running
 /// index can be broken into bounded chunks: two pending thumbnails with
 /// `--limit 1` take two passes, not one.

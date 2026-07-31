@@ -51,6 +51,14 @@ jobs:
         with:
           path: .model-cache
           key: model-siglip2-b16-v1
+      # The torch-side reference model (golden.py's AutoModel.from_pretrained)
+      # downloads into HF's default cache, separate from .model-cache (our
+      # own ONNX artifacts) — cached by the pinned revision so a bump there
+      # invalidates it automatically.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/huggingface
+          key: hf-reference-3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab
       - run: brew install just
       - run: just encoder-conformance
   actions-lint:

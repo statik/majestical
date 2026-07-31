@@ -50,6 +50,23 @@ fn text_tokens_are_fixed_64_right_padded_with_eos() {
 
 #[test]
 #[ignore = "needs fetched model"]
+fn long_text_is_truncated_to_the_fixed_length() {
+    let dir = require_model_dir();
+    let encoder = Encoder::load_text_only(&dir).expect("load text-only encoder");
+    // Without truncation configured, this tokenizes to 242 ids and
+    // `token_ids` errors loudly (its fixed-length check) instead of
+    // silently degrading — this test pins truncation staying configured.
+    let long_text = "a photo of a beach at sunset with palm trees and waves ".repeat(6);
+
+    let ids = encoder
+        .token_ids(&long_text)
+        .expect("long input must truncate, not error");
+
+    assert_eq!(ids.len(), 64);
+}
+
+#[test]
+#[ignore = "needs fetched model"]
 fn matching_text_and_image_score_higher_than_mismatched() {
     let dir = require_model_dir();
     let mut encoder = Encoder::load(

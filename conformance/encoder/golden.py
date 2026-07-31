@@ -1,13 +1,15 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["transformers==5.14.1", "torch", "pillow"]
+# dependencies = ["transformers==5.14.1", "torch==2.13.0", "pillow==12.3.0"]
 # ///
 """Golden embeddings from the reference SigLIP 2 implementation.
 
 Usage: uv run conformance/encoder/golden.py --revision <sha> --out golden.json
 transformers is the pinned oracle (v5 resizes with torchvision's antialiased
-bilinear — the exact behavior our Rust preprocessing must match); torch floats
-free and its version is recorded in the output metadata.
+bilinear — the exact behavior our Rust preprocessing must match). torch and
+pillow are pinned too (not left to float) so a fresh CI runner resolving
+these deps for the first time can't silently drift the oracle; versions are
+still recorded in the output metadata as a cross-check.
 """
 
 import argparse

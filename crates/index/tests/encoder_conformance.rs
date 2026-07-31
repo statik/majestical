@@ -23,6 +23,26 @@ use majestical_index::thumbs::decode_image;
 const VISION_CPU_MIN_COSINE: f32 = 0.999;
 const VISION_COREML_MIN_COSINE: f32 = 0.99;
 const TEXT_MIN_COSINE: f32 = 0.995;
+/// Cosine of two unit vectors can't exceed 1.0; margin covers f32 rounding.
+/// A score above this means our embedding isn't actually unit-normalized —
+/// without this upper bound, every floor assert below is one-sided and
+/// can't catch that (an un-normalized embedding still points the right
+/// direction, so the raw dot product clears the floor by a wide margin).
+const COSINE_UPPER_BOUND: f32 = 1.0 + 1e-3;
+
+/// Asserts `score` is a plausible cosine similarity: at or above `floor`,
+/// and not above [`COSINE_UPPER_BOUND`] (which would mean `embedding` isn't
+/// unit-normalized — see its doc comment).
+fn assert_cosine_floor(score: f32, floor: f32, context: &str) {
+    assert!(
+        score >= floor,
+        "{context}: cosine {score} below floor {floor}"
+    );
+    assert!(
+        score <= COSINE_UPPER_BOUND,
+        "{context}: cosine {score} exceeds {COSINE_UPPER_BOUND}"
+    );
+}
 
 struct Golden {
     images: BTreeMap<String, Vec<f32>>,
@@ -144,10 +164,7 @@ fn cpu_embeddings_match_reference() {
         let embedding = encoder.embed_image(&img).expect("embed image");
         let score = cosine(&embedding, expected);
         worst_vision = worst_vision.min(score);
-        assert!(
-            score >= VISION_CPU_MIN_COSINE,
-            "{name}: cosine {score} below floor {VISION_CPU_MIN_COSINE}"
-        );
+        assert_cosine_floor(score, VISION_CPU_MIN_COSINE, name);
     }
 
     let mut worst_text = f32::MAX;
@@ -155,10 +172,7 @@ fn cpu_embeddings_match_reference() {
         let embedding = encoder.embed_text(text).expect("embed text");
         let score = cosine(&embedding, expected);
         worst_text = worst_text.min(score);
-        assert!(
-            score >= TEXT_MIN_COSINE,
-            "{text:?}: cosine {score} below floor {TEXT_MIN_COSINE}"
-        );
+        assert_cosine_floor(score, TEXT_MIN_COSINE, text);
     }
 
     report_floors(&[("vision (CPU)", worst_vision), ("text", worst_text)]);
@@ -187,10 +201,7 @@ fn coreml_vision_is_close_to_reference() {
         let embedding = encoder.embed_image(&img).expect("embed image");
         let score = cosine(&embedding, expected);
         worst = worst.min(score);
-        assert!(
-            score >= VISION_COREML_MIN_COSINE,
-            "{name}: CoreML cosine {score} below floor {VISION_COREML_MIN_COSINE}"
-        );
+        assert_cosine_floor(score, VISION_COREML_MIN_COSINE, name);
     }
 
     report_floors(&[("vision (CoreML)", worst)]);

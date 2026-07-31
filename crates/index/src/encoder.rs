@@ -225,6 +225,13 @@ fn pooled(outputs: &SessionOutputs<'_>) -> Result<Vec<f32>, IndexError> {
     }
     let mut embedding = data.to_vec();
     l2_normalize(&mut embedding);
+    let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if (norm - 1.0).abs() > 1e-3 {
+        return Err(IndexError::Encoder(format!(
+            "pooler output failed to normalize: norm {norm} not within 1e-3 of 1.0 — \
+             PR 7's Lance ranking assumes unit-normalized embeddings"
+        )));
+    }
     Ok(embedding)
 }
 

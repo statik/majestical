@@ -35,7 +35,10 @@ fn blocks() -> image::RgbImage {
 }
 
 fn wide() -> image::RgbImage {
-    let (width, height) = (512u32, 64u32);
+    // 500x61: non-integer resize ratios on both axes against the 256x256
+    // target (unlike the old 512x64, an exact 2x downscale most filters
+    // agree on) — this is what actually pins the resize filter choice.
+    let (width, height) = (500u32, 61u32);
     let mut img = image::RgbImage::new(width, height);
     for (x, y, px) in img.enumerate_pixels_mut() {
         let red = x % 256;

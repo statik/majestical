@@ -1,6 +1,7 @@
-//! Encoder model artifacts: pinned URLs + sha256, fetched with system curl
-//! into a shared cache. Every artifact is verified before it is placed;
-//! nothing unverified ever sits at a final path.
+//! Model artifacts (encoder, transcriber, text embedder): pinned URLs +
+//! sha256 digests + cache resolution, fetched with system curl into a
+//! shared cache. Every artifact is verified before it is placed; nothing
+//! unverified ever sits at a final path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,14 +11,20 @@ use sha2::{Digest as _, Sha256};
 use crate::error::IndexError;
 
 pub const MODEL_TAG: &str = "siglip2-b16-v1";
-const HF_REPO: &str = "onnx-community/siglip2-base-patch16-256-ONNX";
-const HF_REVISION: &str = "d1114256522a37ffa257a0a58017348ab0058db2";
 
 pub struct ModelFile {
     pub name: &'static str,
     pub repo_path: &'static str,
     pub sha256: &'static str,
     pub bytes: u64,
+}
+
+/// One fetchable model: `tag` doubles as cache-dir leaf and blob model tag.
+pub struct ModelSpec {
+    pub tag: &'static str,
+    pub repo: &'static str,
+    pub revision: &'static str,
+    pub files: &'static [ModelFile],
 }
 
 /// Vision tower fp32 (Core ML handles precision internally), text tower fp16
@@ -46,6 +53,78 @@ pub const MODEL_FILES: [ModelFile; 3] = [
     },
 ];
 
+pub const SIGLIP: ModelSpec = ModelSpec {
+    tag: MODEL_TAG,
+    repo: "onnx-community/siglip2-base-patch16-256-ONNX",
+    revision: "d1114256522a37ffa257a0a58017348ab0058db2",
+    files: &MODEL_FILES,
+};
+
+/// Whisper large-v3-turbo, `q5_0` quantization (ggml/whisper.cpp format).
+///
+/// Pin verified 2026-07-31 via the `HuggingFace` API's `sha` field and the
+/// file tree's LFS sha256 oid — do NOT change without re-verifying.
+pub const WHISPER: ModelSpec = ModelSpec {
+    tag: "whisper-large-v3-turbo-q5-v1",
+    repo: "ggerganov/whisper.cpp",
+    revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
+    files: &[ModelFile {
+        name: "ggml-large-v3-turbo-q5_0.bin",
+        repo_path: "ggml-large-v3-turbo-q5_0.bin",
+        sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        bytes: 574_041_195,
+    }],
+};
+
+/// `sentence-transformers/all-MiniLM-L6-v2`, ONNX export.
+///
+/// Pin verified 2026-07-31 via the `HuggingFace` API's `sha` field and the
+/// file tree's sha256 (LFS oid for `model.onnx`; `tokenizer.json` isn't
+/// LFS-tracked in this repo, so its hash was computed locally from a
+/// downloaded copy at this revision) — do NOT change without re-verifying.
+pub const MINILM: ModelSpec = ModelSpec {
+    tag: "minilm-l6-v2-v1",
+    repo: "sentence-transformers/all-MiniLM-L6-v2",
+    revision: "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    files: &[
+        ModelFile {
+            name: "model.onnx",
+            repo_path: "onnx/model.onnx",
+            sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+            bytes: 90_405_214,
+        },
+        ModelFile {
+            name: "tokenizer.json",
+            repo_path: "tokenizer.json",
+            sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+            bytes: 466_247,
+        },
+    ],
+};
+
+pub const ALL_MODELS: [&ModelSpec; 3] = [&SIGLIP, &WHISPER, &MINILM];
+
+/// The shared model cache root: `MAJ_MODEL_DIR` when set, else the platform
+/// data dir joined with `majestical/models`.
+///
+/// # Errors
+/// Returns [`IndexError::Model`] if no platform data directory can be
+/// resolved and `MAJ_MODEL_DIR` isn't set.
+fn base_dir() -> Result<PathBuf, IndexError> {
+    if let Some(dir) = std::env::var_os("MAJ_MODEL_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| IndexError::Model("no platform data directory available".to_string()))?;
+    Ok(data_dir.join("majestical").join("models"))
+}
+
+/// Composes a cache directory for `spec` under `base` — pure path joining,
+/// factored out so tests can exercise it without touching process env.
+pub(crate) fn dir_under_base(base: &Path, spec: &ModelSpec) -> PathBuf {
+    base.join(spec.tag)
+}
+
 /// Where this model's files live on disk: `MAJ_MODEL_DIR` (joined with
 /// [`MODEL_TAG`]) when set, else the platform data dir.
 ///
@@ -53,12 +132,22 @@ pub const MODEL_FILES: [ModelFile; 3] = [
 /// Returns [`IndexError::Model`] if no platform data directory can be
 /// resolved and `MAJ_MODEL_DIR` isn't set.
 pub fn model_dir() -> Result<PathBuf, IndexError> {
-    if let Some(dir) = std::env::var_os("MAJ_MODEL_DIR") {
-        return Ok(PathBuf::from(dir).join(MODEL_TAG));
-    }
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| IndexError::Model("no platform data directory available".to_string()))?;
-    Ok(data_dir.join("majestical").join("models").join(MODEL_TAG))
+    model_dir_for(&SIGLIP)
+}
+
+/// Cache dir for one model spec (`MAJ_MODEL_DIR` override honored).
+///
+/// # Errors
+/// Returns [`IndexError::Model`] when no data dir can be resolved.
+pub fn model_dir_for(spec: &ModelSpec) -> Result<PathBuf, IndexError> {
+    Ok(dir_under_base(&base_dir()?, spec))
+}
+
+pub(crate) fn file_url(spec: &ModelSpec, file: &ModelFile) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        spec.repo, spec.revision, file.repo_path
+    )
 }
 
 /// Cheap presence check: every [`MODEL_FILES`] entry exists at its exact
@@ -200,18 +289,20 @@ pub fn fetch_one(spec: &FetchSpec<'_>) -> Result<FetchOutcome, IndexError> {
     Ok(FetchOutcome::Downloaded)
 }
 
-/// Fetches every [`MODEL_FILES`] entry into `dir`, reporting each file's
-/// name, size in MB, and outcome via `progress`. Libraries never print —
-/// all progress rendering happens in the CLI callback.
+/// Fetches every file of `spec` into `dir`, reporting each file's name, size
+/// in MB, and outcome via `progress`. Libraries never print — all progress
+/// rendering happens in the CLI callback.
 ///
 /// # Errors
 /// Returns the first [`IndexError::Model`] hit fetching any file.
-pub fn fetch(dir: &Path, verify: bool, progress: &mut dyn FnMut(&str)) -> Result<(), IndexError> {
-    for file in &MODEL_FILES {
-        let url = format!(
-            "https://huggingface.co/{HF_REPO}/resolve/{HF_REVISION}/{}",
-            file.repo_path
-        );
+fn fetch_into(
+    spec: &ModelSpec,
+    dir: &Path,
+    verify: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), IndexError> {
+    for file in spec.files {
+        let url = file_url(spec, file);
         let mb = file.bytes / 1_000_000;
         let outcome = fetch_one(&FetchSpec {
             dir,
@@ -228,6 +319,20 @@ pub fn fetch(dir: &Path, verify: bool, progress: &mut dyn FnMut(&str)) -> Result
         progress(&format!("{} ({mb} MB): {status}", file.name));
     }
     Ok(())
+}
+
+/// Fetches every file of `spec` into its cache dir ([`model_dir_for`]).
+///
+/// # Errors
+/// Returns the first [`IndexError::Model`] hit resolving the cache dir or
+/// fetching any file.
+pub fn fetch_spec(
+    spec: &ModelSpec,
+    verify: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), IndexError> {
+    let dir = model_dir_for(spec)?;
+    fetch_into(spec, &dir, verify, progress)
 }
 
 #[cfg(test)]
@@ -407,6 +512,39 @@ mod tests {
             !temp_path.exists(),
             "unreadable temp file must be removed, not left behind"
         );
+    }
+
+    #[test]
+    fn registry_contains_three_models_with_distinct_tags() {
+        let tags: Vec<&str> = ALL_MODELS.iter().map(|m| m.tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "siglip2-b16-v1",
+                "whisper-large-v3-turbo-q5-v1",
+                "minilm-l6-v2-v1"
+            ]
+        );
+    }
+
+    #[test]
+    fn model_dir_for_appends_tag_under_maj_model_dir() {
+        // MAJ_MODEL_DIR handling is exercised through the public fn; this test
+        // must not mutate the process env (tests run in parallel) — call the
+        // path-composition helper directly.
+        let base = std::path::Path::new("/models");
+        assert_eq!(
+            dir_under_base(base, &WHISPER),
+            std::path::PathBuf::from("/models/whisper-large-v3-turbo-q5-v1")
+        );
+    }
+
+    #[test]
+    fn spec_urls_pin_repo_and_revision() {
+        let url = file_url(&WHISPER, &WHISPER.files[0]);
+        assert!(url.starts_with("https://huggingface.co/ggerganov/whisper.cpp/resolve/"));
+        assert!(url.contains(WHISPER.revision));
+        assert!(url.ends_with("ggml-large-v3-turbo-q5_0.bin"));
     }
 
     #[test]

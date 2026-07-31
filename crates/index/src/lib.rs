@@ -8,6 +8,7 @@ pub mod error;
 pub mod model;
 pub mod preprocess;
 pub mod resize;
+pub mod text_encoder;
 pub mod thumbs;
 pub mod vector_store;
 pub mod video;

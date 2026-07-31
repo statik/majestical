@@ -156,10 +156,31 @@ fn model_fetch_reports_already_present_without_network() {
 
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_root.path())
-        .args(["model", "fetch"])
+        .args([
+            "model",
+            "fetch",
+            "--only",
+            majestical_index::model::MODEL_TAG,
+        ])
         .assert()
         .success()
         .stdout(contains("already present").count(3));
+}
+
+/// `--only` rejects an unrecognized tag before touching the network — the
+/// check runs against the static registry ahead of any fetch, so this test
+/// never needs a model cache or a real download.
+#[test]
+fn model_fetch_only_rejects_unknown_tag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("cat");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    maj(&root, &state)
+        .args(["model", "fetch", "--only", "nonsense-v9"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown model tag nonsense-v9"));
 }
 
 /// `index run` always performs the blob↔Lance diff — even with no model

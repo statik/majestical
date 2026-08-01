@@ -25,6 +25,24 @@ fn renders_first_page_to_rgb() {
     );
 }
 
+/// A portrait `MediaBox` with `/Rotate 90` renders landscape — the longest
+/// edge of the *post-rotation* orientation must land at the requested edge.
+#[test]
+fn rotated_page_renders_landscape_with_exact_longest_edge() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fixture-rotated.pdf"
+    );
+    let rendered = pdf::render_first_page(std::path::Path::new(fixture), 1024).expect("render");
+    assert_eq!(rendered.width().max(rendered.height()), 1024);
+    assert!(
+        rendered.width() > rendered.height(),
+        "rotated portrait page must render landscape, got {}x{}",
+        rendered.width(),
+        rendered.height()
+    );
+}
+
 #[test]
 fn missing_file_is_a_decode_error() {
     assert!(pdf::extract_text(std::path::Path::new("/nonexistent.pdf")).is_err());

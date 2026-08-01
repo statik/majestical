@@ -120,30 +120,12 @@ pub fn render_first_page(path: &Path, edge: u32) -> Result<image::RgbImage, Inde
             "degenerate page bounds {width}x{height}"
         )));
     }
-    // SAFETY: -[PDFPage rotation] reads an NSInteger property (a multiple
-    // of 90) from a retained page; no preconditions.
-    let rotation = unsafe { page.rotation() };
-    // A 90/270 rotation swaps the rendered orientation relative to the
-    // MediaBox, so the aspect math must use the post-rotation extents.
-    let (width, height) = if rotation.rem_euclid(180) == 90 {
-        (height, width)
-    } else {
-        (width, height)
-    };
-    // PDFKit aspect-fits the thumbnail inside the requested size (flooring
-    // the constrained dimension), so the longest edge must be the binding
-    // constraint: pass it exactly and round the other dimension up.
-    let scale = f64::from(edge) / width.max(height);
-    let size = if width >= height {
-        NSSize {
-            width: f64::from(edge),
-            height: (height * scale).ceil().max(1.0),
-        }
-    } else {
-        NSSize {
-            width: (width * scale).ceil().max(1.0),
-            height: f64::from(edge),
-        }
+    // PDFKit aspect-fits the thumbnail inside the requested box, so a
+    // square box puts the longest post-rotation edge at exactly `edge` for
+    // any orientation; the golden tests pin the longest-edge invariant.
+    let size = NSSize {
+        width: f64::from(edge),
+        height: f64::from(edge),
     };
     // SAFETY: -[PDFPage thumbnailOfSize:forBox:] renders offscreen into a
     // new NSImage; the size is finite and positive (checked above) and

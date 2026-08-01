@@ -5,6 +5,17 @@
 //! `crates/ingest/tests/common/mod.rs`.
 use assert_cmd::Command;
 
+// `#[cfg(test)]` on these helpers is not redundant despite every file under
+// `tests/` already building with `--cfg test`: this repo's `clippy.toml`
+// sets `allow-expect-in-tests`/`allow-unwrap-in-tests`/`allow-panic-in-tests`,
+// and clippy's in-test detection for those configs keys off `#[test]`/
+// `#[cfg(test)]` directly on the item, not on the ambient test-binary cfg —
+// dropping it reintroduces `expect_used`/`unwrap_used`/`panic` errors under
+// `-D warnings` (verified: removing it here makes `cargo clippy --test
+// sync_smoke` fail). Every `#[cfg(test)]` helper in this crate's `tests/`
+// tree — here and in `sync_smoke.rs`, `convergence.rs` (a different crate,
+// same clippy.toml-driven reason) — follows this same pattern; this is the
+// one place the full rationale is spelled out.
 #[cfg(test)]
 pub fn maj_as(catalog: &std::path::Path, state: &std::path::Path, machine_id: &str) -> Command {
     let mut c = Command::cargo_bin("maj").unwrap();

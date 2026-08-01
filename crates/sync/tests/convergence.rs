@@ -1,9 +1,9 @@
 //! The sync acceptance criterion, per the phase 6 spec: random
-//! interleavings of append/push/pull across machines and locations, then a
-//! final full round — every machine converges to the same event set and
-//! the same blob set. Reuses nothing but the public transfer API; if this
-//! holds, projection equality follows from the already-proven commutative
-//! idempotent apply.
+//! interleavings of append/write-blob/push/pull across machines and
+//! locations, then a final full round — every machine converges to the
+//! same event set and the same blob set. Reuses nothing but the public
+//! transfer API; if this holds, projection equality follows from the
+//! already-proven commutative idempotent apply.
 use majestical_core::clock::{Hlc, MachineId};
 use majestical_core::event::{AssetId, Event, EventId, Op};
 use majestical_sync::FileEventLog;
@@ -17,14 +17,16 @@ const LOCATIONS: usize = 2;
 
 #[derive(Debug, Clone)]
 enum Step {
-    Append { machine: usize, events: u8 },
+    Append { machine: usize, count: u8 },
+    WriteBlob { machine: usize },
     Push { machine: usize, location: usize },
     Pull { machine: usize, location: usize },
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
     prop_oneof![
-        (0..MACHINES, 1u8..4).prop_map(|(machine, events)| Step::Append { machine, events }),
+        (0..MACHINES, 1u8..4).prop_map(|(machine, count)| Step::Append { machine, count }),
+        (0..MACHINES).prop_map(|machine| Step::WriteBlob { machine }),
         (0..MACHINES, 0..LOCATIONS)
             .prop_map(|(machine, location)| Step::Push { machine, location }),
         (0..MACHINES, 0..LOCATIONS)
@@ -32,6 +34,13 @@ fn step_strategy() -> impl Strategy<Value = Step> {
     ]
 }
 
+/// Builds a synthetic tag-add event uniquely identified by `(n, machine)`
+/// packed into the ULID's random component — a collision here would
+/// silently dedupe two distinct events into one entry in the
+/// `BTreeSet<String>` the property compares against, corrupting the
+/// "no event may be lost" count instead of failing loudly. `wall_ms: n` is
+/// a monotonic per-machine counter standing in for a timestamp, not a real
+/// clock reading — HLC total order isn't what this property tests.
 fn ev(machine: usize, n: u64) -> Event {
     let unique = (u128::from(n) << 8) | machine as u128;
     Event {
@@ -49,12 +58,20 @@ fn ev(machine: usize, n: u64) -> Event {
     }
 }
 
-// `#[cfg(test)]` on these helpers is not redundant despite every file under
-// `tests/` already building with `--cfg test`: this repo's `clippy.toml`
-// sets `allow-expect-in-tests`, and clippy's in-test detection for that
-// config keys off `#[test]`/`#[cfg(test)]` directly on the item, not the
-// ambient test-binary cfg — dropping it reintroduces `expect_used` errors
-// under `-D warnings`. Same pattern as `crates/cli/tests/sync_smoke.rs`.
+// `#[cfg(test)]` on these helpers is required, not redundant — see
+// `crates/cli/tests/common/mod.rs`'s `maj_as` doc comment for the full
+// rationale (a different crate, but the same `clippy.toml`-driven reason).
+/// The event ids visible from `root`, opened as `machine`.
+/// `FileEventLog::read_all` walks EVERY machine directory under `root` —
+/// `machine` does not filter the result down to one machine's own events;
+/// it only selects which reader `open`s the log. That distinction matters
+/// because `open` is not a pure read: it creates `machine`'s own segment
+/// directory under `root` if it doesn't already exist (see `open`'s own
+/// doc), so `machine` must always name a machine that genuinely already
+/// exists at `root` — passing an arbitrary id would silently plant an
+/// empty directory as a side effect of merely computing this set. Every
+/// call site below passes a machine root its own real machine id for
+/// exactly this reason.
 #[cfg(test)]
 fn event_ids(root: &Path, machine: &MachineId) -> BTreeSet<String> {
     FileEventLog::open(root, machine)
@@ -84,7 +101,11 @@ fn sync_pair(src: &Path, dst: &Path) {
 
 /// Writes one blob at a path unique to `machine` — distinct paths per
 /// machine so the union set observed at convergence has exactly
-/// [`MACHINES`] entries, one per planted blob.
+/// [`MACHINES`] entries, one per planted blob. Content is padded by
+/// `machine`'s own index so the planted blobs also differ in SIZE, not
+/// just path — otherwise every machine's base string is the same length
+/// and the size component of [`blob_paths`]'s tuple set would coincidentally
+/// agree across machines, masking a bug that swapped two same-sized blobs.
 #[cfg(test)]
 fn write_machine_blob(root: &Path, machine: usize) {
     let path = root
@@ -92,7 +113,24 @@ fn write_machine_blob(root: &Path, machine: usize) {
         .join(format!("m{machine}"))
         .join("blob.bin");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(path, format!("blob-from-m{machine}")).expect("write blob");
+    let mut content = format!("blob-from-m{machine}").into_bytes();
+    content.extend(std::iter::repeat_n(b'.', machine));
+    std::fs::write(path, content).expect("write blob");
+}
+
+/// Writes an additional, script-driven blob under `machine`'s root, at a
+/// path distinct from both [`write_machine_blob`]'s plant and every other
+/// call for this `machine` (`n` is the caller's own per-machine counter) —
+/// so [`Step::WriteBlob`] genuinely models blob traffic happening mid-script,
+/// interleaved with push/pull, rather than only at setup.
+#[cfg(test)]
+fn write_numbered_blob(root: &Path, machine: usize, n: u64) {
+    let path = root
+        .join("blobs")
+        .join(format!("m{machine}"))
+        .join(format!("w{n}.bin"));
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, format!("w-m{machine}-{n}")).expect("write blob");
 }
 
 /// The set of `(path, size)` pairs under `root/blobs`, path relative to
@@ -110,8 +148,15 @@ fn blob_paths(root: &Path) -> BTreeSet<(PathBuf, u64)> {
     let mut out = BTreeSet::new();
     let mut stack = vec![blobs.clone()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        // NotFound is the one tolerated case — a machine root with no
+        // blobs dir at all is a valid, empty peer, same as the engine's
+        // own `plan_blobs`. Any other error (permission denied, a stale
+        // mount) is a real test-environment bug and must panic loudly
+        // rather than silently reporting an empty blob set.
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("read {}: {e}", dir.display()),
         };
         for entry in entries {
             let entry = entry.expect("dir entry");
@@ -132,11 +177,13 @@ fn blob_paths(root: &Path) -> BTreeSet<(PathBuf, u64)> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
     fn machines_converge_after_a_final_full_round(script in prop::collection::vec(step_strategy(), 0..40)) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut counters = [0u64; MACHINES];
+        let mut blob_counters = [0u64; MACHINES];
+        let mut planted_blobs = MACHINES;
         let machine_roots: Vec<_> = (0..MACHINES).map(|m| {
             let root = dir.path().join(format!("machine{m}"));
             FileEventLog::init(&root, &MachineId(format!("m{m}"))).expect("init");
@@ -152,14 +199,19 @@ proptest! {
 
         for step in script {
             match step {
-                Step::Append { machine, events } => {
+                Step::Append { machine, count } => {
                     let id = MachineId(format!("m{machine}"));
                     let mut log = FileEventLog::open(&machine_roots[machine], &id).expect("open");
-                    let batch: Vec<Event> = (0..events).map(|_| {
+                    let batch: Vec<Event> = (0..count).map(|_| {
                         counters[machine] += 1;
                         ev(machine, counters[machine])
                     }).collect();
                     log.append(&batch).expect("append");
+                }
+                Step::WriteBlob { machine } => {
+                    blob_counters[machine] += 1;
+                    write_numbered_blob(&machine_roots[machine], machine, blob_counters[machine]);
+                    planted_blobs += 1;
                 }
                 Step::Push { machine, location } =>
                     sync_pair(&machine_roots[machine], &location_roots[location]),
@@ -199,14 +251,20 @@ proptest! {
         let blob_reference = blob_paths(&machine_roots[0]);
         prop_assert_eq!(
             blob_reference.len(),
-            MACHINES,
-            "one planted blob per machine must survive: {:?}",
+            planted_blobs,
+            "every planted blob (the initial per-machine plant plus every \
+             Step::WriteBlob) must survive: {:?}",
             blob_reference
         );
         for (m, root) in machine_roots.iter().enumerate().skip(1) {
             prop_assert_eq!(&blob_paths(root), &blob_reference, "machine {} diverged on blobs", m);
         }
         for (l, root) in location_roots.iter().enumerate() {
+            // Blobs only, not events: a location root has no machine of its
+            // own to pass to `event_ids`, and `FileEventLog::open`'s
+            // directory-creating side effect (see `event_ids`'s doc) means
+            // there's no id that could be passed there without planting a
+            // spurious machine dir in the location's own events/ tree.
             prop_assert_eq!(&blob_paths(root), &blob_reference, "location {} diverged on blobs", l);
         }
     }

@@ -1,7 +1,7 @@
 //! `maj sync` push/pull/status end to end over real temp-dir catalogs and
 //! locations.
 mod common;
-use common::{maj, maj_as};
+use common::{first_asset_id, maj, maj_as};
 use std::path::{Path, PathBuf};
 
 // `#[cfg(test)]` on these helpers is not redundant despite every file under
@@ -1414,4 +1414,83 @@ fn a_readonly_member_can_still_pull() {
         .args(["sync", "pull"])
         .assert()
         .success();
+}
+
+/// Two sites that never share a live network connection converge purely
+/// through a traveling shuttle drive: both register the SAME directory as
+/// their `shuttle` location (standing in for a physical drive that visits
+/// each site in turn — the point is neither site ever pushes to or pulls
+/// from the other directly, only through that shared directory), and
+/// convergence proves out in both directions — site A's scanned asset
+/// reaches site B, and site B's tag on it reaches back to site A.
+#[test]
+fn a_shuttle_drive_converges_two_sites_that_never_meet() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let shuttle = root.path().join("shuttle");
+    std::fs::create_dir_all(&shuttle).expect("mkdir");
+
+    let site_a = fixture_as(root.path(), "site-a", "site-a");
+    let site_b = fixture_as(root.path(), "site-b", "site-b");
+    site_a.add_location("shuttle", &shuttle);
+    site_b.add_location("shuttle", &shuttle);
+
+    // Site A catalogs a file and pushes it to the shuttle.
+    std::fs::create_dir_all(&site_a.media).expect("mkdir");
+    std::fs::write(site_a.media.join("interview.mov"), b"mov-bytes").expect("write");
+    maj_as(&site_a.catalog, &site_a.state, "site-a")
+        .args(["scan"])
+        .arg(&site_a.media)
+        .args(["--volume", "vol-a"])
+        .assert()
+        .success();
+    maj_as(&site_a.catalog, &site_a.state, "site-a")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // The drive travels. Site B pulls, sees the asset, tags it, and pushes
+    // its own change back to the shuttle.
+    maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["sync", "pull"])
+        .assert()
+        .success();
+    let out = maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["search", "interview"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("interview.mov"),
+        "site B must see site A's asset after the shuttle round trip: {stdout}"
+    );
+
+    let out = maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["search", "interview", "--json"])
+        .output()
+        .expect("run search --json");
+    let asset = first_asset_id(&out);
+    maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["tag", "add", &asset, "status/select"])
+        .assert()
+        .success();
+    maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // The drive travels back. Site A pulls and sees site B's tag — a
+    // tag-filter search proves the round trip, not just a raw event count.
+    maj_as(&site_a.catalog, &site_a.state, "site-a")
+        .args(["sync", "pull"])
+        .assert()
+        .success();
+    let out = maj_as(&site_a.catalog, &site_a.state, "site-a")
+        .args(["search", "tag:status/select"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("interview.mov"),
+        "site A must see site B's tag after the shuttle round trip: {stdout}"
+    );
 }

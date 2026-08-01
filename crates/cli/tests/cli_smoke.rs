@@ -1,16 +1,9 @@
 //! End-to-end: init a catalog, scan a folder, tag by name-match, search.
 mod common;
 
-use common::{maj, maj_as, walkdir_find};
+use common::{first_asset_id, maj, maj_as, walkdir_find};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, diff};
-
-/// Parses a `search --json` asset id out of the first result.
-#[cfg(test)]
-fn first_asset_id(out: &std::process::Output) -> String {
-    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    hits["results"][0]["asset"].as_str().unwrap().to_string()
-}
 
 /// Reads every event this test's single machine ("test-machine") has
 /// appended so far, in file order.

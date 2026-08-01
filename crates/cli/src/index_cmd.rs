@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::event::AssetId;
 use majestical_core::media_kind::{MediaKind, media_kind};
+use majestical_core::ports::{Describer, TagSubject};
 use majestical_core::projection::Projection;
+use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
@@ -58,7 +60,7 @@ pub(crate) struct IndexRunArgs {
 /// fetched into the cache (see `maj model fetch`) and present at every
 /// file's exact size, whether `ffmpeg`/`ffprobe` are on `PATH`, and whether
 /// the whisper/`MiniLM` models are installed.
-fn capabilities() -> Capabilities {
+fn capabilities(catalog_root: &Path) -> Capabilities {
     let model_tag = majestical_index::model::model_dir()
         .ok()
         .filter(|dir| majestical_index::model::model_present(dir))
@@ -68,9 +70,23 @@ fn capabilities() -> Capabilities {
         ffmpeg: majestical_index::video::ffmpeg_available(),
         whisper: whisper_model_dir_if_present().is_some(),
         text_model: minilm_model_dir_if_present().is_some(),
-        // Task 18 wires the configured describer's tag; until then captions
-        // plan as needs_model and no Caption item is ever produced.
-        describer_tag: None,
+        describer_tag: describer_model_tag(catalog_root),
+    }
+}
+
+/// The configured describer's blob derivation tag, or `None` when no
+/// describer is configured. An unreadable/unparsable `describer.toml`
+/// degrades to unconfigured with a stderr note — a broken describer config
+/// must never kill the rest of indexing.
+fn describer_model_tag(catalog_root: &Path) -> Option<String> {
+    match crate::describer_cmd::load_config(catalog_root) {
+        Ok(config) => config.map(|c| c.model_tag()),
+        Err(err) => {
+            eprintln!(
+                "note: ignoring broken describer config ({err:#}) — captions degrade to unconfigured"
+            );
+            None
+        }
     }
 }
 
@@ -239,15 +255,19 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 }
 
 /// Builds the plan for one pass: gathers sources fresh from the projection
-/// (so `--watch` sees newly scanned assets), diffs against `blobs`, then
-/// narrows `items` to `kinds`. Deliberately does not apply `--limit` here —
-/// that happens after `run_once` splits items by kind, so `--limit` bounds
-/// each kind's own per-pass budget independently rather than one kind
-/// starving another.
-fn build_plan(projection: &Projection, blobs: &BlobStore, kinds: &BTreeSet<String>) -> WorkPlan {
+/// (so `--watch` sees newly scanned assets), diffs against `blobs` under
+/// the caller-computed `caps`, then narrows `items` to `kinds`.
+/// Deliberately does not apply `--limit` here — that happens after
+/// `run_once` splits items by kind, so `--limit` bounds each kind's own
+/// per-pass budget independently rather than one kind starving another.
+fn build_plan(
+    projection: &Projection,
+    blobs: &BlobStore,
+    kinds: &BTreeSet<String>,
+    caps: &Capabilities,
+) -> WorkPlan {
     let sources = gather_sources(projection);
-    let caps = capabilities();
-    let mut plan = work::plan_work(&sources, blobs, &caps);
+    let mut plan = work::plan_work(&sources, blobs, caps);
     plan.items
         .retain(|item| kinds.contains(workkind_name(item.kind)));
     plan
@@ -308,7 +328,8 @@ fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<(
     let (mut db, projection) = open_catalog(app, catalog_dir)?;
     let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
-    let plan = build_plan(&projection, &blobs, args.kinds);
+    let caps = capabilities(catalog_dir);
+    let plan = build_plan(&projection, &blobs, args.kinds, &caps);
     let items = split_and_cap_items(plan.items, args.limit);
 
     let jobs = args.threads.unwrap_or_else(default_index_jobs);
@@ -316,7 +337,11 @@ fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<(
         lance_dir: state_dir.join("lance"),
         coreml_cache_dir: state_dir.join("coreml-cache"),
     };
-    let outcomes = run_all_kinds(&embed_paths, &blobs, &items, jobs)?;
+    let caption_env = CaptionEnv {
+        catalog_root: catalog_dir,
+        vocab: tag_vocabulary(&projection),
+    };
+    let outcomes = run_all_kinds(&embed_paths, &blobs, &items, jobs, &caption_env)?;
 
     heal_text_fts(&mut db, &blobs)?;
     let report = merge_failure_report(
@@ -329,6 +354,25 @@ fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<(
     Ok(())
 }
 
+/// The caption runner's per-pass inputs beyond blobs/items: where the
+/// describer config lives and the catalog's current tag vocabulary. Bundled
+/// to keep [`run_all_kinds`] within the house 5-positional-parameter limit.
+struct CaptionEnv<'a> {
+    catalog_root: &'a Path,
+    vocab: Vec<String>,
+}
+
+/// The catalog's full folksonomy — the union of every asset's tags, sorted
+/// — sent to the describer so it prefers existing tags over inventing new
+/// spellings of the same concept.
+fn tag_vocabulary(projection: &Projection) -> Vec<String> {
+    let mut vocab = BTreeSet::new();
+    for (asset, _) in projection.assets() {
+        vocab.extend(projection.tags(asset));
+    }
+    vocab.into_iter().collect()
+}
+
 /// Executes every kind's items in priority order. Kinds whose capability is
 /// missing (a runner's own model-presence re-check) or whose item list is
 /// empty are cheap no-ops.
@@ -337,6 +381,7 @@ fn run_all_kinds(
     blobs: &BlobStore,
     items: &KindItems,
     jobs: usize,
+    caption_env: &CaptionEnv<'_>,
 ) -> Result<RunOutcomes> {
     Ok(RunOutcomes {
         thumbs: run_thumb_items(blobs, &items.thumbs, jobs),
@@ -346,12 +391,12 @@ fn run_all_kinds(
         transcript_embed: run_transcript_embed_items(paths, blobs, &items.transcript_embeds)?,
         ocr: run_ocr_items(blobs, &items.ocr_images, &items.ocr_keyframes),
         pdf: run_pdf_text_items(blobs, &items.pdfs),
+        captions: run_caption_items(blobs, &items.captions, caption_env),
     })
 }
 
 /// Every kind's items for one pass, split so each executor gets exactly its
-/// own queue. No `Caption` bucket: the planner produces no Caption items
-/// while `describer_tag` is `None` (Task 18 wires the describer).
+/// own queue.
 #[derive(Default)]
 struct KindItems {
     thumbs: Vec<work::WorkItem>,
@@ -362,6 +407,7 @@ struct KindItems {
     ocr_images: Vec<work::WorkItem>,
     ocr_keyframes: Vec<work::WorkItem>,
     pdfs: Vec<work::WorkItem>,
+    captions: Vec<work::WorkItem>,
 }
 
 impl KindItems {
@@ -374,6 +420,7 @@ impl KindItems {
         self.ocr_images.truncate(limit);
         self.ocr_keyframes.truncate(limit);
         self.pdfs.truncate(limit);
+        self.captions.truncate(limit);
     }
 }
 
@@ -392,9 +439,7 @@ fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> Kind
             WorkKind::OcrImage => split.ocr_images.push(item),
             WorkKind::OcrKeyframes => split.ocr_keyframes.push(item),
             WorkKind::PdfText => split.pdfs.push(item),
-            // Unreachable while the planner gates captions on a configured
-            // describer (`describer_tag: None` until Task 18).
-            WorkKind::Caption => {}
+            WorkKind::Caption => split.captions.push(item),
         }
     }
     if let Some(limit) = limit {
@@ -1406,6 +1451,331 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
     outcome
 }
 
+/// One pass's caption-kind result: `written` caption-item completions (a
+/// still's caption blob, or a video's captions blob — each with its tags
+/// blob) and per-item `failed` (path, reason).
+#[derive(Default)]
+struct CaptionOutcome {
+    written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// Upper bound on keyframes described per video: captioning every detected
+/// scene of a long video would mean hundreds of LLM round-trips per asset
+/// for marginal search gain, so the runner samples evenly instead.
+const MAX_DESCRIBED_KEYFRAMES: usize = 12;
+
+/// The failure reason recorded for caption items abandoned after the first
+/// backend failure in a pass — see [`run_caption_items`]'s abort policy.
+const DESCRIBER_SKIPPED_REASON: &str = "describer unavailable — skipped after first failure";
+
+/// Why one caption item failed: a `Backend` (describer) failure aborts the
+/// remaining items in this pass — the backend is down for all of them, and
+/// hammering it item after item just burns wall-clock — while an `Item`
+/// failure (missing thumb, unreadable manifest, frame extraction) records
+/// and moves on to the next item.
+enum CaptionFailure {
+    Backend(String),
+    Item(String),
+}
+
+/// Works every `Caption` item serially against the configured describer.
+/// Run-level `Ok` always: per-item failures (including a whole pass
+/// abandoned to a backend outage) land in the outcome's `failed` list, and
+/// items without done-blobs simply re-plan next run.
+///
+/// The config is re-loaded here rather than threaded from `capabilities()`:
+/// caps only carries the tag string the planner needs, while the runner
+/// needs the full config (base URL, model, key) — and re-reading one small
+/// TOML file per pass is cheaper than widening every signature between
+/// `run_once` and this executor to carry it.
+fn run_caption_items(
+    blobs: &BlobStore,
+    items: &[work::WorkItem],
+    env: &CaptionEnv<'_>,
+) -> CaptionOutcome {
+    let mut outcome = CaptionOutcome::default();
+    if items.is_empty() {
+        return outcome;
+    }
+    let config = match crate::describer_cmd::load_config(env.catalog_root) {
+        Ok(Some(config)) => config,
+        // The planner only queued Caption items because a describer was
+        // configured when caps were computed; a config removed/broken since
+        // then degrades to a no-op pass and the items re-plan later.
+        Ok(None) => return outcome,
+        Err(err) => {
+            eprintln!("note: describer config unreadable ({err:#}) — captions skipped this pass");
+            return outcome;
+        }
+    };
+    let model_tag = config.model_tag();
+    let describer = HttpDescriber::new(config, crate::describer_cmd::env_api_key());
+    for (index, item) in items.iter().enumerate() {
+        match caption_one_item(blobs, &describer, item, &model_tag, &env.vocab) {
+            Ok(()) => outcome.written += 1,
+            Err(CaptionFailure::Item(reason)) => {
+                outcome.failed.push((item.abs_path.clone(), reason));
+            }
+            Err(CaptionFailure::Backend(reason)) => {
+                outcome.failed.push((item.abs_path.clone(), reason));
+                for skipped in &items[index + 1..] {
+                    outcome.failed.push((
+                        skipped.abs_path.clone(),
+                        DESCRIBER_SKIPPED_REASON.to_string(),
+                    ));
+                }
+                break;
+            }
+        }
+    }
+    outcome
+}
+
+/// Routes one `Caption` item by media kind: stills (images and PDFs — the
+/// planner queues both) caption their thumbnail blob; videos caption a
+/// sample of their manifest keyframes.
+fn caption_one_item(
+    blobs: &BlobStore,
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    model_tag: &str,
+    vocab: &[String],
+) -> Result<(), CaptionFailure> {
+    if media_kind(&item.abs_path.to_string_lossy()) == MediaKind::Video {
+        caption_video(blobs, describer, item, model_tag, vocab)
+    } else {
+        caption_still(blobs, describer, item, model_tag, vocab)
+    }
+}
+
+/// Captions + tag-suggests one still from its thumbnail blob — already
+/// WebP, exactly the MIME type the client's data URL claims, and derived
+/// identically for images and PDF page-1 renders, so no re-decode here.
+/// Done (in the planner) means BOTH blobs exist, so an item retried after a
+/// partial run — caption written, tags call failed — skips the caption
+/// round-trip and goes straight to the missing tags half.
+fn caption_still(
+    blobs: &BlobStore,
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    model_tag: &str,
+    vocab: &[String],
+) -> Result<(), CaptionFailure> {
+    let thumb_path = blobs.path_for(&item.asset_hex, &Derivation::Thumb);
+    let webp = std::fs::read(&thumb_path).map_err(|e| {
+        CaptionFailure::Item(format!(
+            "reading thumbnail {}: {e} (thumbs pass must run first)",
+            thumb_path.display()
+        ))
+    })?;
+    let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
+    if !caption_path.is_file() {
+        let caption = describer
+            .caption(&webp)
+            .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
+            .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    }
+    let suggestions = describer
+        .suggest_tags(TagSubject::Image(&webp), vocab)
+        .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+    write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))
+}
+
+/// Captions one video's keyframes, then tag-suggests from the pooled
+/// caption texts — a text-only call. Done (in the planner) means BOTH the
+/// `Captions` and `Tags` blobs exist, so a video retried after a partial
+/// run — captions written, tags call failed — reuses the existing captions
+/// blob's texts rather than re-extracting and re-captioning every keyframe.
+/// A video whose manifest lists zero keyframes still gets its (empty)
+/// blobs; without them it would re-plan forever.
+fn caption_video(
+    blobs: &BlobStore,
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    model_tag: &str,
+    vocab: &[String],
+) -> Result<(), CaptionFailure> {
+    let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
+    let described = match existing_video_captions(&captions_path) {
+        Some(described) => described,
+        None => describe_video_keyframes(blobs, describer, item, model_tag)?,
+    };
+    let texts: Vec<String> = described.into_iter().map(|(_, text)| text).collect();
+    let suggestions = if texts.is_empty() {
+        Vec::new()
+    } else {
+        describer
+            .suggest_tags(TagSubject::Captions(&texts), vocab)
+            .map_err(|e| CaptionFailure::Backend(e.to_string()))?
+    };
+    write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))
+}
+
+/// An existing `Captions` blob's described rows, or `None` when the blob is
+/// missing OR unreadable — an unreadable blob gets a stderr note and is
+/// treated as absent, so the caller re-describes and overwrites it rather
+/// than failing the item every pass forever over the same corrupt bytes.
+fn existing_video_captions(captions_path: &Path) -> Option<Vec<(u64, String)>> {
+    if !captions_path.is_file() {
+        return None;
+    }
+    match read_video_captions_blob(captions_path) {
+        Ok(described) => Some(described),
+        Err(err) => {
+            eprintln!("note: unreadable captions blob ({err}) — re-describing");
+            None
+        }
+    }
+}
+
+/// The caption half of one video item: samples up to
+/// [`MAX_DESCRIBED_KEYFRAMES`] evenly-spaced manifest timestamps, extracts
+/// and captions each, and writes the `Captions` blob before returning the
+/// described rows.
+fn describe_video_keyframes(
+    blobs: &BlobStore,
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    model_tag: &str,
+) -> Result<Vec<(u64, String)>, CaptionFailure> {
+    // The hardcoded `model::MODEL_TAG` matches the planner's manifest gate:
+    // `plan_caption_video` only queues an item after finding a manifest
+    // under `caps.model_tag`, which — when set — is always this constant.
+    let manifest_path = blobs.path_for(
+        &item.asset_hex,
+        &Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    let bytes = std::fs::read(&manifest_path).map_err(|e| {
+        CaptionFailure::Item(format!(
+            "reading keyframe manifest {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let (_, _, timestamps) =
+        keyframes_manifest_read(&bytes).map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    let mut described = Vec::new();
+    for ts_ms in select_described_timestamps(&timestamps) {
+        let caption = caption_video_frame(describer, item, ts_ms)?;
+        described.push((ts_ms, caption.text));
+    }
+    let json = video_captions_json(model_tag, timestamps.len(), &described);
+    let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
+    write_json_blob(blobs, &captions_path, &json)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    Ok(described)
+}
+
+/// Extracts one keyframe and downsizes it through the same 320px WebP
+/// encoder thumbnails use (the one image dialect every backend accepts)
+/// before captioning it.
+fn caption_video_frame(
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    ts_ms: u64,
+) -> Result<majestical_core::ports::Caption, CaptionFailure> {
+    let frame = majestical_index::video::extract_frame(&item.abs_path, ts_ms)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    let webp = majestical_index::thumbs::thumbnail_webp(&frame)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    describer
+        .caption(&webp)
+        .map_err(|e| CaptionFailure::Backend(e.to_string()))
+}
+
+/// Up to [`MAX_DESCRIBED_KEYFRAMES`] timestamps, evenly spaced across the
+/// detected list: the stride is `len / MAX` rounded up, so short videos
+/// keep every keyframe and long ones sample across their full duration
+/// instead of clustering at the start.
+fn select_described_timestamps(timestamps: &[u64]) -> Vec<u64> {
+    let step = timestamps.len().div_ceil(MAX_DESCRIBED_KEYFRAMES).max(1);
+    timestamps
+        .iter()
+        .copied()
+        .step_by(step)
+        .take(MAX_DESCRIBED_KEYFRAMES)
+        .collect()
+}
+
+/// The video captions blob body, mirroring [`keyframes_manifest_json`]'s
+/// hand-built-JSON precedent: `detected_keyframes` preserves the manifest's
+/// full count so the sampling gap (described vs. detected) stays auditable
+/// from the blob alone.
+fn video_captions_json(
+    model_tag: &str,
+    detected_keyframes: usize,
+    described: &[(u64, String)],
+) -> Vec<u8> {
+    serde_json::json!({
+        "model_tag": model_tag,
+        "detected_keyframes": detected_keyframes,
+        "described": described,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Parses a video captions blob written by [`video_captions_json`] back
+/// into its `(ts_ms, text)` rows — the reader the caption heal uses.
+///
+/// # Errors
+/// Returns an error naming the missing/mistyped field on malformed bytes.
+fn video_captions_read(json: &[u8]) -> Result<Vec<(u64, String)>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(json).context("parsing video captions json")?;
+    let described = value["described"]
+        .as_array()
+        .context("video captions missing array field 'described'")?;
+    let mut rows = Vec::new();
+    for entry in described {
+        let ts_ms = entry[0]
+            .as_u64()
+            .context("video caption timestamp is not a non-negative integer")?;
+        let text = entry[1]
+            .as_str()
+            .context("video caption text is not a string")?;
+        rows.push((ts_ms, text.to_string()));
+    }
+    Ok(rows)
+}
+
+/// Writes one still's caption as a zstd JSON blob of the core
+/// [`majestical_core::ports::Caption`] struct.
+fn write_caption_blob(
+    blobs: &BlobStore,
+    asset_hex: &str,
+    model_tag: &str,
+    caption: &majestical_core::ports::Caption,
+) -> Result<()> {
+    let json = serde_json::to_vec(caption).context("serializing caption")?;
+    write_json_blob(
+        blobs,
+        &blobs.path_for(asset_hex, &Derivation::Caption { model_tag }),
+        &json,
+    )
+}
+
+/// Writes an asset's tag suggestions as a zstd JSON blob of
+/// `Vec<TagSuggestion>`.
+fn write_tags_blob(
+    blobs: &BlobStore,
+    asset_hex: &str,
+    model_tag: &str,
+    suggestions: &[majestical_core::ports::TagSuggestion],
+) -> Result<()> {
+    let json = serde_json::to_vec(suggestions).context("serializing tag suggestions")?;
+    write_json_blob(
+        blobs,
+        &blobs.path_for(asset_hex, &Derivation::Tags { model_tag }),
+        &json,
+    )
+}
+
 /// zstd-compresses `json` and writes it atomically at `path`.
 fn write_json_blob(blobs: &BlobStore, path: &Path, json: &[u8]) -> Result<()> {
     let bytes = zstd::encode_all(json, BLOB_ZSTD_LEVEL)
@@ -1484,6 +1854,7 @@ struct RunOutcomes {
     transcript_embed: TranscriptEmbedOutcome,
     ocr: OcrOutcome,
     pdf: PdfOutcome,
+    captions: CaptionOutcome,
 }
 
 impl RunOutcomes {
@@ -1524,9 +1895,10 @@ fn run_result_json(o: &RunOutcomes) -> serde_json::Value {
             "failed": failed_json(&o.ocr.failed),
         },
         "pdf": { "written": o.pdf.written, "failed": failed_json(&o.pdf.failed) },
-        // Task 18 wires the describer; the key exists now so consumers see a
-        // stable shape.
-        "captions": { "written": 0, "failed": [] },
+        "captions": {
+            "written": o.captions.written,
+            "failed": failed_json(&o.captions.failed),
+        },
     })
 }
 
@@ -1573,6 +1945,11 @@ fn print_run_result(o: &RunOutcomes, json: bool) {
             o.pdf.written,
             o.pdf.failed.len()
         );
+        println!(
+            "captions: {} written, {} failed",
+            o.captions.written,
+            o.captions.failed.len()
+        );
     }
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
@@ -1587,6 +1964,7 @@ fn print_run_result(o: &RunOutcomes, json: bool) {
         .chain(&o.transcript_embed.failed)
         .chain(&o.ocr.failed)
         .chain(&o.pdf.failed)
+        .chain(&o.captions.failed)
     {
         eprintln!("failed: {err}");
     }
@@ -1597,13 +1975,14 @@ fn print_run_result(o: &RunOutcomes, json: bool) {
 /// first folds it over the previous report so a `--kinds`-filtered run only
 /// speaks for the kinds it actually worked.
 fn failure_report_json(o: &RunOutcomes) -> serde_json::Value {
-    let kinds: [(&str, Vec<(PathBuf, String)>); 6] = [
+    let kinds: [(&str, Vec<(PathBuf, String)>); 7] = [
         ("thumbs", o.thumbs.failed.clone()),
         ("embeddings", o.embed.failed.clone()),
         ("keyframes", o.keyframes.failed.clone()),
         ("transcripts", o.transcript_failures()),
         ("ocr", o.ocr.failed.clone()),
         ("pdf", o.pdf.failed.clone()),
+        ("captions", o.captions.failed.clone()),
     ];
     let mut map = serde_json::Map::new();
     for (kind, failed) in kinds {
@@ -1665,11 +2044,11 @@ fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_json::
 
 /// The blob↔`text_fts` diff, run at the end of EVERY pass (mirroring
 /// `load_missing_vectors_from_blobs`'s role for Lance): any asset with a
-/// transcript/OCR/PDF-text blob but no `text_fts` rows for that source gets
-/// its rows rebuilt from the blob. `db.text_assets(source)` makes the pass
-/// cheap when nothing changed; a blob that decodes to no usable text is
-/// re-examined each pass rather than tracked (rare, and decoding one small
-/// blob is cheap). Caption healing lands with the describer in Task 18.
+/// transcript/OCR/PDF-text/caption blob but no `text_fts` rows for that
+/// source gets its rows rebuilt from the blob. `db.text_assets(source)`
+/// makes the pass cheap when nothing changed; a blob that decodes to no
+/// usable text is re-examined each pass rather than tracked (rare, and
+/// decoding one small blob is cheap).
 ///
 /// # Errors
 /// Returns an error on a blob-walk or sqlite failure; an individual
@@ -1678,7 +2057,69 @@ fn heal_text_fts(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
     heal_transcript_rows(db, blobs)?;
     heal_ocr_rows(db, blobs)?;
     heal_pdf_rows(db, blobs)?;
+    heal_caption_rows(db, blobs)?;
     Ok(())
+}
+
+/// Heals caption rows from stills (`caption.json.zst`, locator -1) and from
+/// videos (`captions.json.zst`, one row per described keyframe timestamp) —
+/// blobs from any describer tag, this machine's or a teammate's.
+fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+    let covered = db.text_assets("caption")?;
+    for (hex, _, path) in blobs.iter_named("caption.json.zst")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        match read_caption_blob(&path) {
+            Ok(caption) if !caption.text.trim().is_empty() => {
+                db.upsert_text_rows(&asset, "caption", &[(-1, caption.text.as_str())])?;
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("note: skipping unreadable caption blob: {err}"),
+        }
+    }
+    for (hex, _, path) in blobs.iter_named("captions.json.zst")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        let described = match read_video_captions_blob(&path) {
+            Ok(described) => described,
+            Err(err) => {
+                eprintln!("note: skipping unreadable video captions blob: {err}");
+                continue;
+            }
+        };
+        let rows: Vec<(i64, &str)> = described
+            .iter()
+            .filter(|(_, text)| !text.trim().is_empty())
+            .map(|(ts_ms, text)| (ts_ms_i64(*ts_ms), text.as_str()))
+            .collect();
+        if !rows.is_empty() {
+            db.upsert_text_rows(&asset, "caption", &rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads and parses one still's zstd JSON caption blob.
+fn read_caption_blob(path: &Path) -> Result<majestical_core::ports::Caption> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading caption blob {}", path.display()))?;
+    let json = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing caption blob {}", path.display()))?;
+    serde_json::from_slice(&json)
+        .with_context(|| format!("parsing caption blob {}", path.display()))
+}
+
+/// Reads a video's zstd JSON captions blob into its `(ts_ms, text)` rows.
+fn read_video_captions_blob(path: &Path) -> Result<Vec<(u64, String)>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading video captions blob {}", path.display()))?;
+    let json = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing video captions blob {}", path.display()))?;
+    video_captions_read(&json)
 }
 
 fn heal_transcript_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
@@ -1943,10 +2384,8 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
     let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-    // `build_plan` computes capabilities internally; recomputed here only to
-    // phrase the remedy lines (which model is actually missing).
-    let caps = capabilities();
-    let plan = build_plan(&projection, &blobs, &kinds);
+    let caps = capabilities(catalog_dir);
+    let plan = build_plan(&projection, &blobs, &kinds, &caps);
     let failures = read_failure_report(&state_dir);
     if json {
         println!(
@@ -2059,6 +2498,7 @@ mod tests {
                 written: 0,
                 failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
             },
+            captions: CaptionOutcome::default(),
         };
         let report = failure_report_json(&outcomes);
         let map = report.as_object().expect("object");
@@ -2148,6 +2588,43 @@ mod tests {
         assert!(marker.is_file(), "marker written once the add succeeded");
         let assets = store.distinct_assets(MINILM.tag).expect("scan");
         assert!(assets.contains(hex));
+    }
+
+    /// The evenly-spaced sample: short videos keep every keyframe, long
+    /// ones cap at [`MAX_DESCRIBED_KEYFRAMES`] spread across the whole
+    /// list — never the first twelve.
+    #[test]
+    fn select_described_timestamps_keeps_short_lists_and_samples_long_ones() {
+        assert!(select_described_timestamps(&[]).is_empty());
+
+        let short: Vec<u64> = (0..5).map(|i| i * 1000).collect();
+        assert_eq!(select_described_timestamps(&short), short);
+
+        let long: Vec<u64> = (0..100).map(|i| i * 1000).collect();
+        let selected = select_described_timestamps(&long);
+        assert!(selected.len() <= MAX_DESCRIBED_KEYFRAMES, "{selected:?}");
+        assert_eq!(selected[0], 0);
+        assert!(
+            *selected.last().expect("non-empty") >= 88_000,
+            "the sample must span the full list, not cluster at the start: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn video_captions_round_trip_through_the_reader() {
+        let described = vec![
+            (1500u64, "a red barn".to_string()),
+            (4500, "dusk".to_string()),
+        ];
+        let json = video_captions_json("describe-m", 7, &described);
+        let rows = video_captions_read(&json).expect("round trip");
+        assert_eq!(rows, described);
+
+        let err = video_captions_read(b"not json").expect_err("must reject non-json");
+        assert!(err.to_string().contains("video captions"), "{err}");
+        let err = video_captions_read(b"{\"described\":[[\"x\",1]]}")
+            .expect_err("must name the mistyped field");
+        assert!(err.to_string().contains("timestamp"), "{err}");
     }
 
     #[test]

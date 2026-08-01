@@ -7,6 +7,7 @@ mod iso8601;
 mod query;
 mod search;
 mod state_dir;
+mod tags_cmd;
 mod volume_identity;
 
 use anyhow::Result;
@@ -52,6 +53,12 @@ enum Cmd {
     Tag {
         #[command(subcommand)]
         cmd: TagCmd,
+    },
+    /// Review AI-suggested tags: list, confirm into the folksonomy, or
+    /// reject on this machine.
+    Tags {
+        #[command(subcommand)]
+        cmd: TagsCmd,
     },
     /// Search the catalog: bare terms match names; key:value tokens are
     /// hard filters (tag: vol: para: kind: online: before: after:), '-'
@@ -309,6 +316,30 @@ enum TagCmd {
     Rm { asset: String, tag: String },
 }
 
+/// The human review flow for AI tag suggestions (`Caption`/tag-suggestion
+/// blobs written by `maj index run --kinds captions`). Deliberately its own
+/// namespace, not folded into `TagCmd`: `maj tag add/rm` are direct
+/// folksonomy edits, while `maj tags suggestions/confirm/reject` review
+/// derived data that was never a CRDT op until confirmed.
+#[derive(Subcommand)]
+enum TagsCmd {
+    /// List pending AI tag suggestions not yet confirmed or rejected.
+    Suggestions,
+    /// Confirm suggestion(s) into the folksonomy — emits a plain `TagAdd`,
+    /// indistinguishable from `maj tag add` in the event log.
+    Confirm {
+        asset: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Reject suggestion(s) on this machine only (never synced).
+    Reject {
+        asset: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+}
+
 /// Dispatches `maj index`'s subcommands. Split out of `main` purely to stay
 /// under the crate's max-function-length lint.
 fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
@@ -357,6 +388,16 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
     }
 }
 
+/// Dispatches `maj tags`'s subcommands. Split out of `main` purely to stay
+/// under the crate's max-function-length lint, matching [`dispatch_index`].
+fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
+    match cmd {
+        TagsCmd::Suggestions => tags_cmd::cmd_suggestions(app, catalog),
+        TagsCmd::Confirm { asset, tags } => tags_cmd::cmd_confirm(app, &asset, &tags),
+        TagsCmd::Reject { asset, tags } => tags_cmd::cmd_reject(catalog, &asset, &tags),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let author = cli.author.clone().unwrap_or_else(|| cli.machine_id.clone());
@@ -371,6 +412,10 @@ fn main() -> Result<()> {
         Cmd::Tag { cmd } => {
             let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             commands::cmd_tag(&mut app, cmd)?;
+        }
+        Cmd::Tags { cmd } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            dispatch_tags(&mut app, &cli.catalog, cmd)?;
         }
         Cmd::Search {
             query,

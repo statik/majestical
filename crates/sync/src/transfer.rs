@@ -105,6 +105,10 @@ pub struct TransferOutcome {
     pub blob_bytes: u64,
     /// `(machine, events)` counted from each copied segment's new byte
     /// range — what a pull reports as "applied N events from M machines".
+    /// Counts come from parsing only the source's new byte range (from the
+    /// prior destination length onward), so they can undercount, never
+    /// overcount, if the destination was externally truncated to a
+    /// mid-line offset: this is reporting only, convergence is unaffected.
     pub events_added: Vec<(String, usize)>,
 }
 
@@ -254,7 +258,6 @@ pub fn execute(
         copy_via_temp(&from, &to, &staging)?;
         outcome.segments_copied += 1;
         outcome.segment_bytes += seg.src_len.saturating_sub(seg.dst_len);
-        let mut count = 0usize;
         let (events, _) = crate::FileEventLog::read_segment_since(&from, seg.dst_len, |_| {})
             .map_err(|e| match e {
                 crate::LogError::Io { path, source } => TransferError::Io { path, source },
@@ -263,9 +266,10 @@ pub fn execute(
                     source: std::io::Error::other(other.to_string()),
                 },
             })?;
-        count += events.len();
-        if count > 0 {
-            outcome.events_added.push((seg.machine.clone(), count));
+        if !events.is_empty() {
+            outcome
+                .events_added
+                .push((seg.machine.clone(), events.len()));
         }
     }
     for blob in &plan.blobs {
@@ -337,6 +341,23 @@ mod tests {
         std::fs::write(path, bytes).expect("write blob");
     }
 
+    /// Sets `path`'s mtime to a fixed date well over an hour in the past, so
+    /// [`sweep_stale_temps`]'s age guard treats it as stale. Shells out to
+    /// `touch -t` (BSD and GNU agree on this flag's format) rather than
+    /// adding a `filetime` dependency for one test.
+    fn backdate(path: &std::path::Path) {
+        let status = std::process::Command::new("touch")
+            .arg("-t")
+            .arg("202001010000")
+            .arg(path)
+            .status()
+            .expect("run touch -t");
+        assert!(
+            status.success(),
+            "touch -t must succeed to backdate {path:?}"
+        );
+    }
+
     #[test]
     fn classify_covers_every_blob_shape() {
         assert_eq!(classify_blob("thumb-320.webp"), BlobClass::Thumbs);
@@ -402,6 +423,27 @@ mod tests {
             replan.segments.is_empty() && replan.blobs.is_empty(),
             "a second plan after execute must be empty — sync converged"
         );
+
+        // A second push after more events land must count and transfer only
+        // the new delta, not the whole (already-partly-replicated) segment.
+        log.append(&[ev(3), ev(4), ev(5)]).expect("append more");
+        let plan2 = plan_transfer(src.path(), dst.path()).expect("plan2");
+        assert_eq!(
+            plan2.segments.len(),
+            1,
+            "the grown segment must be replanned"
+        );
+        let expected_delta = plan2.segments[0].src_len - plan2.segments[0].dst_len;
+        let outcome2 = execute(src.path(), dst.path(), &plan2).expect("execute2");
+        assert_eq!(
+            outcome2.events_added,
+            vec![("m1".to_string(), 3)],
+            "events_added must count only the new delta (3), not all 5 events"
+        );
+        assert_eq!(
+            outcome2.segment_bytes, expected_delta,
+            "segment_bytes must equal exactly the transferred delta"
+        );
     }
 
     #[test]
@@ -462,7 +504,13 @@ mod tests {
         // A leftover temp file from a killed sync must not appear in a plan.
         let tmp = dst.path().join("tmp");
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
-        std::fs::write(tmp.join("12345-0.part"), b"junk").expect("write junk");
+        let fresh = tmp.join("12345-0.part");
+        std::fs::write(&fresh, b"junk").expect("write junk");
+        // A second leftover, backdated past the stale threshold: it must be
+        // swept, while `fresh` (no mtime override — just created) must not.
+        let stale = tmp.join("99999-0.part");
+        std::fs::write(&stale, b"stale junk").expect("write stale junk");
+        backdate(&stale);
 
         let plan = plan_transfer(src.path(), dst.path()).expect("plan");
         assert_eq!(plan.blobs.len(), 1, "size mismatch = torn copy = re-copy");
@@ -473,6 +521,58 @@ mod tests {
         assert!(
             plan_back.blobs.is_empty(),
             "tmp/ leftovers must never be planned as blobs"
+        );
+        assert!(
+            fresh.exists(),
+            "a young temp file may belong to a concurrent pusher and must survive the sweep"
+        );
+        assert!(
+            !stale.exists(),
+            "a temp file older than the stale threshold must be swept"
+        );
+    }
+
+    #[test]
+    fn zero_byte_blob_present_at_src_and_absent_at_dst_is_copied() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(src.path().join("events")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("events")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("blobs")).expect("skeleton");
+        write_blob(src.path(), "aa/aahex/tags.json.zst", b"");
+
+        let plan = plan_transfer(src.path(), dst.path()).expect("plan");
+        assert_eq!(
+            plan.blobs.len(),
+            1,
+            "a 0-byte blob missing at dst must still be planned — size equality \
+             alone (0 == 0) can't distinguish absence from a match"
+        );
+        execute(src.path(), dst.path(), &plan).expect("execute");
+        assert!(
+            dst.path().join("blobs/aa/aahex/tags.json.zst").is_file(),
+            "the 0-byte blob must be copied to the destination"
+        );
+    }
+
+    #[test]
+    fn segments_are_sorted_by_machine_then_segment() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        // Init "m1" first so directory-iteration order (unspecified) cannot
+        // accidentally already match the expected sorted order.
+        let mut log_m1 = FileEventLog::init(src.path(), &MachineId("m1".into())).expect("init m1");
+        log_m1.append(&[ev(1)]).expect("append m1");
+        let mut log_m0 = FileEventLog::open(src.path(), &MachineId("m0".into())).expect("open m0");
+        log_m0.append(&[ev(2)]).expect("append m0");
+        std::fs::create_dir_all(dst.path().join("blobs")).expect("skeleton");
+
+        let plan = plan_transfer(src.path(), dst.path()).expect("plan");
+        let machines: Vec<&str> = plan.segments.iter().map(|s| s.machine.as_str()).collect();
+        assert_eq!(
+            machines,
+            vec!["m0", "m1"],
+            "plan.segments must be sorted machine-then-segment, not left in directory order"
         );
     }
 }

@@ -92,8 +92,10 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
-/// prefixed or whose kind is [`MediaKind::Other`] are skipped entirely — the
-/// planner has no derivation to offer them.
+/// prefixed, or whose kind is [`MediaKind::Other`], [`MediaKind::Audio`], or
+/// [`MediaKind::Pdf`], are skipped entirely — the planner has no derivation
+/// to offer them yet (audio has no visual thumbnail; PDF thumbnailing lands
+/// in a later task).
 ///
 /// Three passes over `sources` (rather than one) so `items` comes out
 /// globally priority-ordered — every thumbnail before every image embedding
@@ -101,7 +103,10 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 #[must_use]
 pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities) -> WorkPlan {
     let mut plan = WorkPlan::default();
-    for source in sources.iter().filter(|s| s.kind != MediaKind::Other) {
+    for source in sources
+        .iter()
+        .filter(|s| matches!(s.kind, MediaKind::Image | MediaKind::Video))
+    {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_thumb(source, hex, blobs, caps, &mut plan);
         }

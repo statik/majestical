@@ -2,19 +2,71 @@
 //! `kind:` search filter so both always agree.
 
 /// Coarse media class of a catalog path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MediaKind {
     Image,
     Video,
+    Audio,
+    Pdf,
     Other,
 }
 
-const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp", "webp", "heic", "heif", "avif", "dng",
-    "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
-];
-const VIDEO_EXTS: &[&str] = &[
-    "mov", "mp4", "m4v", "avi", "mkv", "mxf", "mts", "m2ts", "webm", "r3d", "braw",
+/// Single source of truth for extension -> kind, so adding a format never
+/// means touching more than one table.
+const EXTENSIONS: &[(&str, MediaKind)] = &[
+    // image
+    ("jpg", MediaKind::Image),
+    ("jpeg", MediaKind::Image),
+    ("png", MediaKind::Image),
+    ("gif", MediaKind::Image),
+    ("tif", MediaKind::Image),
+    ("tiff", MediaKind::Image),
+    ("bmp", MediaKind::Image),
+    ("webp", MediaKind::Image),
+    ("heic", MediaKind::Image),
+    ("heif", MediaKind::Image),
+    ("avif", MediaKind::Image),
+    ("dng", MediaKind::Image),
+    ("cr2", MediaKind::Image),
+    ("cr3", MediaKind::Image),
+    ("nef", MediaKind::Image),
+    ("arw", MediaKind::Image),
+    ("raf", MediaKind::Image),
+    ("orf", MediaKind::Image),
+    ("rw2", MediaKind::Image),
+    ("jxl", MediaKind::Image),
+    ("pef", MediaKind::Image),
+    ("iiq", MediaKind::Image),
+    ("3fr", MediaKind::Image),
+    // video
+    ("mov", MediaKind::Video),
+    ("mp4", MediaKind::Video),
+    ("m4v", MediaKind::Video),
+    ("avi", MediaKind::Video),
+    ("mkv", MediaKind::Video),
+    ("mxf", MediaKind::Video),
+    ("mts", MediaKind::Video),
+    ("m2ts", MediaKind::Video),
+    ("webm", MediaKind::Video),
+    ("r3d", MediaKind::Video),
+    ("braw", MediaKind::Video),
+    ("mpg", MediaKind::Video),
+    ("mpeg", MediaKind::Video),
+    ("3gp", MediaKind::Video),
+    ("wmv", MediaKind::Video),
+    ("insv", MediaKind::Video),
+    // audio
+    ("wav", MediaKind::Audio),
+    ("mp3", MediaKind::Audio),
+    ("m4a", MediaKind::Audio),
+    ("aac", MediaKind::Audio),
+    ("flac", MediaKind::Audio),
+    ("aif", MediaKind::Audio),
+    ("aiff", MediaKind::Audio),
+    ("caf", MediaKind::Audio),
+    ("ogg", MediaKind::Audio),
+    // pdf
+    ("pdf", MediaKind::Pdf),
 ];
 
 impl MediaKind {
@@ -22,13 +74,21 @@ impl MediaKind {
     /// "which kinds exist" so callers (e.g. the CLI's `kind:` filter) can
     /// derive their valid-value set instead of hand-listing it and risking
     /// drift when a variant is added.
-    pub const ALL: [MediaKind; 3] = [MediaKind::Image, MediaKind::Video, MediaKind::Other];
+    pub const ALL: [MediaKind; 5] = [
+        MediaKind::Image,
+        MediaKind::Video,
+        MediaKind::Audio,
+        MediaKind::Pdf,
+        MediaKind::Other,
+    ];
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             MediaKind::Image => "image",
             MediaKind::Video => "video",
+            MediaKind::Audio => "audio",
+            MediaKind::Pdf => "pdf",
             MediaKind::Other => "other",
         }
     }
@@ -45,13 +105,10 @@ pub fn media_kind(path: &str) -> MediaKind {
     let Some(ext) = ext else {
         return MediaKind::Other;
     };
-    if IMAGE_EXTS.contains(&ext.as_str()) {
-        MediaKind::Image
-    } else if VIDEO_EXTS.contains(&ext.as_str()) {
-        MediaKind::Video
-    } else {
-        MediaKind::Other
-    }
+    EXTENSIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == ext)
+        .map_or(MediaKind::Other, |(_, kind)| *kind)
 }
 
 #[cfg(test)]
@@ -65,5 +122,20 @@ mod tests {
         assert_eq!(media_kind("IMG_0001.HEIC"), MediaKind::Image);
         assert_eq!(media_kind("notes.txt"), MediaKind::Other);
         assert_eq!(media_kind("no_extension"), MediaKind::Other);
+    }
+
+    #[test]
+    fn audio_and_pdf_kinds_classify() {
+        assert_eq!(media_kind("voice-memo.m4a"), MediaKind::Audio);
+        assert_eq!(media_kind("PODCAST.WAV"), MediaKind::Audio);
+        assert_eq!(media_kind("brief.pdf"), MediaKind::Pdf);
+        assert_eq!(media_kind("shot.mpg"), MediaKind::Video);
+        assert_eq!(media_kind("frame.jxl"), MediaKind::Image);
+        assert_eq!(media_kind("notes.txt"), MediaKind::Other);
+    }
+
+    #[test]
+    fn all_lists_every_kind() {
+        assert_eq!(MediaKind::ALL.len(), 5);
     }
 }

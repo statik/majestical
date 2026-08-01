@@ -242,7 +242,7 @@ fn eligible_asset_count(projection: &Projection) -> u64 {
         };
         match media_kind(path) {
             MediaKind::Image | MediaKind::Video => count += 1,
-            MediaKind::Other => {}
+            MediaKind::Audio | MediaKind::Pdf | MediaKind::Other => {}
         }
     }
     count

@@ -4465,6 +4465,7 @@ dependencies = [
  "majestical-sync",
  "plist",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "ulid",

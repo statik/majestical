@@ -19,6 +19,17 @@ pub fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
     maj_as(catalog, state, "test-machine")
 }
 
+/// Parses a `search --json` asset id out of the first result. Shared with
+/// `cli_smoke.rs`'s own local copy of this helper (kept there rather than
+/// migrated, to avoid an unrelated churn in this task) — this one exists so
+/// `caption_smoke.rs` can pull an asset id out of a scan without needing its
+/// own copy.
+#[cfg(test)]
+pub fn first_asset_id(out: &std::process::Output) -> String {
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    hits["results"][0]["asset"].as_str().unwrap().to_string()
+}
+
 #[cfg(test)]
 pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     walkdir::WalkDir::new(root)
@@ -37,11 +48,27 @@ pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBu
 // or `#[expect]` (would itself fail wherever the helper IS otherwise used).
 #[cfg(test)]
 mod tests {
-    use super::walkdir_find;
+    use super::{first_asset_id, walkdir_find};
 
     #[test]
     fn walkdir_find_returns_empty_when_name_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(walkdir_find(dir.path(), "no-such-file").is_empty());
+    }
+
+    // Gives every binary compiling this module a real call site for
+    // `first_asset_id`, same rationale as the test above for
+    // `walkdir_find` — not every `tests/*.rs` file that pulls in `common`
+    // calls it directly (e.g. `describer_smoke.rs`), so this keeps it off
+    // `dead_code` without an `#[allow]` (denied by house lint policy).
+    #[test]
+    fn first_asset_id_reads_the_first_result() {
+        let json = serde_json::json!({"results": [{"asset": "xxh3:deadbeef"}]});
+        let output = std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: json.to_string().into_bytes(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(first_asset_id(&output), "xxh3:deadbeef");
     }
 }

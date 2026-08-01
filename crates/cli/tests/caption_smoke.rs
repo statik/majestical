@@ -3,8 +3,9 @@
 //! since no real local LLM backend is guaranteed on a test machine.
 mod common;
 
-use common::{maj, walkdir_find};
+use common::{first_asset_id, maj, walkdir_find};
 use httpmock::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 #[cfg(test)]
@@ -537,4 +538,160 @@ fn video_captions_blob_heals_per_keyframe_rows() {
         covered.contains(&majestical_core::event::AssetId(format!("xxh3:{hex}"))),
         "video caption heal must populate text_fts: {covered:?}"
     );
+}
+
+/// End-to-end suggestion review: a hand-planted `tags.json.zst` blob (unit
+/// isolation from the describer path, which the tests above already cover)
+/// flows through `tags suggestions` -> `tags confirm` -> `search tag:` (a
+/// confirmed suggestion is a plain `TagAdd`, indistinguishable from `maj tag
+/// add`) and separately through `tags suggestions` -> `tags reject`, whose
+/// rejection is recorded in the per-machine state dir rather than the
+/// synced catalog.
+#[test]
+fn suggestions_list_confirm_reject_flow() {
+    let media = tempfile::tempdir().unwrap();
+    write_red_png(&media.path().join("red.png"));
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    let output = maj(&root, &state)
+        .args(["search", "red", "--json"])
+        .output()
+        .unwrap();
+    let asset = first_asset_id(&output);
+    let hex = asset.strip_prefix("xxh3:").unwrap().to_string();
+
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+    let tags_path = blobs.path_for(
+        &hex,
+        &majestical_index::blob::Derivation::Tags {
+            model_tag: "describe-m",
+        },
+    );
+    let suggestions = vec![majestical_core::ports::TagSuggestion {
+        tag: "color/red".to_string(),
+        confidence: 0.95,
+        in_vocab: false,
+        model_tag: "describe-m".to_string(),
+    }];
+    let json = serde_json::to_vec(&suggestions).unwrap();
+    let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+    blobs.write_atomic(&tags_path, &compressed).unwrap();
+
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success()
+        .stdout(
+            contains(asset.as_str())
+                .and(contains("color/red"))
+                .and(contains("0.95"))
+                .and(contains("describe-m")),
+        );
+
+    maj(&root, &state)
+        .args(["tags", "confirm", &asset, "color/red"])
+        .assert()
+        .success();
+
+    // Confirm == a plain TagAdd: `search tag:` must find it exactly as it
+    // would a hand-added tag.
+    maj(&root, &state)
+        .args(["search", "tag:color/red"])
+        .assert()
+        .success()
+        .stdout(contains("red.png"));
+
+    // Already tagged: no longer pending.
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success()
+        .stdout(contains("color/red").not());
+
+    // A second suggestion, rejected instead of confirmed.
+    let more = vec![majestical_core::ports::TagSuggestion {
+        tag: "shape/square".to_string(),
+        confidence: 0.5,
+        in_vocab: false,
+        model_tag: "describe-m".to_string(),
+    }];
+    let json = serde_json::to_vec(&more).unwrap();
+    let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+    blobs.write_atomic(&tags_path, &compressed).unwrap();
+
+    maj(&root, &state)
+        .args(["tags", "reject", &asset, "shape/square"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success()
+        .stdout(contains("shape/square").not());
+
+    // Rejections are per-machine state, not a catalog artifact: the log
+    // lives under the state dir and must survive a projection rebuild
+    // (nothing about `tags suggestions`/`tags reject` above touched the
+    // sqlite projection directly, so its mere presence here already proves
+    // that; this assertion pins the file's existence and location).
+    assert_eq!(
+        walkdir_find(&state, "tag-rejections.jsonl").len(),
+        1,
+        "exactly one per-machine rejections log"
+    );
+}
+
+/// A fresh catalog with no suggestion blobs at all: `tags suggestions`
+/// succeeds (an empty pending list is not an error) and names the exact
+/// remedy, mirroring `caption_status_without_describer_names_the_remedy`.
+#[test]
+fn suggestions_empty_state_prints_guidance() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success()
+        .stdout(contains("maj index run"));
+}
+
+/// Confirming a tag on an asset that was never scanned must fail loudly
+/// with the same remedy `maj tag add` gives — a typo'd asset id must never
+/// silently create a phantom catalog entry.
+#[test]
+fn confirm_unknown_asset_errors_actionably() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["tags", "confirm", "xxh3:doesnotexist", "some/tag"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown asset").and(contains("scan its volume first")));
 }

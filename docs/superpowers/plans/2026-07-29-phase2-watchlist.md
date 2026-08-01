@@ -636,6 +636,174 @@ gated: `probe`/`analysis_frames`/`extract_frame`/`ffmpeg_available`) +
 (gated). Plus the 1 `thumbs.rs::scaled_dimension` timeout, accounted for
 separately (not in the 139).
 
+## Phase 5 deferrals
+
+Recorded during the phase 5 PR chain (#43-#53) and its reviews. Items marked
+"(phase 5 spec)" come from that spec's own deferred list; the rest were found
+during execution.
+
+- **Hosted multimodal embeddings (the OpenRouter quality tier) are not
+  built.** OpenRouter participates only as a describer backend
+  (`crates/describe/src/client.rs`'s `BackendKind::OpenRouter`); a hosted
+  embedding tier needs a parallel vector space plus cross-space fusion.
+  `Derivation`'s model tags (`crates/index/src/blob.rs:18-86`) already key
+  every blob by model, so nothing forecloses it (phase 5 spec).
+- **Tag-suggestion rejections are per-machine and never synced.**
+  `tag-rejections.jsonl` lives in the state dir, deliberately outside both
+  the event log and the disposable SQLite so projection rebuilds can't
+  resurrect a rejected suggestion (`crates/cli/src/tags_cmd.rs`). A teammate
+  rejecting a suggestion does not stop it reappearing on your machine
+  (phase 5 spec).
+- **API keys live in `describer.toml` at mode 0600, not the macOS
+  Keychain** — `crates/describe/src/config.rs` writes the file with
+  restricted permissions and `MAJ_OPENROUTER_KEY` lets the file stay keyless,
+  but the key is still plaintext on disk when set (phase 5 spec).
+- **PSD/Sketch/AI native parsing is not implemented.** `.ai` files that are
+  PDF-compatible open through `crates/index/src/pdf.rs` for free; genuinely
+  layered formats classify as `MediaKind::Other` and derive nothing
+  (phase 5 spec).
+- **Caption, OCR, and PDF text are FTS-only — only transcripts get
+  vectors.** `text_fts` (`crates/catalog-sqlite/src/schema.rs:81`) indexes
+  all four sources; the 384-d Lance text table
+  (`crates/index/src/vector_store.rs:543`) holds transcript chunks alone, so
+  a paraphrase query can only reach spoken words, never on-screen or
+  captioned text (phase 5 spec).
+- **No diarization, translation, or language forcing** in transcription —
+  `crates/index/src/transcribe.rs` runs whisper with language auto-detect
+  and no speaker attribution (phase 5 spec).
+- **`maj describer test` exits 0 even for a provably unusable config** —
+  a missing model or `capabilities.vision: false` prints prose but returns
+  `Ok(())` (`crates/cli/src/describer_cmd.rs:61`), so a script can't gate on
+  it. Nonzero exit for provably-unusable (as opposed to merely unreachable)
+  configuration is the fix (PR1 quality review).
+- **No dialect test covers a non-2xx backend response.** The fixtures replay
+  200s; a 401 or 500 from `crates/describe/src/client.rs` has no test
+  asserting the error names the URL it called (PR1 spec review).
+- **The caption `PortError` for malformed tag output carries a snippet and
+  context but not the backend URL** — enough to see what came back, not
+  enough to see which of several configured machines sent it
+  (`crates/describe/src/client.rs`, PR1 spec review).
+- **Cosmetic describer-CLI nits, not applied**: `cmd_set` clones three
+  fields where by-value would do, and `std::path::PathBuf` is written
+  fully-qualified rather than imported (`crates/cli/src/describer_cmd.rs`) —
+  fold in whenever that file is next touched (PR1 quality review).
+- **`text_encoder_conformance.rs` has neither a cosine upper-bound check nor
+  measured-floor reporting**, both of which its SigLIP sibling
+  (`crates/index/tests/encoder_conformance.rs`) has — so a suspiciously
+  perfect 1.0 (an oracle accidentally comparing a vector to itself) would
+  pass, and a slow drift toward the floor is invisible until it crosses
+  (PR2 quality review, discretionary).
+- **`fetch_spec` (the function) and `FetchSpec` (the struct) collide by
+  name** in `crates/index/src/model.rs:175`; and **`TextEncoder` has no
+  `Debug` derive** (`crates/index/src/text_encoder.rs:18`), so it can't be
+  embedded in any struct that wants one (PR2 quality review,
+  discretionary).
+- **The pre-existing ffmpeg/ffprobe calls still have no timeout.**
+  `run_with_timeout` (`crates/index/src/video.rs:259`) landed this phase but
+  is wired only into `extract_audio_pcm` (`:325`), the new audio path;
+  `probe` (`:88`), `analysis_frames` (`:161`), and `extract_frame` (`:223`)
+  still call bare `.output()`. Narrows, but does not close, the phase 4
+  item (PR3).
+- **`run_with_timeout`'s `try_wait` error path leaks the child and the
+  reader thread.** The `?` at `crates/index/src/video.rs:280` returns
+  without `kill()`ing the child or joining the reader — the timeout path
+  right below it does both. Also still missing: the one-line comment
+  documenting `extract_audio_pcm`'s `chunks_exact(4)` alignment invariant
+  (`:337`) (PR3 quality review).
+- **`whisper_gated`'s `say` fixture produced a silent aiff once on CI** and
+  the test was hardened rather than diagnosed: it now prefers `MAJ_AUDIO`
+  when the recipe set it, and otherwise retries `say` once after an
+  `is_silent` check (`crates/index/tests/whisper_gated.rs:20-66`). Why
+  `say` occasionally emits silence on a CI runner is still unexplained; the
+  retry masks it (PR5 CI run, hardened in PR6).
+- **The locked-PDF branch is written but untested.** `open_document`
+  rejects password-protected PDFs via `isLocked`
+  (`crates/index/src/pdf.rs:42-63`); no fixture exercises it because `qpdf`
+  (the tool that would generate an encrypted fixture) isn't installed on
+  this machine. Add the fixture to `crates/index/tests/pdf_golden.rs` when
+  it is (PR6).
+- **`maj tags suggestions` takes no query argument** — the phase 5 spec
+  wrote `maj tags suggestions [query]`, and the optional filter was not
+  built (`crates/cli/src/main.rs:327`, `crates/cli/src/tags_cmd.rs`).
+  Suggestions are listed whole; filtering is the caller's job (PR8 spec
+  review, deferred explicitly in PR9).
+- **`maj tags reject` does no asset validation** — an id that names no
+  asset appends to `tag-rejections.jsonl` all the same
+  (`crates/cli/src/tags_cmd.rs`). Matches the plan; recorded as an
+  observation, not a defect, since the file is a per-machine suppression
+  list rather than catalog state (PR8 spec review).
+- **A mid-run describer outage records one skip row per remaining item, not
+  one aggregate count.** `run_caption_items`
+  (`crates/cli/src/index_cmd.rs:1521-1524`) attributes
+  `DESCRIBER_SKIPPED_REASON` to every item after the first failure, where
+  the plan said report the skipped count — defensible (each row is
+  independently re-plannable and the count is derivable), but it makes a
+  large outage noisy in the run report (PR8, as-built).
+- **`PortError` conflates a per-item malformed response with a whole-backend
+  outage.** The caption loop can only see "this call failed", so one asset
+  whose response won't parse aborts the remaining caption work exactly like
+  a dead backend does (`crates/cli/src/index_cmd.rs:1483-1524`).
+  Distinguishing them is a port-level change (a retryable-vs-fatal
+  discriminant on `DescribeError`); left until it actually bites (PR8).
+- **`search_text_ranked` treats `Some(<empty set>)` of sources as "no
+  sources at all"** (`crates/catalog-sqlite/src/query.rs:113-130`) —
+  documented at the call site rather than made unrepresentable in the type
+  (PR4).
+- **The image `VectorStore`'s empty-add short-circuit is unpinned.**
+  `VectorStore::add`'s `rows.is_empty()` guard
+  (`crates/index/src/vector_store.rs:131-132`) is only checked by row count
+  (`:826`), which a deleted guard still passes — Lance versions every write
+  that reaches the table, including an empty one. The text store's
+  equivalent test pins `table.version()` across the call
+  (`:1150-1157`); the image store's does not. A pre-existing gap, found
+  while testing the text store (PR4).
+- **`eligible_assets` walks the whole projection once per text source.**
+  `crates/cli/src/search.rs:494` is called four times (once per
+  `TEXT_SOURCE_INFO` entry, `:465-490`) and `eligible_asset_count`
+  (`:439`) walks it a fifth time, each classifying the same first-instance
+  basename. One pass building all five populations is the fix if coverage
+  notices ever show up in a search profile (PR9).
+- **`--json` emits the `-1` locator sentinel verbatim.**
+  `crates/cli/src/search.rs:1087` writes `locator` straight through for
+  every text hit, while the human renderer (`:1013-1020`) correctly prints
+  nothing for `-1` (captions and still-image OCR, which have no timestamp
+  or page). A JSON consumer therefore sees a magic number where the field
+  should be absent (PR9).
+- **`search.rs`'s test module is still named `semantic_tests`**
+  (`crates/cli/src/search.rs:1218`) though it now covers FTS text hits,
+  N-way fusion, locator rendering, and coverage notices as well as the
+  semantic path (PR9).
+- **The phase 5 plan's Task 14 verification command lacks `--lib`** — the
+  acceptance harness rejects a test-name filter without it; fix if the plan
+  document is ever edited again (PR6 quality review).
+
+<!-- MUTANTS-TRIAGE-SECTION -->
+
+## Done in phase 5
+
+Items this phase closed from earlier watchlists.
+
+- **`media_kind`'s missing extensions and the one-place extension table** —
+  both closed. `crates/core/src/media_kind.rs:16-70` is now a single
+  `EXTENSIONS: &[(&str, MediaKind)]` table, and it carries the formats the
+  phase 4 review named: `mpg`/`mpeg`/`3gp`/`wmv`/`insv` for video and
+  `jxl`/`pef`/`iiq`/`3fr` for image, plus the new `Audio` and `Pdf` kinds
+  PR #50 needed (was: "**`media_kind`'s extension lists omit several common
+  formats**", phase 4 deferrals).
+- **The ffmpeg-subprocess timeout gap, for the new audio call site only.**
+  `run_with_timeout` (`crates/index/src/video.rs:259`) with a
+  duration-scaled budget (`audio_timeout`, `:304`) covers
+  `extract_audio_pcm`, so a stalled volume can no longer hang transcription.
+  `probe`, `analysis_frames`, and `extract_frame` still call bare
+  `.output()` — the phase 4 item stays open for those three (see phase 5
+  deferrals).
+- **The gated video-caption e2e deferred from PR 8** — closed by
+  `video_captions_describe_real_keyframes`
+  (`crates/cli/tests/phase5_e2e.rs:218`), which drives real scene detection
+  and real keyframe re-extraction through the CLI against a mock
+  OpenAI-compatible backend, rather than PR 8's hand-planted
+  `KeyframeManifest`/`Captions` blobs.
+
 ## Done in phase 4
 
 - **`para_nodes()` remaining inherent-only on `SqliteCatalog`** carries

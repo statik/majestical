@@ -301,3 +301,119 @@ triage, watchlist + handoff updates — the phase-4 closing discipline.
 - PSD/Sketch native parsing
 - Caption/OCR/PDF text vectors (FTS-only this phase)
 - Diarization; translation; language forcing
+
+## As-built deviations
+
+Where execution diverged from the spec above, and why. Everything else
+shipped as written.
+
+### Query layer
+
+- **Multi-term FTS is AND, not OR.** The spec did not say which; the
+  phase 4 name search joined terms with `OR`. Both name and text search now
+  join with `AND` through one shared builder,
+  `fts_match_expr` (`crates/catalog-sqlite/src/query.rs:36`, used at `:60`
+  and `:128`) — a two-word query returning everything matching *either*
+  word is not what anyone means by search, and having the two surfaces
+  disagree would have been worse than either choice.
+- **Best-per-asset text dedupe happens client-side, not in SQL.** The spec
+  implies one ranked row per asset out of `text_fts`. SQLite's `snippet()`
+  is not usable under `GROUP BY` (it reads the current match's context,
+  which a grouped row no longer has), so the query returns every matching
+  row with its own snippet and the CLI keeps the best-ranked row per asset
+  (`crates/cli/src/search.rs`, `TextHit` dedupe). The alternative — group in
+  SQL and re-query for a snippet — costs a second statement per result.
+- **Text score is the raw bm25 rank.** The plan's parenthetical suggested
+  `-rank`, which contradicted itself (bm25 in SQLite is already
+  negative-is-better). The stored/compared value is bm25's own output,
+  matching `search_names_ranked`'s existing convention exactly rather than
+  inventing a second one.
+- **ANY `in:` restriction disables the image-vector layer**, not just
+  `in:name` as the spec's syntax section implies. `image_semantic_enabled`
+  (`crates/cli/src/search.rs:322-330`) turns image vectors off for every
+  restricted query: the four text sources plus `name` are all *text*
+  sources, and there is no `in:image` to ask for the image layer back.
+  Reviewed and accepted rather than adding a speculative `in:image` with no
+  requester.
+
+### Derivation pipeline
+
+- **Video caption frames reuse the 320px thumbnail edge.** The spec left
+  the caption-frame resolution unstated; `caption_video_frame`
+  (`crates/cli/src/index_cmd.rs:1676`) re-extracts at the existing
+  `THUMB_EDGE`, so the caption path adds no new size constant and no new
+  decode profile.
+- **Caption/tags completion requires BOTH blobs, not caption-first.** The
+  spec's ordering ("one caption call + one tag call per asset") implies a
+  caption blob alone marks progress; the planner treats an asset as
+  described only when both the `Caption`/`Captions` and `Tags` blobs exist,
+  so an interrupted run between the two calls re-plans instead of stalling
+  with a caption and no tags forever.
+- **A completion-marker family was added that the spec's blob list does not
+  mention**: `OcrComplete`, `ChunksComplete`, and `ChunksEmpty`
+  (`crates/index/src/blob.rs:70-86`). The spec's per-item blobs
+  (`kf-<ts>.json.zst`, `chunk-<start-ms>.f32le.zst`) cannot express "every
+  item is done" — a planner would have to diff every keyframe timestamp or
+  re-chunk the transcript on every status call, and a legitimately empty
+  transcript would re-plan forever. `has_chunk_completion`
+  (`crates/index/src/blob.rs:181`) makes the distinction explicit:
+  individual chunk blobs are not completion, because they are written one
+  at a time before the vector-store add.
+- **Text vectors get a blob to Lance heal the spec did not call for.**
+  `load_missing_text_vectors_from_blobs` (`crates/cli/src/index_cmd.rs:1184`)
+  runs on every pass regardless of `--kinds`, mirroring the image path's
+  always-on diff — a teammate's synced chunk vectors index locally without
+  re-inference, and a deleted `lance/` directory rebuilds from blobs.
+
+### Models and bindings
+
+- **Model presence is one definition, not two.** The spec assumed the
+  phase 4 `model_present` carried over; it was SigLIP-only. It became
+  `model_present_for(spec, dir)` (`crates/index/src/model.rs:160`) before
+  the whisper/MiniLM consumers could copy the hardcoded version — used by
+  `search.rs:654` (SigLIP) and `:802` (MiniLM) and both conformance suites.
+- **whisper-rs API adaptations.** `to_str_lossy()` in whisper-rs 0.16
+  returns a `Result` rather than a `&str`
+  (`crates/index/src/transcribe.rs:115`), and segment timestamps come back
+  in centiseconds, not milliseconds — converted at the boundary and pinned
+  by `centiseconds_convert_to_ms` (`:155`) so the blob format stays
+  millisecond-based like every other locator in the system.
+- **MiniLM's ONNX export has no pooled output.** The spec said "384-d via
+  ort", implying a pooled vector comes out of the session; the export
+  exposes `last_hidden_state` only, so mean-pooling over the attention mask
+  is done in Rust (`mean_pool`, `crates/index/src/text_encoder.rs:123`)
+  before the L2 normalize. This is exactly what the
+  `sentence-transformers` oracle does internally, which is why the
+  conformance floor holds.
+- **PDFKit renders through a square box.** The spec said "first-page
+  1024px render"; `-[PDFPage thumbnailOfSize:forBox:]` sizes to a box, so
+  `render_first_page` (`crates/index/src/pdf.rs:102-130`) passes an
+  `edge`x`edge` square, which puts the longest post-rotation edge at
+  exactly `edge` for any page aspect ratio or rotation.
+
+### Testing
+
+- **OCR fixtures are rendered with ImageMagick, not ffmpeg `drawtext`.**
+  The spec named `drawtext`; this machine's ffmpeg is built without
+  freetype, so `magick -annotate` renders the text fixtures instead — for
+  `crates/index/tests/fixtures/ocr-hello.png` (PR 5) and again for the e2e
+  clip generator (`render_text_png`,
+  `crates/cli/tests/phase5_e2e.rs:20`). The assertions are unchanged
+  (substrings, not layout).
+- **Python oracles pin `device="cpu"` explicitly.** The spec did not
+  mention device selection. torch auto-selects MPS on Apple silicon, and
+  the virtualized CI Metal stack silently corrupts embeddings — the
+  text-encoder oracle measured cosine 0.738 against the Rust encoder
+  instead of the expected ≥0.999, with no error anywhere. Every
+  `SentenceTransformer`-based oracle now pins CPU. (`AutoModel`-based
+  oracles such as the SigLIP `golden.py` are CPU-default and were never
+  affected; the `faster-whisper` oracle already pinned CPU per plan.)
+
+### CLI surface
+
+- **Tag review is its own verb, `maj tags`, not a subcommand of `tag`.**
+  The spec wrote `maj tags suggestions|confirm|reject` but the repo already
+  had a singular `maj tag add|rm`; folding review under `tag` would have
+  mixed a CRDT-writing verb with a per-machine review workflow that mostly
+  writes nothing. `Cmd::Tags` (`crates/cli/src/main.rs:59`) is separate, and
+  `tags confirm` emits a plain `TagAdd` exactly as specified.

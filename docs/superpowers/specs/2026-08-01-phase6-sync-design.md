@@ -221,10 +221,10 @@ Unreachable (unmounted NAS, ejected shuttle) is a skip-with-notice naming
 the path, not an abort.
 
 `maj index status`'s per-derivation coverage already counts real rows and
-blobs, so "teammate derived it, you haven't pulled it" surfaces there
-naturally once pull lands blobs — with `maj sync pull` as the named remedy
-in search degradation notices where a text source's coverage gap traces to
-unpulled blobs.
+blobs, so pulled blobs surface there naturally with the existing remedies
+(`maj index run` imports them). Search degradation notices are unchanged —
+local coverage cannot distinguish "never derived" from "not yet pulled",
+so pull's own completion notice is where the sync remedy lives.
 
 ## Error handling
 

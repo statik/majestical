@@ -639,6 +639,190 @@ fn json_rows(results: &[LocationResult]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// One machine's ahead/behind segment tally within a direction: files
+/// pending and the bytes the destination is missing (`saturating_sub` —
+/// house rule; a shorter destination can never make this negative).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+struct SegmentCounts {
+    files: usize,
+    bytes: u64,
+}
+
+/// One location's status: either reachable, with both directions' full
+/// plans (so text and JSON rendering read the exact same walk and can never
+/// disagree), or unreachable — a reported row per the spec, never an error.
+enum StatusRow {
+    Reachable {
+        name: String,
+        ahead: transfer::TransferPlan,
+        behind: transfer::TransferPlan,
+    },
+    Unreachable {
+        name: String,
+        path: PathBuf,
+    },
+}
+
+/// `maj sync status`: for every configured location, plans BOTH
+/// directions — what a push would send (`ahead`) and what a pull would
+/// fetch (`behind`) — without executing either
+/// ([`transfer::plan_transfer`] only reads; it never creates a `tmp/`
+/// staging dir or touches anything, unlike [`transfer::execute`]). Every
+/// count comes from a fresh diff of real files at this moment; nothing is
+/// cached, so a file that changes underneath a location between two
+/// `status` calls changes the next call's counts (see the
+/// `status_counts_are_walked_not_cached` sabotage test). An unreachable
+/// location is a reported row, not an error — `status` exits 0 as long as
+/// at least one location is configured.
+///
+/// # Errors
+/// Returns an error when there's no catalog at `catalog`, no sync locations
+/// are configured, or a reachable location's directories exist but can't be
+/// read (a permission error, distinct from an unmounted/missing location).
+pub(crate) fn cmd_status(catalog: &Path, json: bool) -> Result<()> {
+    ensure_catalog(catalog)?;
+    let cfg = SyncConfig::load(&config_path(catalog)?)?;
+    anyhow::ensure!(!cfg.locations.is_empty(), "{NO_LOCATIONS_HINT}");
+    let mut rows = Vec::with_capacity(cfg.locations.len());
+    for loc in &cfg.locations {
+        rows.push(status_row(catalog, loc)?);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json_rows(&rows))
+                .context("serializing sync status report")?
+        );
+        return Ok(());
+    }
+    print_status_rows(&rows);
+    if cfg.readonly {
+        println!("readonly = true — this machine never pushes");
+    }
+    Ok(())
+}
+
+/// Plans both directions for one location. Read-only, by construction: it
+/// only ever calls [`transfer::plan_transfer`], never
+/// [`transfer::execute`].
+fn status_row(catalog: &Path, loc: &Location) -> Result<StatusRow> {
+    if !loc.path.is_dir() {
+        return Ok(StatusRow::Unreachable {
+            name: loc.name.clone(),
+            path: loc.path.clone(),
+        });
+    }
+    Ok(StatusRow::Reachable {
+        name: loc.name.clone(),
+        ahead: transfer::plan_transfer(catalog, &loc.path)?,
+        behind: transfer::plan_transfer(&loc.path, catalog)?,
+    })
+}
+
+/// Blob counts by [`transfer::BlobClass`], zero-filled for every class so
+/// the JSON contract's key set never varies with what's actually pending.
+fn class_counts(blobs: &[transfer::BlobCopy]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::from([
+        ("thumbs", 0usize),
+        ("metadata", 0),
+        ("vectors", 0),
+        ("transcripts", 0),
+    ]);
+    for b in blobs {
+        *counts.entry(b.class.as_str()).or_default() += 1;
+    }
+    counts
+}
+
+/// Segment counts grouped per machine — the spec's granularity, unlike
+/// push/pull's report, which totals every machine's bytes into one figure.
+/// A plan never emits a zero-length [`transfer::SegmentCopy`], so every
+/// entry here is already nonzero: both JSON and text rendering can iterate
+/// this directly with no separate filter.
+fn segments_by_machine(segments: &[transfer::SegmentCopy]) -> BTreeMap<String, SegmentCounts> {
+    let mut by_machine: BTreeMap<String, SegmentCounts> = BTreeMap::new();
+    for s in segments {
+        let counts = by_machine.entry(s.machine.clone()).or_default();
+        counts.files += 1;
+        counts.bytes += s.src_len.saturating_sub(s.dst_len);
+    }
+    by_machine
+}
+
+/// One direction's (`ahead` or `behind`) JSON shape:
+/// `{"segments": {"<machine>": {"files", "bytes"}, ...}, "blobs": {"thumbs", "metadata", "vectors", "transcripts"}}`.
+fn direction_json(plan: &transfer::TransferPlan) -> serde_json::Value {
+    serde_json::json!({
+        "segments": segments_by_machine(&plan.segments),
+        "blobs": class_counts(&plan.blobs),
+    })
+}
+
+fn status_json_rows(rows: &[StatusRow]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| match r {
+            StatusRow::Reachable {
+                name,
+                ahead,
+                behind,
+            } => serde_json::json!({
+                "location": name,
+                "reachable": true,
+                "ahead": direction_json(ahead),
+                "behind": direction_json(behind),
+            }),
+            StatusRow::Unreachable { name, path } => serde_json::json!({
+                "location": name,
+                "reachable": false,
+                "path": path,
+            }),
+        })
+        .collect()
+}
+
+fn print_status_rows(rows: &[StatusRow]) {
+    for row in rows {
+        match row {
+            StatusRow::Reachable {
+                name,
+                ahead,
+                behind,
+            } => {
+                print_direction(name, "ahead (push would send)", ahead);
+                print_direction(name, "behind (pull would fetch)", behind);
+            }
+            StatusRow::Unreachable { name, path } => {
+                println!(
+                    "{name}: unreachable at {} — mount it and retry",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Prints one direction's line(s) for one location: a segment line per
+/// machine with something pending (a "0 segment(s)" line when there is
+/// none, so the direction is never silent), then one blob-class line,
+/// always — an empty class still shows as "0" rather than being omitted.
+fn print_direction(name: &str, label: &str, plan: &transfer::TransferPlan) {
+    let segments = segments_by_machine(&plan.segments);
+    if segments.is_empty() {
+        println!("{name}: {label}: 0 segment(s)");
+    }
+    for (machine, counts) in &segments {
+        println!(
+            "{name}: {label}: {machine}: {} segment(s) ({} bytes)",
+            counts.files, counts.bytes
+        );
+    }
+    let blobs = class_counts(&plan.blobs);
+    println!(
+        "{name}: {label}: blobs: thumbs {} / metadata {} / vectors {} / transcripts {}",
+        blobs["thumbs"], blobs["metadata"], blobs["vectors"], blobs["transcripts"]
+    );
+}
+
 pub(crate) fn cmd_location_list(catalog: &Path, json: bool) -> Result<()> {
     let cfg = SyncConfig::load(&config_path(catalog)?)?;
     if json {

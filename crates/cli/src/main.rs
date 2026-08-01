@@ -325,6 +325,12 @@ enum SyncCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report each configured location's reachability and ahead/behind
+    /// counts, walked fresh from real files. Never executes a transfer.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -475,6 +481,7 @@ fn dispatch_sync(catalog: &Path, machine_id: &str, author: &str, cmd: SyncCmd) -
                 json,
             },
         ),
+        SyncCmd::Status { json } => sync_cmd::cmd_status(catalog, json),
     }
 }
 

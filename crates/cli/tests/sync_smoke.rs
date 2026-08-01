@@ -762,6 +762,253 @@ fn pull_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
 }
 
 #[test]
+fn status_counts_are_walked_not_cached() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let synced = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let synced: serde_json::Value =
+        serde_json::from_slice(&synced.get_output().stdout).expect("json");
+    assert_eq!(
+        synced[0]["ahead"]["blobs"]["thumbs"], 0,
+        "in sync after push: {synced}"
+    );
+
+    // Sabotage: delete the remote blob. Status must see it — no cache.
+    std::fs::remove_file(location.join("blobs/ab/abcd/thumb-320.webp")).expect("rm");
+    let after = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_slice(&after.get_output().stdout).expect("json");
+    assert_eq!(
+        after[0]["ahead"]["blobs"]["thumbs"], 1,
+        "a deleted remote blob must reappear in ahead-counts: {after}"
+    );
+}
+
+#[test]
+fn status_reports_an_unreachable_location_and_exits_zero() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let gone = root.path().join("shuttle");
+    std::fs::create_dir_all(&gone).expect("mkdir");
+    fx.add_location("shuttle", &gone);
+    let canonical_gone = gone.canonicalize().expect("canonicalize before eject");
+    std::fs::remove_dir_all(&gone).expect("eject the shuttle");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let row = &rows[0];
+    assert_eq!(row["location"], "shuttle");
+    assert_eq!(row["reachable"], false);
+    assert_eq!(
+        row["path"].as_str(),
+        canonical_gone.to_str(),
+        "the unreachable row: {row}"
+    );
+    let keys: std::collections::BTreeSet<&str> = row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "reachable", "path"].into_iter().collect(),
+        "an unreachable row's keys are exactly {{location, reachable, path}}: {row}"
+    );
+
+    // Text mode also names the location and the path, and still exits 0.
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("shuttle") && stdout.contains(canonical_gone.to_str().expect("utf8")),
+        "unreachable text row must name the location and path: {stdout}"
+    );
+}
+
+#[test]
+fn status_reports_behind_when_the_location_has_what_the_catalog_lacks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    let a = fixture_as(root.path(), "a", "m1");
+    a.write_blob("ab/abcd/thumb-320.webp", b"w");
+    a.add_location("nas", &location);
+    maj_as(&a.catalog, &a.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let b = fixture_as(root.path(), "b", "m2");
+    b.add_location("nas", &location);
+    let out = maj_as(&b.catalog, &b.state, "m2")
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    assert_eq!(
+        rows[0]["behind"]["blobs"]["thumbs"], 1,
+        "b's catalog lacks what a already pushed to the shared location: {rows}"
+    );
+    assert_eq!(
+        rows[0]["ahead"]["blobs"]["thumbs"], 0,
+        "b has pushed nothing of its own: {rows}"
+    );
+}
+
+#[test]
+fn status_never_writes_to_the_location_or_catalog() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+
+    assert!(
+        !location.join("tmp").exists(),
+        "status must never stage a transfer — no tmp/ dir at the location"
+    );
+    assert!(
+        !location.join("blobs/ab/abcd/thumb-320.webp").exists(),
+        "status must never execute a transfer — the blob must not have been pushed"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn status_json_pins_the_agent_facing_contract() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let rows = rows.as_array().expect("array of rows");
+    assert_eq!(rows.len(), 1, "one row per configured location: {rows:?}");
+    let row = &rows[0];
+
+    let keys: std::collections::BTreeSet<&str> = row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "reachable", "ahead", "behind"]
+            .into_iter()
+            .collect(),
+        "a reachable row's keys: {row}"
+    );
+
+    let ahead = &row["ahead"];
+    let ahead_keys: std::collections::BTreeSet<&str> = ahead
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        ahead_keys,
+        ["segments", "blobs"].into_iter().collect(),
+        "a direction's keys: {ahead}"
+    );
+
+    let blob_keys: std::collections::BTreeSet<&str> = ahead["blobs"]
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        blob_keys,
+        ["thumbs", "metadata", "vectors", "transcripts"]
+            .into_iter()
+            .collect(),
+        "blob class keys are always present, zero-filled: {ahead}"
+    );
+
+    let segments = ahead["segments"].as_object().expect("segments object");
+    assert_eq!(
+        segments.len(),
+        1,
+        "one machine ahead by its one pushed segment: {ahead}"
+    );
+    let seg = &segments["test-machine"];
+    let seg_keys: std::collections::BTreeSet<&str> = seg
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        seg_keys,
+        ["files", "bytes"].into_iter().collect(),
+        "a per-machine segment entry's keys: {seg}"
+    );
+    assert_eq!(seg["files"], 1);
+    assert!(seg["bytes"].as_u64().is_some_and(|b| b > 0));
+
+    assert!(
+        row["behind"]["segments"]
+            .as_object()
+            .expect("segments object")
+            .is_empty(),
+        "nothing behind yet — nothing has ever been pulled: {row}"
+    );
+}
+
+#[test]
+fn status_fails_when_no_locations_are_configured() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no sync locations configured") && stderr.contains("maj sync location add"),
+        "status with no locations configured must name the remedy: {stderr}"
+    );
+}
+
+#[test]
 fn a_readonly_member_can_still_pull() {
     let root = tempfile::tempdir().expect("tempdir");
     let location = root.path().join("nas");

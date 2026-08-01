@@ -301,6 +301,18 @@ enum SyncCmd {
         #[command(subcommand)]
         cmd: SyncLocationCmd,
     },
+    /// Replicate everything this catalog has (segments + blobs) to
+    /// configured locations.
+    Push {
+        /// Push to only this location (default: every configured one).
+        #[arg(long)]
+        location: Option<String>,
+        /// Restrict to one transfer class.
+        #[arg(long, value_enum)]
+        only: Option<sync_cmd::OnlyArg>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -429,6 +441,11 @@ fn dispatch_sync(catalog: &Path, cmd: SyncCmd) -> Result<()> {
             SyncLocationCmd::List { json } => sync_cmd::cmd_location_list(catalog, json),
             SyncLocationCmd::Rm { name } => sync_cmd::cmd_location_rm(catalog, &name),
         },
+        SyncCmd::Push {
+            location,
+            only,
+            json,
+        } => sync_cmd::cmd_push(catalog, location.as_deref(), only, json),
     }
 }
 

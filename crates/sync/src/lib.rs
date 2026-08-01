@@ -8,6 +8,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub mod transfer;
+
 /// Rotation threshold: an append that would grow the active segment past
 /// this starts the next `NNNN.jsonl` instead, bounding the whole-file
 /// re-copy cost of `maj sync push` (segments transfer longer-wins as whole
@@ -255,7 +257,7 @@ impl FileEventLog {
     /// pulled mid-write. A permanently truncated tail is therefore deferred
     /// indefinitely and invisible to both readers: no error, no
     /// `on_bad_line` call, no diagnostic at all.
-    fn read_segment_since(
+    pub(crate) fn read_segment_since(
         seg: &Path,
         from: u64,
         mut on_bad_line: impl FnMut(&str),

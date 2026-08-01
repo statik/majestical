@@ -283,10 +283,7 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
 
     let state_dir = crate::state_dir::state_dir_for(args.catalog_dir)?;
     let query_text = args.terms.join(" ");
-    // Image vectors match visual content, not any nameable text source —
-    // any `in:` restriction (even `in:name`: "name means names") turns
-    // them off.
-    let (image_ids, keyframe_ts, embedded) = if args.sources.is_none() {
+    let (image_ids, keyframe_ts, embedded) = if image_semantic_enabled(args.sources) {
         semantic_candidates(&state_dir, &query_text, semantic_limit)
     } else {
         (Vec::new(), HashMap::new(), None)
@@ -320,6 +317,16 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
         text_meta,
         text_coverage,
     })
+}
+
+/// Whether the image-vector layer participates: only on an unrestricted
+/// query. Image vectors match visual content, not any nameable text source
+/// — any `in:` restriction (even `in:name`: "name means names") turns them
+/// off. A pure function so the gate itself is unit-testable: the CLI smoke
+/// tests run without a `SigLIP` model and cannot tell "layer disabled" from
+/// "ran and found nothing".
+fn image_semantic_enabled(sources: Option<&BTreeSet<String>>) -> bool {
+    sources.is_none()
 }
 
 /// The four `text_fts` sources restricted to the `in:` set — `None` when
@@ -1415,6 +1422,24 @@ mod semantic_tests {
             value: value.into(),
             negated,
         }
+    }
+
+    #[test]
+    fn image_semantic_enabled_only_without_an_in_restriction() {
+        assert!(
+            super::image_semantic_enabled(None),
+            "an unrestricted query includes the image-vector layer"
+        );
+        let transcript: BTreeSet<String> = ["transcript".to_string()].into();
+        assert!(
+            !super::image_semantic_enabled(Some(&transcript)),
+            "in:transcript must not surface image-vector hits"
+        );
+        let name: BTreeSet<String> = ["name".to_string()].into();
+        assert!(
+            !super::image_semantic_enabled(Some(&name)),
+            "in:name means names — no image-vector hits"
+        );
     }
 
     #[test]

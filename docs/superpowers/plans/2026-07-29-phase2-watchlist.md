@@ -777,7 +777,82 @@ during execution.
   acceptance harness rejects a test-name filter without it; fix if the plan
   document is ever edited again (PR6 quality review).
 
-<!-- MUTANTS-TRIAGE-SECTION -->
+### cargo-mutants triage (phase 5)
+
+`majestical-describe` (spec's local-LLM describer client/config, all new in
+phase 5): 47 mutants tested, 32 caught, 10 unviable, 5 missed, before triage.
+`majestical-index`, scoped to `chunk.rs` only (see "not run" below): 7
+mutants tested, 6 caught, 1 unviable, 0 missed. Every count below is
+recounted directly against each run's own output, not estimated.
+
+**Invocations used:**
+
+```
+cargo mutants -p majestical-describe --timeout 120 -j 4
+cargo mutants -p majestical-index -f crates/index/src/chunk.rs --timeout 180 -j 4
+```
+
+**Not run (model/framework-bound; triage deferred):** `crates/index/src/
+ocr.rs`, `crates/index/src/pdf.rs`, `crates/index/src/text_encoder.rs`,
+`crates/index/src/transcribe.rs`. `majestical-index`'s build graph pulls in
+`lance`/`ort`/`whisper-rs`, so every per-mutant incremental rebuild against
+this crate is expensive: the `chunk.rs`-only scoped run alone took a 278s
+baseline build plus a further ~12 minutes wall-clock for just 7 mutants (pure
+logic, no model dependency). A `-p majestical-index` run additionally
+scoped to these four files (884 lines together, each doing real work against
+an external model or framework — Whisper transcription, OCR, PDF text
+extraction, the MiniLM ONNX text encoder) would run for hours against this
+task's foreground/interactive budget, well past what two prior attempts (a
+full-crate run and a five-file run) already showed timing out or getting
+killed mid-build. This is the same structural shape as the phase-4 triage's
+note that gated/`#[ignore]`d conformance suites (encoder, whisper, ffmpeg)
+show mutants in their own files as "missed" against cargo-mutants's default
+run even where the gated suite genuinely catches them — except here the cost
+is in the rebuild itself, not just suite selection, so even a single-file
+scoped run per remaining file needs a dedicated longer-timeout session
+(ideally a background/CI job) rather than this task's foreground window.
+
+**`majestical-describe` genuine gaps — closed with new tests:**
+
+- **`tags_prompt` (`crates/describe/src/client.rs:16-28`, 2 mutants: replace
+  body with `String::new()` / `"xyzzy".into()`):** every existing test that
+  reaches this function goes through `suggest_tags` and an httpmock server
+  that matches requests only on method/path — never the prompt text in the
+  request body (unlike the caption path's `ollama_caption_sends_base64_
+  data_url_no_auth`, which does inspect the body via `is_true`) — so
+  collapsing the whole prompt to an empty or constant string went unnoticed,
+  even though it would silently drop the vocab list from every real
+  request. Closed by two new tests that call the function directly:
+  `tags_prompt_lists_the_vocab_and_the_json_reply_shape` (asserts both vocab
+  tags and the JSON reply shape appear in the text) and `tags_prompt_names_
+  empty_vocab_explicitly` (asserts the `"(none yet)"` branch).
+- **`BackendKind::as_str` (`crates/describe/src/config.rs:26-33`, 2 mutants:
+  `""` / `"xyzzy"`):** its only caller is `describer_cmd.rs`'s `println!` for
+  `maj describer status`, which no test exercises. The sibling
+  `default_base_url` already had `default_base_urls_per_backend` pinning
+  every variant; `as_str` had no equivalent. Closed by `as_str_per_backend`
+  (`config.rs`), mirroring that existing test one-for-one.
+- **`DescriberConfig::load`'s `NotFound` guard (`crates/describe/src/
+  config.rs:76`, 1 mutant: widen the guard to unconditional `true`):** the
+  only existing test on the `Err`-turned-`Ok(None)` branch
+  (`load_missing_file_is_none`) triggers a genuine `NotFound`, so a mutant
+  that treats *every* io error as "file absent" still returns `Ok(None)`
+  there — indistinguishable from correct behavior. Closed by `load_non_
+  not_found_io_error_is_a_read_error` (`config.rs`), which points `load` at
+  a directory (a different io error kind on every platform this runs on)
+  and asserts the result surfaces as `ConfigError::Read`, not swallowed into
+  `None`.
+
+5 mutants (2 + 2 + 1) closed by four new tests — confirmed by rerunning
+`cargo mutants -p majestical-describe --timeout 120 -j 4` after the fix:
+47 mutants tested, 37 caught, 10 unviable, **0 missed**.
+
+**`majestical-index` (`chunk.rs`) — no gaps found:** 7 mutants tested, 6
+caught, 1 unviable, 0 missed. `chunk.rs`'s existing property test
+(`crates/index/src/chunk.rs`'s `proptest!` block, lines 169+, fuzzing
+segment durations and word counts) together with its direct unit tests
+already discriminates every mutant cargo-mutants tried in this scope; no
+action needed.
 
 ## Done in phase 5
 

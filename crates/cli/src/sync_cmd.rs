@@ -4,6 +4,7 @@
 //! never synced.
 
 use anyhow::{Context, Result};
+use majestical_sync::transfer;
 use std::path::{Path, PathBuf};
 
 pub(crate) const NO_LOCATIONS_HINT: &str =
@@ -154,6 +155,241 @@ pub(crate) fn cmd_location_add(catalog: &Path, name: &str, location: &Path) -> R
 pub(crate) fn cmd_location_rm(catalog: &Path, name: &str) -> Result<()> {
     remove_location(&config_path(catalog)?, name)?;
     println!("removed sync location '{name}' (its files were not touched)");
+    Ok(())
+}
+
+/// `--only` surface for `maj sync push` (and, later, `pull`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum OnlyArg {
+    Segments,
+    Thumbs,
+    Metadata,
+    Vectors,
+    Transcripts,
+}
+
+/// Narrows `plan` to one transfer class. `None` (no `--only`) returns the
+/// plan unchanged.
+fn filter_plan(plan: transfer::TransferPlan, only: Option<OnlyArg>) -> transfer::TransferPlan {
+    let Some(only) = only else { return plan };
+    let class = match only {
+        OnlyArg::Segments => {
+            return transfer::TransferPlan {
+                segments: plan.segments,
+                blobs: Vec::new(),
+            };
+        }
+        OnlyArg::Thumbs => transfer::BlobClass::Thumbs,
+        OnlyArg::Metadata => transfer::BlobClass::Metadata,
+        OnlyArg::Vectors => transfer::BlobClass::Vectors,
+        OnlyArg::Transcripts => transfer::BlobClass::Transcripts,
+    };
+    transfer::TransferPlan {
+        segments: Vec::new(),
+        blobs: plan
+            .blobs
+            .into_iter()
+            .filter(|b| b.class == class)
+            .collect(),
+    }
+}
+
+/// Locations to operate on: every configured location, or exactly the named
+/// one.
+///
+/// # Errors
+/// Returns an error when no locations are configured at all, or `name` is
+/// given but doesn't match any configured location.
+fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Vec<&'a Location>> {
+    anyhow::ensure!(!cfg.locations.is_empty(), "{NO_LOCATIONS_HINT}");
+    let Some(name) = name else {
+        return Ok(cfg.locations.iter().collect());
+    };
+    cfg.locations.iter().find(|l| l.name == name).map_or_else(
+        || {
+            let known: Vec<&str> = cfg.locations.iter().map(|l| l.name.as_str()).collect();
+            Err(anyhow::anyhow!(
+                "no sync location named '{name}' — configured: {}",
+                known.join(", ")
+            ))
+        },
+        |l| Ok(vec![l]),
+    )
+}
+
+/// One location's push (or, later, pull) result — either it ran (with an
+/// outcome, possibly carrying per-file failures) or it never ran (named in
+/// `skipped`: unreachable, or a transfer setup failure).
+struct LocationResult {
+    name: String,
+    outcome: Option<transfer::TransferOutcome>,
+    skipped: Option<String>,
+}
+
+/// `maj sync push`: replicate everything this catalog has (segments +
+/// blobs) to configured locations. Refuses outright when this machine is a
+/// read-only sync member; otherwise every reachable location gets its own
+/// independent transfer attempt, and per-file failures within a transfer
+/// are recorded rather than aborting it (see [`transfer::TransferOutcome`]).
+///
+/// # Errors
+/// Returns an error when there's no catalog at `catalog`, this machine is
+/// readonly, every requested location failed or was skipped, or any
+/// per-file failures occurred (progress is still kept and reported either
+/// way — see [`report_and_check`]).
+pub(crate) fn cmd_push(
+    catalog: &Path,
+    location: Option<&str>,
+    only: Option<OnlyArg>,
+    json: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        catalog.join("events").is_dir(),
+        "no catalog at {} — run `maj catalog init` first",
+        catalog.display()
+    );
+    let config = config_path(catalog)?;
+    let cfg = SyncConfig::load(&config)?;
+    anyhow::ensure!(
+        !cfg.readonly,
+        "readonly = true in {} — this machine is a read-only sync member and never pushes",
+        config.display()
+    );
+    let targets = resolve_targets(&cfg, location)?;
+    let results: Vec<LocationResult> = targets
+        .into_iter()
+        .map(|loc| transfer_one(catalog, loc, only))
+        .collect();
+    report_and_check(&results, "push", json)
+}
+
+/// Runs one location's push (catalog -> location), converting an
+/// unreachable location or a plan/execute setup failure into a skip row
+/// rather than propagating an error — one bad location must never abort
+/// every other location's transfer.
+///
+/// `catalog` is always the transfer source here; `maj sync pull` (a later
+/// task) will need this to run in the other direction too, but that's not
+/// wired up yet — don't add unused direction plumbing ahead of it.
+fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> LocationResult {
+    if !loc.path.is_dir() {
+        return LocationResult {
+            name: loc.name.clone(),
+            outcome: None,
+            skipped: Some(format!("unreachable at {} — skipped", loc.path.display())),
+        };
+    }
+    let (src, dst) = (catalog, loc.path.as_path());
+    let run = transfer::plan_transfer(src, dst)
+        .map(|plan| filter_plan(plan, only))
+        .and_then(|plan| transfer::execute(src, dst, &plan));
+    match run {
+        Ok(outcome) => LocationResult {
+            name: loc.name.clone(),
+            outcome: Some(outcome),
+            skipped: None,
+        },
+        Err(e) => LocationResult {
+            name: loc.name.clone(),
+            outcome: None,
+            skipped: Some(format!("failed: {e}")),
+        },
+    }
+}
+
+/// Prints one row per location and enforces the exit policy. A text row
+/// reads `<name>: <verb>ed N segment(s) (B bytes), N blob(s) (B bytes)`,
+/// with `, N failed` appended when that location's outcome carries
+/// per-file failures; each failure is additionally printed to stderr as
+/// `<location>: failed <path>: <reason>`. JSON rows carry the same numbers
+/// plus a `failures` array of `{path, error}` objects.
+///
+/// Exit policy: nonzero when EVERY requested location failed or was
+/// skipped, and ALSO when any location's outcome carries per-file
+/// failures — partial progress is kept and reported either way (the engine
+/// records and continues past per-file errors), but a sync that could not
+/// move everything must not exit 0 under cron. The final error names the
+/// failing locations and says progress was kept and the next run retries.
+///
+/// # Errors
+/// See "Exit policy" above.
+fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Result<()> {
+    if json {
+        print_json_rows(results)?;
+    } else {
+        print_text_rows(results, verb);
+    }
+    for r in results {
+        if let Some(o) = &r.outcome {
+            for (path, reason) in &o.failures {
+                eprintln!("{}: failed {}: {reason}", r.name, path.display());
+            }
+        }
+    }
+    anyhow::ensure!(
+        results.iter().any(|r| r.outcome.is_some()),
+        "sync {verb} failed for every requested location"
+    );
+    let failing: Vec<&str> = results
+        .iter()
+        .filter(|r| r.outcome.as_ref().is_some_and(|o| !o.failures.is_empty()))
+        .map(|r| r.name.as_str())
+        .collect();
+    anyhow::ensure!(
+        failing.is_empty(),
+        "sync {verb} had per-file failures at {} — progress was kept; the next run retries",
+        failing.join(", ")
+    );
+    Ok(())
+}
+
+fn print_text_rows(results: &[LocationResult], verb: &str) {
+    for r in results {
+        match (&r.outcome, &r.skipped) {
+            (Some(o), _) => {
+                let failed = if o.failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} failed", o.failures.len())
+                };
+                println!(
+                    "{}: {verb}ed {} segment(s) ({} bytes), {} blob(s) ({} bytes){failed}",
+                    r.name, o.segments_copied, o.segment_bytes, o.blobs_copied, o.blob_bytes
+                );
+            }
+            (None, Some(reason)) => println!("{}: {reason}", r.name),
+            (None, None) => {}
+        }
+    }
+}
+
+/// # Errors
+/// Returns an error if the report can't be serialized to JSON (unreachable
+/// in practice — every field is a plain number, string, or path).
+fn print_json_rows(results: &[LocationResult]) -> Result<()> {
+    let rows: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| match (&r.outcome, &r.skipped) {
+            (Some(o), _) => serde_json::json!({
+                "location": r.name,
+                "segments": o.segments_copied,
+                "segment_bytes": o.segment_bytes,
+                "blobs": o.blobs_copied,
+                "blob_bytes": o.blob_bytes,
+                "failures": o.failures.iter().map(|(path, error)| {
+                    serde_json::json!({ "path": path, "error": error })
+                }).collect::<Vec<_>>(),
+            }),
+            (None, skipped) => serde_json::json!({
+                "location": r.name,
+                "skipped": skipped,
+            }),
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).context("serializing sync report")?
+    );
     Ok(())
 }
 

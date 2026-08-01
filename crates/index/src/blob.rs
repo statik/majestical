@@ -51,6 +51,38 @@ pub enum Derivation<'a> {
     PdfText {
         model_tag: &'a str,
     },
+    /// Describer caption (JSON, zstd-compressed) for a still image or PDF
+    /// page render.
+    Caption {
+        model_tag: &'a str,
+    },
+    /// Describer captions (JSON, zstd-compressed) for a video's keyframes.
+    Captions {
+        model_tag: &'a str,
+    },
+    /// Describer tags (JSON, zstd-compressed) for an asset.
+    Tags {
+        model_tag: &'a str,
+    },
+    /// Marker written once every timestamp in a video's keyframe manifest
+    /// has an OCR blob — cheaper than diffing every timestamp in the
+    /// planner on every status call.
+    OcrComplete {
+        model_tag: &'a str,
+    },
+    /// Marker written in place of any `TranscriptChunk` blobs when a
+    /// transcript chunked to zero chunks (e.g. an empty transcript).
+    ChunksEmpty {
+        model_tag: &'a str,
+    },
+    /// Marker written once EVERY chunk of a transcript has its
+    /// `TranscriptChunk` blob and the chunks are indexed — the
+    /// transcript-embed done signal (mirrors [`Derivation::OcrComplete`]).
+    /// Individual chunk blobs without this marker mean an interrupted run:
+    /// the item re-plans, and the existing blobs make the retry cheap.
+    ChunksComplete {
+        model_tag: &'a str,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -126,7 +158,64 @@ impl BlobStore {
                 .join(model_tag)
                 .join(format!("kf-{timestamp_ms}.json.zst")),
             Derivation::PdfText { model_tag } => dir.join(model_tag).join("text.json.zst"),
+            Derivation::Caption { model_tag } => dir.join(model_tag).join("caption.json.zst"),
+            Derivation::Captions { model_tag } => dir.join(model_tag).join("captions.json.zst"),
+            Derivation::Tags { model_tag } => dir.join(model_tag).join("tags.json.zst"),
+            Derivation::OcrComplete { model_tag } => dir.join(model_tag).join("ocr-complete.json"),
+            Derivation::ChunksEmpty { model_tag } => dir.join(model_tag).join("chunks-empty.json"),
+            Derivation::ChunksComplete { model_tag } => {
+                dir.join(model_tag).join("chunks-complete.json")
+            }
         }
+    }
+
+    /// True when transcript chunking has COMPLETED for the asset: either the
+    /// [`Derivation::ChunksComplete`] marker (every chunk blob written and
+    /// indexed) or the [`Derivation::ChunksEmpty`] marker (chunking
+    /// legitimately produced zero chunks — an answer that must count as done
+    /// too, or the planner would retry it forever) exists. Individual
+    /// `TranscriptChunk` blobs deliberately do NOT count: they're written
+    /// one at a time before the vector-store add, so their presence alone
+    /// can mean an interrupted, partially indexed run.
+    #[must_use]
+    pub fn has_chunk_completion(&self, asset_hex: &str, model_tag: &str) -> bool {
+        self.path_for(asset_hex, &Derivation::ChunksComplete { model_tag })
+            .is_file()
+            || self
+                .path_for(asset_hex, &Derivation::ChunksEmpty { model_tag })
+                .is_file()
+    }
+
+    /// Walks `blobs/` for every file named `file_name` across every asset and
+    /// every model tag, returning `(asset_hex, model_tag, path)` triples.
+    /// Unlike [`Self::iter_vectors`], this isn't pinned to one `model_tag` —
+    /// it's built for tags/captions blobs, which a status/index consumer
+    /// wants across whichever describer tag produced them. A missing
+    /// `blobs/` root, or a missing per-asset dir, yields an empty result
+    /// rather than an error — the walk is over a tree that mostly doesn't
+    /// exist yet on a fresh catalog.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::Blob`] if a directory entry can't be read once
+    /// the walk has started (a transient I/O error mid-walk).
+    pub fn iter_named(
+        &self,
+        file_name: &str,
+    ) -> Result<Vec<(String, String, PathBuf)>, IndexError> {
+        let mut refs = Vec::new();
+        let Ok(prefixes) = std::fs::read_dir(&self.root) else {
+            return Ok(refs);
+        };
+        for prefix_entry in prefixes {
+            let prefix_entry = prefix_entry.map_err(|source| IndexError::Blob {
+                path: self.root.clone(),
+                source,
+            })?;
+            if prefix_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                iter_named_under_prefix(&prefix_entry.path(), file_name, &mut refs)?;
+            }
+        }
+        Ok(refs)
     }
 
     /// Temp-name + rename so a crash never leaves a partial blob at a final
@@ -282,6 +371,44 @@ fn iter_vectors_under_prefix(
     Ok(())
 }
 
+fn iter_named_under_prefix(
+    prefix_dir: &Path,
+    file_name: &str,
+    refs: &mut Vec<(String, String, PathBuf)>,
+) -> Result<(), IndexError> {
+    let Ok(asset_dirs) = std::fs::read_dir(prefix_dir) else {
+        return Ok(());
+    };
+    for asset_entry in asset_dirs {
+        let asset_entry = asset_entry.map_err(|source| IndexError::Blob {
+            path: prefix_dir.to_path_buf(),
+            source,
+        })?;
+        if !asset_entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let hex = asset_entry.file_name().to_string_lossy().into_owned();
+        let Ok(model_dirs) = std::fs::read_dir(asset_entry.path()) else {
+            continue;
+        };
+        for model_entry in model_dirs {
+            let model_entry = model_entry.map_err(|source| IndexError::Blob {
+                path: asset_entry.path(),
+                source,
+            })?;
+            if !model_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let model_tag = model_entry.file_name().to_string_lossy().into_owned();
+            let candidate = model_entry.path().join(file_name);
+            if candidate.is_file() {
+                refs.push((hex.clone(), model_tag, candidate));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::blob::{BlobStore, Derivation, THUMB_NAME, asset_hex};
@@ -406,6 +533,152 @@ mod tests {
             },
         );
         assert!(path.ends_with("aa/aabb/pdfkit-v1/text.json.zst"));
+    }
+
+    #[test]
+    fn caption_captions_and_tags_blob_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caption = store.path_for(
+            "aabb",
+            &Derivation::Caption {
+                model_tag: "describe-qwen3-vl-8b",
+            },
+        );
+        assert!(caption.ends_with("aa/aabb/describe-qwen3-vl-8b/caption.json.zst"));
+        let captions = store.path_for(
+            "aabb",
+            &Derivation::Captions {
+                model_tag: "describe-qwen3-vl-8b",
+            },
+        );
+        assert!(captions.ends_with("aa/aabb/describe-qwen3-vl-8b/captions.json.zst"));
+        let tags = store.path_for(
+            "aabb",
+            &Derivation::Tags {
+                model_tag: "describe-qwen3-vl-8b",
+            },
+        );
+        assert!(tags.ends_with("aa/aabb/describe-qwen3-vl-8b/tags.json.zst"));
+    }
+
+    #[test]
+    fn ocr_complete_and_chunks_empty_blob_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let ocr_complete = store.path_for(
+            "aabb",
+            &Derivation::OcrComplete {
+                model_tag: "applevision-r3-v1",
+            },
+        );
+        assert!(ocr_complete.ends_with("aa/aabb/applevision-r3-v1/ocr-complete.json"));
+        let chunks_empty = store.path_for(
+            "aabb",
+            &Derivation::ChunksEmpty {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        assert!(chunks_empty.ends_with("aa/aabb/minilm-l6-v2-v1/chunks-empty.json"));
+        let chunks_complete = store.path_for(
+            "aabb",
+            &Derivation::ChunksComplete {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        assert!(chunks_complete.ends_with("aa/aabb/minilm-l6-v2-v1/chunks-complete.json"));
+    }
+
+    #[test]
+    fn has_chunk_completion_requires_a_marker_not_just_chunk_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        assert!(
+            !store.has_chunk_completion("aabb", "minilm-l6-v2-v1"),
+            "no model dir at all must be false"
+        );
+
+        // A chunk vector blob alone can mean an interrupted run whose store
+        // add never happened — it must NOT count as completion.
+        let chunk_path = store.path_for(
+            "aabb",
+            &Derivation::TranscriptChunk {
+                model_tag: "minilm-l6-v2-v1",
+                start_ms: 0,
+            },
+        );
+        store
+            .write_vector(&chunk_path, &[0.1, 0.2])
+            .expect("write chunk");
+        assert!(
+            !store.has_chunk_completion("aabb", "minilm-l6-v2-v1"),
+            "a chunk blob without a completion marker is NOT done"
+        );
+
+        let complete_marker = store.path_for(
+            "aabb",
+            &Derivation::ChunksComplete {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        store
+            .write_atomic(&complete_marker, b"{}")
+            .expect("write complete marker");
+        assert!(store.has_chunk_completion("aabb", "minilm-l6-v2-v1"));
+
+        let empty_marker = store.path_for(
+            "ccdd",
+            &Derivation::ChunksEmpty {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        store
+            .write_atomic(&empty_marker, b"{}")
+            .expect("write empty marker");
+        assert!(
+            store.has_chunk_completion("ccdd", "minilm-l6-v2-v1"),
+            "the empty-transcript marker alone must also count as done"
+        );
+    }
+
+    #[test]
+    fn iter_named_finds_a_file_across_assets_and_model_tags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let tags_a = store.path_for(
+            "aa11aa11aa11aa11aa11aa11aa11aa11",
+            &Derivation::Tags {
+                model_tag: "describe-qwen3-vl-8b",
+            },
+        );
+        store.write_atomic(&tags_a, b"[]").expect("write tags a");
+        let tags_b = store.path_for(
+            "bb22bb22bb22bb22bb22bb22bb22bb22",
+            &Derivation::Tags {
+                model_tag: "describe-other-model",
+            },
+        );
+        store.write_atomic(&tags_b, b"[]").expect("write tags b");
+
+        let mut refs = store.iter_named("tags.json.zst").expect("iter_named");
+        refs.sort();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[0],
+            (
+                "aa11aa11aa11aa11aa11aa11aa11aa11".to_string(),
+                "describe-qwen3-vl-8b".to_string(),
+                tags_a
+            )
+        );
+        assert_eq!(
+            refs[1],
+            (
+                "bb22bb22bb22bb22bb22bb22bb22bb22".to_string(),
+                "describe-other-model".to_string(),
+                tags_b
+            )
+        );
     }
 
     #[test]

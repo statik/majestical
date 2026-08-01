@@ -1416,40 +1416,79 @@ fn a_readonly_member_can_still_pull() {
         .success();
 }
 
-/// Two sites that never share a live network connection converge purely
-/// through a traveling shuttle drive: both register the SAME directory as
+/// The spec's `§Testing` topology: site A is TWO machines (A1, A2) sharing a
+/// local NAS location dir, plus a `shuttle` location that carries state to
+/// site B, a single machine that never touches the NAS. Two sites that
+/// never share a live network connection still converge purely through the
+/// traveling shuttle drive — both A1 and B register the SAME directory as
 /// their `shuttle` location (standing in for a physical drive that visits
-/// each site in turn — the point is neither site ever pushes to or pulls
-/// from the other directly, only through that shared directory), and
-/// convergence proves out in both directions — site A's scanned asset
-/// reaches site B, and site B's tag on it reaches back to site A.
+/// each site in turn) — and the gossip hop through A1 proves out: A2's
+/// asset, known to A1 only via A1's own NAS pull, still reaches site B
+/// through A1's shuttle push, which must carry every machine dir under
+/// A1's catalog root, not just A1's own. The existing tag round trip (site
+/// B's tag on A1's asset reaching back to A1) is kept unchanged.
 #[test]
 fn a_shuttle_drive_converges_two_sites_that_never_meet() {
     let root = tempfile::tempdir().expect("tempdir");
     let shuttle = root.path().join("shuttle");
+    let nas = root.path().join("nas");
     std::fs::create_dir_all(&shuttle).expect("mkdir");
+    std::fs::create_dir_all(&nas).expect("mkdir");
 
-    let site_a = fixture_as(root.path(), "site-a", "site-a");
+    let site_a1 = fixture_as(root.path(), "site-a1", "site-a1");
+    let site_a2 = fixture_as(root.path(), "site-a2", "site-a2");
     let site_b = fixture_as(root.path(), "site-b", "site-b");
-    site_a.add_location("shuttle", &shuttle);
+    site_a1.add_location("nas", &nas);
+    site_a1.add_location("shuttle", &shuttle);
+    site_a2.add_location("nas", &nas);
     site_b.add_location("shuttle", &shuttle);
 
-    // Site A catalogs a file and pushes it to the shuttle.
-    std::fs::create_dir_all(&site_a.media).expect("mkdir");
-    std::fs::write(site_a.media.join("interview.mov"), b"mov-bytes").expect("write");
-    maj_as(&site_a.catalog, &site_a.state, "site-a")
+    // A1 catalogs its own file, but does not push yet — its push below
+    // must carry this alongside whatever it gossips in from A2 via NAS.
+    std::fs::create_dir_all(&site_a1.media).expect("mkdir");
+    std::fs::write(site_a1.media.join("interview.mov"), b"mov-bytes").expect("write");
+    maj_as(&site_a1.catalog, &site_a1.state, "site-a1")
         .args(["scan"])
-        .arg(&site_a.media)
-        .args(["--volume", "vol-a"])
+        .arg(&site_a1.media)
+        .args(["--volume", "vol-a1"])
         .assert()
         .success();
-    maj_as(&site_a.catalog, &site_a.state, "site-a")
+
+    // A2 catalogs a second, distinct file and pushes it to the local NAS —
+    // A1 and B never see this push directly.
+    std::fs::create_dir_all(&site_a2.media).expect("mkdir");
+    std::fs::write(site_a2.media.join("b-roll.mov"), b"broll-bytes").expect("write");
+    maj_as(&site_a2.catalog, &site_a2.state, "site-a2")
+        .args(["scan"])
+        .arg(&site_a2.media)
+        .args(["--volume", "vol-a2"])
+        .assert()
+        .success();
+    maj_as(&site_a2.catalog, &site_a2.state, "site-a2")
         .args(["sync", "push"])
         .assert()
         .success();
 
-    // The drive travels. Site B pulls, sees the asset, tags it, and pushes
-    // its own change back to the shuttle.
+    // The gossip hop: A1 pulls from the NAS, learning A2's asset, THEN
+    // pushes to the shuttle. That push's events/ tree now holds both A1's
+    // and A2's machine dirs, so it carries A2's segment onward even though
+    // A2 never touched the shuttle itself.
+    maj_as(&site_a1.catalog, &site_a1.state, "site-a1")
+        .args(["sync", "pull"])
+        .arg("--location")
+        .arg("nas")
+        .assert()
+        .success();
+    maj_as(&site_a1.catalog, &site_a1.state, "site-a1")
+        .args(["sync", "push"])
+        .arg("--location")
+        .arg("shuttle")
+        .assert()
+        .success();
+
+    // The drive travels. Site B pulls the shuttle ONLY — it never touches
+    // the NAS — and must see BOTH A1's and A2's assets: finding only A1's
+    // would mean the gossip hop above didn't actually carry A2's segment.
     maj_as(&site_b.catalog, &site_b.state, "site-b")
         .args(["sync", "pull"])
         .assert()
@@ -1461,9 +1500,20 @@ fn a_shuttle_drive_converges_two_sites_that_never_meet() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(
         stdout.contains("interview.mov"),
-        "site B must see site A's asset after the shuttle round trip: {stdout}"
+        "site B must see A1's asset after the shuttle round trip: {stdout}"
+    );
+    let out = maj_as(&site_b.catalog, &site_b.state, "site-b")
+        .args(["search", "b-roll"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("b-roll.mov"),
+        "site B must see A2's asset gossiped through A1's NAS pull + shuttle push: {stdout}"
     );
 
+    // Site B tags A1's asset and pushes its own change back to the
+    // shuttle.
     let out = maj_as(&site_b.catalog, &site_b.state, "site-b")
         .args(["search", "interview", "--json"])
         .output()
@@ -1478,19 +1528,21 @@ fn a_shuttle_drive_converges_two_sites_that_never_meet() {
         .assert()
         .success();
 
-    // The drive travels back. Site A pulls and sees site B's tag — a
+    // The drive travels back. A1 pulls and sees site B's tag — a
     // tag-filter search proves the round trip, not just a raw event count.
-    maj_as(&site_a.catalog, &site_a.state, "site-a")
+    maj_as(&site_a1.catalog, &site_a1.state, "site-a1")
         .args(["sync", "pull"])
+        .arg("--location")
+        .arg("shuttle")
         .assert()
         .success();
-    let out = maj_as(&site_a.catalog, &site_a.state, "site-a")
+    let out = maj_as(&site_a1.catalog, &site_a1.state, "site-a1")
         .args(["search", "tag:status/select"])
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(
         stdout.contains("interview.mov"),
-        "site A must see site B's tag after the shuttle round trip: {stdout}"
+        "A1 must see site B's tag after the shuttle round trip: {stdout}"
     );
 }

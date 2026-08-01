@@ -95,12 +95,17 @@ fn write_machine_blob(root: &Path, machine: usize) {
     std::fs::write(path, format!("blob-from-m{machine}")).expect("write blob");
 }
 
-/// The set of blob paths under `root/blobs`, relative to `blobs/` — the
-/// blob-side analogue of [`event_ids`]. A location root has no dedicated
+/// The set of `(path, size)` pairs under `root/blobs`, path relative to
+/// `blobs/` — the blob-side analogue of [`event_ids`]. Size is part of the
+/// identity, not just the path: the engine's own diff in `plan_blobs` is
+/// size-based (a size mismatch is a torn copy that gets re-planned), so a
+/// convergence check that only compared paths would pass a blob that
+/// landed with truncated content at the right name — the exact torn-copy
+/// case the engine exists to catch. A location root has no dedicated
 /// walker of its own (unlike [`FileEventLog`] for events), so this walks
 /// the tree directly.
 #[cfg(test)]
-fn blob_paths(root: &Path) -> BTreeSet<PathBuf> {
+fn blob_paths(root: &Path) -> BTreeSet<(PathBuf, u64)> {
     let blobs = root.join("blobs");
     let mut out = BTreeSet::new();
     let mut stack = vec![blobs.clone()];
@@ -114,11 +119,12 @@ fn blob_paths(root: &Path) -> BTreeSet<PathBuf> {
             if entry.file_type().expect("file type").is_dir() {
                 stack.push(path);
             } else {
-                out.insert(
-                    path.strip_prefix(&blobs)
-                        .expect("under blobs/")
-                        .to_path_buf(),
-                );
+                let size = entry.metadata().expect("metadata").len();
+                let rel = path
+                    .strip_prefix(&blobs)
+                    .expect("under blobs/")
+                    .to_path_buf();
+                out.insert((rel, size));
             }
         }
     }
@@ -163,11 +169,14 @@ proptest! {
         }
 
         // Final full round: everyone pushes everywhere, then everyone
-        // pulls everywhere — one round suffices because push carries
-        // gossiped segments (and blobs), not just the pusher's own. Every
-        // pull below therefore sees every push above; pushing and pulling
-        // interleaved instead could leave a machine's late push invisible
-        // to a peer that already pulled from the same location.
+        // pulls everywhere — one round suffices because phase 1 (every
+        // machine pushing to every location) leaves each location holding
+        // exactly the union of every machine's pre-phase knowledge, and
+        // phase 2 (every machine pulling from every location) distributes
+        // that union back out. Every pull below therefore sees every push
+        // above; pushing and pulling interleaved instead could leave a
+        // machine's late push invisible to a peer that already pulled from
+        // the same location.
         for root in &machine_roots {
             for loc in &location_roots {
                 sync_pair(root, loc);

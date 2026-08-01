@@ -93,10 +93,8 @@ pub(crate) fn config_path(catalog: &Path) -> Result<PathBuf> {
 /// directory, `location` is not valid UTF-8, `name` is already configured,
 /// the skeleton directories can't be created, or `config` can't be stored.
 fn add_location(config: &Path, name: &str, location: &Path) -> Result<()> {
-    anyhow::ensure!(
-        !name.trim().is_empty(),
-        "sync location name must not be empty"
-    );
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "sync location name must not be empty");
     anyhow::ensure!(
         location.is_dir(),
         "{} is not an accessible directory — mount it or check the path",
@@ -267,5 +265,16 @@ mod tests {
         let stored = &cfg.locations[0].path;
         assert!(stored.is_absolute());
         assert_eq!(*stored, loc.canonicalize().expect("canonicalize"));
+    }
+
+    #[test]
+    fn add_stores_a_trimmed_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.toml");
+        let loc = dir.path().join("remote");
+        std::fs::create_dir(&loc).expect("mkdir");
+        add_location(&path, "  nas  ", &loc).expect("add");
+        let cfg = SyncConfig::load(&path).expect("load");
+        assert_eq!(cfg.locations[0].name, "nas");
     }
 }

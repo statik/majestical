@@ -811,6 +811,50 @@ fn failed_derivations_are_reported_and_replanned() {
         .stdout(contains("broken.pdf"));
 }
 
+/// A `--kinds`-filtered run must not erase another kind's failure record:
+/// the failure marker is merged per kind, so a later `--kinds thumbs` pass
+/// (which never retried the broken pdf item) leaves the pdf failure
+/// standing in `index status`.
+#[test]
+fn failure_records_survive_runs_of_other_kinds() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.pdf"), b"not a pdf").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "pdf"])
+        .assert()
+        .success();
+
+    // A pass of a different kind: must not touch the pdf record.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("pdf failed last run"));
+}
+
 /// `index run --kinds transcripts` with no whisper model is a graceful
 /// skip, not an error — and status names the gap with the fetch remedy.
 #[test]
@@ -919,6 +963,17 @@ fn text_chunks_loaded_from_blobs_without_model() {
     assert!(
         assets.contains(hex),
         "the chunk row must land in the text store: {assets:?}"
+    );
+
+    // The same pass's text_fts heal must also have indexed the transcript's
+    // text for FTS, keyed by the asset id.
+    let db_paths = walkdir_find(&state, "catalog.db");
+    assert_eq!(db_paths.len(), 1, "exactly one state-dir sqlite catalog");
+    let db = majestical_catalog_sqlite::SqliteCatalog::open(&db_paths[0]).unwrap();
+    let covered = db.text_assets("transcript").unwrap();
+    assert!(
+        covered.contains(&majestical_core::event::AssetId(format!("xxh3:{hex}"))),
+        "transcript heal must populate text_fts: {covered:?}"
     );
 }
 

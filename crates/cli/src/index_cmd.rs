@@ -319,7 +319,12 @@ fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<(
     let outcomes = run_all_kinds(&embed_paths, &blobs, &items, jobs)?;
 
     heal_text_fts(&mut db, &blobs)?;
-    write_failure_report(&state_dir, &failure_report_json(&outcomes))?;
+    let report = merge_failure_report(
+        read_failure_report(&state_dir),
+        &failure_report_json(&outcomes),
+        args.kinds,
+    );
+    write_failure_report(&state_dir, &report)?;
     print_run_result(&outcomes, args.json);
     Ok(())
 }
@@ -1049,7 +1054,7 @@ fn embed_transcript_chunks(
                 model_tag: MINILM.tag,
             },
         );
-        blobs.write_atomic(&marker, b"{}")?;
+        write_json_blob_uncompressed(blobs, &marker, &serde_json::json!({}))?;
         return Ok(ChunkEmbedResult::Empty);
     }
     let written = u64::try_from(rows.len()).unwrap_or(u64::MAX);
@@ -1059,9 +1064,10 @@ fn embed_transcript_chunks(
 
 /// Adds the freshly embedded rows to the text store, then — ONLY after the
 /// add succeeds — writes the `ChunksComplete` done-marker (its body listing
-/// every chunk's `start_ms`, mirroring `OcrComplete`'s timestamp list). A
-/// failing add returns before the marker exists, so the item re-plans next
-/// pass instead of counting done with vectors missing from the store.
+/// every chunk's `start_ms` under the same `timestamps` key `OcrComplete`
+/// uses, keeping the marker family consistent). A failing add returns
+/// before the marker exists, so the item re-plans next pass instead of
+/// counting done with vectors missing from the store.
 fn finish_chunk_embed(
     blobs: &BlobStore,
     store: &TextVectorStore,
@@ -1079,7 +1085,7 @@ fn finish_chunk_embed(
     write_json_blob_uncompressed(
         blobs,
         &marker,
-        &serde_json::json!({ "chunks": chunk_starts }),
+        &serde_json::json!({ "timestamps": chunk_starts }),
     )
 }
 
@@ -1344,14 +1350,14 @@ fn run_ocr_items(
                     outcome.videos_done += 1;
                 } else {
                     let first = result.first_failure.as_deref().unwrap_or("<no reason>");
+                    // No path in the message: the tuple's first element
+                    // already carries it (Vision/ffmpeg reasons embed it too).
                     outcome.failed.push((
                         item.abs_path.clone(),
                         format!(
-                            "{}: {}/{} keyframes failed OCR — first failure: {first} — \
+                            "{}/{} keyframes failed OCR — first failure: {first} — \
                              video incomplete, will retry",
-                            item.abs_path.display(),
-                            result.failures,
-                            result.total,
+                            result.failures, result.total,
                         ),
                     ));
                 }
@@ -1586,9 +1592,10 @@ fn print_run_result(o: &RunOutcomes, json: bool) {
     }
 }
 
-/// The per-run failure marker's JSON body: `{kind: [{path, error}, ..]}`,
-/// kinds with no failures omitted. An empty pass writes `{}` — the file is
-/// always overwritten, so a clean run clears the previous run's failures.
+/// This pass's failures as `{kind: [{path, error}, ..]}`, kinds with no
+/// failures omitted. Never written to disk as-is: [`merge_failure_report`]
+/// first folds it over the previous report so a `--kinds`-filtered run only
+/// speaks for the kinds it actually worked.
 fn failure_report_json(o: &RunOutcomes) -> serde_json::Value {
     let kinds: [(&str, Vec<(PathBuf, String)>); 6] = [
         ("thumbs", o.thumbs.failed.clone()),
@@ -1607,6 +1614,28 @@ fn failure_report_json(o: &RunOutcomes) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Folds this pass's failures over the previous report: keys for every kind
+/// in this pass's `--kinds` set are replaced (cleared when the kind now has
+/// no failures), while kinds the pass never worked keep their old record —
+/// `index run --kinds thumbs` must not erase a pdf failure whose item was
+/// never retried.
+fn merge_failure_report(
+    previous: serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Value,
+    kinds: &BTreeSet<String>,
+) -> serde_json::Value {
+    let mut merged = previous;
+    for kind in kinds {
+        merged.remove(kind);
+    }
+    if let Some(current) = current.as_object() {
+        for (kind, failures) in current {
+            merged.insert(kind.clone(), failures.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
 fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
@@ -1615,14 +1644,23 @@ fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<
         .with_context(|| format!("writing failure report {}", path.display()))
 }
 
-/// Reads the last run's failure marker; a missing or unparsable file is an
-/// empty report (a fresh catalog has no last run to report on).
+/// Reads the last run's failure marker. A missing file is an empty report
+/// (a fresh catalog has no last run to report on); an unparsable one is
+/// noted on stderr and treated as empty — the next run overwrites it.
 fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read(state_dir.join(FAILURES_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+    let path = state_dir.join(FAILURES_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return serde_json::Map::new();
+    };
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) {
+        map
+    } else {
+        eprintln!(
+            "note: ignoring unparsable failure report at {} — treating as empty",
+            path.display()
+        );
+        serde_json::Map::new()
+    }
 }
 
 /// The blob↔`text_fts` diff, run at the end of EVERY pass (mirroring
@@ -2029,6 +2067,41 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["path"], "/media/broken.pdf");
         assert_eq!(entries[0]["error"], "not a valid pdf");
+    }
+
+    /// A `--kinds`-filtered pass only speaks for its own kinds: it replaces
+    /// (or clears) their keys and preserves every other kind's record.
+    #[test]
+    fn merge_failure_report_preserves_kinds_the_pass_never_worked() {
+        let mut previous = serde_json::Map::new();
+        previous.insert(
+            "pdf".to_string(),
+            serde_json::json!([{ "path": "/m/broken.pdf", "error": "not a valid pdf" }]),
+        );
+        previous.insert(
+            "thumbs".to_string(),
+            serde_json::json!([{ "path": "/m/old.png", "error": "stale" }]),
+        );
+
+        // A thumbs-only pass with no failures: clears thumbs, keeps pdf.
+        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
+        let merged = merge_failure_report(previous.clone(), &serde_json::json!({}), &kinds);
+        let map = merged.as_object().expect("object");
+        assert!(map.contains_key("pdf"), "pdf record must survive: {merged}");
+        assert!(
+            !map.contains_key("thumbs"),
+            "a clean thumbs pass clears its own record: {merged}"
+        );
+
+        // A pdf pass with a fresh failure: replaces pdf, keeps thumbs.
+        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
+        let current = serde_json::json!({
+            "pdf": [{ "path": "/m/broken.pdf", "error": "still broken" }],
+        });
+        let merged = merge_failure_report(previous, &current, &kinds);
+        let map = merged.as_object().expect("object");
+        assert_eq!(map["pdf"][0]["error"], "still broken");
+        assert_eq!(map["thumbs"][0]["error"], "stale");
     }
 
     fn chunk_row(asset_hex: &str, dims: usize) -> TextChunkRow {

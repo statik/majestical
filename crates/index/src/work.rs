@@ -103,10 +103,10 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 #[must_use]
 pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities) -> WorkPlan {
     let mut plan = WorkPlan::default();
-    for source in sources
-        .iter()
-        .filter(|s| matches!(s.kind, MediaKind::Image | MediaKind::Video))
-    {
+    for source in sources.iter().filter(|s| match s.kind {
+        MediaKind::Image | MediaKind::Video => true,
+        MediaKind::Audio | MediaKind::Pdf | MediaKind::Other => false,
+    }) {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_thumb(source, hex, blobs, caps, &mut plan);
         }

@@ -2,7 +2,7 @@
 //! `kind:` search filter so both always agree.
 
 /// Coarse media class of a catalog path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Image,
     Video,

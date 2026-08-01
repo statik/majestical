@@ -1,13 +1,6 @@
 //! File-based event log: `events/<machine-id>/NNNN.jsonl` under a sync
 //! root. Append-only; reading merges every machine's segments. Designed
 //! so dumb transports (Dropbox, rsync, a shuttle drive) can carry it.
-//!
-//! Known divergence: [`FileEventLog::read_all_reporting`] reads each
-//! segment whole with `fs::read_to_string`, so non-UTF-8 bytes anywhere in
-//! a segment fail the whole read, while
-//! [`FileEventLog::read_since_reporting`] decodes line by line and degrades
-//! a non-UTF-8 line to the `on_bad_line` callback instead. Unifying the two
-//! is deferred to a follow-up.
 use majestical_core::clock::MachineId;
 use majestical_core::event::Event;
 use majestical_core::ports::{EventLog, LogCursor, PortError};
@@ -37,6 +30,17 @@ pub enum LogError {
     },
 }
 
+impl LogError {
+    /// `map_err(LogError::io(&path))` — replaces the hand-built closure at
+    /// every I/O call site.
+    fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
+        move |source| Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
 pub struct FileEventLog {
     root: PathBuf,
     machine_dir: PathBuf,
@@ -55,10 +59,7 @@ impl FileEventLog {
     /// Returns [`LogError::Io`] if the directories can't be created.
     pub fn init(root: &Path, machine: &MachineId) -> Result<Self, LogError> {
         let machine_dir = root.join("events").join(&machine.0);
-        fs::create_dir_all(&machine_dir).map_err(|source| LogError::Io {
-            path: machine_dir.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&machine_dir).map_err(LogError::io(&machine_dir))?;
         Ok(Self {
             root: root.to_path_buf(),
             machine_dir,
@@ -81,10 +82,7 @@ impl FileEventLog {
             return Err(LogError::NotInitialized { path: events_dir });
         }
         let machine_dir = events_dir.join(&machine.0);
-        fs::create_dir_all(&machine_dir).map_err(|source| LogError::Io {
-            path: machine_dir.clone(),
-            source,
-        })?;
+        fs::create_dir_all(&machine_dir).map_err(LogError::io(&machine_dir))?;
         Ok(Self {
             root: root.to_path_buf(),
             machine_dir,
@@ -94,11 +92,10 @@ impl FileEventLog {
     /// Append to this machine's current segment (0001.jsonl for phase 1;
     /// segment rotation arrives with sync push/pull in a later phase).
     ///
-    /// No fsync: a crash mid-write may drop the tail of the batch. Readers
-    /// tolerate this, but differently: [`Self::read_all_reporting`] treats
-    /// the incomplete line as a bad line rather than failing the whole
-    /// read, while [`Self::read_since_reporting`] defers it — the cursor
-    /// stops before the torn tail so it's re-read once the write completes.
+    /// No fsync: a crash mid-write may drop the tail of the batch. Both
+    /// readers ([`Self::read_all_reporting`] and
+    /// [`Self::read_since_reporting`]) defer the incomplete line rather than
+    /// reporting it — it's re-read once the write completes.
     ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized, or
@@ -115,15 +112,8 @@ impl FileEventLog {
             .create(true)
             .append(true)
             .open(&seg)
-            .map_err(|source| LogError::Io {
-                path: seg.clone(),
-                source,
-            })?;
-        f.write_all(batch.as_bytes())
-            .map_err(|source| LogError::Io {
-                path: seg.clone(),
-                source,
-            })?;
+            .map_err(LogError::io(&seg))?;
+        f.write_all(batch.as_bytes()).map_err(LogError::io(&seg))?;
         Ok(())
     }
 
@@ -135,7 +125,12 @@ impl FileEventLog {
     }
 
     /// Corrupt lines are skipped and reported, never fatal: one bad byte
-    /// on a shuttle drive must not take down the whole catalog.
+    /// on a shuttle drive must not take down the whole catalog. Shares the
+    /// segment walk with [`Self::read_since_reporting`] (this is that read
+    /// with empty cursors, cursors discarded), so the two paths can no
+    /// longer diverge in walk order or UTF-8 handling. A torn tail (a
+    /// write in progress) is left unread rather than reported — it parses
+    /// on the next read once the write completes.
     ///
     /// Returned order is grouped by machine (directory iteration order,
     /// which is unspecified), with segments sorted within each machine —
@@ -147,40 +142,10 @@ impl FileEventLog {
     /// segments can't be read.
     pub fn read_all_reporting(
         &self,
-        mut on_bad_line: impl FnMut(&str),
+        on_bad_line: impl FnMut(&str),
     ) -> Result<Vec<Event>, LogError> {
-        let events_dir = self.root.join("events");
-        let mut out = Vec::new();
-        let machines = fs::read_dir(&events_dir).map_err(|source| LogError::Io {
-            path: events_dir.clone(),
-            source,
-        })?;
-        for machine in machines {
-            let machine = machine.map_err(|source| LogError::Io {
-                path: events_dir.clone(),
-                source,
-            })?;
-            let is_dir = machine.file_type().map_err(|source| LogError::Io {
-                path: machine.path(),
-                source,
-            })?;
-            if !is_dir.is_dir() {
-                continue;
-            }
-            for (_, seg) in Self::list_segments(&machine.path())? {
-                let text = fs::read_to_string(&seg).map_err(|source| LogError::Io {
-                    path: seg.clone(),
-                    source,
-                })?;
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    match serde_json::from_str::<Event>(line) {
-                        Ok(e) => out.push(e),
-                        Err(_) => on_bad_line(line),
-                    }
-                }
-            }
-        }
-        Ok(out)
+        let (events, _cursors) = self.read_since_reporting(&[], on_bad_line)?;
+        Ok(events)
     }
 
     /// `.jsonl` segments directly under `machine_dir`, as (file name, path)
@@ -188,21 +153,12 @@ impl FileEventLog {
     /// [`Self::read_all_reporting`]: segment names must stay zero-padded and
     /// equal-width for lexicographic order to also be numeric order.
     fn list_segments(machine_dir: &Path) -> Result<Vec<(String, PathBuf)>, LogError> {
-        let entries = fs::read_dir(machine_dir).map_err(|source| LogError::Io {
-            path: machine_dir.to_path_buf(),
-            source,
-        })?;
+        let entries = fs::read_dir(machine_dir).map_err(LogError::io(machine_dir))?;
         let mut segments = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|source| LogError::Io {
-                path: machine_dir.to_path_buf(),
-                source,
-            })?;
-            let file_type = entry.file_type().map_err(|source| LogError::Io {
-                path: entry.path(),
-                source,
-            })?;
+            let entry = entry.map_err(LogError::io(machine_dir))?;
             let path = entry.path();
+            let file_type = entry.file_type().map_err(LogError::io(&path))?;
             if file_type.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
                 segments.push((entry.file_name().to_string_lossy().into_owned(), path));
             }
@@ -221,20 +177,10 @@ impl FileEventLog {
         mut on_bad_line: impl FnMut(&str),
     ) -> Result<(Vec<Event>, u64), LogError> {
         use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut f = fs::File::open(seg).map_err(|source| LogError::Io {
-            path: seg.to_path_buf(),
-            source,
-        })?;
-        f.seek(SeekFrom::Start(from))
-            .map_err(|source| LogError::Io {
-                path: seg.to_path_buf(),
-                source,
-            })?;
+        let mut f = fs::File::open(seg).map_err(LogError::io(seg))?;
+        f.seek(SeekFrom::Start(from)).map_err(LogError::io(seg))?;
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|source| LogError::Io {
-            path: seg.to_path_buf(),
-            source,
-        })?;
+        f.read_to_end(&mut buf).map_err(LogError::io(seg))?;
         let consumed = buf.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
         let mut events = Vec::new();
         for line in buf[..consumed].split(|&b| b == b'\n') {
@@ -283,33 +229,20 @@ impl FileEventLog {
         let events_dir = self.root.join("events");
         let mut events = Vec::new();
         let mut out = Vec::new();
-        let machines = fs::read_dir(&events_dir).map_err(|source| LogError::Io {
-            path: events_dir.clone(),
-            source,
-        })?;
+        let machines = fs::read_dir(&events_dir).map_err(LogError::io(&events_dir))?;
         for machine in machines {
-            let machine = machine.map_err(|source| LogError::Io {
-                path: events_dir.clone(),
-                source,
-            })?;
-            let is_dir = machine.file_type().map_err(|source| LogError::Io {
-                path: machine.path(),
-                source,
-            })?;
+            let machine = machine.map_err(LogError::io(&events_dir))?;
+            let machine_path = machine.path();
+            let is_dir = machine.file_type().map_err(LogError::io(&machine_path))?;
             if !is_dir.is_dir() {
                 continue;
             }
             let machine_name = machine.file_name().to_string_lossy().into_owned();
-            for (segment_name, seg) in Self::list_segments(&machine.path())? {
+            for (segment_name, seg) in Self::list_segments(&machine_path)? {
                 let from = start
                     .remove(&(machine_name.clone(), segment_name.clone()))
                     .unwrap_or(0);
-                let len = fs::metadata(&seg)
-                    .map_err(|source| LogError::Io {
-                        path: seg.clone(),
-                        source,
-                    })?
-                    .len();
+                let len = fs::metadata(&seg).map_err(LogError::io(&seg))?.len();
                 if from > len {
                     return Err(LogError::StaleCursor {
                         machine: machine_name,
@@ -616,6 +549,25 @@ mod tests {
             .expect("meta")
             .len();
         assert_eq!(m2_cursor.offset, len);
+    }
+
+    #[test]
+    fn read_all_reports_non_utf8_line_and_keeps_reading() {
+        // Previously read_all_reporting used fs::read_to_string, so one bad
+        // byte failed the WHOLE segment. Unified with the read_since walk it
+        // must degrade per line instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        let mut bytes = std::fs::read(&seg).expect("read seg");
+        bytes.extend_from_slice(&[0xFF, 0xFE, b'\n']);
+        std::fs::write(&seg, bytes).expect("write");
+        let mut bad = 0;
+        let all = log
+            .read_all_reporting(|_| bad += 1)
+            .expect("read must not fail");
+        assert_eq!((all.len(), bad), (1, 1));
     }
 
     #[test]

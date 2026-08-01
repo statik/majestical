@@ -158,7 +158,7 @@ fn json_vector_map(value: &serde_json::Value, key: &str) -> BTreeMap<String, Vec
 fn require_model_dir() -> PathBuf {
     let dir = model::model_dir().expect("resolving model dir");
     assert!(
-        model::model_present(&dir),
+        model::model_present_for(&model::SIGLIP, &dir),
         "model not present at {}; run `maj model fetch`",
         dir.display()
     );

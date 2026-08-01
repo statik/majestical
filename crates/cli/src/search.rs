@@ -11,7 +11,7 @@ use majestical_core::event::{AssetId, Op};
 use majestical_core::media_kind::{MediaKind, media_kind};
 use majestical_core::ports::{AssetSummary, Filter};
 use majestical_core::projection::Projection;
-use majestical_index::model::MINILM;
+use majestical_index::model::{MINILM, SIGLIP};
 use majestical_index::text_encoder::TextEncoder;
 use majestical_index::vector_store::{TextChunkHit, TextVectorStore, VectorHit, VectorStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -649,9 +649,9 @@ impl SemanticMiss {
 /// `embedded == 0` (indistinguishable from a genuinely empty index) by a
 /// `.ok()`/`map_or` outside the guard.
 fn open_semantic_index(state_dir: &Path) -> Result<(PathBuf, VectorStore, u64), SemanticMiss> {
-    let model_dir = majestical_index::model::model_dir()
+    let model_dir = majestical_index::model::model_dir_for(&SIGLIP)
         .ok()
-        .filter(|dir| majestical_index::model::model_present(dir))
+        .filter(|dir| majestical_index::model::model_present_for(&SIGLIP, dir))
         .ok_or(SemanticMiss::NoModel)?;
 
     let lance_dir = state_dir.join("lance");
@@ -788,15 +788,6 @@ impl TextSemanticMiss {
     }
 }
 
-/// Cheap `MiniLM` presence check: every registry file at its exact byte
-/// size — [`majestical_index::model::model_present`]'s rule applied to the
-/// `MiniLM` spec (that function is pinned to the `SigLIP` file list).
-fn minilm_present(dir: &Path) -> bool {
-    MINILM.files.iter().all(|file| {
-        std::fs::metadata(dir.join(file.name)).is_ok_and(|meta| meta.len() == file.bytes)
-    })
-}
-
 /// Resolves the `MiniLM` model (file-size checks only), then opens the
 /// local `text_chunks` Lance table READ-ONLY and confirms it holds at least
 /// one chunk for `MINILM.tag` — mirroring [`open_semantic_index`]'s
@@ -808,7 +799,7 @@ fn open_text_semantic_index(
 ) -> Result<(PathBuf, TextVectorStore), TextSemanticMiss> {
     let model_dir = majestical_index::model::model_dir_for(&MINILM)
         .ok()
-        .filter(|dir| minilm_present(dir))
+        .filter(|dir| majestical_index::model::model_present_for(&MINILM, dir))
         .ok_or(TextSemanticMiss::NoModel)?;
 
     let lance_dir = state_dir.join("lance");

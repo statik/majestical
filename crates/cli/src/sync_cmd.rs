@@ -217,13 +217,21 @@ fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Vec<&'
     )
 }
 
-/// One location's push (or, later, pull) result — either it ran (with an
-/// outcome, possibly carrying per-file failures) or it never ran (named in
-/// `skipped`: unreachable, or a transfer setup failure).
-struct LocationResult {
-    name: String,
-    outcome: Option<transfer::TransferOutcome>,
-    skipped: Option<String>,
+/// One location's push (or, later, pull) result: either it ran — with an
+/// outcome that may itself carry per-file failures — or it never ran at all
+/// (unreachable, or a transfer setup failure). An enum rather than a struct
+/// with two `Option` fields: those states are mutually exclusive, and a
+/// struct would admit an unrepresentable third case (both `None`) that
+/// every caller would still have to handle.
+enum LocationResult {
+    Outcome {
+        name: String,
+        outcome: transfer::TransferOutcome,
+    },
+    Skipped {
+        name: String,
+        reason: String,
+    },
 }
 
 /// `maj sync push`: replicate everything this catalog has (segments +
@@ -273,10 +281,9 @@ pub(crate) fn cmd_push(
 /// wired up yet — don't add unused direction plumbing ahead of it.
 fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> LocationResult {
     if !loc.path.is_dir() {
-        return LocationResult {
+        return LocationResult::Skipped {
             name: loc.name.clone(),
-            outcome: None,
-            skipped: Some(format!("unreachable at {} — skipped", loc.path.display())),
+            reason: format!("unreachable at {} — skipped", loc.path.display()),
         };
     }
     let (src, dst) = (catalog, loc.path.as_path());
@@ -284,15 +291,13 @@ fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> Locati
         .map(|plan| filter_plan(plan, only))
         .and_then(|plan| transfer::execute(src, dst, &plan));
     match run {
-        Ok(outcome) => LocationResult {
+        Ok(outcome) => LocationResult::Outcome {
             name: loc.name.clone(),
-            outcome: Some(outcome),
-            skipped: None,
+            outcome,
         },
-        Err(e) => LocationResult {
+        Err(e) => LocationResult::Skipped {
             name: loc.name.clone(),
-            outcome: None,
-            skipped: Some(format!("failed: {e}")),
+            reason: format!("failed: {e}"),
         },
     }
 }
@@ -320,20 +325,26 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
         print_text_rows(results, verb);
     }
     for r in results {
-        if let Some(o) = &r.outcome {
-            for (path, reason) in &o.failures {
-                eprintln!("{}: failed {}: {reason}", r.name, path.display());
+        if let LocationResult::Outcome { name, outcome } = r {
+            for (path, reason) in &outcome.failures {
+                eprintln!("{name}: failed {}: {reason}", path.display());
             }
         }
     }
     anyhow::ensure!(
-        results.iter().any(|r| r.outcome.is_some()),
+        results
+            .iter()
+            .any(|r| matches!(r, LocationResult::Outcome { .. })),
         "sync {verb} failed for every requested location"
     );
     let failing: Vec<&str> = results
         .iter()
-        .filter(|r| r.outcome.as_ref().is_some_and(|o| !o.failures.is_empty()))
-        .map(|r| r.name.as_str())
+        .filter_map(|r| match r {
+            LocationResult::Outcome { name, outcome } if !outcome.failures.is_empty() => {
+                Some(name.as_str())
+            }
+            LocationResult::Outcome { .. } | LocationResult::Skipped { .. } => None,
+        })
         .collect();
     anyhow::ensure!(
         failing.is_empty(),
@@ -345,20 +356,22 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
 
 fn print_text_rows(results: &[LocationResult], verb: &str) {
     for r in results {
-        match (&r.outcome, &r.skipped) {
-            (Some(o), _) => {
-                let failed = if o.failures.is_empty() {
+        match r {
+            LocationResult::Outcome { name, outcome } => {
+                let failed = if outcome.failures.is_empty() {
                     String::new()
                 } else {
-                    format!(", {} failed", o.failures.len())
+                    format!(", {} failed", outcome.failures.len())
                 };
                 println!(
-                    "{}: {verb}ed {} segment(s) ({} bytes), {} blob(s) ({} bytes){failed}",
-                    r.name, o.segments_copied, o.segment_bytes, o.blobs_copied, o.blob_bytes
+                    "{name}: {verb}ed {} segment(s) ({} bytes), {} blob(s) ({} bytes){failed}",
+                    outcome.segments_copied,
+                    outcome.segment_bytes,
+                    outcome.blobs_copied,
+                    outcome.blob_bytes
                 );
             }
-            (None, Some(reason)) => println!("{}: {reason}", r.name),
-            (None, None) => {}
+            LocationResult::Skipped { name, reason } => println!("{name}: {reason}"),
         }
     }
 }
@@ -369,20 +382,20 @@ fn print_text_rows(results: &[LocationResult], verb: &str) {
 fn print_json_rows(results: &[LocationResult]) -> Result<()> {
     let rows: Vec<serde_json::Value> = results
         .iter()
-        .map(|r| match (&r.outcome, &r.skipped) {
-            (Some(o), _) => serde_json::json!({
-                "location": r.name,
-                "segments": o.segments_copied,
-                "segment_bytes": o.segment_bytes,
-                "blobs": o.blobs_copied,
-                "blob_bytes": o.blob_bytes,
-                "failures": o.failures.iter().map(|(path, error)| {
+        .map(|r| match r {
+            LocationResult::Outcome { name, outcome } => serde_json::json!({
+                "location": name,
+                "segments": outcome.segments_copied,
+                "segment_bytes": outcome.segment_bytes,
+                "blobs": outcome.blobs_copied,
+                "blob_bytes": outcome.blob_bytes,
+                "failures": outcome.failures.iter().map(|(path, error)| {
                     serde_json::json!({ "path": path, "error": error })
                 }).collect::<Vec<_>>(),
             }),
-            (None, skipped) => serde_json::json!({
-                "location": r.name,
-                "skipped": skipped,
+            LocationResult::Skipped { name, reason } => serde_json::json!({
+                "location": name,
+                "skipped": reason,
             }),
         })
         .collect();

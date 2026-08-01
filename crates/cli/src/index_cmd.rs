@@ -40,6 +40,12 @@ fn capabilities() -> Capabilities {
     Capabilities {
         model_tag,
         ffmpeg: majestical_index::video::ffmpeg_available(),
+        // Task 17 wires real detection (whisper/minilm model-present checks
+        // and a configured describer tag); hardcoded here only to keep this
+        // crate compiling against work.rs's expanded Capabilities.
+        whisper: false,
+        text_model: false,
+        describer_tag: None,
     }
 }
 
@@ -169,6 +175,15 @@ fn workkind_name(kind: WorkKind) -> &'static str {
         WorkKind::Thumb => "thumbs",
         WorkKind::ImageEmbed => "embeddings",
         WorkKind::Keyframes => "keyframes",
+        // Not in VALID_KINDS yet — their runners land in Task 17. Named here
+        // only so `build_plan`'s `--kinds` filter (which calls this fn) has
+        // an exhaustive match; since no `--kinds` value ever matches these
+        // names, `retain` drops any such item before it reaches
+        // `split_and_cap_items`.
+        WorkKind::Transcribe | WorkKind::TranscriptEmbed => "transcripts",
+        WorkKind::OcrImage | WorkKind::OcrKeyframes => "ocr",
+        WorkKind::PdfText => "pdf",
+        WorkKind::Caption => "captions",
     }
 }
 
@@ -257,8 +272,12 @@ fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<(
 }
 
 /// Splits `items` by kind, then caps each kind independently at `limit` —
-/// every kind has an executor now, so `--limit` bounds each one's own
-/// per-pass budget rather than one kind starving another.
+/// thumbs/embeddings/keyframes each have an executor, so `--limit` bounds
+/// each one's own per-pass budget rather than one kind starving another.
+/// The transcript/OCR/PDF/caption kinds aren't reachable here yet:
+/// `build_plan`'s `--kinds` filter (`workkind_name`) never matches them
+/// since they're not in `VALID_KINDS`, so `plan.items.retain(..)` drops them
+/// before `split_and_cap_items` runs — their runners land in Task 17.
 fn split_and_cap_items(
     items: Vec<work::WorkItem>,
     limit: Option<usize>,
@@ -275,6 +294,12 @@ fn split_and_cap_items(
             WorkKind::Thumb => thumbs.push(item),
             WorkKind::ImageEmbed => embeds.push(item),
             WorkKind::Keyframes => keyframes.push(item),
+            WorkKind::Transcribe
+            | WorkKind::TranscriptEmbed
+            | WorkKind::OcrImage
+            | WorkKind::OcrKeyframes
+            | WorkKind::PdfText
+            | WorkKind::Caption => {}
         }
     }
     if let Some(limit) = limit {

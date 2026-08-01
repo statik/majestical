@@ -11,7 +11,7 @@ workspace = true
 majestical-core = { path = "../core" }
 serde_json.workspace = true
 thiserror.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-ulid.workspace = true

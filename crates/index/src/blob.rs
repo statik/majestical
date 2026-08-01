@@ -47,6 +47,10 @@ pub enum Derivation<'a> {
         model_tag: &'a str,
         timestamp_ms: u64,
     },
+    /// Per-page extracted text (JSON, zstd-compressed) for a PDF asset.
+    PdfText {
+        model_tag: &'a str,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -121,6 +125,7 @@ impl BlobStore {
             } => dir
                 .join(model_tag)
                 .join(format!("kf-{timestamp_ms}.json.zst")),
+            Derivation::PdfText { model_tag } => dir.join(model_tag).join("text.json.zst"),
         }
     }
 
@@ -388,6 +393,19 @@ mod tests {
             },
         );
         assert!(kf.ends_with("aa/aabb/applevision-r3-v1/kf-7000.json.zst"));
+    }
+
+    #[test]
+    fn pdf_text_blob_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let path = store.path_for(
+            "aabb",
+            &Derivation::PdfText {
+                model_tag: "pdfkit-v1",
+            },
+        );
+        assert!(path.ends_with("aa/aabb/pdfkit-v1/text.json.zst"));
     }
 
     #[test]

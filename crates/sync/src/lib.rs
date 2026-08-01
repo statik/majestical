@@ -31,8 +31,7 @@ pub enum LogError {
 }
 
 impl LogError {
-    /// `map_err(LogError::io(&path))` — replaces the hand-built closure at
-    /// every I/O call site.
+    /// `map_err(LogError::io(&path))`.
     fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
         move |source| Self::Io {
             path: path.to_path_buf(),
@@ -92,10 +91,9 @@ impl FileEventLog {
     /// Append to this machine's current segment (0001.jsonl for phase 1;
     /// segment rotation arrives with sync push/pull in a later phase).
     ///
-    /// No fsync: a crash mid-write may drop the tail of the batch. Both
-    /// readers ([`Self::read_all_reporting`] and
-    /// [`Self::read_since_reporting`]) defer the incomplete line rather than
-    /// reporting it — it's re-read once the write completes.
+    /// No fsync: a crash mid-write may drop the tail of the batch. See
+    /// [`Self::read_segment_since`] for how readers handle the resulting
+    /// torn tail.
     ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized, or
@@ -128,9 +126,8 @@ impl FileEventLog {
     /// on a shuttle drive must not take down the whole catalog. Shares the
     /// segment walk with [`Self::read_since_reporting`] (this is that read
     /// with empty cursors, cursors discarded), so the two paths can no
-    /// longer diverge in walk order or UTF-8 handling. A torn tail (a
-    /// write in progress) is left unread rather than reported — it parses
-    /// on the next read once the write completes.
+    /// longer diverge in walk order or UTF-8 handling. See
+    /// [`Self::read_segment_since`] for the torn-tail rule.
     ///
     /// Returned order is grouped by machine (directory iteration order,
     /// which is unspecified), with segments sorted within each machine —
@@ -150,8 +147,8 @@ impl FileEventLog {
 
     /// `.jsonl` segments directly under `machine_dir`, as (file name, path)
     /// pairs sorted lexicographically — same ordering constraint as
-    /// [`Self::read_all_reporting`]: segment names must stay zero-padded and
-    /// equal-width for lexicographic order to also be numeric order.
+    /// [`Self::read_since_reporting`]: segment names must stay zero-padded
+    /// and equal-width for lexicographic order to also be numeric order.
     fn list_segments(machine_dir: &Path) -> Result<Vec<(String, PathBuf)>, LogError> {
         let entries = fs::read_dir(machine_dir).map_err(LogError::io(machine_dir))?;
         let mut segments = Vec::new();
@@ -169,8 +166,18 @@ impl FileEventLog {
 
     /// Reads one segment from byte offset `from` to its last complete line,
     /// reporting parse failures through `on_bad_line`. Returns the parsed
-    /// events plus the new offset (`from` plus whole bytes consumed); a torn
-    /// tail after the last `\n` is left unconsumed.
+    /// events plus the new offset (`from` plus whole bytes consumed).
+    ///
+    /// Torn-tail rule (the normative statement — [`Self::append`],
+    /// [`Self::read_all_reporting`], and [`Self::read_since_reporting`] link
+    /// here rather than restating it): any bytes after the last `\n` are
+    /// left unconsumed instead of parsed or reported. If the write that
+    /// produced them later completes, the next read picks the line up
+    /// normally. But nothing distinguishes a write still in progress from
+    /// one that never will finish — an interrupted copy, a shuttle drive
+    /// pulled mid-write. A permanently truncated tail is therefore deferred
+    /// indefinitely and invisible to both readers: no error, no
+    /// `on_bad_line` call, no diagnostic at all.
     fn read_segment_since(
         seg: &Path,
         from: u64,
@@ -204,10 +211,8 @@ impl FileEventLog {
     /// This is the segment walk — [`Self::read_all_reporting`] just calls
     /// this with empty cursors and discards the returned cursors. Each
     /// segment is sought to its cursor offset instead of read from the
-    /// start, and stops at the last complete line: a torn tail (a write in
-    /// progress) stays unconsumed so the cursor never advances past it, and
-    /// it's re-read — and only then possibly reported as a bad line — on
-    /// the next call once the write completes.
+    /// start. See [`Self::read_segment_since`] for the torn-tail rule that
+    /// keeps the cursor from advancing past an incomplete line.
     ///
     /// Cursors are returned sorted by machine then segment, so two calls
     /// that see no new data produce equal cursor lists.
@@ -554,9 +559,8 @@ mod tests {
 
     #[test]
     fn read_all_reports_non_utf8_line_and_keeps_reading() {
-        // Previously read_all_reporting used fs::read_to_string, so one bad
-        // byte failed the WHOLE segment. Unified with the read_since walk it
-        // must degrade per line instead.
+        // Invariant: one bad byte must degrade a single line, never the
+        // whole segment.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut log = FileEventLog::init(dir.path(), &MachineId("m1".into())).expect("init");
         log.append(&[ev(1)]).expect("append");

@@ -33,7 +33,7 @@ impl Clock for SystemClock {
 pub(crate) fn warn_skipped_corrupt_lines(skipped: usize, catalog_root: &Path) {
     if skipped > 0 {
         eprintln!(
-            "warning: skipped {skipped} corrupt event log line(s) in {}/events — a torn write or damaged transport; affected metadata may be missing",
+            "warning: skipped {skipped} corrupt event log line(s) in {}/events — damaged transport; affected metadata may be missing",
             catalog_root.display()
         );
     }

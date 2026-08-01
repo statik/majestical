@@ -204,6 +204,27 @@ mod tests {
     }
 
     #[test]
+    fn in_filter_parses_sources() {
+        let parsed = parse_query("barn in:transcript in:ocr").expect("parse");
+        assert_eq!(parsed.terms, vec!["barn"]);
+        let sources: Vec<_> = parsed
+            .filters
+            .iter()
+            .filter(|f| f.key == "in")
+            .map(|f| f.value.as_str())
+            .collect();
+        assert_eq!(sources, vec!["transcript", "ocr"]);
+    }
+
+    #[test]
+    fn negated_in_filter_is_rejected_at_resolve_time_not_parse_time() {
+        // The parser stays generic (RawFilter); rejection happens during
+        // filter resolution like before:/after: negation does.
+        let parsed = parse_query("-in:ocr").expect("parse");
+        assert!(parsed.filters[0].negated);
+    }
+
+    #[test]
     fn uppercase_keys_fold_and_non_alpha_colons_are_terms() {
         let q = parse_query("TAG:x 16:9 a:b:c").expect("parse");
         assert_eq!(

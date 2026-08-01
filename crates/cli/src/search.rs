@@ -27,7 +27,7 @@ pub(crate) struct SearchArgs {
 
 /// The filter keys `search` understands, listed in error messages so a typo'd
 /// key points straight at the fix instead of a silent zero-result search.
-const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
+const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after, in";
 
 /// Searches the catalog: bare terms are ranked by `search_names_ranked` (best
 /// match first); `key:value` tokens resolve to hard `Filter`s and narrow the

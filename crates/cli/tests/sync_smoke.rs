@@ -37,6 +37,30 @@ fn find_sync_toml(state: &Path) -> PathBuf {
     entry.path().join("sync.toml")
 }
 
+/// state/catalogs/<key>/catalog.db — same one-key-per-test layout as
+/// [`find_sync_toml`].
+#[cfg(test)]
+fn find_catalog_db(state: &Path) -> PathBuf {
+    let catalogs = state.join("catalogs");
+    let entry = std::fs::read_dir(&catalogs)
+        .expect("state dir")
+        .next()
+        .expect("one catalog key")
+        .expect("entry");
+    entry.path().join("catalog.db")
+}
+
+/// Counts rows in the local `assets` table, read directly off `db_path` —
+/// bypasses the CLI entirely so a test can assert `cmd_pull` itself wrote
+/// to sqlite, rather than a later `maj` invocation (which incrementally
+/// syncs the catalog on every open) doing it instead.
+#[cfg(test)]
+fn asset_count(db_path: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open catalog.db");
+    conn.query_row("select count(*) from assets", [], |row| row.get(0))
+        .expect("count assets")
+}
+
 /// A `maj` catalog + state dir pair, initialized and ready for `sync`
 /// commands — the common preamble every push test needs. Built from a
 /// shared `root` plus a `name` so two fixtures (e.g. Task 6's two-machine
@@ -542,6 +566,19 @@ fn pull_applies_a_teammates_events_and_names_the_index_remedy() {
         "the pulled blob must land in machine 2's own catalog"
     );
 
+    // Pin the apply directly, on disk, BEFORE any other `maj` invocation:
+    // `maj search` (below) itself opens and incrementally syncs the sqlite
+    // catalog, so asserting only through search couldn't tell "`cmd_pull`
+    // applied this" from "the next command happened to apply it" — deleting
+    // `cmd_pull`'s own `FsApp::open`/`open_catalog` call would leave this
+    // test green regardless. Read `assets` straight off `catalog.db`.
+    let db = find_catalog_db(&m2.state);
+    assert!(
+        asset_count(&db) >= 1,
+        "the pulled asset must already be in machine 2's sqlite catalog \
+         immediately after pull, before any other command could apply it"
+    );
+
     // The pulled events are actually in machine 2's catalog: search sees
     // the scanned asset.
     let out = maj_as(&m2.catalog, &m2.state, "m2")
@@ -555,7 +592,9 @@ fn pull_applies_a_teammates_events_and_names_the_index_remedy() {
     );
 
     // A second pull after full convergence reports zero applied, not an
-    // error — the manual round-trip check this pins automatically.
+    // error — the manual round-trip check this pins automatically. Zero
+    // blobs fetched this time means the index remedy notice must be gone,
+    // not printed unconditionally.
     let out = maj_as(&m2.catalog, &m2.state, "m2")
         .args(["sync", "pull"])
         .assert()
@@ -564,6 +603,71 @@ fn pull_applies_a_teammates_events_and_names_the_index_remedy() {
     assert!(
         stdout.contains("applied 0 new event"),
         "a converged pull reports zero applied: {stdout}"
+    );
+    assert!(
+        !stdout.contains("maj index run"),
+        "a converged pull fetched no blobs — the remedy notice must not print: {stdout}"
+    );
+
+    // `--json` on that same converged pull must be exactly one parseable
+    // document — see `assert_pull_json_is_one_document`'s doc comment.
+    assert_pull_json_is_one_document(&m2);
+}
+
+/// Runs `maj sync pull --json` and asserts stdout is exactly ONE parseable
+/// JSON document: the per-location rows folded into the summary object,
+/// not the rows array printed separately followed by a second object.
+/// `serde_json::from_str` is strict about trailing data, so two
+/// concatenated documents fail to parse at all. Split out of
+/// `pull_applies_a_teammates_events_and_names_the_index_remedy` purely to
+/// stay under the house max-function-length lint.
+#[cfg(test)]
+fn assert_pull_json_is_one_document(m2: &Fixture) {
+    let out = maj_as(&m2.catalog, &m2.state, &m2.machine)
+        .args(["sync", "pull", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("pull --json must print exactly one parseable JSON document");
+    let keys: std::collections::BTreeSet<&str> = doc
+        .as_object()
+        .expect("a JSON object, not an array of rows")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["locations", "applied_events", "machines", "blobs_fetched"]
+            .into_iter()
+            .collect(),
+        "pull --json's top-level keys: {doc}"
+    );
+    let nas_row = doc["locations"]
+        .as_array()
+        .expect("locations is an array")
+        .iter()
+        .find(|r| r["location"] == "nas")
+        .expect("a row for nas");
+    let row_keys: std::collections::BTreeSet<&str> = nas_row
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        row_keys,
+        [
+            "location",
+            "segments",
+            "segment_bytes",
+            "blobs",
+            "blob_bytes",
+            "failures"
+        ]
+        .into_iter()
+        .collect(),
+        "a location outcome row's keys: {nas_row}"
     );
 }
 

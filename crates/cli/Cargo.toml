@@ -52,6 +52,11 @@ assert_cmd.workspace = true
 httpmock.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+# Not a workspace dependency (only `catalog-sqlite` depends on it directly,
+# outside `[workspace.dependencies]`) — pinned here to the same
+# version/features so a test can read `catalog.db` straight off disk and
+# assert `cmd_pull` itself applied events, not a later `maj` invocation.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # Cucumber acceptance harness, pinned to match crates/core's and
 # crates/ingest's versions.
 cucumber = "0.23"

@@ -313,6 +313,18 @@ enum SyncCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Fetch everything configured locations have that this catalog
+    /// doesn't (segments + blobs), then apply newly landed events locally.
+    Pull {
+        /// Pull from only this location (default: every configured one).
+        #[arg(long)]
+        location: Option<String>,
+        /// Restrict to one transfer class.
+        #[arg(long, value_enum)]
+        only: Option<sync_cmd::OnlyArg>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -432,7 +444,10 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
 
 /// Dispatches `maj sync`'s subcommands. Split out of `main` purely to stay
 /// under the crate's max-function-length lint, matching [`dispatch_index`].
-fn dispatch_sync(catalog: &Path, cmd: SyncCmd) -> Result<()> {
+/// Takes `machine_id`/`author` (unlike [`dispatch_index`]'s app-only
+/// signature) because `Pull` needs them to open the local catalog and
+/// apply newly landed events itself, not just orchestrate file transfers.
+fn dispatch_sync(catalog: &Path, machine_id: &str, author: &str, cmd: SyncCmd) -> Result<()> {
     match cmd {
         SyncCmd::Location { cmd } => match cmd {
             SyncLocationCmd::Add { name, path } => {
@@ -446,6 +461,20 @@ fn dispatch_sync(catalog: &Path, cmd: SyncCmd) -> Result<()> {
             only,
             json,
         } => sync_cmd::cmd_push(catalog, location.as_deref(), only, json),
+        SyncCmd::Pull {
+            location,
+            only,
+            json,
+        } => sync_cmd::cmd_pull(
+            catalog,
+            machine_id,
+            author,
+            &sync_cmd::PullArgs {
+                location,
+                only,
+                json,
+            },
+        ),
     }
 }
 
@@ -514,9 +543,10 @@ fn main() -> Result<()> {
         // Deliberately does not open a catalog: describer config lives in
         // the per-machine state dir, not the event log.
         Cmd::Describer { cmd } => dispatch_describer(&cli.catalog, cmd)?,
-        // Deliberately does not open a catalog: sync location config lives
-        // in the per-machine state dir, not the event log.
-        Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, cmd)?,
+        // Deliberately does not open the catalog itself here: sync location
+        // config lives in the per-machine state dir, not the event log —
+        // `Pull` opens the catalog internally, once it needs to apply.
+        Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, &cli.machine_id, &author, cmd)?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {

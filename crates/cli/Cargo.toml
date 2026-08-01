@@ -52,6 +52,11 @@ assert_cmd.workspace = true
 httpmock.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+# Lets a test read `catalog.db` straight off disk to assert `cmd_pull`
+# itself applied events, not a later `maj` invocation. Same workspace pin
+# `catalog-sqlite` depends on — see the root `Cargo.toml` comment on why
+# it's pinned once, not per-crate.
+rusqlite.workspace = true
 # Cucumber acceptance harness, pinned to match crates/core's and
 # crates/ingest's versions.
 cucumber = "0.23"

@@ -1495,6 +1495,20 @@ Expected: FAIL — `maj sync pull` unknown.
 
 - [ ] **Step 3: Implement pull**
 
+REQUIRED PRE-WORK (Task 5 review finding): split `report_and_check` into
+`render_rows` (build the report rows) and `check_exit_policy` (the two
+`ensure`s) BEFORE wiring pull. Reason: pull must (a) apply pulled events to
+the local catalog even when per-file blob failures occurred — the current
+fused fn would `?`-short-circuit before the apply, leaving landed segments
+unapplied while claiming "the next run retries" (it won't: the transfer
+already converged); and (b) emit ONE JSON document — rows plus the
+`{applied_events, machines, blobs_fetched}` summary in a single object —
+not two concatenated documents that break every JSON consumer. Order in
+`cmd_pull`: transfer → render (don't print yet in json mode) → apply →
+print combined output → check_exit_policy LAST. `cmd_push` calls the two
+split fns back-to-back (no behavior change; existing tests must stay
+green untouched).
+
 In `sync_cmd.rs` (uses `FsApp` + `open_catalog` for the incremental apply):
 
 ```rust

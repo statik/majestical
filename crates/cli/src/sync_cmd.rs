@@ -3,8 +3,10 @@
 //! (mount points differ per machine) in the state dir's `sync.toml`,
 //! never synced.
 
+use crate::app::FsApp;
 use anyhow::{Context, Result};
 use majestical_sync::transfer;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) const NO_LOCATIONS_HINT: &str =
@@ -158,7 +160,7 @@ pub(crate) fn cmd_location_rm(catalog: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `--only` surface for `maj sync push` (and, later, `pull`).
+/// `--only` surface for `maj sync push` and `maj sync pull`.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum OnlyArg {
     Segments,
@@ -217,14 +219,25 @@ fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Vec<&'
     )
 }
 
-/// One location's push (or, later, pull) result: it either ran — with an
-/// outcome that may itself carry per-file failures — or it never ran at
-/// all, for one of two distinct reasons: the location's mount wasn't there
-/// (`Skipped`) or the transfer engine itself failed setting up or running
-/// the transfer (`Failed`, e.g. `plan_transfer`/`execute`'s own error). An
-/// enum rather than a struct with `Option` fields: these three states are
-/// mutually exclusive, and every caller has to handle all of them — a
-/// struct would instead admit unrepresentable combinations.
+/// Which side of a location pair is the transfer source. Push sends the
+/// catalog's own state out to the location; pull fetches the location's
+/// state into the catalog — otherwise identical plumbing (same plan/execute
+/// call, same [`LocationResult`] shape), so [`transfer_one`] takes this
+/// instead of duplicating itself per direction.
+#[derive(Clone, Copy)]
+enum Direction {
+    Push,
+    Pull,
+}
+
+/// One location's push or pull result: it either ran — with an outcome that
+/// may itself carry per-file failures — or it never ran at all, for one of
+/// two distinct reasons: the location's mount wasn't there (`Skipped`) or
+/// the transfer engine itself failed setting up or running the transfer
+/// (`Failed`, e.g. `plan_transfer`/`execute`'s own error). An enum rather
+/// than a struct with `Option` fields: these three states are mutually
+/// exclusive, and every caller has to handle all of them — a struct would
+/// instead admit unrepresentable combinations.
 enum LocationResult {
     Outcome {
         name: String,
@@ -250,6 +263,28 @@ impl LocationResult {
     }
 }
 
+/// Guards every sync entry point against operating on a directory that was
+/// never `maj catalog init`ed. Without this, `cmd_pull` in particular would
+/// manufacture a working catalog out of thin air: the transfer engine
+/// creates `events/<machine>/` on the destination as a side effect of
+/// copying a segment there, so by the time `FsApp::open` ran its own guard
+/// afterward it would already see a (transfer-created) `events/` dir and
+/// pass. A `catalog` root that doesn't exist at all would instead surface
+/// as a raw `canonicalize` I/O error out of [`config_path`], with no
+/// remedy — this runs first, before either of those.
+///
+/// # Errors
+/// Returns an error naming `maj catalog init` as the remedy when `catalog`
+/// has no `events/` directory.
+fn ensure_catalog(catalog: &Path) -> Result<()> {
+    anyhow::ensure!(
+        catalog.join("events").is_dir(),
+        "no catalog at {} — run `maj catalog init` first",
+        catalog.display()
+    );
+    Ok(())
+}
+
 /// `maj sync push`: replicate everything this catalog has (segments +
 /// blobs) to configured locations. Refuses outright when this machine is a
 /// read-only sync member; otherwise every reachable location gets its own
@@ -260,18 +295,14 @@ impl LocationResult {
 /// Returns an error when there's no catalog at `catalog`, this machine is
 /// readonly, every requested location failed or was skipped, or any
 /// per-file failures occurred (progress is still kept and reported either
-/// way — see [`report_and_check`]).
+/// way — see [`check_exit_policy`]).
 pub(crate) fn cmd_push(
     catalog: &Path,
     location: Option<&str>,
     only: Option<OnlyArg>,
     json: bool,
 ) -> Result<()> {
-    anyhow::ensure!(
-        catalog.join("events").is_dir(),
-        "no catalog at {} — run `maj catalog init` first",
-        catalog.display()
-    );
+    ensure_catalog(catalog)?;
     let config = config_path(catalog)?;
     let cfg = SyncConfig::load(&config)?;
     anyhow::ensure!(
@@ -282,28 +313,48 @@ pub(crate) fn cmd_push(
     let targets = resolve_targets(&cfg, location)?;
     let results: Vec<LocationResult> = targets
         .into_iter()
-        .map(|loc| transfer_one(catalog, loc, only))
+        .map(|loc| transfer_one(catalog, loc, only, Direction::Push))
         .collect();
-    report_and_check(&results, "push", json)
+
+    // Same tail shape as `cmd_pull`: text rows, then failure lines (always,
+    // to stderr), then the JSON document (a different stream — reordering
+    // it after the failure lines changes nothing a test can observe), then
+    // the exit-policy check last.
+    if !json {
+        print_text_rows(&results, "push");
+    }
+    print_failure_lines(&results);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_rows(&results))
+                .context("serializing sync report")?
+        );
+    }
+    check_exit_policy(&results, "push")
 }
 
-/// Runs one location's push (catalog -> location), converting an
-/// unreachable location into a `Skipped` row and any `plan_transfer` /
-/// `execute` setup error into a `Failed` row, rather than propagating an
-/// error out of this function — one bad location must never abort every
-/// other location's transfer.
-///
-/// `catalog` is always the transfer source here; `maj sync pull` (a later
-/// task) will need this to run in the other direction too, but that's not
-/// wired up yet — don't add unused direction plumbing ahead of it.
-fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> LocationResult {
+/// Runs one location's transfer in `direction`, converting an unreachable
+/// location into a `Skipped` row and any `plan_transfer`/`execute` setup
+/// error into a `Failed` row, rather than propagating an error out of this
+/// function — one bad location must never abort every other location's
+/// transfer.
+fn transfer_one(
+    catalog: &Path,
+    loc: &Location,
+    only: Option<OnlyArg>,
+    direction: Direction,
+) -> LocationResult {
     if !loc.path.is_dir() {
         return LocationResult::Skipped {
             name: loc.name.clone(),
             reason: format!("unreachable at {} — skipped", loc.path.display()),
         };
     }
-    let (src, dst) = (catalog, loc.path.as_path());
+    let (src, dst) = match direction {
+        Direction::Push => (catalog, loc.path.as_path()),
+        Direction::Pull => (loc.path.as_path(), catalog),
+    };
     let run = transfer::plan_transfer(src, dst)
         .map(|plan| filter_plan(plan, only))
         .and_then(|plan| transfer::execute(src, dst, &plan));
@@ -319,33 +370,10 @@ fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> Locati
     }
 }
 
-/// Prints one row per location and enforces the exit policy. A text row for
-/// a location that ran reads `<name>: <verb>ed N segment(s) (B bytes), N
-/// blob(s) (B bytes)`, with `, N failed` appended when its outcome carries
-/// per-file failures; each such failure is additionally printed to stderr
-/// as `<location>: failed <path>: <reason>`. A location that never ran
-/// prints `<name>: <reason>` (unreachable) or `<name>: transfer failed —
-/// <error>` (a `plan_transfer`/`execute` setup error). JSON rows mirror
-/// this: `{location, segments, segment_bytes, blobs, blob_bytes,
-/// failures}` for a location that ran, `{location, skipped}` for
-/// unreachable, `{location, error}` for a setup failure.
-///
-/// Exit policy: nonzero when EVERY requested location was skipped, failed
-/// outright, or otherwise never ran, and ALSO when a location that DID run
-/// had per-file failures within its own transfer — that location's other
-/// files still copied (the engine records and continues past per-file
-/// errors), but a sync that could not move everything must not exit 0
-/// under cron. The final error names the failing locations and, for the
-/// all-failed case, says progress was kept and the next run retries.
-///
-/// # Errors
-/// See "Exit policy" above.
-fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Result<()> {
-    if json {
-        print_json_rows(results)?;
-    } else {
-        print_text_rows(results, verb);
-    }
+/// The per-file failure lines every report (push or pull, either output
+/// format) prints to stderr: `<location>: failed <path>: <reason>`, one per
+/// entry in a ran location's [`transfer::TransferOutcome::failures`].
+fn print_failure_lines(results: &[LocationResult]) {
     for r in results {
         if let LocationResult::Outcome { name, outcome } = r {
             for (path, reason) in &outcome.failures {
@@ -353,6 +381,25 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
             }
         }
     }
+}
+
+/// Enforces the exit policy over an already-reported `results`: nonzero
+/// when EVERY requested location was skipped, failed outright, or
+/// otherwise never ran, and ALSO when a location that DID run had per-file
+/// failures within its own transfer — that location's other files still
+/// copied (the engine records and continues past per-file errors), but a
+/// sync that could not move everything must not exit 0 under cron. The
+/// final error names the failing locations and, for the all-failed case,
+/// says progress was kept and the next run retries.
+///
+/// Both `cmd_push` and `cmd_pull` report first and call this LAST:
+/// `cmd_pull` in particular applies pulled events between reporting and
+/// this check, so a per-file failure at one location never blocks
+/// already-landed segments from being applied.
+///
+/// # Errors
+/// See above.
+fn check_exit_policy(results: &[LocationResult], verb: &str) -> Result<()> {
     anyhow::ensure!(
         results
             .iter()
@@ -383,6 +430,157 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
     Ok(())
 }
 
+/// Bundles `maj sync pull`'s flags within the house 5-positional-parameter
+/// limit.
+pub(crate) struct PullArgs {
+    pub location: Option<String>,
+    pub only: Option<OnlyArg>,
+    pub json: bool,
+}
+
+/// `maj sync pull`: fetch everything configured locations have that this
+/// catalog doesn't (segments + blobs), then apply the newly landed events
+/// to the local sqlite catalog. Like `cmd_push`, refuses outright when
+/// there's no catalog at `catalog` (see [`ensure_catalog`]); unlike
+/// `cmd_push`, there is no readonly refusal — a read-only member still
+/// needs to pull.
+///
+/// Order matters: transfer every location, THEN apply, THEN check the exit
+/// policy — see [`check_exit_policy`]'s doc for why a per-file blob failure
+/// at one location must never block already-landed segments from being
+/// applied.
+///
+/// In `--json` mode the rows are held back and folded into one combined
+/// object printed only after the apply below (see [`print_pull_summary`]),
+/// so an apply failure in `--json` mode prints NOTHING to stdout — unlike
+/// text mode, which has already printed its rows by then. Nothing is lost
+/// either way: the transfer already landed on disk regardless, and the
+/// next run's plan is empty for whatever transferred and simply re-applies
+/// for whatever didn't.
+///
+/// # Errors
+/// Returns an error when there's no catalog at `catalog`, the local
+/// catalog can't be opened or synced, every requested location failed or
+/// was skipped, or any per-file failures occurred (progress is still
+/// applied and reported either way).
+pub(crate) fn cmd_pull(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    args: &PullArgs,
+) -> Result<()> {
+    ensure_catalog(catalog)?;
+    let cfg = SyncConfig::load(&config_path(catalog)?)?;
+    let targets = resolve_targets(&cfg, args.location.as_deref())?;
+    let results: Vec<LocationResult> = targets
+        .into_iter()
+        .map(|loc| transfer_one(catalog, loc, args.only, Direction::Pull))
+        .collect();
+
+    // Text rows have no single-document constraint, so they print now;
+    // `--json` instead folds the same rows into the one combined object
+    // printed below, once the apply below has run.
+    if !args.json {
+        print_text_rows(&results, "pull");
+    }
+    print_failure_lines(&results);
+
+    // Apply pulled events to the local catalog BEFORE checking the exit
+    // policy: a per-file blob failure elsewhere must still let already-
+    // landed segments become searchable, not leave them stranded on disk
+    // unapplied because an early return skipped straight past this.
+    // Opening the sqlite catalog applies past its saved cursor — the open
+    // IS the apply; there is no separate step to call.
+    let app = FsApp::open(catalog, machine_id, author)?;
+    crate::commands::open_catalog(&app, catalog)?;
+
+    let summary = summarize_pull(&results);
+    print_pull_summary(&results, &summary, args.json)?;
+    check_exit_policy(&results, "pull")
+}
+
+/// What `cmd_pull` reports at the end: events newly landed, which machines
+/// they came from, and how many blobs landed.
+struct PullSummary {
+    /// Events newly landed in the file-based event log this run — a
+    /// transfer-engine fact (counted from each copied segment's new byte
+    /// range), not a sqlite fact, and unaffected by whether the sqlite
+    /// apply above succeeds.
+    applied: usize,
+    machines: Vec<String>,
+    blobs_fetched: usize,
+}
+
+/// Aggregates `results` into a [`PullSummary`].
+///
+/// A pulled event can never be double-counted across two locations holding
+/// the same segment tail: `events_added` is already aggregated per machine
+/// within one location's outcome (the transfer engine's own accounting,
+/// counted from the destination after each copy lands), and the second
+/// location's own plan is measured against that already-caught-up
+/// destination — its range has shrunk to nothing by the time it's diffed,
+/// so it contributes nothing further. This only sums across locations.
+fn summarize_pull(results: &[LocationResult]) -> PullSummary {
+    let mut per_machine: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut blobs_fetched = 0usize;
+    for r in results {
+        if let LocationResult::Outcome { outcome, .. } = r {
+            blobs_fetched += outcome.blobs_copied;
+            for (machine, n) in &outcome.events_added {
+                *per_machine.entry(machine.as_str()).or_default() += n;
+            }
+        }
+    }
+    let applied = per_machine.values().sum();
+    let machines = per_machine.into_keys().map(str::to_string).collect();
+    PullSummary {
+        applied,
+        machines,
+        blobs_fetched,
+    }
+}
+
+/// Prints `cmd_pull`'s final summary: one JSON object (`{locations,
+/// applied_events, machines, blobs_fetched}`) in `--json` mode — the rows
+/// folded in here rather than printed separately, so a caller sees exactly
+/// one parseable document — or two text lines: what applied, and (only
+/// when blobs actually landed) the `maj index run` remedy notice.
+///
+/// # Errors
+/// Returns an error only if the JSON writer fails.
+fn print_pull_summary(results: &[LocationResult], summary: &PullSummary, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "locations": json_rows(results),
+                "applied_events": summary.applied,
+                "machines": summary.machines,
+                "blobs_fetched": summary.blobs_fetched,
+            }))
+            .context("serializing sync pull report")?
+        );
+        return Ok(());
+    }
+    let names = if summary.machines.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", summary.machines.join(", "))
+    };
+    println!(
+        "applied {} new event(s) from {} machine(s){names}",
+        summary.applied,
+        summary.machines.len()
+    );
+    if summary.blobs_fetched > 0 {
+        println!(
+            "fetched {} blob(s); run `maj index run` to make fetched vectors and text searchable",
+            summary.blobs_fetched
+        );
+    }
+    Ok(())
+}
+
 fn print_text_rows(results: &[LocationResult], verb: &str) {
     for r in results {
         match r {
@@ -408,15 +606,15 @@ fn print_text_rows(results: &[LocationResult], verb: &str) {
     }
 }
 
-/// Serializes `results` to JSON and prints it: a row for a location that
-/// ran is `{location, segments, segment_bytes, blobs, blob_bytes,
-/// failures}`; an unreachable location is `{location, skipped}`; a
-/// `plan_transfer`/`execute` setup failure is `{location, error}`.
-///
-/// # Errors
-/// Returns an error only if the JSON writer fails.
-fn print_json_rows(results: &[LocationResult]) -> Result<()> {
-    let rows: Vec<serde_json::Value> = results
+/// Builds the JSON row for each location — shared by `cmd_push`'s own
+/// `[rows...]` array document and `cmd_pull`'s merged `{locations,
+/// applied_events, machines, blobs_fetched}` object, so the two can never
+/// drift on row shape. A row for a location that ran is `{location,
+/// segments, segment_bytes, blobs, blob_bytes, failures}`; an unreachable
+/// location is `{location, skipped}`; a `plan_transfer`/`execute` setup
+/// failure is `{location, error}`.
+fn json_rows(results: &[LocationResult]) -> Vec<serde_json::Value> {
+    results
         .iter()
         .map(|r| match r {
             LocationResult::Outcome { name, outcome } => serde_json::json!({
@@ -438,12 +636,7 @@ fn print_json_rows(results: &[LocationResult]) -> Result<()> {
                 "error": error,
             }),
         })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&rows).context("serializing sync report")?
-    );
-    Ok(())
+        .collect()
 }
 
 pub(crate) fn cmd_location_list(catalog: &Path, json: bool) -> Result<()> {

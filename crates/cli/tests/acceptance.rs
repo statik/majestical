@@ -35,6 +35,11 @@ struct SearchWorld {
     empty_model_dir: Option<tempfile::TempDir>,
     last_stdout: String,
     last_stderr: String,
+    /// The filename of the most recently scanned audio asset — resolved to
+    /// an asset hex by `a transcript blob containing {string}` so the text
+    /// search scenarios don't need to thread an asset id through the
+    /// Gherkin text themselves.
+    last_audio_asset: Option<String>,
 }
 
 impl SearchWorld {
@@ -45,6 +50,7 @@ impl SearchWorld {
             empty_model_dir: None,
             last_stdout: String::new(),
             last_stderr: String::new(),
+            last_audio_asset: None,
         }
     }
 
@@ -208,6 +214,89 @@ fn catalog_with_an_offline_asset(world: &mut SearchWorld, name: String) -> Resul
     Ok(())
 }
 
+/// A single-asset catalog for the text-search scenarios: one scanned audio
+/// file, no transcript blob yet (that's a separate step, since not every
+/// scenario needs one at the same point).
+#[given(expr = "a catalog with a scanned audio file {string}")]
+fn catalog_with_scanned_audio_file(world: &mut SearchWorld, name: String) -> Result<(), String> {
+    let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let media = root.path().join("media");
+    std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
+    write_asset(&media, &name)?;
+    world.root = Some(root);
+    world.empty_model_dir = Some(tempfile::tempdir().map_err(|e| e.to_string())?);
+
+    world.exec(DEFAULT_MACHINE, &["catalog", "init"])?;
+    let media_str = media.to_string_lossy().into_owned();
+    world.exec(
+        DEFAULT_MACHINE,
+        &["scan", &media_str, "--volume", "acceptance-vol"],
+    )?;
+    world.last_audio_asset = Some(name);
+    Ok(())
+}
+
+/// Hand-writes a transcript blob for the most recently scanned audio asset
+/// (see `last_audio_asset`), as if `index run --kinds transcripts` had
+/// already transcribed it — mirrors `write_transcript_blob` in
+/// `search_text_smoke.rs`, letting the scenario reach the FTS path without
+/// fetching the whisper model.
+#[given(expr = "a transcript blob containing {string}")]
+fn transcript_blob_containing(world: &mut SearchWorld, text: String) -> Result<(), String> {
+    let name = world
+        .last_audio_asset
+        .clone()
+        .ok_or_else(|| "no scanned audio asset yet".to_string())?;
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(stem, _)| stem);
+    world.exec(DEFAULT_MACHINE, &["search", stem, "--json"])?;
+    let hits = world.last_results_json()?;
+    let results = hits["results"]
+        .as_array()
+        .ok_or_else(|| format!("no results array in: {hits}"))?;
+    let asset_hex = results
+        .iter()
+        .find(|r| r["name"] == name)
+        .and_then(|r| r["asset"].as_str())
+        .ok_or_else(|| format!("no result named {name:?} in: {hits}"))?
+        .strip_prefix("xxh3:")
+        .ok_or_else(|| "asset id is not xxh3-prefixed".to_string())?
+        .to_string();
+
+    let catalog = world.catalog_dir()?;
+    let transcript = majestical_index::transcribe::Transcript {
+        model_tag: majestical_index::transcribe::WHISPER_MODEL_TAG.to_string(),
+        segments: vec![majestical_index::transcribe::TranscriptSegment {
+            start_ms: 5_000,
+            end_ms: 12_000,
+            text: text.clone(),
+        }],
+        text,
+    };
+    let json = transcript.to_json().map_err(|e| e.to_string())?;
+    let compressed = zstd::encode_all(&json[..], 3).map_err(|e| e.to_string())?;
+    let blobs = majestical_index::blob::BlobStore::new(&catalog);
+    let path = blobs.path_for(
+        &asset_hex,
+        &majestical_index::blob::Derivation::Transcript {
+            model_tag: majestical_index::transcribe::WHISPER_MODEL_TAG,
+        },
+    );
+    blobs
+        .write_atomic(&path, &compressed)
+        .map_err(|e| e.to_string())
+}
+
+#[when(expr = "I run index with kinds {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn run_index_with_kinds(world: &mut SearchWorld, kinds: String) -> Result<(), String> {
+    world.exec(DEFAULT_MACHINE, &["index", "run", "--kinds", &kinds])
+}
+
 #[given("no encoder model is installed")]
 fn no_encoder_model(_world: &mut SearchWorld) {
     // A no-op: `MAJ_MODEL_DIR` is always pointed at a permanently empty
@@ -270,6 +359,41 @@ fn results_are_empty(world: &mut SearchWorld) -> Result<(), String> {
         .ok_or_else(|| format!("no count field in: {hits}"))?;
     if count != 0 {
         return Err(format!("expected zero results, got: {hits}"));
+    }
+    Ok(())
+}
+
+/// Checks a text hit's `locator`/`snippet` JSON fields — the same detail
+/// `render_text_meta` prints as `@MmSSs "snippet"` in the human format —
+/// confirming a real timestamp (not the "no locator" sentinel `-1`) and a
+/// non-empty snippet reached the result, not just a name match.
+#[then(expr = "the hit for {string} shows a timestamp and a snippet")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn hit_shows_timestamp_and_snippet(world: &mut SearchWorld, name: String) -> Result<(), String> {
+    let hits = world.last_results_json()?;
+    let results = hits["results"]
+        .as_array()
+        .ok_or_else(|| format!("no results array in: {hits}"))?;
+    let hit = results
+        .iter()
+        .find(|r| r["name"] == name)
+        .ok_or_else(|| format!("no result named {name:?} in: {hits}"))?;
+    let locator = hit["locator"]
+        .as_i64()
+        .ok_or_else(|| format!("no locator (timestamp) on hit: {hit}"))?;
+    if locator < 0 {
+        return Err(format!(
+            "expected a real timestamp locator, got {locator}: {hit}"
+        ));
+    }
+    let snippet = hit["snippet"]
+        .as_str()
+        .ok_or_else(|| format!("no snippet on hit: {hit}"))?;
+    if snippet.is_empty() {
+        return Err(format!("expected a non-empty snippet on hit: {hit}"));
     }
     Ok(())
 }

@@ -1563,8 +1563,11 @@ fn caption_still(
     vocab: &[String],
 ) -> Result<(), CaptionFailure> {
     let thumb_path = blobs.path_for(&item.asset_hex, &Derivation::Thumb);
-    let webp = std::fs::read(&thumb_path).map_err(|_| {
-        CaptionFailure::Item("thumbnail missing (thumbs pass must run first)".to_string())
+    let webp = std::fs::read(&thumb_path).map_err(|e| {
+        CaptionFailure::Item(format!(
+            "reading thumbnail {}: {e} (thumbs pass must run first)",
+            thumb_path.display()
+        ))
     })?;
     let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
     if !caption_path.is_file() {
@@ -1596,18 +1599,11 @@ fn caption_video(
     vocab: &[String],
 ) -> Result<(), CaptionFailure> {
     let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
-    let texts: Vec<String> = if captions_path.is_file() {
-        read_video_captions_blob(&captions_path)
-            .map_err(|e| CaptionFailure::Item(e.to_string()))?
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect()
-    } else {
-        describe_video_keyframes(blobs, describer, item, model_tag)?
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect()
+    let described = match existing_video_captions(&captions_path) {
+        Some(described) => described,
+        None => describe_video_keyframes(blobs, describer, item, model_tag)?,
     };
+    let texts: Vec<String> = described.into_iter().map(|(_, text)| text).collect();
     let suggestions = if texts.is_empty() {
         Vec::new()
     } else {
@@ -1617,6 +1613,23 @@ fn caption_video(
     };
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
+}
+
+/// An existing `Captions` blob's described rows, or `None` when the blob is
+/// missing OR unreadable — an unreadable blob gets a stderr note and is
+/// treated as absent, so the caller re-describes and overwrites it rather
+/// than failing the item every pass forever over the same corrupt bytes.
+fn existing_video_captions(captions_path: &Path) -> Option<Vec<(u64, String)>> {
+    if !captions_path.is_file() {
+        return None;
+    }
+    match read_video_captions_blob(captions_path) {
+        Ok(described) => Some(described),
+        Err(err) => {
+            eprintln!("note: unreadable captions blob ({err}) — re-describing");
+            None
+        }
+    }
 }
 
 /// The caption half of one video item: samples up to
@@ -1629,6 +1642,9 @@ fn describe_video_keyframes(
     item: &work::WorkItem,
     model_tag: &str,
 ) -> Result<Vec<(u64, String)>, CaptionFailure> {
+    // The hardcoded `model::MODEL_TAG` matches the planner's manifest gate:
+    // `plan_caption_video` only queues an item after finding a manifest
+    // under `caps.model_tag`, which — when set — is always this constant.
     let manifest_path = blobs.path_for(
         &item.asset_hex,
         &Derivation::KeyframeManifest {

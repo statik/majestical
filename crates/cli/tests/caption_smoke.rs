@@ -400,6 +400,97 @@ fn captions_are_healed_into_text_fts() {
     );
 }
 
+/// Fake-size model files at the exact byte sizes `model_present()` checks —
+/// same precedent as `index_smoke.rs`. Opens the planner's vision-model gate
+/// (the keyframe-manifest path needs `caps.model_tag`) without a real,
+/// loadable model; nothing in these tests may reach `Encoder::load`.
+#[cfg(test)]
+fn seed_fake_model_files(model_root: &std::path::Path) {
+    let model_dir = model_root.join(majestical_index::model::MODEL_TAG);
+    std::fs::create_dir_all(&model_dir).unwrap();
+    for file in majestical_index::model::MODEL_FILES {
+        let f = std::fs::File::create(model_dir.join(file.name)).unwrap();
+        f.set_len(file.bytes).unwrap();
+    }
+}
+
+/// A corrupt existing captions blob must not wedge the video item forever:
+/// the runner notes it, treats it as absent, re-describes, and overwrites
+/// it — a zero-keyframe manifest keeps the re-describe path off ffmpeg, so
+/// this runs on any machine.
+#[test]
+fn corrupt_video_captions_blob_recovers_by_redescribing() {
+    let server = MockServer::start();
+    mock_describer_backend(&server);
+    let media = tempfile::tempdir().unwrap();
+    let mov_path = media.path().join("clip.mov");
+    // Never decoded: the caption path reads only the manifest and blobs.
+    std::fs::write(&mov_path, b"not a real mov").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_root = tempfile::tempdir().unwrap();
+    seed_fake_model_files(model_root.path());
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    configure_describer(&root, &state, &server.base_url());
+
+    let bytes = std::fs::read(&mov_path).unwrap();
+    let hex = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&bytes));
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+    let manifest_path = blobs.path_for(
+        &hex,
+        &majestical_index::blob::Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    blobs
+        .write_atomic(
+            &manifest_path,
+            br#"{"model_tag":"m1","detected":0,"timestamps":[]}"#,
+        )
+        .unwrap();
+    let captions_path = blobs.path_for(
+        &hex,
+        &majestical_index::blob::Derivation::Captions {
+            model_tag: "describe-mock-model",
+        },
+    );
+    blobs
+        .write_atomic(&captions_path, b"GARBAGE-NOT-ZSTD-JSON")
+        .unwrap();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "run", "--kinds", "captions"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 1 written"))
+        .stderr(contains("re-describing"));
+
+    // Rewritten in place: the blob decodes again (zero described rows —
+    // the manifest listed no keyframes).
+    let rewritten = std::fs::read(&captions_path).unwrap();
+    let json = zstd::decode_all(&rewritten[..]).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(value["described"].as_array().unwrap().len(), 0);
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 1 done"));
+}
+
 /// The video-captions heal path: a hand-written `captions.json.zst` blob
 /// (as if produced on a teammate's machine with ffmpeg + a backend) gets
 /// its per-keyframe rows healed into `text_fts` by any later pass — the

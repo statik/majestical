@@ -1,5 +1,5 @@
-//! `maj sync push`/`maj sync pull` end to end over real temp-dir catalogs
-//! and locations.
+//! `maj sync` push/pull/status end to end over real temp-dir catalogs and
+//! locations.
 mod common;
 use common::{maj, maj_as};
 use std::path::{Path, PathBuf};
@@ -1127,7 +1127,6 @@ fn status_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
 }
 
 #[test]
-#[cfg(unix)]
 fn status_json_pins_the_agent_facing_contract() {
     let root = tempfile::tempdir().expect("tempdir");
     let fx = fixture(root.path(), "fx");
@@ -1214,6 +1213,157 @@ fn status_json_pins_the_agent_facing_contract() {
             .expect("segments object")
             .is_empty(),
         "nothing behind yet — nothing has ever been pulled: {row}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn status_reports_a_failed_location_alongside_a_healthy_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let healthy = root.path().join("nas");
+    let broken = root.path().join("denied");
+    std::fs::create_dir_all(&healthy).expect("mkdir");
+    std::fs::create_dir_all(&broken).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &healthy);
+    fx.add_location("denied", &broken);
+    // The location root itself stays listable (it must, or it would just
+    // read as unreachable), but its `events/` subdirectory becomes
+    // unreadable — a permission error `plan_transfer` hits mid-walk, not a
+    // missing mount.
+    std::fs::set_permissions(
+        broken.join("events"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod 000 the events dir");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success(); // one location failing must not abort the report, and must not fail the exit code
+
+    // Text mode names the location and says status failed, on its own
+    // line, without aborting the rest of the report. Run this WHILE
+    // permissions are still broken — restoring them before this second
+    // invocation would make "denied" healthy again and defeat the point.
+    let text_out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&text_out.get_output().stdout).into_owned();
+
+    // Restore permissions so the tempdir can be cleaned up regardless of
+    // what the assertions below find.
+    std::fs::set_permissions(
+        broken.join("events"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("restore perms");
+
+    assert!(
+        stdout.contains("denied: status failed"),
+        "the text report must name the failed location: {stdout}"
+    );
+    assert!(
+        stdout.contains("nas:"),
+        "the healthy location must still be reported in text mode: {stdout}"
+    );
+
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let rows = rows.as_array().expect("array of rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both locations must still get a row: {rows:?}"
+    );
+
+    let healthy_row = rows
+        .iter()
+        .find(|r| r["location"] == "nas")
+        .expect("a row for nas");
+    assert_eq!(
+        healthy_row["reachable"], true,
+        "the healthy location's row must be unaffected by the other's failure: {healthy_row}"
+    );
+
+    let failed_row = rows
+        .iter()
+        .find(|r| r["location"] == "denied")
+        .expect("a row for denied");
+    let keys: std::collections::BTreeSet<&str> = failed_row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "error"].into_iter().collect(),
+        "a failed row carries only {{location, error}}, distinct from reachable/unreachable: {failed_row}"
+    );
+    assert!(
+        failed_row["error"].is_string()
+            && !failed_row["error"].as_str().unwrap_or_default().is_empty(),
+        "error must be a non-empty string: {failed_row}"
+    );
+}
+
+#[test]
+fn status_text_mode_collapses_in_sync_and_headers_reachable_rows() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+
+    // Before any push: the catalog is ahead by one blob — not converged,
+    // so the report must be the `<name>:` header plus indented direction
+    // lines, never the old `{name}: {label}:` prefix repeated per line.
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("nas:\n"),
+        "an out-of-sync location gets its own header line: {stdout}"
+    );
+    assert!(
+        stdout.contains("  ahead (push would send):")
+            && stdout.contains("  behind (pull would fetch):"),
+        "each direction is one indented line under the header: {stdout}"
+    );
+    assert!(
+        !stdout.contains("nas: ahead") && !stdout.contains("nas: behind"),
+        "the old per-line '{{name}}: {{label}}:' prefix must be gone: {stdout}"
+    );
+    assert!(
+        !stdout.contains("in sync"),
+        "an out-of-sync location must not also print the collapsed line: {stdout}"
+    );
+
+    // After a push, both directions are empty: the report collapses to one
+    // line.
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("nas: in sync"),
+        "a fully converged location collapses to a single line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ahead") && !stdout.contains("behind"),
+        "a converged location must not also print the direction lines: {stdout}"
     );
 }
 

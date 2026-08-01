@@ -63,6 +63,42 @@ fn asset_count(db_path: &Path) -> i64 {
         .expect("count assets")
 }
 
+/// Recursively snapshots every entry under `root` — files as
+/// `Some((size, mtime))`, directories as `None` (so a new EMPTY directory,
+/// e.g. an `execute`-created `tmp/` staging dir, still shows up as a map
+/// diff even though it has no size or mtime of its own to compare). Two
+/// snapshots taken around a command that must be read-only compare equal
+/// via plain `assert_eq!` — any added/removed path, size change, or mtime
+/// change (a rewrite-in-place that happens to keep the same length) shows
+/// up as a diff, which is a stronger proof than spot-checking a couple of
+/// paths that are "supposed" to change.
+#[cfg(test)]
+fn tree_snapshot(
+    root: &Path,
+) -> std::collections::BTreeMap<PathBuf, Option<(u64, std::time::SystemTime)>> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                snapshot.insert(path.clone(), None);
+                stack.push(path);
+            } else {
+                let mtime = meta.modified().expect("mtime");
+                snapshot.insert(path, Some((meta.len(), mtime)));
+            }
+        }
+    }
+    snapshot
+}
+
 /// A `maj` catalog + state dir pair, initialized and ready for `sync`
 /// commands — the common preamble every push test needs. Built from a
 /// shared `root` plus a `name` so two fixtures (e.g. Task 6's two-machine
@@ -878,26 +914,215 @@ fn status_reports_behind_when_the_location_has_what_the_catalog_lacks() {
 }
 
 #[test]
-fn status_never_writes_to_the_location_or_catalog() {
+fn status_never_mutates_the_location_or_catalog_tree() {
     let root = tempfile::tempdir().expect("tempdir");
     let fx = fixture(root.path(), "fx");
     let location = root.path().join("nas");
     std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
     fx.write_blob("ab/abcd/thumb-320.webp", b"w");
     fx.add_location("nas", &location);
+    // Push once first so both trees hold real content for status to walk —
+    // an empty location can't distinguish "status wrote nothing" from
+    // "status wrote nothing because there was nothing to diff".
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+    // The push above leaves its own `tmp/` staging dir behind at the
+    // location (by design — `execute` never cleans up its own successful
+    // run, only stale leftovers from an interrupted one). Remove it before
+    // snapshotting so a status regression that (re)creates a `tmp/` dir is
+    // visible as a diff, not masked by one push already having left it
+    // there.
+    let stray_tmp = location.join("tmp");
+    if stray_tmp.is_dir() {
+        std::fs::remove_dir_all(&stray_tmp).expect("remove push's own tmp/ leftover");
+    }
 
+    let before_location = tree_snapshot(&location);
+    let before_catalog = tree_snapshot(&fx.catalog);
+    assert!(
+        !before_location.is_empty() && !before_catalog.is_empty(),
+        "the fixture must have produced real files in both trees before status runs"
+    );
+
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
     maj(&fx.catalog, &fx.state)
         .args(["sync", "status"])
         .assert()
         .success();
 
-    assert!(
-        !location.join("tmp").exists(),
-        "status must never stage a transfer — no tmp/ dir at the location"
+    let after_location = tree_snapshot(&location);
+    let after_catalog = tree_snapshot(&fx.catalog);
+    assert_eq!(
+        before_location, after_location,
+        "status (json or text) must not add, remove, resize, or touch any file at the location"
     );
+    assert_eq!(
+        before_catalog, after_catalog,
+        "status (json or text) must not add, remove, resize, or touch any file in the catalog"
+    );
+}
+
+#[test]
+fn status_groups_ahead_segments_per_machine() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    // Two machines each push their own segment straight to the shared
+    // location — no third fixture yet.
+    let m1 = fixture_as(root.path(), "m1", "m1");
+    m1.scan_one_file();
+    m1.add_location("nas", &location);
+    maj_as(&m1.catalog, &m1.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let m2 = fixture_as(root.path(), "m2", "m2");
+    m2.scan_one_file();
+    m2.add_location("nas", &location);
+    maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // A third, empty fixture is behind both machines' segments — this is
+    // where per-machine grouping is observable: collapsing the two
+    // machines' entries into one key (e.g. keying by segment name instead
+    // of machine id) would leave only one entry here instead of two.
+    let m3 = fixture_as(root.path(), "m3", "m3");
+    m3.add_location("nas", &location);
+    let out = maj_as(&m3.catalog, &m3.state, "m3")
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let segments = rows[0]["behind"]["segments"]
+        .as_object()
+        .expect("segments object");
+    let keys: std::collections::BTreeSet<&str> = segments.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["m1", "m2"].into_iter().collect(),
+        "both machines' segments must appear as distinct keys, not collapsed: {segments:?}"
+    );
+    assert_eq!(
+        segments["m1"]["files"], 1,
+        "m1 pushed exactly one segment file: {segments:?}"
+    );
+    assert_eq!(
+        segments["m2"]["files"], 1,
+        "m2 pushed exactly one segment file: {segments:?}"
+    );
+}
+
+#[test]
+fn status_segment_bytes_are_the_destination_shortfall() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
+    fx.add_location("nas", &location);
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Truncate the just-pushed remote copy to a known, small size: the
+    // location is now behind by exactly `full_len - truncated_len` bytes,
+    // not by the full source length (`src_len`) and not by nothing.
+    let remote_segment = location.join("events/test-machine/0001.jsonl");
+    let full_len = std::fs::metadata(&remote_segment).expect("meta").len();
+    let truncated_len = 10u64;
     assert!(
-        !location.join("blobs/ab/abcd/thumb-320.webp").exists(),
-        "status must never execute a transfer — the blob must not have been pushed"
+        truncated_len < full_len,
+        "the fixture's segment must be longer than the truncation target: {full_len}"
+    );
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&remote_segment)
+        .expect("open");
+    f.set_len(truncated_len).expect("truncate");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let entry = &rows[0]["ahead"]["segments"]["test-machine"];
+    assert_eq!(
+        entry["files"], 1,
+        "the truncated segment is still pending: {entry}"
+    );
+    assert_eq!(
+        entry["bytes"],
+        full_len - truncated_len,
+        "bytes must be the destination shortfall (full_len - truncated_len), \
+         not the full source length and not zero: {entry}"
+    );
+}
+
+#[test]
+fn status_readonly_notice_is_text_only() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.add_location("nas", &location);
+    let config = find_sync_toml(&fx.state);
+    let text = std::fs::read_to_string(&config).expect("read");
+    let flipped = text.replace("readonly = false", "readonly = true");
+    assert_ne!(
+        flipped, text,
+        "sync.toml must already contain readonly = false: {text}"
+    );
+    std::fs::write(&config, flipped).expect("write");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("readonly = true — this machine never pushes"),
+        "text status must print the readonly notice: {stdout}"
+    );
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        !stdout.contains("readonly"),
+        "--json status must never print the text-mode readonly notice: {stdout}"
+    );
+}
+
+#[test]
+fn status_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // mkdir'd but never `maj catalog init`ed — the directory exists, but
+    // has no `events/`.
+    let catalog = root.path().join("cat");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&catalog).expect("mkdir");
+
+    let out = maj(&catalog, &state)
+        .args(["sync", "status"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no catalog at") && stderr.contains("maj catalog init"),
+        "status against an uninitialized catalog must name the remedy: {stderr}"
     );
 }
 

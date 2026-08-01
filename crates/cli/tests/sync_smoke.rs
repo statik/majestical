@@ -1,8 +1,16 @@
 //! `maj sync push` end to end over real temp-dir catalogs and locations.
 mod common;
 use common::maj;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+// `#[cfg(test)]` on these helpers is not redundant despite every file under
+// `tests/` already building with `--cfg test`: this repo's `clippy.toml`
+// sets `allow-expect-in-tests`/`allow-unwrap-in-tests`, and clippy's
+// in-test detection for that config keys off `#[test]`/`#[cfg(test)]`
+// directly on the item, not on the ambient test-binary cfg — dropping it
+// reintroduces `expect_used` errors under `-D warnings` (verified: removing
+// it here makes `cargo clippy --test sync_smoke` fail). Same pattern as
+// `tests/common/mod.rs`'s helpers.
 #[cfg(test)]
 fn init_catalog(catalog: &Path, state: &Path) {
     maj(catalog, state)
@@ -11,35 +19,84 @@ fn init_catalog(catalog: &Path, state: &Path) {
         .success();
 }
 
+/// state/catalogs/<key>/sync.toml — exactly one catalog key exists per test.
+#[cfg(test)]
+fn find_sync_toml(state: &Path) -> PathBuf {
+    let catalogs = state.join("catalogs");
+    let entry = std::fs::read_dir(&catalogs)
+        .expect("state dir")
+        .next()
+        .expect("one catalog key")
+        .expect("entry");
+    entry.path().join("sync.toml")
+}
+
+/// A `maj` catalog + state dir pair, initialized and ready for `sync`
+/// commands — the common preamble every push test needs. Built from a
+/// shared `root` plus a `name` so two fixtures (e.g. Task 6's two-machine
+/// pull tests) can live under the same tempdir without colliding.
+struct Fixture {
+    catalog: PathBuf,
+    state: PathBuf,
+    media: PathBuf,
+}
+
+#[cfg(test)]
+fn fixture(root: &Path, name: &str) -> Fixture {
+    let catalog = root.join(format!("{name}-cat"));
+    let state = root.join(format!("{name}-state"));
+    let media = root.join(format!("{name}-media"));
+    init_catalog(&catalog, &state);
+    Fixture {
+        catalog,
+        state,
+        media,
+    }
+}
+
+#[cfg(test)]
+impl Fixture {
+    /// Scans a single real file into this fixture's catalog, producing one
+    /// real segment (`events/test-machine/0001.jsonl`) with actual content.
+    fn scan_one_file(&self) {
+        std::fs::create_dir_all(&self.media).expect("mkdir");
+        std::fs::write(self.media.join("a.jpg"), b"jpeg-bytes").expect("write");
+        maj(&self.catalog, &self.state)
+            .args(["scan"])
+            .arg(&self.media)
+            .args(["--volume", "vol1"])
+            .assert()
+            .success();
+    }
+
+    /// Writes a blob at `blobs/<rel>` under this fixture's catalog.
+    fn write_blob(&self, rel: &str, contents: &[u8]) {
+        let path = self.catalog.join("blobs").join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, contents).expect("write");
+    }
+
+    /// Registers `path` as a sync location named `name` on this fixture.
+    fn add_location(&self, name: &str, path: &Path) {
+        maj(&self.catalog, &self.state)
+            .args(["sync", "location", "add", name])
+            .arg(path)
+            .assert()
+            .success();
+    }
+}
+
 #[test]
 fn push_replicates_segments_and_blobs_to_a_location() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let location = root.path().join("nas");
     std::fs::create_dir_all(&location).expect("mkdir");
-    init_catalog(&catalog, &state);
-    // One real event past init: scan a file to get a segment with content.
-    let media = root.path().join("media");
-    std::fs::create_dir_all(&media).expect("mkdir");
-    std::fs::write(media.join("a.jpg"), b"jpeg-bytes").expect("write");
-    maj(&catalog, &state)
-        .args(["scan"])
-        .arg(&media)
-        .args(["--volume", "vol1"])
-        .assert()
-        .success();
-    // A blob to carry along.
-    let blob_dir = catalog.join("blobs/ab/abcd");
-    std::fs::create_dir_all(&blob_dir).expect("mkdir");
-    std::fs::write(blob_dir.join("thumb-320.webp"), b"w").expect("write");
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
 
-    maj(&catalog, &state)
-        .args(["sync", "location", "add", "nas"])
-        .arg(&location)
-        .assert()
-        .success();
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .success();
@@ -59,7 +116,7 @@ fn push_replicates_segments_and_blobs_to_a_location() {
 
     // A second push after full convergence must report zero copies, not an
     // error — the plan is empty, and an empty plan is still success.
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .success();
@@ -73,18 +130,12 @@ fn push_replicates_segments_and_blobs_to_a_location() {
 #[test]
 fn readonly_refuses_push_naming_the_config_file() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
-    init_catalog(&catalog, &state);
+    let fx = fixture(root.path(), "fx");
     let location = root.path().join("nas");
     std::fs::create_dir_all(&location).expect("mkdir");
-    maj(&catalog, &state)
-        .args(["sync", "location", "add", "nas"])
-        .arg(&location)
-        .assert()
-        .success();
+    fx.add_location("nas", &location);
     // Flip readonly by rewriting the config file the CLI just created.
-    let config = find_sync_toml(&state);
+    let config = find_sync_toml(&fx.state);
     let text = std::fs::read_to_string(&config).expect("read");
     let flipped = text.replace("readonly = false", "readonly = true");
     assert_ne!(
@@ -92,48 +143,31 @@ fn readonly_refuses_push_naming_the_config_file() {
         "sync.toml must already contain readonly = false: {text}"
     );
     std::fs::write(&config, flipped).expect("write");
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(
-        stderr.contains("readonly = true") && stderr.contains("sync.toml"),
-        "refusal must name the setting and the file: {stderr}"
+        stderr.contains("readonly = true")
+            && stderr.contains("sync.toml")
+            && stderr.contains("set `readonly = false` there to push from this machine"),
+        "refusal must name the setting, the file, and the remedy: {stderr}"
     );
-}
-
-/// state/catalogs/<key>/sync.toml — exactly one catalog key exists per test.
-#[cfg(test)]
-fn find_sync_toml(state: &Path) -> std::path::PathBuf {
-    let catalogs = state.join("catalogs");
-    let entry = std::fs::read_dir(&catalogs)
-        .expect("state dir")
-        .next()
-        .expect("one catalog key")
-        .expect("entry");
-    entry.path().join("sync.toml")
 }
 
 #[test]
 fn unreachable_location_is_skipped_with_a_notice_not_an_error() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
-    init_catalog(&catalog, &state);
+    let fx = fixture(root.path(), "fx");
     let good = root.path().join("nas");
     let gone = root.path().join("shuttle");
     std::fs::create_dir_all(&good).expect("mkdir");
     std::fs::create_dir_all(&gone).expect("mkdir");
-    for (name, path) in [("nas", &good), ("shuttle", &gone)] {
-        maj(&catalog, &state)
-            .args(["sync", "location", "add", name])
-            .arg(path)
-            .assert()
-            .success();
-    }
+    fx.add_location("nas", &good);
+    fx.add_location("shuttle", &gone);
     std::fs::remove_dir_all(&gone).expect("eject the shuttle");
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .success(); // one location succeeded — exit 0
@@ -150,28 +184,18 @@ fn a_per_file_push_failure_still_copies_other_blobs_but_exits_nonzero() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let location = root.path().join("nas");
     std::fs::create_dir_all(&location).expect("mkdir");
-    init_catalog(&catalog, &state);
 
     // Two blobs; one becomes unreadable before push runs.
-    let blocked_dir = catalog.join("blobs/ab/abcd");
-    let ok_dir = catalog.join("blobs/cd/cdef");
-    std::fs::create_dir_all(&blocked_dir).expect("mkdir");
-    std::fs::create_dir_all(&ok_dir).expect("mkdir");
-    let blocked = blocked_dir.join("thumb-320.webp");
-    std::fs::write(&blocked, b"w1").expect("write");
-    std::fs::write(ok_dir.join("thumb-320.webp"), b"w2").expect("write");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w1");
+    fx.write_blob("cd/cdef/thumb-320.webp", b"w2");
+    let blocked = fx.catalog.join("blobs/ab/abcd/thumb-320.webp");
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    fx.add_location("nas", &location);
 
-    maj(&catalog, &state)
-        .args(["sync", "location", "add", "nas"])
-        .arg(&location)
-        .assert()
-        .success();
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .failure();
@@ -205,35 +229,19 @@ fn a_per_file_push_failure_still_copies_other_blobs_but_exits_nonzero() {
 #[test]
 fn only_flag_filters_the_transfer_plan_to_one_class() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let location = root.path().join("nas");
     std::fs::create_dir_all(&location).expect("mkdir");
-    init_catalog(&catalog, &state);
-    let media = root.path().join("media");
-    std::fs::create_dir_all(&media).expect("mkdir");
-    std::fs::write(media.join("a.jpg"), b"jpeg-bytes").expect("write");
-    maj(&catalog, &state)
-        .args(["scan"])
-        .arg(&media)
-        .args(["--volume", "vol1"])
-        .assert()
-        .success();
-    let blob_dir = catalog.join("blobs/ab/abcd");
-    std::fs::create_dir_all(&blob_dir).expect("mkdir");
-    std::fs::write(blob_dir.join("thumb-320.webp"), b"thumb").expect("write");
-    std::fs::write(blob_dir.join("tags.json.zst"), b"tags").expect("write");
-    maj(&catalog, &state)
-        .args(["sync", "location", "add", "nas"])
-        .arg(&location)
-        .assert()
-        .success();
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"thumb");
+    fx.write_blob("ab/abcd/tags.json.zst", b"tags");
+    fx.add_location("nas", &location);
 
     let segment = location.join("events/test-machine/0001.jsonl");
     let thumb = location.join("blobs/ab/abcd/thumb-320.webp");
     let metadata = location.join("blobs/ab/abcd/tags.json.zst");
 
-    maj(&catalog, &state)
+    maj(&fx.catalog, &fx.state)
         .args(["sync", "push", "--only", "thumbs"])
         .assert()
         .success();
@@ -247,7 +255,7 @@ fn only_flag_filters_the_transfer_plan_to_one_class() {
         "--only thumbs must not transfer other blob classes"
     );
 
-    maj(&catalog, &state)
+    maj(&fx.catalog, &fx.state)
         .args(["sync", "push", "--only", "segments"])
         .assert()
         .success();
@@ -260,7 +268,7 @@ fn only_flag_filters_the_transfer_plan_to_one_class() {
         "--only segments must still not transfer blobs"
     );
 
-    maj(&catalog, &state)
+    maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .success();
@@ -273,34 +281,17 @@ fn only_flag_filters_the_transfer_plan_to_one_class() {
 #[test]
 fn location_flag_restricts_push_to_the_named_location() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let nas = root.path().join("nas");
     let usb = root.path().join("usb");
     std::fs::create_dir_all(&nas).expect("mkdir");
     std::fs::create_dir_all(&usb).expect("mkdir");
-    init_catalog(&catalog, &state);
-    let media = root.path().join("media");
-    std::fs::create_dir_all(&media).expect("mkdir");
-    std::fs::write(media.join("a.jpg"), b"jpeg-bytes").expect("write");
-    maj(&catalog, &state)
-        .args(["scan"])
-        .arg(&media)
-        .args(["--volume", "vol1"])
-        .assert()
-        .success();
-    let blob_dir = catalog.join("blobs/ab/abcd");
-    std::fs::create_dir_all(&blob_dir).expect("mkdir");
-    std::fs::write(blob_dir.join("thumb-320.webp"), b"thumb").expect("write");
-    for (name, path) in [("nas", &nas), ("usb", &usb)] {
-        maj(&catalog, &state)
-            .args(["sync", "location", "add", name])
-            .arg(path)
-            .assert()
-            .success();
-    }
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"thumb");
+    fx.add_location("nas", &nas);
+    fx.add_location("usb", &usb);
 
-    maj(&catalog, &state)
+    maj(&fx.catalog, &fx.state)
         .args(["sync", "push", "--location", "nas"])
         .assert()
         .success();
@@ -321,7 +312,7 @@ fn location_flag_restricts_push_to_the_named_location() {
         "an unnamed location must be left untouched"
     );
 
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push", "--location", "ghost"])
         .assert()
         .failure();
@@ -335,41 +326,43 @@ fn location_flag_restricts_push_to_the_named_location() {
 }
 
 #[test]
+#[cfg(unix)]
 fn json_rows_pin_the_agent_facing_contract() {
+    use std::os::unix::fs::PermissionsExt;
+
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let nas = root.path().join("nas");
     let gone = root.path().join("gone");
+    let denied = root.path().join("denied");
     std::fs::create_dir_all(&nas).expect("mkdir");
     std::fs::create_dir_all(&gone).expect("mkdir");
-    init_catalog(&catalog, &state);
-    let media = root.path().join("media");
-    std::fs::create_dir_all(&media).expect("mkdir");
-    std::fs::write(media.join("a.jpg"), b"jpeg-bytes").expect("write");
-    maj(&catalog, &state)
-        .args(["scan"])
-        .arg(&media)
-        .args(["--volume", "vol1"])
-        .assert()
-        .success();
-    for (name, path) in [("nas", &nas), ("gone", &gone)] {
-        maj(&catalog, &state)
-            .args(["sync", "location", "add", name])
-            .arg(path)
-            .assert()
-            .success();
-    }
+    std::fs::create_dir_all(&denied).expect("mkdir");
+    fx.scan_one_file();
+    fx.add_location("nas", &nas);
+    fx.add_location("gone", &gone);
+    fx.add_location("denied", &denied);
     std::fs::remove_dir_all(&gone).expect("eject the gone location");
+    // No write permission on the location root itself means `execute` can't
+    // create its `tmp/` staging dir — a plan/execute setup failure distinct
+    // from "the mount isn't there at all".
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod 555 to block tmp/ creation");
 
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push", "--json"])
         .assert()
-        .success();
+        .success(); // "nas" still succeeded — exit 0
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    // Restore permissions so the tempdir can be cleaned up regardless of
+    // what the assertions below find.
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755))
+        .expect("restore perms");
+
     let rows: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let rows = rows.as_array().expect("a JSON array of rows");
-    assert_eq!(rows.len(), 2, "one row per requested location: {stdout}");
+    assert_eq!(rows.len(), 3, "one row per requested location: {stdout}");
 
     let nas_row = rows
         .iter()
@@ -413,35 +406,48 @@ fn json_rows_pin_the_agent_facing_contract() {
     assert_eq!(
         keys,
         ["location", "skipped"].into_iter().collect(),
-        "a skipped row carries only {{location, skipped}}, never the outcome fields: {gone_row}"
+        "an unreachable row carries only {{location, skipped}}, never the outcome fields: {gone_row}"
     );
     assert!(
         gone_row["skipped"].is_string(),
         "skipped must be a string, never null: {gone_row}"
+    );
+
+    let denied_row = rows
+        .iter()
+        .find(|r| r["location"] == "denied")
+        .expect("a row for denied");
+    let keys: std::collections::BTreeSet<&str> = denied_row
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "error"].into_iter().collect(),
+        "a failed-transfer row carries only {{location, error}}, distinct from skipped: {denied_row}"
+    );
+    assert!(
+        denied_row["error"].is_string(),
+        "error must be a string, never null: {denied_row}"
     );
 }
 
 #[test]
 fn push_fails_when_every_requested_location_is_unreachable() {
     let root = tempfile::tempdir().expect("tempdir");
-    let catalog = root.path().join("cat");
-    let state = root.path().join("state");
+    let fx = fixture(root.path(), "fx");
     let a = root.path().join("a");
     let b = root.path().join("b");
     std::fs::create_dir_all(&a).expect("mkdir");
     std::fs::create_dir_all(&b).expect("mkdir");
-    init_catalog(&catalog, &state);
-    for (name, path) in [("a", &a), ("b", &b)] {
-        maj(&catalog, &state)
-            .args(["sync", "location", "add", name])
-            .arg(path)
-            .assert()
-            .success();
-    }
+    fx.add_location("a", &a);
+    fx.add_location("b", &b);
     std::fs::remove_dir_all(&a).expect("eject a");
     std::fs::remove_dir_all(&b).expect("eject b");
 
-    let out = maj(&catalog, &state)
+    let out = maj(&fx.catalog, &fx.state)
         .args(["sync", "push"])
         .assert()
         .failure();
@@ -453,7 +459,7 @@ fn push_fails_when_every_requested_location_is_unreachable() {
 }
 
 #[test]
-fn push_ensures_name_the_catalog_and_no_locations_remedies() {
+fn push_errors_name_their_remedies() {
     let root = tempfile::tempdir().expect("tempdir");
     let catalog = root.path().join("cat"); // never initialized
     let state = root.path().join("state");

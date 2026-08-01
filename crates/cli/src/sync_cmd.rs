@@ -217,12 +217,14 @@ fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Vec<&'
     )
 }
 
-/// One location's push (or, later, pull) result: either it ran — with an
-/// outcome that may itself carry per-file failures — or it never ran at all
-/// (unreachable, or a transfer setup failure). An enum rather than a struct
-/// with two `Option` fields: those states are mutually exclusive, and a
-/// struct would admit an unrepresentable third case (both `None`) that
-/// every caller would still have to handle.
+/// One location's push (or, later, pull) result: it either ran — with an
+/// outcome that may itself carry per-file failures — or it never ran at
+/// all, for one of two distinct reasons: the location's mount wasn't there
+/// (`Skipped`) or the transfer engine itself failed setting up or running
+/// the transfer (`Failed`, e.g. `plan_transfer`/`execute`'s own error). An
+/// enum rather than a struct with `Option` fields: these three states are
+/// mutually exclusive, and every caller has to handle all of them — a
+/// struct would instead admit unrepresentable combinations.
 enum LocationResult {
     Outcome {
         name: String,
@@ -232,6 +234,20 @@ enum LocationResult {
         name: String,
         reason: String,
     },
+    Failed {
+        name: String,
+        error: String,
+    },
+}
+
+impl LocationResult {
+    fn name(&self) -> &str {
+        match self {
+            Self::Outcome { name, .. } | Self::Skipped { name, .. } | Self::Failed { name, .. } => {
+                name
+            }
+        }
+    }
 }
 
 /// `maj sync push`: replicate everything this catalog has (segments +
@@ -260,7 +276,7 @@ pub(crate) fn cmd_push(
     let cfg = SyncConfig::load(&config)?;
     anyhow::ensure!(
         !cfg.readonly,
-        "readonly = true in {} — this machine is a read-only sync member and never pushes",
+        "readonly = true in {} — this machine is a read-only sync member and never pushes — set `readonly = false` there to push from this machine",
         config.display()
     );
     let targets = resolve_targets(&cfg, location)?;
@@ -272,9 +288,10 @@ pub(crate) fn cmd_push(
 }
 
 /// Runs one location's push (catalog -> location), converting an
-/// unreachable location or a plan/execute setup failure into a skip row
-/// rather than propagating an error — one bad location must never abort
-/// every other location's transfer.
+/// unreachable location into a `Skipped` row and any `plan_transfer` /
+/// `execute` setup error into a `Failed` row, rather than propagating an
+/// error out of this function — one bad location must never abort every
+/// other location's transfer.
 ///
 /// `catalog` is always the transfer source here; `maj sync pull` (a later
 /// task) will need this to run in the other direction too, but that's not
@@ -295,26 +312,31 @@ fn transfer_one(catalog: &Path, loc: &Location, only: Option<OnlyArg>) -> Locati
             name: loc.name.clone(),
             outcome,
         },
-        Err(e) => LocationResult::Skipped {
+        Err(e) => LocationResult::Failed {
             name: loc.name.clone(),
-            reason: format!("failed: {e}"),
+            error: e.to_string(),
         },
     }
 }
 
-/// Prints one row per location and enforces the exit policy. A text row
-/// reads `<name>: <verb>ed N segment(s) (B bytes), N blob(s) (B bytes)`,
-/// with `, N failed` appended when that location's outcome carries
-/// per-file failures; each failure is additionally printed to stderr as
-/// `<location>: failed <path>: <reason>`. JSON rows carry the same numbers
-/// plus a `failures` array of `{path, error}` objects.
+/// Prints one row per location and enforces the exit policy. A text row for
+/// a location that ran reads `<name>: <verb>ed N segment(s) (B bytes), N
+/// blob(s) (B bytes)`, with `, N failed` appended when its outcome carries
+/// per-file failures; each such failure is additionally printed to stderr
+/// as `<location>: failed <path>: <reason>`. A location that never ran
+/// prints `<name>: <reason>` (unreachable) or `<name>: transfer failed —
+/// <error>` (a `plan_transfer`/`execute` setup error). JSON rows mirror
+/// this: `{location, segments, segment_bytes, blobs, blob_bytes,
+/// failures}` for a location that ran, `{location, skipped}` for
+/// unreachable, `{location, error}` for a setup failure.
 ///
-/// Exit policy: nonzero when EVERY requested location failed or was
-/// skipped, and ALSO when any location's outcome carries per-file
-/// failures — partial progress is kept and reported either way (the engine
-/// records and continues past per-file errors), but a sync that could not
-/// move everything must not exit 0 under cron. The final error names the
-/// failing locations and says progress was kept and the next run retries.
+/// Exit policy: nonzero when EVERY requested location was skipped, failed
+/// outright, or otherwise never ran, and ALSO when a location that DID run
+/// had per-file failures within its own transfer — that location's other
+/// files still copied (the engine records and continues past per-file
+/// errors), but a sync that could not move everything must not exit 0
+/// under cron. The final error names the failing locations and, for the
+/// all-failed case, says progress was kept and the next run retries.
 ///
 /// # Errors
 /// See "Exit policy" above.
@@ -335,7 +357,12 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
         results
             .iter()
             .any(|r| matches!(r, LocationResult::Outcome { .. })),
-        "sync {verb} failed for every requested location"
+        "sync {verb} failed for every requested location ({}) — check they're mounted and reachable",
+        results
+            .iter()
+            .map(LocationResult::name)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let failing: Vec<&str> = results
         .iter()
@@ -343,7 +370,9 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
             LocationResult::Outcome { name, outcome } if !outcome.failures.is_empty() => {
                 Some(name.as_str())
             }
-            LocationResult::Outcome { .. } | LocationResult::Skipped { .. } => None,
+            LocationResult::Outcome { .. }
+            | LocationResult::Skipped { .. }
+            | LocationResult::Failed { .. } => None,
         })
         .collect();
     anyhow::ensure!(
@@ -372,13 +401,20 @@ fn print_text_rows(results: &[LocationResult], verb: &str) {
                 );
             }
             LocationResult::Skipped { name, reason } => println!("{name}: {reason}"),
+            LocationResult::Failed { name, error } => {
+                println!("{name}: transfer failed — {error}");
+            }
         }
     }
 }
 
+/// Serializes `results` to JSON and prints it: a row for a location that
+/// ran is `{location, segments, segment_bytes, blobs, blob_bytes,
+/// failures}`; an unreachable location is `{location, skipped}`; a
+/// `plan_transfer`/`execute` setup failure is `{location, error}`.
+///
 /// # Errors
-/// Returns an error if the report can't be serialized to JSON (unreachable
-/// in practice — every field is a plain number, string, or path).
+/// Returns an error only if the JSON writer fails.
 fn print_json_rows(results: &[LocationResult]) -> Result<()> {
     let rows: Vec<serde_json::Value> = results
         .iter()
@@ -390,12 +426,16 @@ fn print_json_rows(results: &[LocationResult]) -> Result<()> {
                 "blobs": outcome.blobs_copied,
                 "blob_bytes": outcome.blob_bytes,
                 "failures": outcome.failures.iter().map(|(path, error)| {
-                    serde_json::json!({ "path": path, "error": error })
+                    serde_json::json!({ "path": path.display().to_string(), "error": error })
                 }).collect::<Vec<_>>(),
             }),
             LocationResult::Skipped { name, reason } => serde_json::json!({
                 "location": name,
                 "skipped": reason,
+            }),
+            LocationResult::Failed { name, error } => serde_json::json!({
+                "location": name,
+                "error": error,
             }),
         })
         .collect();

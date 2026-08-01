@@ -12,9 +12,8 @@ use std::path::{Path, PathBuf};
 /// this starts the next `NNNN.jsonl` instead, bounding the whole-file
 /// re-copy cost of `maj sync push` (segments transfer longer-wins as whole
 /// files). Rotated segments are immutable thereafter, for as long as the
-/// tip segment they rotated away from continues to exist — a fresh append
-/// after that tip is deleted or replaced falls back to re-evaluating
-/// whatever `NNNN.jsonl` is now the highest-numbered survivor.
+/// higher-numbered segment that superseded them still exists; if it is
+/// deleted, the previous segment becomes the tip again and grows.
 pub(crate) const ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 /// Segment names are zero-padded width-4 so lexicographic order is numeric
 /// order (see `list_segments`); 9999 is therefore the namespace's end.
@@ -118,7 +117,8 @@ impl FileEventLog {
     /// batch has to land somewhere, and an empty segment can't be made to
     /// hold it by rotating again. A fresh machine directory starts at
     /// `0001.jsonl`. Rotated segments are never appended to again while the
-    /// tip segment they rotated away from still exists.
+    /// higher-numbered segment that superseded them still exists; if it is
+    /// deleted, the previous segment becomes the tip again and grows.
     ///
     /// No fsync: a crash mid-write may drop the tail of the batch. See
     /// [`Self::read_segment_since`] for how readers handle the resulting
@@ -128,7 +128,7 @@ impl FileEventLog {
     /// Returns [`LogError::Serde`] if an event can't be serialized,
     /// [`LogError::Io`] if the segment file can't be opened, written to, or
     /// stat'd, or [`LogError::SegmentOverflow`] if this machine has already
-    /// filled segment 9999.
+    /// filled segment `MAX_SEGMENT`.
     pub fn append(&mut self, events: &[Event]) -> Result<(), LogError> {
         if events.is_empty() {
             return Ok(());
@@ -151,12 +151,14 @@ impl FileEventLog {
 
     /// The segment this append should write: the highest-numbered existing
     /// `NNNN.jsonl` unless this batch would push it past [`ROTATE_BYTES`],
-    /// in which case the next number starts fresh. A brand-new machine dir
-    /// starts at `0001.jsonl`. Non-numeric or non-width-4 `.jsonl` names (a
-    /// sync tool's "conflicted copy", or a stray `9.jsonl`/`10000.jsonl`)
-    /// never become the active tip, though readers still read them.
+    /// in which case the next number starts fresh — unless that
+    /// highest-numbered segment is still empty, in which case the batch
+    /// lands there regardless of size. A brand-new machine dir starts at
+    /// `0001.jsonl`. Non-numeric or non-width-4 `.jsonl` names (a sync
+    /// tool's "conflicted copy", or a stray `9.jsonl`/`10000.jsonl`) never
+    /// become the active tip, though readers still read them.
     ///
-    /// The `len == 0` exception below is also a crash-recovery guarantee:
+    /// The `len == 0` exception above is also a crash-recovery guarantee:
     /// if a rotation's new segment file got created but the crash happened
     /// before any bytes landed in it, the next append sees it as the
     /// existing tip at length 0 and reuses it rather than rotating past a
@@ -694,15 +696,10 @@ mod tests {
         let seg = dir.path().join("events/m1/9999.jsonl");
         let f = std::fs::File::create(&seg).expect("create");
         f.set_len(ROTATE_BYTES + 1).expect("grow");
-        let err = log.append(&[ev(1)]);
-        assert!(matches!(err, Err(LogError::SegmentOverflow { .. })));
-        let Err(LogError::SegmentOverflow { machine }) = err else {
-            unreachable!("just matched Err(SegmentOverflow)")
-        };
-        assert_eq!(
-            machine, "m1",
-            "the error must name the machine that overflowed"
-        );
+        match log.append(&[ev(1)]) {
+            Err(LogError::SegmentOverflow { machine }) => assert_eq!(machine, "m1"),
+            other => panic!("expected SegmentOverflow, got {other:?}"),
+        }
     }
 
     #[test]
@@ -726,6 +723,35 @@ mod tests {
         );
         let all = log.read_all().expect("read");
         assert_eq!(all.len(), 1, "the oversized event must still be readable");
+    }
+
+    #[test]
+    fn non_conforming_names_never_become_the_active_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append segment 1");
+        let seg2 = dir.path().join("events/m1/0002.jsonl");
+        let line = serde_json::to_string(&ev(2)).expect("serialize");
+        std::fs::write(&seg2, format!("{line}\n")).expect("write segment 2");
+        let seg2_len_before = std::fs::metadata(&seg2).expect("meta").len();
+        // "9.jsonl" sorts after "0002.jsonl" lexicographically, and
+        // "10000.jsonl" both lexicographically and numerically — either
+        // would wrongly become the tip without the width-4 filter.
+        std::fs::write(dir.path().join("events/m1/9.jsonl"), b"").expect("write 9.jsonl");
+        std::fs::write(dir.path().join("events/m1/10000.jsonl"), b"").expect("write 10000.jsonl");
+        log.append(&[ev(3)]).expect("append after strays");
+        assert!(
+            !dir.path().join("events/m1/0003.jsonl").exists(),
+            "the highest-numbered CONFORMING segment is 0002.jsonl; append must not rotate past a stray"
+        );
+        let seg2_len_after = std::fs::metadata(&seg2).expect("meta").len();
+        assert!(
+            seg2_len_after > seg2_len_before,
+            "the new event must land in 0002.jsonl, not a stray"
+        );
+        let all = log.read_all().expect("read");
+        assert_eq!(all.len(), 3, "all three real events must still be readable");
     }
 
     #[test]

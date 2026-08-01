@@ -19,11 +19,7 @@ pub fn maj(catalog: &std::path::Path, state: &std::path::Path) -> Command {
     maj_as(catalog, state, "test-machine")
 }
 
-/// Parses a `search --json` asset id out of the first result. Shared with
-/// `cli_smoke.rs`'s own local copy of this helper (kept there rather than
-/// migrated, to avoid an unrelated churn in this task) — this one exists so
-/// `caption_smoke.rs` can pull an asset id out of a scan without needing its
-/// own copy.
+/// Parses a `search --json` asset id out of the first result.
 #[cfg(test)]
 pub fn first_asset_id(out: &std::process::Output) -> String {
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

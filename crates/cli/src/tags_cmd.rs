@@ -81,7 +81,11 @@ fn read_tags_blob(path: &Path) -> Result<Vec<TagSuggestion>> {
 /// A blob that fails to read or decode is skipped with a stderr note
 /// rather than failing the whole listing — it may be mid-write by another
 /// process, and one bad blob shouldn't hide every other asset's
-/// suggestions.
+/// suggestions. Blobs from more than one describer model tag can list the
+/// same `(asset, tag)` pair twice, once per model tag — each row is kept
+/// (the model tag is part of what's displayed), and confirming or
+/// rejecting that tag clears every one of them at once, since both act on
+/// the `(asset, tag)` pair alone.
 fn pending_suggestions(catalog_root: &Path, projection: &Projection) -> Result<Vec<Pending>> {
     let blobs = BlobStore::new(catalog_root);
     let rejections = load_rejections(catalog_root)?;
@@ -186,7 +190,10 @@ pub(crate) fn cmd_confirm(app: &mut FsApp, asset: &str, tags: &[String]) -> Resu
 /// `maj tags reject <asset> <tag>...`: appends each pair to this machine's
 /// rejection log. Never touches the event log — a rejection is a
 /// per-machine "stop suggesting this" note, not a fact synced to
-/// teammates.
+/// teammates. The pair is recorded as given, without checking it against
+/// any current suggestion: a typo'd asset or tag just writes a rejection
+/// that never matches anything, a harmless no-op line, rather than paying
+/// for a full blob scan on every reject to validate it up front.
 ///
 /// # Errors
 /// Returns an error if the state dir can't be resolved or the rejection

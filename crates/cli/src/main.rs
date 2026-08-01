@@ -7,6 +7,7 @@ mod iso8601;
 mod query;
 mod search;
 mod state_dir;
+mod sync_cmd;
 mod tags_cmd;
 mod volume_identity;
 
@@ -99,6 +100,12 @@ enum Cmd {
     Describer {
         #[command(subcommand)]
         cmd: DescriberCmd,
+    },
+    /// Sync the catalog with configured locations (NAS, Dropbox folder,
+    /// shuttle drive).
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
     },
     /// List every volume the catalog has ever seen.
     Volumes {
@@ -287,6 +294,29 @@ impl From<DescriberBackendArg> for majestical_describe::BackendKind {
 }
 
 #[derive(Subcommand)]
+enum SyncCmd {
+    /// Manage this machine's sync locations (stored in the state dir,
+    /// never synced).
+    Location {
+        #[command(subcommand)]
+        cmd: SyncLocationCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncLocationCmd {
+    /// Add a named location and initialize its events/ + blobs/ layout.
+    Add { name: String, path: PathBuf },
+    /// List this machine's sync locations.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a location from config (never touches its files).
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum SearchesCmd {
     /// List saved searches.
     List {
@@ -388,6 +418,20 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
     }
 }
 
+/// Dispatches `maj sync`'s subcommands. Split out of `main` purely to stay
+/// under the crate's max-function-length lint, matching [`dispatch_index`].
+fn dispatch_sync(catalog: &Path, cmd: SyncCmd) -> Result<()> {
+    match cmd {
+        SyncCmd::Location { cmd } => match cmd {
+            SyncLocationCmd::Add { name, path } => {
+                sync_cmd::cmd_location_add(catalog, &name, &path)
+            }
+            SyncLocationCmd::List { json } => sync_cmd::cmd_location_list(catalog, json),
+            SyncLocationCmd::Rm { name } => sync_cmd::cmd_location_rm(catalog, &name),
+        },
+    }
+}
+
 /// Dispatches `maj tags`'s subcommands. Split out of `main` purely to stay
 /// under the crate's max-function-length lint, matching [`dispatch_index`].
 fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
@@ -453,6 +497,9 @@ fn main() -> Result<()> {
         // Deliberately does not open a catalog: describer config lives in
         // the per-machine state dir, not the event log.
         Cmd::Describer { cmd } => dispatch_describer(&cli.catalog, cmd)?,
+        // Deliberately does not open a catalog: sync location config lives
+        // in the per-machine state dir, not the event log.
+        Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, cmd)?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {

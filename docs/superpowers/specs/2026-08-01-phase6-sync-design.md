@@ -125,6 +125,9 @@ name = "shuttle"
 path = "/Volumes/Shuttle/majestical-sync"
 ```
 
+`maj sync location add|rm` rewrite this file from the parsed struct —
+unknown keys survive, TOML comments do not.
+
 `readonly = true` is the entire read-only-member feature: events already
 carry author identity; a reader who never pushes needs no new data concept.
 

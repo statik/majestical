@@ -384,12 +384,16 @@ fn plan_transcribe(
 /// not kind-driven): no transcript blob -> skip entirely, silently (an asset
 /// with no transcript isn't this kind's work to count; `plan_transcribe`
 /// already counted it). Blob exists -> check
-/// [`BlobStore::has_any_chunk`] against `MINILM`'s fixed model tag (unlike
-/// `ImageEmbedding`, the chunk blob path doesn't depend on `caps.model_tag`,
-/// so done can be checked before any capability gate) -> done; else no text
-/// model -> `needs_model`; else pending+item. Never offline: this reads a
-/// blob, not the source file, so a transcript synced in from a teammate can
-/// be chunked even when the original video/audio isn't reachable here.
+/// [`BlobStore::has_chunk_completion`] against `MINILM`'s fixed model tag
+/// (unlike `ImageEmbedding`, the marker path doesn't depend on
+/// `caps.model_tag`, so done can be checked before any capability gate) ->
+/// done; else no text model -> `needs_model`; else pending+item. Individual
+/// chunk blobs without a completion marker count PENDING — an interrupted
+/// run may have written blobs without indexing them, and re-planning is
+/// cheap since the runner skips blobs that already exist. Never offline:
+/// this reads a blob, not the source file, so a transcript synced in from a
+/// teammate can be chunked even when the original video/audio isn't
+/// reachable here.
 fn plan_transcript_embed(
     source: &AssetSource,
     hex: &str,
@@ -406,7 +410,7 @@ fn plan_transcript_embed(
     if !transcript_path.is_file() {
         return;
     }
-    if blobs.has_any_chunk(hex, MINILM.tag) {
+    if blobs.has_chunk_completion(hex, MINILM.tag) {
         plan.transcripts.done += 1;
         return;
     }
@@ -1144,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_embed_done_when_chunks_exist() {
+    fn transcript_embed_done_when_completion_marker_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
         let hex = "bb11bb11bb11bb11bb11bb11bb11bb11";
@@ -1165,6 +1169,15 @@ mod tests {
             },
         );
         store.write_vector(&chunk, &[0.1, 0.2]).expect("seed chunk");
+        let marker = store.path_for(
+            hex,
+            &Derivation::ChunksComplete {
+                model_tag: MINILM.tag,
+            },
+        );
+        store
+            .write_atomic(&marker, b"{}")
+            .expect("seed completion marker");
         let asset = format!("xxh3:{hex}");
         let sources = vec![source(&asset, MediaKind::Video, Some("/tmp/v.mov"))];
         let plan = plan_work(&sources, &store, &full_caps());
@@ -1174,13 +1187,53 @@ mod tests {
                 .items
                 .iter()
                 .any(|i| i.kind == WorkKind::TranscriptEmbed),
-            "chunks already exist: {:?}",
+            "the completion marker means done: {:?}",
             plan.items
         );
         assert_eq!(
             plan.transcripts.done, 2,
-            "both the transcribe kind (blob exists) and the embed kind (chunk exists) count done"
+            "both the transcribe kind (blob exists) and the embed kind (marker exists) count done"
         );
+    }
+
+    /// The rebuildable-projection invariant: chunk blobs are written before
+    /// the vector-store add, so a chunk blob WITHOUT the completion marker
+    /// can mean an interrupted, partially indexed run — it must re-plan as
+    /// pending, never count done.
+    #[test]
+    fn transcript_embed_chunk_blob_without_marker_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hex = "ee22ee22ee22ee22ee22ee22ee22ee22";
+        let transcript = store.path_for(
+            hex,
+            &Derivation::Transcript {
+                model_tag: WHISPER_MODEL_TAG,
+            },
+        );
+        store
+            .write_atomic(&transcript, b"{}")
+            .expect("seed transcript");
+        let chunk = store.path_for(
+            hex,
+            &Derivation::TranscriptChunk {
+                model_tag: MINILM.tag,
+                start_ms: 0,
+            },
+        );
+        store.write_vector(&chunk, &[0.1, 0.2]).expect("seed chunk");
+        let asset = format!("xxh3:{hex}");
+        let sources = vec![source(&asset, MediaKind::Audio, Some("/tmp/a.m4a"))];
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.kind == WorkKind::TranscriptEmbed),
+            "a chunk blob without the completion marker must re-plan: {:?}",
+            plan.items
+        );
+        assert_eq!(plan.transcripts.pending, 1);
     }
 
     #[test]

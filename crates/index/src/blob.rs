@@ -75,6 +75,14 @@ pub enum Derivation<'a> {
     ChunksEmpty {
         model_tag: &'a str,
     },
+    /// Marker written once EVERY chunk of a transcript has its
+    /// `TranscriptChunk` blob and the chunks are indexed — the
+    /// transcript-embed done signal (mirrors [`Derivation::OcrComplete`]).
+    /// Individual chunk blobs without this marker mean an interrupted run:
+    /// the item re-plans, and the existing blobs make the retry cheap.
+    ChunksComplete {
+        model_tag: &'a str,
+    },
 }
 
 /// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
@@ -155,27 +163,27 @@ impl BlobStore {
             Derivation::Tags { model_tag } => dir.join(model_tag).join("tags.json.zst"),
             Derivation::OcrComplete { model_tag } => dir.join(model_tag).join("ocr-complete.json"),
             Derivation::ChunksEmpty { model_tag } => dir.join(model_tag).join("chunks-empty.json"),
+            Derivation::ChunksComplete { model_tag } => {
+                dir.join(model_tag).join("chunks-complete.json")
+            }
         }
     }
 
-    /// True when the asset's `<model_tag>/` dir already has at least one
-    /// `TranscriptChunk` vector, or the [`Derivation::ChunksEmpty`] marker
-    /// (the empty-transcript case — chunking a transcript can legitimately
-    /// produce zero chunks, and that answer must count as done too, or the
-    /// planner would retry it forever).
+    /// True when transcript chunking has COMPLETED for the asset: either the
+    /// [`Derivation::ChunksComplete`] marker (every chunk blob written and
+    /// indexed) or the [`Derivation::ChunksEmpty`] marker (chunking
+    /// legitimately produced zero chunks — an answer that must count as done
+    /// too, or the planner would retry it forever) exists. Individual
+    /// `TranscriptChunk` blobs deliberately do NOT count: they're written
+    /// one at a time before the vector-store add, so their presence alone
+    /// can mean an interrupted, partially indexed run.
     #[must_use]
-    pub fn has_any_chunk(&self, asset_hex: &str, model_tag: &str) -> bool {
-        let prefix = asset_hex.get(..2).unwrap_or("xx");
-        let dir = self.root.join(prefix).join(asset_hex).join(model_tag);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return false;
-        };
-        entries.flatten().any(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name == "chunks-empty.json"
-                || (name.starts_with("chunk-") && name.ends_with(".f32le.zst"))
-        })
+    pub fn has_chunk_completion(&self, asset_hex: &str, model_tag: &str) -> bool {
+        self.path_for(asset_hex, &Derivation::ChunksComplete { model_tag })
+            .is_file()
+            || self
+                .path_for(asset_hex, &Derivation::ChunksEmpty { model_tag })
+                .is_file()
     }
 
     /// Walks `blobs/` for every file named `file_name` across every asset and
@@ -572,17 +580,26 @@ mod tests {
             },
         );
         assert!(chunks_empty.ends_with("aa/aabb/minilm-l6-v2-v1/chunks-empty.json"));
+        let chunks_complete = store.path_for(
+            "aabb",
+            &Derivation::ChunksComplete {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        assert!(chunks_complete.ends_with("aa/aabb/minilm-l6-v2-v1/chunks-complete.json"));
     }
 
     #[test]
-    fn has_any_chunk_is_false_with_no_dir_true_with_a_chunk_or_just_the_empty_marker() {
+    fn has_chunk_completion_requires_a_marker_not_just_chunk_blobs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
         assert!(
-            !store.has_any_chunk("aabb", "minilm-l6-v2-v1"),
+            !store.has_chunk_completion("aabb", "minilm-l6-v2-v1"),
             "no model dir at all must be false"
         );
 
+        // A chunk vector blob alone can mean an interrupted run whose store
+        // add never happened — it must NOT count as completion.
         let chunk_path = store.path_for(
             "aabb",
             &Derivation::TranscriptChunk {
@@ -593,7 +610,21 @@ mod tests {
         store
             .write_vector(&chunk_path, &[0.1, 0.2])
             .expect("write chunk");
-        assert!(store.has_any_chunk("aabb", "minilm-l6-v2-v1"));
+        assert!(
+            !store.has_chunk_completion("aabb", "minilm-l6-v2-v1"),
+            "a chunk blob without a completion marker is NOT done"
+        );
+
+        let complete_marker = store.path_for(
+            "aabb",
+            &Derivation::ChunksComplete {
+                model_tag: "minilm-l6-v2-v1",
+            },
+        );
+        store
+            .write_atomic(&complete_marker, b"{}")
+            .expect("write complete marker");
+        assert!(store.has_chunk_completion("aabb", "minilm-l6-v2-v1"));
 
         let empty_marker = store.path_for(
             "ccdd",
@@ -605,7 +636,7 @@ mod tests {
             .write_atomic(&empty_marker, b"{}")
             .expect("write empty marker");
         assert!(
-            store.has_any_chunk("ccdd", "minilm-l6-v2-v1"),
+            store.has_chunk_completion("ccdd", "minilm-l6-v2-v1"),
             "the empty-transcript marker alone must also count as done"
         );
     }

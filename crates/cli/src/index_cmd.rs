@@ -973,14 +973,17 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
     Ok(outcome)
 }
 
-/// One pass's transcript-embed result: `chunks_written` chunk vectors,
-/// `empty` transcripts that chunked to nothing (their `ChunksEmpty` marker
-/// written), and per-item `failed` (transcript blob path, reason — the
-/// item's own `abs_path` can be the empty sentinel, see
-/// `work::WorkItem::abs_path`).
+/// One pass's transcript-embed result: `chunks_written` freshly embedded
+/// chunk vectors, `loaded` vectors pulled in from chunk blobs the local
+/// text Lance table didn't have yet (the blob↔Lance diff — see
+/// [`load_missing_text_vectors_from_blobs`]), `empty` transcripts that
+/// chunked to nothing (their `ChunksEmpty` marker written), and per-item
+/// `failed` (transcript blob path, reason — the item's own `abs_path` can
+/// be the empty sentinel, see `work::WorkItem::abs_path`).
 #[derive(Default)]
 struct TranscriptEmbedOutcome {
     chunks_written: u64,
+    loaded: u64,
     empty: u64,
     failed: Vec<(PathBuf, String)>,
 }
@@ -1006,13 +1009,14 @@ fn embed_transcript_chunks(
     let transcript = read_transcript_blob(&transcript_path)?;
     let chunks = chunk_segments(&transcript.segments);
     let mut rows = Vec::new();
+    let mut chunk_starts = Vec::new();
     for chunk in &chunks {
         // Whitespace-only segments can chunk to empty text — nothing to
         // embed, and the encoder would just produce a meaningless vector.
         if chunk.text.trim().is_empty() {
             continue;
         }
-        let vector = encoder.embed(&chunk.text)?;
+        chunk_starts.push(chunk.start_ms);
         let path = blobs.path_for(
             &item.asset_hex,
             &Derivation::TranscriptChunk {
@@ -1020,6 +1024,13 @@ fn embed_transcript_chunks(
                 start_ms: chunk.start_ms,
             },
         );
+        // A blob left by an interrupted earlier run: skip re-inference — the
+        // always-on blob↔Lance diff (`load_missing_text_vectors_from_blobs`)
+        // indexes it if the store is missing its row.
+        if path.is_file() {
+            continue;
+        }
+        let vector = encoder.embed(&chunk.text)?;
         blobs.write_vector(&path, &vector)?;
         rows.push(TextChunkRow {
             asset_hex: item.asset_hex.clone(),
@@ -1031,7 +1042,7 @@ fn embed_transcript_chunks(
             vector,
         });
     }
-    if rows.is_empty() {
+    if chunk_starts.is_empty() {
         let marker = blobs.path_for(
             &item.asset_hex,
             &Derivation::ChunksEmpty {
@@ -1042,48 +1053,165 @@ fn embed_transcript_chunks(
         return Ok(ChunkEmbedResult::Empty);
     }
     let written = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-    store.add(rows)?;
+    finish_chunk_embed(blobs, store, &item.asset_hex, rows, &chunk_starts)?;
     Ok(ChunkEmbedResult::Written(written))
+}
+
+/// Adds the freshly embedded rows to the text store, then — ONLY after the
+/// add succeeds — writes the `ChunksComplete` done-marker (its body listing
+/// every chunk's `start_ms`, mirroring `OcrComplete`'s timestamp list). A
+/// failing add returns before the marker exists, so the item re-plans next
+/// pass instead of counting done with vectors missing from the store.
+fn finish_chunk_embed(
+    blobs: &BlobStore,
+    store: &TextVectorStore,
+    asset_hex: &str,
+    rows: Vec<TextChunkRow>,
+    chunk_starts: &[u64],
+) -> Result<()> {
+    store.add(rows)?;
+    let marker = blobs.path_for(
+        asset_hex,
+        &Derivation::ChunksComplete {
+            model_tag: MINILM.tag,
+        },
+    );
+    write_json_blob_uncompressed(
+        blobs,
+        &marker,
+        &serde_json::json!({ "chunks": chunk_starts }),
+    )
 }
 
 /// Works every `TranscriptEmbed` item serially: reads the transcript blob
 /// (never the source file), chunks it, embeds each non-empty chunk with a
-/// `MiniLM` encoder loaded ONCE, writes chunk vector blobs, and indexes the
-/// chunks (text included) into the local text Lance table. A transcript
-/// with zero non-empty chunks gets the `ChunksEmpty` done-marker instead.
+/// `MiniLM` encoder loaded ONCE, writes chunk vector blobs, indexes the
+/// chunks (text included) into the local text Lance table, and writes the
+/// `ChunksComplete` done-marker only after the store add succeeds. A
+/// transcript with zero non-empty chunks gets the `ChunksEmpty` marker
+/// instead. Then ALWAYS performs the chunk blob↔Lance diff — even with zero
+/// items or no `MiniLM` installed — see
+/// [`load_missing_text_vectors_from_blobs`], the text-table analogue of
+/// `run_embed_items`'s always-on self-heal.
 ///
 /// # Errors
-/// Returns an error if the `MiniLM` model fails to load or the text vector
-/// store can't be opened even after one corruption-recovery retry —
-/// per-item failures land in the outcome's `failed` list instead.
+/// Returns an error if the `MiniLM` model fails to load, the text vector
+/// store can't be opened even after one corruption-recovery retry, or the
+/// blob↔Lance diff fails — per-item failures land in the outcome's
+/// `failed` list instead.
 fn run_transcript_embed_items(
     paths: &EmbedPaths,
     blobs: &BlobStore,
     items: &[work::WorkItem],
 ) -> Result<TranscriptEmbedOutcome> {
     let mut outcome = TranscriptEmbedOutcome::default();
-    if items.is_empty() {
-        return Ok(outcome);
-    }
-    let Some(model_dir) = minilm_model_dir_if_present() else {
-        return Ok(outcome);
-    };
-    let mut encoder = TextEncoder::load(&model_dir)?;
     let store = open_or_rebuild_text(&paths.lance_dir)?;
-    for item in items {
-        let transcript_path = blobs.path_for(
-            &item.asset_hex,
-            &Derivation::Transcript {
-                model_tag: WHISPER_MODEL_TAG,
-            },
-        );
-        match embed_transcript_chunks(blobs, &mut encoder, &store, item) {
-            Ok(ChunkEmbedResult::Written(n)) => outcome.chunks_written += n,
-            Ok(ChunkEmbedResult::Empty) => outcome.empty += 1,
-            Err(err) => outcome.failed.push((transcript_path, err.to_string())),
+    let model_dir = if items.is_empty() {
+        None
+    } else {
+        minilm_model_dir_if_present()
+    };
+    if let Some(model_dir) = model_dir {
+        let mut encoder = TextEncoder::load(&model_dir)?;
+        for item in items {
+            let transcript_path = blobs.path_for(
+                &item.asset_hex,
+                &Derivation::Transcript {
+                    model_tag: WHISPER_MODEL_TAG,
+                },
+            );
+            match embed_transcript_chunks(blobs, &mut encoder, &store, item) {
+                Ok(ChunkEmbedResult::Written(n)) => outcome.chunks_written += n,
+                Ok(ChunkEmbedResult::Empty) => outcome.empty += 1,
+                Err(err) => outcome.failed.push((transcript_path, err.to_string())),
+            }
         }
     }
+    outcome.loaded = load_missing_text_vectors_from_blobs(&store, blobs)?;
     Ok(outcome)
+}
+
+/// The chunk blob↔Lance diff: adds every `MiniLM` chunk vector blob the
+/// local text Lance table doesn't have yet, recovering each chunk's text
+/// and `end_ms` by re-chunking the asset's transcript blob and matching on
+/// `start_ms` (chunking is deterministic, so a blob written by any machine
+/// re-chunks identically). This is what makes the text table rebuildable
+/// from blobs — a teammate's synced chunk vectors, a lance dir rebuilt
+/// after corruption, or a run interrupted between blob write and store add
+/// all converge here with zero re-inference. A chunk blob whose transcript
+/// blob is gone (or no longer chunks to that `start_ms`) is skipped with a
+/// counted stderr note rather than failing the pass.
+fn load_missing_text_vectors_from_blobs(store: &TextVectorStore, blobs: &BlobStore) -> Result<u64> {
+    let model_tag = MINILM.tag;
+    let existing = store.existing_keys(model_tag)?;
+    let mut chunk_cache: std::collections::BTreeMap<
+        String,
+        Option<Vec<majestical_index::chunk::Chunk>>,
+    > = std::collections::BTreeMap::new();
+    let mut loaded = 0u64;
+    let mut skipped = 0u64;
+    let mut batch = Vec::new();
+    for blob_ref in blobs.iter_vectors(model_tag)? {
+        if blob_ref.kind != "chunk" {
+            continue;
+        }
+        let key = (blob_ref.asset_hex.clone(), blob_ref.ts_ms);
+        if existing.contains(&key) {
+            continue;
+        }
+        let chunks = chunk_cache
+            .entry(blob_ref.asset_hex.clone())
+            .or_insert_with(|| load_transcript_chunks(blobs, &blob_ref.asset_hex));
+        let chunk = chunks.as_ref().and_then(|chunks| {
+            chunks
+                .iter()
+                .find(|c| ts_ms_i64(c.start_ms) == blob_ref.ts_ms)
+        });
+        let Some(chunk) = chunk else {
+            skipped += 1;
+            continue;
+        };
+        let vector = blobs.read_vector(&blob_ref.path)?;
+        batch.push(TextChunkRow {
+            asset_hex: blob_ref.asset_hex,
+            source: "transcript".to_string(),
+            start_ms: blob_ref.ts_ms,
+            end_ms: ts_ms_i64(chunk.end_ms),
+            model_tag: model_tag.to_string(),
+            text: chunk.text.clone(),
+            vector,
+        });
+        loaded += 1;
+        if batch.len() >= 256 {
+            store.add(std::mem::take(&mut batch))?;
+        }
+    }
+    if !batch.is_empty() {
+        store.add(batch)?;
+    }
+    if skipped > 0 {
+        eprintln!(
+            "note: {skipped} chunk vector blob(s) skipped in the text-store rebuild — \
+             transcript blob missing, or its chunking no longer matches"
+        );
+    }
+    Ok(loaded)
+}
+
+/// Re-derives an asset's chunk list from its transcript blob, or `None`
+/// when the blob is missing/unreadable (the caller counts and skips).
+fn load_transcript_chunks(
+    blobs: &BlobStore,
+    asset_hex: &str,
+) -> Option<Vec<majestical_index::chunk::Chunk>> {
+    let path = blobs.path_for(
+        asset_hex,
+        &Derivation::Transcript {
+            model_tag: WHISPER_MODEL_TAG,
+        },
+    );
+    let transcript = read_transcript_blob(&path).ok()?;
+    Some(chunk_segments(&transcript.segments))
 }
 
 /// One pass's OCR-kind result across stills and video keyframes.
@@ -1303,7 +1431,10 @@ fn read_transcript_blob(path: &Path) -> Result<Transcript> {
 /// Opens the text-chunk Lance table with the same probe + corruption
 /// recovery policy as [`open_or_rebuild`]. The text table shares the lance
 /// dataset directory with the image-vector table, so a rebuild here removes
-/// both — both are disposable, rebuilt from blobs by later passes.
+/// both — both are disposable, repopulated from blobs by the always-on
+/// blob↔Lance diffs (`load_missing_vectors_from_blobs` for image/keyframe
+/// vectors, [`load_missing_text_vectors_from_blobs`] for chunk vectors)
+/// with zero re-inference.
 fn open_or_rebuild_text(dir: &Path) -> Result<TextVectorStore> {
     match open_and_probe_text(dir) {
         Ok(store) => return Ok(store),
@@ -1376,6 +1507,7 @@ fn run_result_json(o: &RunOutcomes) -> serde_json::Value {
         "transcripts": {
             "transcribed": o.transcribe.written,
             "chunks_written": o.transcript_embed.chunks_written,
+            "chunks_loaded_from_blobs": o.transcript_embed.loaded,
             "chunks_empty": o.transcript_embed.empty,
             "failed": failed_json(&o.transcript_failures()),
         },
@@ -1415,9 +1547,11 @@ fn print_run_result(o: &RunOutcomes, json: bool) {
             o.keyframes.failed.len()
         );
         println!(
-            "transcripts: {} transcribed, {} chunks embedded, {} empty, {} failed",
+            "transcripts: {} transcribed, {} chunks embedded, {} loaded from blobs, {} empty, \
+             {} failed",
             o.transcribe.written,
             o.transcript_embed.chunks_written,
+            o.transcript_embed.loaded,
             o.transcript_embed.empty,
             o.transcribe.failed.len() + o.transcript_embed.failed.len()
         );
@@ -1895,6 +2029,52 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["path"], "/media/broken.pdf");
         assert_eq!(entries[0]["error"], "not a valid pdf");
+    }
+
+    fn chunk_row(asset_hex: &str, dims: usize) -> TextChunkRow {
+        TextChunkRow {
+            asset_hex: asset_hex.to_string(),
+            source: "transcript".to_string(),
+            start_ms: 0,
+            end_ms: 2000,
+            model_tag: MINILM.tag.to_string(),
+            text: "hello".to_string(),
+            vector: vec![0.1; dims],
+        }
+    }
+
+    /// The rebuildable-projection guard: `finish_chunk_embed` writes the
+    /// `ChunksComplete` marker ONLY after the store add succeeds. A failing
+    /// add (a wrong-dimension row, which `TextVectorStore::add` rejects)
+    /// must leave no marker behind — the planner then re-plans the item.
+    /// This is the test that catches the "marker written before/despite the
+    /// add" mutation.
+    #[test]
+    fn finish_chunk_embed_writes_no_marker_when_the_store_add_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = BlobStore::new(dir.path());
+        let store = TextVectorStore::open(&dir.path().join("lance")).expect("open text store");
+        let hex = "aa11aa11aa11aa11aa11aa11aa11aa11";
+        let marker = blobs.path_for(
+            hex,
+            &Derivation::ChunksComplete {
+                model_tag: MINILM.tag,
+            },
+        );
+
+        finish_chunk_embed(&blobs, &store, hex, vec![chunk_row(hex, 3)], &[0])
+            .expect_err("a wrong-dimension row must fail the store add");
+        assert!(
+            !marker.is_file(),
+            "no completion marker may exist after a failed store add"
+        );
+
+        let dim = majestical_index::vector_store::TEXT_DIM;
+        finish_chunk_embed(&blobs, &store, hex, vec![chunk_row(hex, dim)], &[0])
+            .expect("a valid add succeeds");
+        assert!(marker.is_file(), "marker written once the add succeeded");
+        let assets = store.distinct_assets(MINILM.tag).expect("scan");
+        assert!(assets.contains(hex));
     }
 
     #[test]

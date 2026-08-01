@@ -848,6 +848,80 @@ fn transcribe_run_without_model_skips_with_named_gap() {
         .stdout(contains("model fetch"));
 }
 
+/// The text-chunk analogue of `embeddings_loaded_from_blobs_without_model`:
+/// `index run` always performs the chunk blob↔Lance diff, so a hand-written
+/// chunk vector blob (as if synced from a teammate) plus its transcript
+/// blob gets indexed into the local text store with no `MiniLM` installed —
+/// the `text_chunks` table is rebuildable from blobs alone, with the chunk
+/// text recovered by re-chunking the transcript.
+#[test]
+fn text_chunks_loaded_from_blobs_without_model() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    // Empty model cache: no encoder of any kind may load on this path.
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    let hex = "feedfacefeedfacefeedfacefeedface";
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+
+    // The transcript blob the rebuild re-chunks to recover text/end_ms.
+    let transcript = majestical_index::transcribe::Transcript {
+        model_tag: majestical_index::transcribe::WHISPER_MODEL_TAG.to_string(),
+        segments: vec![majestical_index::transcribe::TranscriptSegment {
+            start_ms: 0,
+            end_ms: 2000,
+            text: "hello from a teammate".into(),
+        }],
+        text: "hello from a teammate".into(),
+    };
+    let json = transcript.to_json().unwrap();
+    let compressed = zstd::encode_all(&json[..], 3).unwrap();
+    let transcript_path = blobs.path_for(
+        hex,
+        &majestical_index::blob::Derivation::Transcript {
+            model_tag: majestical_index::transcribe::WHISPER_MODEL_TAG,
+        },
+    );
+    blobs.write_atomic(&transcript_path, &compressed).unwrap();
+
+    // The chunk vector blob, matching the transcript's single chunk.
+    let chunk_path = blobs.path_for(
+        hex,
+        &majestical_index::blob::Derivation::TranscriptChunk {
+            model_tag: majestical_index::model::MINILM.tag,
+            start_ms: 0,
+        },
+    );
+    let vector = vec![0.1f32; majestical_index::vector_store::TEXT_DIM];
+    blobs.write_vector(&chunk_path, &vector).unwrap();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run"])
+        .assert()
+        .success()
+        .stdout(contains("1 loaded from blobs"));
+
+    let lance_dirs = walkdir_find(&state, "lance");
+    assert_eq!(lance_dirs.len(), 1, "exactly one lance dir under state");
+    let store = majestical_index::vector_store::TextVectorStore::open_existing(&lance_dirs[0])
+        .unwrap()
+        .expect("text_chunks table exists");
+    let assets = store
+        .distinct_assets(majestical_index::model::MINILM.tag)
+        .unwrap();
+    assert!(
+        assets.contains(hex),
+        "the chunk row must land in the text store: {assets:?}"
+    );
+}
+
 /// Full pipeline through the real CLI, with a real fetched model and real
 /// ffmpeg: scan a three-segment color clip, `index run` it (video
 /// thumbnail + scene-detected keyframes + embeddings), then confirm

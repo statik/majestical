@@ -307,6 +307,7 @@ enum SyncCmd {
 enum SyncLocationCmd {
     /// Add a named location and initialize its events/ + blobs/ layout.
     Add { name: String, path: PathBuf },
+    /// List this machine's sync locations.
     List {
         #[arg(long)]
         json: bool,

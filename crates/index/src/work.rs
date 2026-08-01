@@ -8,13 +8,19 @@ use majestical_core::media_kind::MediaKind;
 
 use crate::blob::{BlobStore, Derivation, asset_hex};
 
-/// Extensions we know we cannot decode yet: the RAW family, plus AVIF (the
-/// `image` crate build we depend on has no AVIF decoder enabled). Planner-
-/// level so status is deterministic instead of discovered by failing
-/// forever — a scanned `.avif` would otherwise retry every pass under
-/// `--watch` with no way to ever succeed.
+/// Extensions we know we cannot decode yet: the RAW family, plus AVIF and
+/// JXL (the `image` crate build we depend on has no decoder enabled for
+/// either). Planner-level so status is deterministic instead of discovered
+/// by failing forever — a scanned `.avif` would otherwise retry every pass
+/// under `--watch` with no way to ever succeed.
+///
+/// Coupled to `media_kind`'s extension table: any extension classified
+/// `MediaKind::Image` there must either decode via the `image` crate or be
+/// listed here — otherwise it counts `pending`, fails to decode, and
+/// retry-loops under `--watch` forever, exactly the failure mode this
+/// constant exists to avoid.
 const UNDECODABLE_EXTS: &[&str] = &[
-    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "avif",
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "iiq", "3fr", "avif", "jxl",
 ];
 
 /// One kind of derivable work a [`WorkItem`] can carry.
@@ -92,8 +98,10 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
-/// prefixed or whose kind is [`MediaKind::Other`] are skipped entirely — the
-/// planner has no derivation to offer them.
+/// prefixed, or whose kind is [`MediaKind::Other`], [`MediaKind::Audio`], or
+/// [`MediaKind::Pdf`], are skipped entirely — the planner has no derivation
+/// to offer them yet (audio has no visual thumbnail; PDF thumbnailing lands
+/// in a later task).
 ///
 /// Three passes over `sources` (rather than one) so `items` comes out
 /// globally priority-ordered — every thumbnail before every image embedding
@@ -101,7 +109,10 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 #[must_use]
 pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities) -> WorkPlan {
     let mut plan = WorkPlan::default();
-    for source in sources.iter().filter(|s| s.kind != MediaKind::Other) {
+    for source in sources.iter().filter(|s| match s.kind {
+        MediaKind::Image | MediaKind::Video => true,
+        MediaKind::Audio | MediaKind::Pdf | MediaKind::Other => false,
+    }) {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_thumb(source, hex, blobs, caps, &mut plan);
         }
@@ -315,6 +326,53 @@ mod tests {
         assert_eq!(plan.embeddings.unsupported, 2);
         assert_eq!(plan.embeddings.pending, 1, "aa11 embedding is embeddable");
         assert_eq!(plan.items.len(), 1, "one ImageEmbed item for aa11");
+    }
+
+    /// The RAW/JXL extensions this PR added to `media_kind`'s table (pef,
+    /// iiq, 3fr, jxl) must also be in `UNDECODABLE_EXTS` — otherwise they'd
+    /// count `pending`, fail to decode, and retry every `--watch` pass
+    /// forever instead of settling into `unsupported`.
+    #[test]
+    fn newly_classified_raw_and_jxl_extensions_are_unsupported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = Capabilities {
+            model_tag: None,
+            ffmpeg: false,
+        };
+        let sources = vec![
+            AssetSource {
+                asset: "xxh3:pef1".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/shot.pef".into()),
+            },
+            AssetSource {
+                asset: "xxh3:iiq1".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/shot.iiq".into()),
+            },
+            AssetSource {
+                asset: "xxh3:3fr1".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/shot.3fr".into()),
+            },
+            AssetSource {
+                asset: "xxh3:jxl1".into(),
+                kind: MediaKind::Image,
+                abs_path: Some("/tmp/shot.jxl".into()),
+            },
+        ];
+        let plan = plan_work(&sources, &store, &caps);
+        assert_eq!(
+            plan.thumbs.unsupported, 4,
+            "pef, iiq, 3fr, and jxl must all classify as unsupported, not pending"
+        );
+        assert_eq!(plan.thumbs.pending, 0);
+        assert!(
+            plan.items.is_empty(),
+            "no work item should be queued for any of them: {:?}",
+            plan.items
+        );
     }
 
     /// `items` is globally priority-ordered — every thumbnail before every

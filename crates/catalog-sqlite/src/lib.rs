@@ -57,7 +57,11 @@ pub enum CatalogError {
 /// Bumped to 5: `create_tables` gained the `saved_searches` table.
 ///
 /// Bumped to 6: `create_tables` gained the `text_fts` table.
-pub(crate) const SNAPSHOT_VERSION: i64 = 6;
+///
+/// Bumped to 7: `MediaKind` gained `Audio` and `Pdf` variants, so pre-existing
+/// audio/pdf files (previously classified `Other` in the `instances.kind`
+/// column) need a full rebuild to reclassify.
+pub(crate) const SNAPSHOT_VERSION: i64 = 7;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.

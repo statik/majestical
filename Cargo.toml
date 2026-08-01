@@ -58,6 +58,21 @@ objc2-vision = { version = "0.3.2", default-features = false, features = [
     "VNRecognizeTextRequest",
     "objc2-core-foundation",
 ] }
+# PDFKit's default features pull the whole annotation/outline/view surface;
+# the pdf module only opens documents, reads page text, and renders one
+# thumbnail (`objc2-app-kit` gates `thumbnailOfSize:forBox:` → NSImage).
+objc2-pdf-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "PDFDocument",
+    "PDFPage",
+    "objc2-app-kit",
+] }
+# Direct dep only for calling TIFFRepresentation on the NSImage that
+# PDFKit's thumbnail call returns.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSImage",
+] }
 
 # WATCHLIST (2026-07-30): a `cli`/`index` dev/test build linking lancedb's
 # dependency graph (lancedb -> datafusion -> arrow, plus ort) hits macOS

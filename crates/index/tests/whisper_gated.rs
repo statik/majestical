@@ -39,7 +39,17 @@ fn transcribes_spoken_fixture_with_sane_timestamps() {
     // dodges the flake below entirely. Fall back to say+extract for a
     // standalone run of just this test.
     let pcm = if let Ok(audio) = std::env::var("MAJ_AUDIO") {
-        video::extract_audio_pcm(Path::new(&audio), 120_000).expect("pcm")
+        // 120_000ms cap (vs. the fallback's 10_000): the recipe fixture runs
+        // ~11.5s including its 2s silent lead-in, which would be truncated
+        // by the fallback's shorter cap.
+        let pcm = video::extract_audio_pcm(Path::new(&audio), 120_000).expect("pcm");
+        // No retry here, unlike the fallback below — this is someone else's
+        // committed/generated file, not one we can resynthesize in place.
+        assert!(
+            !is_silent(&pcm),
+            "MAJ_AUDIO fixture is silent — regenerate target/whisper-fixture.wav"
+        );
+        pcm
     } else {
         let tmp = tempfile::tempdir().expect("tempdir");
         let aiff = tmp.path().join("fixture.aiff");

@@ -136,6 +136,13 @@ mod tests {
 
     #[test]
     fn all_lists_every_kind() {
-        assert_eq!(MediaKind::ALL.len(), 5);
+        assert_eq!(MediaKind::ALL.len(), 5, "no duplicate entries in ALL");
+        let names: std::collections::BTreeSet<&str> =
+            MediaKind::ALL.iter().map(|kind| kind.as_str()).collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["image", "video", "audio", "pdf", "other"]),
+            "ALL must classify to exactly these kinds, no more, no fewer"
+        );
     }
 }

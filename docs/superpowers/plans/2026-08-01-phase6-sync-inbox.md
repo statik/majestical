@@ -857,8 +857,14 @@ pub fn plan_transfer(src: &Path, dst: &Path) -> Result<TransferPlan, TransferErr
     Ok(plan)
 }
 
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+/// DESTINATION-side length only: absent (or unreadable) = 0 = "needs the
+/// copy", which is self-correcting — if the file is unreadable rather than
+/// absent, the planned copy fails loudly in `execute`. Never use this for
+/// SOURCE lengths: a source metadata failure must propagate, or the file
+/// silently drops out of the plan (Task 2's review caught exactly this
+/// swallow-and-degrade pattern in rotation).
+fn dst_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 fn plan_segments(src: &Path, dst: &Path, plan: &mut TransferPlan) -> Result<(), TransferError> {
@@ -887,8 +893,10 @@ fn plan_segments(src: &Path, dst: &Path, plan: &mut TransferPlan) -> Result<(), 
                 continue;
             }
             let segment = entry.file_name().to_string_lossy().into_owned();
-            let src_len = file_len(&path);
-            let dst_len = file_len(&dst.join("events").join(&machine_name).join(&segment));
+            let src_len = std::fs::metadata(&path)
+                .map_err(TransferError::io(&path))?
+                .len();
+            let dst_len = dst_len(&dst.join("events").join(&machine_name).join(&segment));
             if src_len > dst_len {
                 plan.segments.push(SegmentCopy {
                     machine: machine_name.clone(),
@@ -929,9 +937,11 @@ fn plan_blobs(src: &Path, dst: &Path, plan: &mut TransferPlan) -> Result<(), Tra
             let Ok(rel) = path.strip_prefix(&src_blobs) else {
                 continue;
             };
-            let size = file_len(&path);
+            let size = std::fs::metadata(&path)
+                .map_err(TransferError::io(&path))?
+                .len();
             let dst_path = dst_blobs.join(rel);
-            if !dst_path.is_file() || file_len(&dst_path) != size {
+            if !dst_path.is_file() || dst_len(&dst_path) != size {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 plan.blobs.push(BlobCopy {
                     rel: rel.to_path_buf(),

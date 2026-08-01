@@ -187,6 +187,30 @@ mod tests {
         );
     }
 
+    /// `load`'s `NotFound` guard must be exact: any other io error (here, an
+    /// `IsADirectory`/similar error from reading a directory as a file) has
+    /// to surface as `ConfigError::Read`, not silently swallowed into
+    /// `Ok(None)` the way a missing file is. Without this, a mutant that
+    /// widens the guard to match unconditionally still passes
+    /// `load_missing_file_is_none` (a real `NotFound` either way).
+    #[test]
+    fn load_non_not_found_io_error_is_a_read_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = DescriberConfig::load(dir.path()).expect_err("directory is not a file");
+        assert!(matches!(err, ConfigError::Read { .. }), "{err}");
+    }
+
+    /// `BackendKind::as_str` has no other caller under test (`describer_cmd`
+    /// only prints it), so a mutant collapsing it to `""`/`"xyzzy"` for
+    /// every variant would otherwise survive — mirrors
+    /// `default_base_urls_per_backend` for the sibling method.
+    #[test]
+    fn as_str_per_backend() {
+        assert_eq!(BackendKind::Ollama.as_str(), "ollama");
+        assert_eq!(BackendKind::LmStudio.as_str(), "lm-studio");
+        assert_eq!(BackendKind::OpenRouter.as_str(), "open-router");
+    }
+
     #[test]
     fn env_key_wins_over_file_key() {
         let config = DescriberConfig {

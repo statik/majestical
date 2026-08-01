@@ -56,7 +56,9 @@ fn find_catalog_db(state: &Path) -> PathBuf {
 /// syncs the catalog on every open) doing it instead.
 #[cfg(test)]
 fn asset_count(db_path: &Path) -> i64 {
-    let conn = rusqlite::Connection::open(db_path).expect("open catalog.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open catalog.db read-only");
     conn.query_row("select count(*) from assets", [], |row| row.get(0))
         .expect("count assets")
 }
@@ -573,8 +575,9 @@ fn pull_applies_a_teammates_events_and_names_the_index_remedy() {
     // `cmd_pull`'s own `FsApp::open`/`open_catalog` call would leave this
     // test green regardless. Read `assets` straight off `catalog.db`.
     let db = find_catalog_db(&m2.state);
-    assert!(
-        asset_count(&db) >= 1,
+    assert_eq!(
+        asset_count(&db),
+        1,
         "the pulled asset must already be in machine 2's sqlite catalog \
          immediately after pull, before any other command could apply it"
     );
@@ -728,4 +731,65 @@ fn pull_applies_events_despite_a_blob_failure_then_exits_nonzero() {
         stdout.contains("a.jpg"),
         "the applied event must be searchable despite the blob failure: {stdout}"
     );
+}
+
+#[test]
+fn pull_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // mkdir'd but never `maj catalog init`ed — the directory exists, but
+    // has no `events/`.
+    let catalog = root.path().join("cat");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&catalog).expect("mkdir");
+
+    let out = maj_as(&catalog, &state, "m1")
+        .args(["sync", "pull"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no catalog at") && stderr.contains("maj catalog init"),
+        "pull against an uninitialized catalog must name the remedy: {stderr}"
+    );
+    assert!(
+        std::fs::read_dir(&catalog)
+            .expect("read catalog dir")
+            .next()
+            .is_none(),
+        "pull must not manufacture an events/ dir (or anything else) in an \
+         uninitialized catalog — it must refuse before touching it"
+    );
+}
+
+#[test]
+fn a_readonly_member_can_still_pull() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    let m1 = fixture_as(root.path(), "m1", "m1");
+    m1.scan_one_file();
+    m1.add_location("nas", &location);
+    maj_as(&m1.catalog, &m1.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Machine 2 is a read-only sync member — push refuses this (pinned by
+    // `readonly_refuses_push_naming_the_config_file`), but pull must not.
+    let m2 = fixture_as(root.path(), "m2", "m2");
+    m2.add_location("nas", &location);
+    let config = find_sync_toml(&m2.state);
+    let text = std::fs::read_to_string(&config).expect("read");
+    let flipped = text.replace("readonly = false", "readonly = true");
+    assert_ne!(
+        flipped, text,
+        "sync.toml must already contain readonly = false: {text}"
+    );
+    std::fs::write(&config, flipped).expect("write");
+
+    maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "pull"])
+        .assert()
+        .success();
 }

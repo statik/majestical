@@ -43,6 +43,12 @@ ureq = { version = "3.3.0", features = ["json"] }
 base64 = "0.23.0"
 toml = "1.1.4"
 httpmock = "0.8.3"
+# Native sqlite3 link (links = "sqlite3") — pinned once here, lockstep,
+# rather than in each dependent crate: two independent pins of a `links`
+# crate are exactly the kind of thing that silently drifts into a build
+# break (cargo allows only one version of a `links` crate per build graph
+# regardless of what any individual crate asks for).
+rusqlite = { version = "0.37", features = ["bundled"] }
 whisper-rs = { version = "0.16.0", features = ["metal"] }
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"

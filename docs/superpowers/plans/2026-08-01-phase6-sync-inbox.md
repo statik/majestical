@@ -1326,7 +1326,12 @@ fn transfer_one(
 }
 
 /// Prints per-location rows and enforces the exit policy: nonzero only
-/// when EVERY requested location failed or was skipped.
+/// when EVERY requested location failed or was skipped. A location whose
+/// outcome carries per-file `failures` still counts as progress (the
+/// engine records and continues past per-file errors — Task 4 as-built);
+/// its row appends ", N failed" and each failure prints to stderr as
+/// `<location>: failed <path>: <reason>` so partial syncs are loud but
+/// non-fatal.
 fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Result<()> {
     if json {
         let rows: Vec<serde_json::Value> = results
@@ -1338,6 +1343,9 @@ fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Resul
                     "segment_bytes": o.segment_bytes,
                     "blobs": o.blobs_copied,
                     "blob_bytes": o.blob_bytes,
+                    "failures": o.failures.iter().map(|(p, e)| {
+                        serde_json::json!({ "path": p, "error": e })
+                    }).collect::<Vec<_>>(),
                 }),
                 (None, skipped) => serde_json::json!({
                     "location": r.name,

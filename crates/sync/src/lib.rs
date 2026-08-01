@@ -201,12 +201,13 @@ impl FileEventLog {
     /// updated cursors covering every segment seen (unknown segments read
     /// from 0 and gain a cursor of their own).
     ///
-    /// Mirrors [`Self::read_all_reporting`]'s directory walk, but seeks each
-    /// segment to its cursor offset instead of reading from the start, and
-    /// stops at the last complete line: a torn tail (a write in progress)
-    /// stays unconsumed so the cursor never advances past it, and it's
-    /// re-read — and only then possibly reported as a bad line — on the
-    /// next call once the write completes.
+    /// This is the segment walk — [`Self::read_all_reporting`] just calls
+    /// this with empty cursors and discards the returned cursors. Each
+    /// segment is sought to its cursor offset instead of read from the
+    /// start, and stops at the last complete line: a torn tail (a write in
+    /// progress) stays unconsumed so the cursor never advances past it, and
+    /// it's re-read — and only then possibly reported as a bad line — on
+    /// the next call once the write completes.
     ///
     /// Cursors are returned sorted by machine then segment, so two calls
     /// that see no new data produce equal cursor lists.

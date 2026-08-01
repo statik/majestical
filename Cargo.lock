@@ -4468,6 +4468,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "ulid",
  "walkdir",
  "xxhash-rust",

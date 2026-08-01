@@ -8,6 +8,15 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Rotation threshold: an append that would grow the active segment past
+/// this starts the next `NNNN.jsonl` instead, bounding the whole-file
+/// re-copy cost of `maj sync push` (segments transfer longer-wins as whole
+/// files). Rotated segments are immutable thereafter.
+pub(crate) const ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+/// Segment names are zero-padded width-4 so lexicographic order is numeric
+/// order (see `list_segments`); 9999 is therefore the namespace's end.
+const MAX_SEGMENT: u32 = 9999;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error(
@@ -28,6 +37,10 @@ pub enum LogError {
         segment: String,
         offset: u64,
     },
+    #[error(
+        "machine {machine} reached segment 9999 — the log segment namespace is exhausted; this catalog needs a new machine id"
+    )]
+    SegmentOverflow { machine: String },
 }
 
 impl LogError {
@@ -88,24 +101,28 @@ impl FileEventLog {
         })
     }
 
-    /// Append to this machine's current segment (0001.jsonl for phase 1;
-    /// segment rotation arrives with sync push/pull in a later phase).
+    /// Append to this machine's active segment. Batches that would grow the
+    /// active segment past [`ROTATE_BYTES`] start the next `NNNN.jsonl`
+    /// instead; a fresh machine directory starts at `0001.jsonl`. Rotated
+    /// segments are never appended to again.
     ///
     /// No fsync: a crash mid-write may drop the tail of the batch. See
     /// [`Self::read_segment_since`] for how readers handle the resulting
     /// torn tail.
     ///
     /// # Errors
-    /// Returns [`LogError::Serde`] if an event can't be serialized, or
-    /// [`LogError::Io`] if the segment file can't be opened or written to.
+    /// Returns [`LogError::Serde`] if an event can't be serialized,
+    /// [`LogError::Io`] if the segment file can't be opened or written to,
+    /// or [`LogError::SegmentOverflow`] if this machine has already filled
+    /// segment 9999.
     pub fn append(&mut self, events: &[Event]) -> Result<(), LogError> {
-        let seg = self.machine_dir.join("0001.jsonl");
         let mut batch = String::new();
         for e in events {
             let line = serde_json::to_string(e)?;
             batch.push_str(&line);
             batch.push('\n');
         }
+        let seg = self.active_segment(batch.len() as u64)?;
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -113,6 +130,41 @@ impl FileEventLog {
             .map_err(LogError::io(&seg))?;
         f.write_all(batch.as_bytes()).map_err(LogError::io(&seg))?;
         Ok(())
+    }
+
+    /// The segment this append should write: the highest-numbered existing
+    /// `NNNN.jsonl` unless this batch would push it past [`ROTATE_BYTES`],
+    /// in which case the next number starts fresh. A brand-new machine dir
+    /// starts at `0001.jsonl`. Non-numeric `.jsonl` names (a sync tool's
+    /// "conflicted copy") never become the active tip, though readers
+    /// still read them.
+    fn active_segment(&self, batch_len: u64) -> Result<PathBuf, LogError> {
+        let segments = Self::list_segments(&self.machine_dir)?;
+        let current = segments
+            .iter()
+            .filter_map(|(name, path)| {
+                let n: u32 = name.strip_suffix(".jsonl")?.parse().ok()?;
+                Some((n, path.clone()))
+            })
+            .next_back();
+        let Some((num, path)) = current else {
+            return Ok(self.machine_dir.join("0001.jsonl"));
+        };
+        let len = fs::metadata(&path).map_or(0, |m| m.len());
+        if len == 0 || len + batch_len <= ROTATE_BYTES {
+            return Ok(path);
+        }
+        let next = num + 1;
+        if next > MAX_SEGMENT {
+            return Err(LogError::SegmentOverflow {
+                machine: self
+                    .machine_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(self.machine_dir.join(format!("{next:04}.jsonl")))
     }
 
     /// # Errors
@@ -573,6 +625,52 @@ mod tests {
             .read_all_reporting(|_| bad += 1)
             .expect("read must not fail");
         assert_eq!((all.len(), bad), (1, 1));
+    }
+
+    #[test]
+    fn append_rotates_past_the_size_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        // Grow 0001.jsonl past the threshold without writing 4MiB of real
+        // events. set_len pads with NUL bytes and no trailing newline, which
+        // reads back as a torn tail (deferred, not reported) rather than a
+        // complete bad line; write a trailing newline so the padded region
+        // terminates and reads as exactly one reported bad line instead.
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open");
+        f.set_len(ROTATE_BYTES + 1).expect("grow");
+        f.write_all(b"\n").expect("terminate the padded region");
+        log.append(&[ev(2)]).expect("append after threshold");
+        assert!(
+            dir.path().join("events/m1/0002.jsonl").is_file(),
+            "append past the threshold must start 0002.jsonl"
+        );
+        let mut bad = 0;
+        let all = log.read_all_reporting(|_| bad += 1).expect("read");
+        assert_eq!(
+            (all.len(), bad),
+            (2, 1),
+            "events merge across both segments; the NUL padding reads as one reported bad line"
+        );
+    }
+
+    #[test]
+    fn segment_overflow_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        let seg = dir.path().join("events/m1/9999.jsonl");
+        let f = std::fs::File::create(&seg).expect("create");
+        f.set_len(ROTATE_BYTES + 1).expect("grow");
+        assert!(matches!(
+            log.append(&[ev(1)]),
+            Err(LogError::SegmentOverflow { .. })
+        ));
     }
 
     #[test]

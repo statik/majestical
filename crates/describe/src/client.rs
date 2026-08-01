@@ -276,6 +276,27 @@ mod tests {
         })
     }
 
+    /// No test sends real HTTP requests through an assertion that inspects
+    /// the tags prompt's text (unlike `ollama_caption_sends_base64_data_url_
+    /// no_auth`'s body matcher for captions), so a mutant collapsing
+    /// `tags_prompt` to an empty or constant string would otherwise survive
+    /// unnoticed even though it would drop the vocab list from every real
+    /// request. Calls the function directly instead.
+    #[test]
+    fn tags_prompt_lists_the_vocab_and_the_json_reply_shape() {
+        let vocab = vec!["person/dana".to_string(), "status/select".to_string()];
+        let prompt = tags_prompt(&vocab);
+        assert!(prompt.contains("person/dana"), "{prompt}");
+        assert!(prompt.contains("status/select"), "{prompt}");
+        assert!(prompt.contains("\"tags\""), "{prompt}");
+    }
+
+    #[test]
+    fn tags_prompt_names_empty_vocab_explicitly() {
+        let prompt = tags_prompt(&[]);
+        assert!(prompt.contains("(none yet)"), "{prompt}");
+    }
+
     #[test]
     fn ollama_caption_sends_base64_data_url_no_auth() {
         let server = MockServer::start();

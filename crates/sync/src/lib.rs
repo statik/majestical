@@ -674,6 +674,51 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_batch_still_lands_in_the_empty_active_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        // Pre-create 0001.jsonl empty (len 0) so the `len == 0 ||` guard is
+        // the only thing keeping a batch that's already over ROTATE_BYTES
+        // from rotating: without the guard, len(0) + batch_len > ROTATE_BYTES
+        // would push straight past it and start 0002.jsonl, then 0003.jsonl,
+        // forever, since no single segment can ever hold the batch.
+        let seg = dir.path().join("events/m1/0001.jsonl");
+        std::fs::File::create(&seg).expect("pre-create empty 0001.jsonl");
+        let mut oversized = ev(1);
+        let Op::TagAdd { tag, .. } = &mut oversized.op else {
+            unreachable!("ev() always builds a TagAdd")
+        };
+        *tag = "x".repeat(usize::try_from(ROTATE_BYTES).expect("fits usize") + 1);
+        log.append(&[oversized]).expect("append oversized batch");
+        assert!(
+            !dir.path().join("events/m1/0002.jsonl").exists(),
+            "an oversized batch must land in the empty active segment, not rotate forever"
+        );
+        let all = log.read_all().expect("read");
+        assert_eq!(all.len(), 1, "the oversized event must still be readable");
+    }
+
+    #[test]
+    fn segment_9999_is_legal_only_10000_would_overflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = MachineId("m1".into());
+        let mut log = FileEventLog::init(dir.path(), &m).expect("init");
+        // 9998, not 9999: distinguishes `next > MAX_SEGMENT` from
+        // `next >= MAX_SEGMENT` — next here is 9999, which must still
+        // succeed since only 10000 is out of the namespace.
+        let seg = dir.path().join("events/m1/9998.jsonl");
+        let f = std::fs::File::create(&seg).expect("create");
+        f.set_len(ROTATE_BYTES + 1).expect("grow past threshold");
+        log.append(&[ev(1)])
+            .expect("rolling from 9998 to 9999 must succeed");
+        assert!(
+            dir.path().join("events/m1/9999.jsonl").is_file(),
+            "segment 9999 is legal; only 10000 overflows"
+        );
+    }
+
+    #[test]
     fn cursors_are_sorted_across_machines() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut log = FileEventLog::init(dir.path(), &MachineId("zebra".into())).expect("init");

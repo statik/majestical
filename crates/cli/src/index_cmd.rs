@@ -15,7 +15,7 @@ use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
-use majestical_index::model::{MINILM, WHISPER};
+use majestical_index::model::{MINILM, SIGLIP, WHISPER};
 use majestical_index::ocr::{OCR_MODEL_TAG, OcrResult};
 use majestical_index::pdf::{PDF_MODEL_TAG, PdfContent};
 use majestical_index::text_encoder::TextEncoder;
@@ -61,10 +61,7 @@ pub(crate) struct IndexRunArgs {
 /// file's exact size, whether `ffmpeg`/`ffprobe` are on `PATH`, and whether
 /// the whisper/`MiniLM` models are installed.
 fn capabilities(catalog_root: &Path) -> Capabilities {
-    let model_tag = majestical_index::model::model_dir()
-        .ok()
-        .filter(|dir| majestical_index::model::model_present(dir))
-        .map(|_| majestical_index::model::MODEL_TAG.to_string());
+    let model_tag = model_dir_if_present().map(|_| majestical_index::model::MODEL_TAG.to_string());
     Capabilities {
         model_tag,
         ffmpeg: majestical_index::video::ffmpeg_available(),
@@ -90,20 +87,22 @@ fn describer_model_tag(catalog_root: &Path) -> Option<String> {
     }
 }
 
-/// The whisper cache dir, only if the single ggml weights file is present.
-/// A file-presence check (not size/hash) — mirrors the spirit of
-/// `model_present` without re-hashing half a gigabyte per invocation.
-fn whisper_model_dir_if_present() -> Option<PathBuf> {
+/// The whisper cache dir, only if `model_present_for` accepts it (every
+/// registry file present at its exact byte size) — the single "installed"
+/// definition, not a re-hash, so this stays cheap on every invocation.
+/// `pub(crate)`: `search`'s transcript coverage notice reuses this exact
+/// check so its remedy can't disagree with `index status`'s.
+pub(crate) fn whisper_model_dir_if_present() -> Option<PathBuf> {
     let dir = majestical_index::model::model_dir_for(&WHISPER).ok()?;
-    dir.join(majestical_index::transcribe::MODEL_FILE)
-        .is_file()
-        .then_some(dir)
+    majestical_index::model::model_present_for(&WHISPER, &dir).then_some(dir)
 }
 
-/// The `MiniLM` cache dir, only if its ONNX graph is present.
-fn minilm_model_dir_if_present() -> Option<PathBuf> {
+/// The `MiniLM` cache dir, only if `model_present_for` accepts it.
+/// `pub(crate)`: shared with `search`'s coverage remedy, same rationale as
+/// [`whisper_model_dir_if_present`].
+pub(crate) fn minilm_model_dir_if_present() -> Option<PathBuf> {
     let dir = majestical_index::model::model_dir_for(&MINILM).ok()?;
-    dir.join("model.onnx").is_file().then_some(dir)
+    majestical_index::model::model_present_for(&MINILM, &dir).then_some(dir)
 }
 
 /// Validates `--kinds`, defaulting to every kind when omitted.
@@ -452,8 +451,8 @@ fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> Kind
 /// file's exact size — mirrors `capabilities()`'s check, kept separate
 /// since that function returns a `model_tag` string, not a usable path.
 fn model_dir_if_present() -> Option<PathBuf> {
-    let dir = majestical_index::model::model_dir().ok()?;
-    majestical_index::model::model_present(&dir).then_some(dir)
+    let dir = majestical_index::model::model_dir_for(&SIGLIP).ok()?;
+    majestical_index::model::model_present_for(&SIGLIP, &dir).then_some(dir)
 }
 
 /// Opens `dir` and runs a cheap probe scan (`existing_keys`), catching both
@@ -2334,26 +2333,39 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
     })
 }
 
+/// The captions remedy line, shared verbatim by `index status` and
+/// `search`'s coverage notices so the two surfaces cannot drift.
+pub(crate) const DESCRIBER_REMEDY: &str = "run `maj describer set` to configure a backend";
+
+/// The `model fetch` remedy for the transcript pipeline, naming exactly the
+/// missing models — `None` when both are installed. Shared by `index
+/// status` and `search`'s coverage notices so the command they print is
+/// always the same one.
+pub(crate) fn transcript_model_remedy(whisper: bool, text_model: bool) -> Option<String> {
+    let mut fetches = Vec::new();
+    if !whisper {
+        fetches.push(format!("--only {}", WHISPER.tag));
+    }
+    if !text_model {
+        fetches.push(format!("--only {}", MINILM.tag));
+    }
+    if fetches.is_empty() {
+        None
+    } else {
+        Some(format!("run `maj model fetch {}`", fetches.join(" ")))
+    }
+}
+
 /// Remedy lines for capability gaps, printed under the per-kind status
 /// lines: each names the exact command that closes the gap.
 fn print_status_remedies(plan: &WorkPlan, caps: &Capabilities) {
-    if plan.transcripts.needs_model > 0 {
-        let mut fetches = Vec::new();
-        if !caps.whisper {
-            fetches.push(format!("--only {}", WHISPER.tag));
-        }
-        if !caps.text_model {
-            fetches.push(format!("--only {}", MINILM.tag));
-        }
-        if !fetches.is_empty() {
-            println!(
-                "transcripts needs model: run `maj model fetch {}`",
-                fetches.join(" ")
-            );
-        }
+    if plan.transcripts.needs_model > 0
+        && let Some(remedy) = transcript_model_remedy(caps.whisper, caps.text_model)
+    {
+        println!("transcripts needs model: {remedy}");
     }
     if plan.captions.needs_model > 0 {
-        println!("captions needs model: run `maj describer set` to configure a backend");
+        println!("captions needs model: {DESCRIBER_REMEDY}");
     }
 }
 

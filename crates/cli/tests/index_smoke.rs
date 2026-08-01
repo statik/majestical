@@ -264,7 +264,7 @@ fn search_without_model_degrades_with_notice() {
         .stderr(contains("maj model fetch"));
 }
 
-/// Fake-size model files at the exact byte sizes `model_present()` checks —
+/// Fake-size model files at the exact byte sizes `model_present_for()` checks —
 /// same precedent as `model_fetch_reports_already_present_without_network`.
 /// Passes the (size-only) presence check without a real, loadable model, so
 /// any test using this must never actually reach `Encoder::load`.
@@ -996,7 +996,7 @@ fn keyframe_search_resolves_the_correct_segment_and_timestamp() {
     );
     let model_dir = majestical_index::model::model_dir().expect("resolve model dir");
     assert!(
-        majestical_index::model::model_present(&model_dir),
+        majestical_index::model::model_present_for(&majestical_index::model::SIGLIP, &model_dir),
         "model not present at {}; run `maj model fetch`",
         model_dir.display()
     );

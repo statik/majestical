@@ -11,7 +11,7 @@ use majestical_index::model;
 fn require_model_dir() -> PathBuf {
     let dir = model::model_dir().expect("resolving model dir");
     assert!(
-        model::model_present(&dir),
+        model::model_present_for(&model::SIGLIP, &dir),
         "model not present at {}; run `maj model fetch`",
         dir.display()
     );

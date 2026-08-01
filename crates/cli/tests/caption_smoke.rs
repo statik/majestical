@@ -401,7 +401,7 @@ fn captions_are_healed_into_text_fts() {
     );
 }
 
-/// Fake-size model files at the exact byte sizes `model_present()` checks —
+/// Fake-size model files at the exact byte sizes `model_present_for()` checks —
 /// same precedent as `index_smoke.rs`. Opens the planner's vision-model gate
 /// (the keyframe-manifest path needs `caps.model_tag`) without a real,
 /// loadable model; nothing in these tests may reach `Encoder::load`.

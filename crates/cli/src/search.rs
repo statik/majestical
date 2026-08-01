@@ -11,8 +11,11 @@ use majestical_core::event::{AssetId, Op};
 use majestical_core::media_kind::{MediaKind, media_kind};
 use majestical_core::ports::{AssetSummary, Filter};
 use majestical_core::projection::Projection;
-use majestical_index::vector_store::{VectorHit, VectorStore};
+use majestical_index::model::{MINILM, SIGLIP};
+use majestical_index::text_encoder::TextEncoder;
+use majestical_index::vector_store::{TextChunkHit, TextVectorStore, VectorHit, VectorStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Args for `maj search`, bundled to keep `cmd_search`'s own signature
@@ -27,7 +30,7 @@ pub(crate) struct SearchArgs {
 
 /// The filter keys `search` understands, listed in error messages so a typo'd
 /// key points straight at the fix instead of a silent zero-result search.
-const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after";
+const FILTER_KEYS: &str = "tag, vol/volume, para, kind, online, before, after, in";
 
 /// Searches the catalog: bare terms are ranked by `search_names_ranked` (best
 /// match first); `key:value` tokens resolve to hard `Filter`s and narrow the
@@ -95,13 +98,23 @@ fn run_search(
         !parsed.terms.is_empty() || !parsed.filters.is_empty(),
         "empty query: give search terms or at least one filter"
     );
+    // `in:` scopes where TERMS match, so it routes around the catalog-filter
+    // path entirely (resolve_filters errors on unknown keys) — and without
+    // terms there is nothing for it to scope.
+    let sources = in_sources(&parsed.filters)?;
+    let catalog_raw: Vec<&crate::query::RawFilter> =
+        parsed.filters.iter().filter(|f| f.key != "in").collect();
+    anyhow::ensure!(
+        !(parsed.terms.is_empty() && sources.is_some()),
+        "in: requires search terms — it scopes where terms match, not which assets exist"
+    );
     let (db, projection) = open_catalog(app, catalog_dir)?;
     // Resolved once and shared: `resolve_filter`'s `online:` arm and
     // `print_search_results`'s per-volume online flag both need the mounted
     // set, and each call shells out to `diskutil` per mount — computing it
     // twice would double a search's latency for no benefit.
     let mounted = volume_identity::mounted_volumes();
-    let filters = resolve_filters(&projection, &parsed.filters, &mounted)?;
+    let filters = resolve_filters(&projection, &catalog_raw, &mounted)?;
     let allowed = if filters.is_empty() {
         None
     } else {
@@ -110,12 +123,14 @@ fn run_search(
 
     // Filter-only queries never touch the semantic layer: there is no query
     // text to embed, and every allowed asset is already an exact match.
-    let (ranked, keyframe_ts, coverage) = if parsed.terms.is_empty() {
+    let out = if parsed.terms.is_empty() {
         let Some(set) = &allowed else {
             unreachable!("empty query is rejected above before a catalog is even opened");
         };
-        let ranked = set.iter().map(|a| (a.clone(), 0.0)).take(limit).collect();
-        (ranked, HashMap::new(), None)
+        TermSearchOutput {
+            ranked: set.iter().map(|a| (a.clone(), 0.0)).take(limit).collect(),
+            ..TermSearchOutput::default()
+        }
     } else {
         term_search(
             &db,
@@ -125,20 +140,55 @@ fn run_search(
                 allowed: allowed.as_ref(),
                 limit,
                 projection: &projection,
+                sources: sources.as_ref(),
             },
         )?
     };
     print_search_results(
         &db,
-        &ranked,
+        &out.ranked,
         &PrintOptions {
-            keyframe_ts: &keyframe_ts,
+            keyframe_ts: &out.keyframe_ts,
             mounted: &mounted,
             limit,
             json,
-            coverage,
+            coverage: out.semantic_coverage,
+            text_meta: &out.text_meta,
+            text_coverage: &out.text_coverage,
         },
     )
+}
+
+/// The `in:` source values `search` understands, listed in the error for a
+/// typo'd value. `name` is the filename FTS index; the other four are the
+/// `text_fts` sources.
+const IN_SOURCE_VALUES: [&str; 5] = ["transcript", "caption", "ocr", "pdf", "name"];
+
+/// Collects the `in:` filters into the set of sources to search — `None`
+/// when the query has no `in:` at all (search everything). Multiple `in:`
+/// values union.
+///
+/// # Errors
+/// Returns an error for a negated `in:` (there's no sensible "everywhere
+/// but" over ranked fusion) or a value outside [`IN_SOURCE_VALUES`].
+fn in_sources(raw: &[crate::query::RawFilter]) -> Result<Option<BTreeSet<String>>> {
+    let mut sources = BTreeSet::new();
+    let mut any = false;
+    for filter in raw.iter().filter(|f| f.key == "in") {
+        anyhow::ensure!(
+            !filter.negated,
+            "in: does not support negation — name only the sources to search"
+        );
+        anyhow::ensure!(
+            IN_SOURCE_VALUES.contains(&filter.value.as_str()),
+            "unknown in: source '{}' — one of: {}",
+            filter.value,
+            IN_SOURCE_VALUES.join(", ")
+        );
+        any = true;
+        sources.insert(filter.value.clone());
+    }
+    Ok(any.then_some(sources))
 }
 
 /// Args for `term_search`, bundled to keep its own signature within the
@@ -149,29 +199,59 @@ struct TermSearchArgs<'a> {
     allowed: Option<&'a BTreeSet<AssetId>>,
     limit: usize,
     projection: &'a Projection,
+    /// The `in:` source restriction — `None` searches every source.
+    sources: Option<&'a BTreeSet<String>>,
 }
 
-/// Ranked results, each ranked asset's nearest keyframe timestamp, and
-/// `Some((embedded, eligible))` semantic coverage counts when the semantic
-/// layer ran this search.
-type TermSearchResult = (
-    Vec<(AssetId, f64)>,
-    HashMap<AssetId, i64>,
-    Option<(u64, u64)>,
-);
+/// The text-row detail printed alongside a hit that matched (or
+/// semantically resembled) indexed text: which source, that row's locator
+/// (ms timestamp, PDF page, or -1 for none), and a short snippet.
+struct TextMeta {
+    source: String,
+    locator: i64,
+    snippet: String,
+}
 
-/// Runs a terms-bearing search: FTS name-ranked hits fused with semantic
-/// (embedding) hits via [`fuse_ranked`]. Falls back to FTS-only — exactly
-/// today's ranking and truncation — when the semantic layer contributes
-/// nothing (no model installed, nothing indexed yet, or a query that simply
-/// matched nothing there).
+/// One per-source coverage notice: how much of the eligible catalog this
+/// text source has actually indexed, and the command that closes the gap.
+struct TextCoverage {
+    label: &'static str,
+    noun: &'static str,
+    covered: usize,
+    eligible: usize,
+    remedy: String,
+}
+
+/// Everything a terms-bearing search produces beyond the ranking itself.
+#[derive(Default)]
+struct TermSearchOutput {
+    ranked: Vec<(AssetId, f64)>,
+    /// Each ranked asset's nearest keyframe timestamp (image-semantic
+    /// keyframe hits only).
+    keyframe_ts: HashMap<AssetId, i64>,
+    /// `Some((embedded, eligible))` when the image-semantic layer ran.
+    semantic_coverage: Option<(u64, u64)>,
+    /// Per-asset text detail for printing (FTS row, else best chunk).
+    text_meta: HashMap<AssetId, TextMeta>,
+    /// Per-source text coverage notices, in [`TEXT_SOURCE_INFO`] order.
+    text_coverage: Vec<TextCoverage>,
+}
+
+/// Runs a terms-bearing search: filename FTS, indexed-text FTS, image
+/// vectors, and transcript-chunk vectors, fused via [`fuse_ranked_n`].
+/// Falls back to name-FTS-only — exactly the phase-4 ranking and
+/// truncation — when every other layer contributes nothing (no model
+/// installed, nothing indexed yet, or a query that simply matched nothing
+/// there). An `in:` restriction disables every layer outside the named
+/// sources — including the image-semantic layer, which matches content
+/// rather than any nameable text source.
 ///
 /// # Errors
-/// Returns an error if the FTS query or the local state dir can't be
-/// resolved.
-fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSearchResult> {
-    // A wider net than `limit` for both ranking sources: fusing two rankings
-    // needs headroom past the final cut, or an asset either source ranks
+/// Returns an error if an FTS query, the coverage counts, or the local
+/// state dir can't be resolved.
+fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSearchOutput> {
+    // A wider net than `limit` for every ranking source: fusing rankings
+    // needs headroom past the final cut, or an asset one source ranks
     // just outside its own top `limit` — but that would rank first once
     // fused — never gets the chance to. With a hard filter present, every
     // ranked match is fetched (mirroring the filter-only path's own
@@ -192,42 +272,164 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
         (widened, widened)
     };
 
-    let fts_hits = db.search_names_ranked(args.terms, fts_limit)?;
+    let name_fts = if args.sources.is_none_or(|s| s.contains("name")) {
+        db.search_names_ranked(args.terms, fts_limit)?
+    } else {
+        Vec::new()
+    };
+    let text_sources = selected_text_sources(args.sources);
+    let (text_fts, mut text_meta) =
+        text_fts_search(db, args.terms, text_sources.as_ref(), fts_limit)?;
 
     let state_dir = crate::state_dir::state_dir_for(args.catalog_dir)?;
     let query_text = args.terms.join(" ");
-    let (semantic_ids, keyframe_ts, embedded) =
-        semantic_candidates(&state_dir, &query_text, semantic_limit);
+    let (image_ids, keyframe_ts, embedded) = if image_semantic_enabled(args.sources) {
+        semantic_candidates(&state_dir, &query_text, semantic_limit)
+    } else {
+        (Vec::new(), HashMap::new(), None)
+    };
+    let (chunk_ids, chunk_meta) = if args.sources.is_none_or(|s| s.contains("transcript")) {
+        text_semantic_candidates(&state_dir, &query_text, semantic_limit)
+    } else {
+        (Vec::new(), HashMap::new())
+    };
+    // FTS meta wins when both exist: its snippet highlights the actual
+    // term match; the chunk fills in for purely semantic hits.
+    for (asset, meta) in chunk_meta {
+        text_meta.entry(asset).or_insert(meta);
+    }
 
-    let ranked = fuse_ranked(fts_hits, semantic_ids, args.allowed, args.limit);
+    let ranked = fuse_ranked_n(&FuseInputs {
+        name_fts,
+        text_fts,
+        semantic: vec![image_ids, chunk_ids],
+        allowed: args.allowed,
+        limit: args.limit,
+    });
 
-    let coverage = embedded.map(|embedded| (embedded, eligible_asset_count(args.projection)));
-    Ok((ranked, keyframe_ts, coverage))
+    let semantic_coverage =
+        embedded.map(|embedded| (embedded, eligible_asset_count(args.projection)));
+    let text_coverage = text_coverage_notices(db, args)?;
+    Ok(TermSearchOutput {
+        ranked,
+        keyframe_ts,
+        semantic_coverage,
+        text_meta,
+        text_coverage,
+    })
 }
 
-/// Intersects both ranking sources against `allowed` — a hard filter, not a
-/// ranking hint, so a semantic hit outside the filter set must never survive
-/// fusion — then fuses them via [`rrf_merge`]. With no semantic hits this is
-/// FTS-only: the original bm25 scores and order, truncated at `limit`.
-fn fuse_ranked(
-    fts: Vec<(AssetId, f64)>,
-    semantic: Vec<AssetId>,
-    allowed: Option<&BTreeSet<AssetId>>,
+/// Whether the image-vector layer participates: only on an unrestricted
+/// query. Image vectors match visual content, not any nameable text source
+/// — any `in:` restriction (even `in:name`: "name means names") turns them
+/// off. A pure function so the gate itself is unit-testable: the CLI smoke
+/// tests run without a `SigLIP` model and cannot tell "layer disabled" from
+/// "ran and found nothing".
+fn image_semantic_enabled(sources: Option<&BTreeSet<String>>) -> bool {
+    sources.is_none()
+}
+
+/// The four `text_fts` sources restricted to the `in:` set — `None` when
+/// the query is unrestricted (search every source). `Some(empty)` (e.g.
+/// `in:name`) means "no text source at all".
+fn selected_text_sources(sources: Option<&BTreeSet<String>>) -> Option<BTreeSet<String>> {
+    sources.map(|selected| {
+        TEXT_SOURCE_INFO
+            .iter()
+            .filter(|info| selected.contains(info.source))
+            .map(|info| info.source.to_string())
+            .collect()
+    })
+}
+
+/// Ranked text-FTS hits plus each hit's per-asset print detail.
+type RankedTextHits = (Vec<(AssetId, f64)>, HashMap<AssetId, TextMeta>);
+
+/// Ranked text-FTS hits (best row per asset, raw bm25 scores — same
+/// convention as `search_names_ranked`) plus each hit's source/locator/
+/// snippet detail for printing.
+///
+/// # Errors
+/// Returns an error if the underlying FTS query fails.
+fn text_fts_search(
+    db: &SqliteCatalog,
+    terms: &[String],
+    sources: Option<&BTreeSet<String>>,
     limit: usize,
-) -> Vec<(AssetId, f64)> {
-    let fts: Vec<(AssetId, f64)> = fts
-        .into_iter()
-        .filter(|(a, _)| allowed.is_none_or(|s| s.contains(a)))
-        .collect();
-    let semantic: Vec<AssetId> = semantic
-        .into_iter()
-        .filter(|a| allowed.is_none_or(|s| s.contains(a)))
-        .collect();
-    if semantic.is_empty() {
-        return fts.into_iter().take(limit).collect();
+) -> Result<RankedTextHits> {
+    if sources.is_some_and(BTreeSet::is_empty) {
+        return Ok((Vec::new(), HashMap::new()));
     }
-    let fts_ids: Vec<AssetId> = fts.into_iter().map(|(a, _)| a).collect();
-    rrf_merge(&[fts_ids, semantic], limit)
+    let hits = db.search_text_ranked(terms, sources, limit)?;
+    let mut ranked = Vec::new();
+    let mut meta = HashMap::new();
+    for hit in hits {
+        ranked.push((hit.asset.clone(), hit.score));
+        meta.insert(
+            hit.asset,
+            TextMeta {
+                source: hit.source,
+                locator: hit.locator,
+                snippet: hit.snippet,
+            },
+        );
+    }
+    Ok((ranked, meta))
+}
+
+/// Ranked inputs for [`fuse_ranked_n`], bundled to keep its signature
+/// within the house 5-positional-parameter limit.
+struct FuseInputs<'a> {
+    /// bm25-scored filename hits, best-first (raw ranks: more negative is
+    /// better; order is what matters here).
+    name_fts: Vec<(AssetId, f64)>,
+    /// bm25-scored indexed-text hits, best row per asset.
+    text_fts: Vec<(AssetId, f64)>,
+    /// Rank-ordered semantic lists (image vectors, transcript chunks).
+    semantic: Vec<Vec<AssetId>>,
+    allowed: Option<&'a BTreeSet<AssetId>>,
+    limit: usize,
+}
+
+/// N-way reciprocal-rank fusion with the hard-filter intersection applied
+/// to EVERY input list — the phase-4 filter-leak fix, generalized: a hit
+/// outside the filter set must never survive fusion no matter which list it
+/// arrived on. When only name FTS has results this is exactly the phase-4
+/// N=1 behavior: bm25 scores and order, truncated at `limit`.
+fn fuse_ranked_n(inputs: &FuseInputs<'_>) -> Vec<(AssetId, f64)> {
+    let keep = |asset: &AssetId| inputs.allowed.is_none_or(|allowed| allowed.contains(asset));
+    let name: Vec<(AssetId, f64)> = inputs
+        .name_fts
+        .iter()
+        .filter(|(a, _)| keep(a))
+        .cloned()
+        .collect();
+    let text: Vec<(AssetId, f64)> = inputs
+        .text_fts
+        .iter()
+        .filter(|(a, _)| keep(a))
+        .cloned()
+        .collect();
+    let semantic: Vec<Vec<AssetId>> = inputs
+        .semantic
+        .iter()
+        .map(|list| list.iter().filter(|a| keep(a)).cloned().collect::<Vec<_>>())
+        .filter(|list: &Vec<AssetId>| !list.is_empty())
+        .collect();
+    if text.is_empty() && semantic.is_empty() {
+        let mut ranked = name;
+        ranked.truncate(inputs.limit);
+        return ranked;
+    }
+    let mut lists: Vec<Vec<AssetId>> = Vec::new();
+    if !name.is_empty() {
+        lists.push(name.into_iter().map(|(a, _)| a).collect());
+    }
+    if !text.is_empty() {
+        lists.push(text.into_iter().map(|(a, _)| a).collect());
+    }
+    lists.extend(semantic);
+    rrf_merge(&lists, inputs.limit)
 }
 
 /// Counts catalog assets eligible for semantic embedding: any asset whose
@@ -246,6 +448,131 @@ fn eligible_asset_count(projection: &Projection) -> u64 {
         }
     }
     count
+}
+
+/// One `text_fts` source's coverage-notice metadata: its row key, the label
+/// and eligible-population noun the notice prints, and which media kinds
+/// the index planner considers eligible for it (mirroring
+/// `majestical_index::work`'s per-kind eligibility).
+struct TextSourceInfo {
+    source: &'static str,
+    label: &'static str,
+    noun: &'static str,
+    kinds: &'static [MediaKind],
+}
+
+/// The four text sources, in notice-print order.
+const TEXT_SOURCE_INFO: [TextSourceInfo; 4] = [
+    TextSourceInfo {
+        source: "transcript",
+        label: "transcripts",
+        noun: "video/audio assets",
+        kinds: &[MediaKind::Video, MediaKind::Audio],
+    },
+    TextSourceInfo {
+        source: "caption",
+        label: "captions",
+        noun: "image/video/pdf assets",
+        kinds: &[MediaKind::Image, MediaKind::Video, MediaKind::Pdf],
+    },
+    TextSourceInfo {
+        source: "ocr",
+        label: "ocr",
+        noun: "image/video assets",
+        kinds: &[MediaKind::Image, MediaKind::Video],
+    },
+    TextSourceInfo {
+        source: "pdf",
+        label: "pdf",
+        noun: "pdf assets",
+        kinds: &[MediaKind::Pdf],
+    },
+];
+
+/// Catalog assets whose media kind (first instance's basename classifies,
+/// as everywhere else) is one of `kinds`.
+fn eligible_assets(projection: &Projection, kinds: &[MediaKind]) -> BTreeSet<AssetId> {
+    let mut eligible = BTreeSet::new();
+    for (asset, state) in projection.assets() {
+        let Some((_, path)) = state.instances.keys().next() else {
+            continue;
+        };
+        if kinds.contains(&media_kind(path)) {
+            eligible.insert(asset.clone());
+        }
+    }
+    eligible
+}
+
+/// Builds the per-source text coverage notices: for every text source this
+/// search consulted, count the eligible assets versus those with `text_fts`
+/// rows, and attach the remedy that closes the gap. A fully covered (or
+/// empty-population) source produces no notice.
+///
+/// # Errors
+/// Returns an error if a `text_assets` query fails.
+fn text_coverage_notices(
+    db: &SqliteCatalog,
+    args: &TermSearchArgs<'_>,
+) -> Result<Vec<TextCoverage>> {
+    let mut notices = Vec::new();
+    for info in &TEXT_SOURCE_INFO {
+        if !args.sources.is_none_or(|s| s.contains(info.source)) {
+            continue;
+        }
+        let eligible = eligible_assets(args.projection, info.kinds);
+        if eligible.is_empty() {
+            continue;
+        }
+        let covered_all = db.text_assets(info.source)?;
+        let covered = eligible.iter().filter(|a| covered_all.contains(*a)).count();
+        if covered < eligible.len() {
+            notices.push(TextCoverage {
+                label: info.label,
+                noun: info.noun,
+                covered,
+                eligible: eligible.len(),
+                remedy: source_remedy(info.source, args.catalog_dir),
+            });
+        }
+    }
+    Ok(notices)
+}
+
+/// The generic close-the-gap command for a text source with no capability
+/// gate (OCR, PDF — and transcripts/captions once their models/backends are
+/// in place).
+const INDEX_RUN_REMEDY: &str = "run `maj index run`";
+
+/// The remedy a coverage notice names for `source`: the shared `index
+/// status` strings (see `index_cmd::transcript_model_remedy` and
+/// `index_cmd::DESCRIBER_REMEDY` — shared consts so the two surfaces can't
+/// drift) when a capability is missing, otherwise plain
+/// [`INDEX_RUN_REMEDY`].
+fn source_remedy(source: &str, catalog_dir: &Path) -> String {
+    match source {
+        "transcript" => {
+            let whisper = crate::index_cmd::whisper_model_dir_if_present().is_some();
+            let text_model = crate::index_cmd::minilm_model_dir_if_present().is_some();
+            crate::index_cmd::transcript_model_remedy(whisper, text_model)
+                .unwrap_or_else(|| INDEX_RUN_REMEDY.to_string())
+        }
+        "caption" => {
+            // An unreadable describer config degrades to "unconfigured"
+            // here, matching `index_cmd::capabilities`' treatment — this
+            // only selects which remedy line to print.
+            let configured = crate::describer_cmd::load_config(catalog_dir)
+                .ok()
+                .flatten()
+                .is_some();
+            if configured {
+                INDEX_RUN_REMEDY.to_string()
+            } else {
+                crate::index_cmd::DESCRIBER_REMEDY.to_string()
+            }
+        }
+        _ => INDEX_RUN_REMEDY.to_string(),
+    }
 }
 
 /// Reciprocal Rank Fusion: merges ranked `lists` into one ranking by
@@ -322,9 +649,9 @@ impl SemanticMiss {
 /// `embedded == 0` (indistinguishable from a genuinely empty index) by a
 /// `.ok()`/`map_or` outside the guard.
 fn open_semantic_index(state_dir: &Path) -> Result<(PathBuf, VectorStore, u64), SemanticMiss> {
-    let model_dir = majestical_index::model::model_dir()
+    let model_dir = majestical_index::model::model_dir_for(&SIGLIP)
         .ok()
-        .filter(|dir| majestical_index::model::model_present(dir))
+        .filter(|dir| majestical_index::model::model_present_for(&SIGLIP, dir))
         .ok_or(SemanticMiss::NoModel)?;
 
     let lance_dir = state_dir.join("lance");
@@ -431,7 +758,147 @@ fn semantic_candidates(
     (ranked, keyframe_ts, Some(embedded))
 }
 
-/// Formats a keyframe timestamp as `@MmSSs` (e.g. `@1m05s`), text-mode only.
+/// Why the transcript-semantic layer couldn't run this search — the text
+/// analogue of [`SemanticMiss`], with its own messages because the fixes
+/// differ: the model here is `MiniLM`, and the index is the `text_chunks`
+/// Lance table rather than the image `vectors` table.
+enum TextSemanticMiss {
+    NoModel,
+    EmptyIndex,
+    /// The `text_chunks` table exists but couldn't be read — same corrupt-
+    /// dataset possibility as [`SemanticMiss::Unreadable`], same rule:
+    /// `search` never repairs, only `index run` may rebuild.
+    Unreadable(String),
+}
+
+impl TextSemanticMiss {
+    fn note(&self) -> String {
+        match self {
+            TextSemanticMiss::NoModel => format!(
+                "transcript search unavailable — run `maj model fetch --only {}`",
+                MINILM.tag
+            ),
+            TextSemanticMiss::EmptyIndex => {
+                "transcript index is empty — run `maj index run`".to_string()
+            }
+            TextSemanticMiss::Unreadable(reason) => {
+                format!("transcript index unreadable ({reason}) — run `maj index run` to rebuild")
+            }
+        }
+    }
+}
+
+/// Resolves the `MiniLM` model (file-size checks only), then opens the
+/// local `text_chunks` Lance table READ-ONLY and confirms it holds at least
+/// one chunk for `MINILM.tag` — mirroring [`open_semantic_index`]'s
+/// structure exactly, including running the open AND the probe inside one
+/// `catch_corruption` closure so a counting-read error surfaces as
+/// `Unreadable` instead of masquerading as an empty index.
+fn open_text_semantic_index(
+    state_dir: &Path,
+) -> Result<(PathBuf, TextVectorStore), TextSemanticMiss> {
+    let model_dir = majestical_index::model::model_dir_for(&MINILM)
+        .ok()
+        .filter(|dir| majestical_index::model::model_present_for(&MINILM, dir))
+        .ok_or(TextSemanticMiss::NoModel)?;
+
+    let lance_dir = state_dir.join("lance");
+    let opened = majestical_index::vector_store::catch_corruption(move || {
+        let Some(store) = TextVectorStore::open_existing(&lance_dir)? else {
+            return Ok(None);
+        };
+        let embedded = store.distinct_assets(MINILM.tag)?.len();
+        Ok(Some((store, embedded)))
+    });
+    let (store, embedded) = match opened {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Err(TextSemanticMiss::EmptyIndex),
+        Err(reason) => return Err(TextSemanticMiss::Unreadable(reason)),
+    };
+    if embedded == 0 {
+        return Err(TextSemanticMiss::EmptyIndex);
+    }
+    Ok((model_dir, store))
+}
+
+/// Loads the `MiniLM` text encoder and embeds `query` (384-d unit-norm).
+fn embed_text_query(model_dir: &Path, query: &str) -> Option<Vec<f32>> {
+    let mut encoder = TextEncoder::load(model_dir).ok()?;
+    encoder.embed(query).ok()
+}
+
+/// Truncates chunk text to a short display snippet — chunks run to a few
+/// sentences, far too long to append to every result line verbatim.
+fn snippet_text(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(MAX_CHARS).collect();
+    format!("{cut}\u{2026}")
+}
+
+/// Collapses chunk hits to one entry per asset, keeping the first (nearest)
+/// chunk's rank and its `(start_ms, text)` for printing — same
+/// score-inflation rationale as [`dedupe_hits`]: an asset with many
+/// near-matching chunks must rank by how well it matched, not how often.
+fn dedupe_text_chunk_hits(hits: Vec<TextChunkHit>) -> (Vec<AssetId>, HashMap<AssetId, TextMeta>) {
+    let mut ranked = Vec::new();
+    let mut meta: HashMap<AssetId, TextMeta> = HashMap::new();
+    for hit in hits {
+        let asset = AssetId(format!("xxh3:{}", hit.asset_hex));
+        if meta.contains_key(&asset) {
+            continue;
+        }
+        ranked.push(asset.clone());
+        meta.insert(
+            asset,
+            TextMeta {
+                source: hit.source,
+                locator: hit.start_ms,
+                snippet: snippet_text(&hit.text),
+            },
+        );
+    }
+    (ranked, meta)
+}
+
+/// Runs the transcript-semantic side of a search: embeds `query` with
+/// `MiniLM` and nearest-neighbor searches the local `text_chunks` table.
+/// Degrades to `(empty, empty)` on any miss — additive, never a hard
+/// requirement — printing the specific stderr note for the reason (see
+/// [`TextSemanticMiss`]), mirroring [`semantic_candidates`].
+fn text_semantic_candidates(
+    state_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> (Vec<AssetId>, HashMap<AssetId, TextMeta>) {
+    let (model_dir, store) = match open_text_semantic_index(state_dir) {
+        Ok(opened) => opened,
+        Err(miss) => {
+            eprintln!("{}", miss.note());
+            return (Vec::new(), HashMap::new());
+        }
+    };
+    let Some(vector) = embed_text_query(&model_dir, query) else {
+        eprintln!("{}", TextSemanticMiss::NoModel.note());
+        return (Vec::new(), HashMap::new());
+    };
+    let hits = match store.search(&vector, MINILM.tag, limit) {
+        Ok(hits) => hits,
+        Err(err) => {
+            // Same open-passed-but-read-failed reasoning as
+            // `semantic_candidates`: `Unreadable`, never relabeled empty.
+            eprintln!("{}", TextSemanticMiss::Unreadable(err.to_string()).note());
+            return (Vec::new(), HashMap::new());
+        }
+    };
+    dedupe_text_chunk_hits(hits)
+}
+
+/// Formats a millisecond timestamp (keyframe or transcript/OCR locator) as
+/// `@MmSSs` (e.g. `@1m05s`), text-mode only.
 fn format_ts(ts_ms: i64) -> String {
     let total_secs = ts_ms.max(0) / 1000;
     let minutes = total_secs / 60;
@@ -445,7 +912,7 @@ fn format_ts(ts_ms: i64) -> String {
 /// than silently ignoring it.
 fn resolve_filters(
     projection: &Projection,
-    raw: &[crate::query::RawFilter],
+    raw: &[&crate::query::RawFilter],
     mounted: &BTreeMap<String, PathBuf>,
 ) -> Result<Vec<Filter>> {
     raw.iter()
@@ -535,15 +1002,35 @@ struct PrintOptions<'a> {
     /// ran this search; `None` when it didn't (filter-only query, or a
     /// degraded miss already noted on stderr).
     coverage: Option<(u64, u64)>,
+    /// Per-asset text detail (source, locator, snippet) for hits that
+    /// matched or resembled indexed text; empty otherwise.
+    text_meta: &'a HashMap<AssetId, TextMeta>,
+    /// Per-source text coverage notices; empty for filter-only queries.
+    text_coverage: &'a [TextCoverage],
+}
+
+/// Renders one hit's text detail: locator (` @MmSSs` for a ms timestamp,
+/// ` p<page>` for a PDF page, nothing for locator -1) followed by the
+/// quoted snippet.
+fn render_text_meta(meta: &TextMeta) -> String {
+    let mut out = String::new();
+    if meta.source == "pdf" {
+        let _ = write!(out, "  p{}", meta.locator);
+    } else if meta.locator >= 0 {
+        let _ = write!(out, "  {}", format_ts(meta.locator));
+    }
+    let _ = write!(out, "  \"{}\"", meta.snippet);
+    out
 }
 
 /// Renders ranked results: JSON prints one object per hit with its volumes
-/// (online/offline per the currently mounted set), tags, and (for a semantic
-/// keyframe hit) `timestamp_ms`; text prints one line per hit (`{asset}
-/// {name}  [label●|○,...]`, `tags:` and `@MmSSs` appended when present)
-/// followed by a `"{n} results"` summary line, a truncation hint when the
-/// result count hit `limit` exactly, and — when the semantic layer ran but
-/// hasn't embedded every eligible asset yet — a coverage notice.
+/// (online/offline per the currently mounted set), tags, (for a semantic
+/// keyframe hit) `timestamp_ms`, and (for a text hit) `source`/`locator`/
+/// `snippet`; text prints one line per hit (`{asset} {name}  [label●|○,...]`,
+/// `tags:`, `@MmSSs`, and the text hit's locator + quoted snippet appended
+/// when present) followed by a `"{n} results"` summary line, a truncation
+/// hint when the result count hit `limit` exactly, and — when a layer ran
+/// but hasn't indexed every eligible asset yet — its coverage notice.
 fn print_search_results(
     db: &SqliteCatalog,
     ranked: &[(AssetId, f64)],
@@ -595,6 +1082,11 @@ fn print_search_results_json(
             if let Some(ts) = opts.keyframe_ts.get(asset) {
                 result["timestamp_ms"] = serde_json::json!(ts);
             }
+            if let Some(meta) = opts.text_meta.get(asset) {
+                result["source"] = serde_json::json!(meta.source);
+                result["locator"] = serde_json::json!(meta.locator);
+                result["snippet"] = serde_json::json!(meta.snippet);
+            }
             result
         })
         .collect();
@@ -602,6 +1094,21 @@ fn print_search_results_json(
     if let Some((embedded, eligible)) = opts.coverage {
         payload["semantic_coverage"] =
             serde_json::json!({ "embedded": embedded, "eligible": eligible });
+    }
+    if !opts.text_coverage.is_empty() {
+        let notices: Vec<_> = opts
+            .text_coverage
+            .iter()
+            .map(|notice| {
+                serde_json::json!({
+                    "source": notice.label,
+                    "covered": notice.covered,
+                    "eligible": notice.eligible,
+                    "remedy": notice.remedy,
+                })
+            })
+            .collect();
+        payload["text_coverage"] = serde_json::json!(notices);
     }
     println!("{payload}");
 }
@@ -635,6 +1142,9 @@ fn print_search_results_text(
         if let Some(ts) = opts.keyframe_ts.get(asset) {
             print!("  {}", format_ts(*ts));
         }
+        if let Some(meta) = opts.text_meta.get(asset) {
+            print!("{}", render_text_meta(meta));
+        }
         println!();
     }
     println!("{} results", ranked.len());
@@ -651,6 +1161,12 @@ fn print_search_results_text(
         && embedded < eligible
     {
         println!("semantic index: {embedded} of {eligible} eligible assets");
+    }
+    for notice in opts.text_coverage {
+        println!(
+            "{}: {} of {} {} — {}",
+            notice.label, notice.covered, notice.eligible, notice.noun, notice.remedy
+        );
     }
 }
 
@@ -700,11 +1216,14 @@ fn print_saved_searches(projection: &Projection, json: bool) {
 
 #[cfg(test)]
 mod semantic_tests {
-    use super::{AssetId, dedupe_hits, eligible_asset_count, format_ts, fuse_ranked, rrf_merge};
+    use super::{
+        AssetId, FuseInputs, dedupe_hits, dedupe_text_chunk_hits, eligible_asset_count, format_ts,
+        fuse_ranked_n, in_sources, render_text_meta, rrf_merge, snippet_text,
+    };
     use majestical_core::clock::{Hlc, MachineId};
     use majestical_core::event::{Event, EventId, Op};
     use majestical_core::projection::Projection;
-    use majestical_index::vector_store::VectorHit;
+    use majestical_index::vector_store::{TextChunkHit, VectorHit};
     use std::collections::BTreeSet;
 
     #[test]
@@ -746,19 +1265,22 @@ mod semantic_tests {
         assert_eq!(merged.len(), 1);
     }
 
+    /// Migrated from the phase-4 two-list `fuse_ranked` — pins the same
+    /// behavior at N=2 (name FTS + one semantic list).
     #[test]
-    fn fuse_ranked_drops_semantic_hits_outside_the_filter_set() {
+    fn fuse_n_drops_semantic_hits_outside_the_filter_set() {
         let kept = AssetId("xxh3:aaa".into());
         let excluded = AssetId("xxh3:bbb".into());
         let allowed: BTreeSet<AssetId> = [kept.clone()].into_iter().collect();
         // `excluded` is the top semantic hit and absent from FTS entirely —
         // exactly the shape a `-tag:x` exclusion produces.
-        let merged = fuse_ranked(
-            vec![(kept.clone(), 1.0)],
-            vec![excluded, kept.clone()],
-            Some(&allowed),
-            10,
-        );
+        let merged = fuse_ranked_n(&FuseInputs {
+            name_fts: vec![(kept.clone(), 1.0)],
+            text_fts: Vec::new(),
+            semantic: vec![vec![excluded, kept.clone()]],
+            allowed: Some(&allowed),
+            limit: 10,
+        });
         let ids: Vec<&AssetId> = merged.iter().map(|(id, _)| id).collect();
         assert_eq!(
             ids,
@@ -767,30 +1289,228 @@ mod semantic_tests {
         );
     }
 
+    /// Migrated from the phase-4 two-list `fuse_ranked`, same N=2 pin.
     #[test]
-    fn fuse_ranked_drops_fts_hits_outside_the_filter_set() {
+    fn fuse_n_drops_fts_hits_outside_the_filter_set() {
         let kept = AssetId("xxh3:aaa".into());
         let excluded = AssetId("xxh3:bbb".into());
         let allowed: BTreeSet<AssetId> = [kept.clone()].into_iter().collect();
-        let merged = fuse_ranked(
-            vec![(excluded, 2.0), (kept.clone(), 1.0)],
-            vec![kept.clone()],
-            Some(&allowed),
-            10,
-        );
+        let merged = fuse_ranked_n(&FuseInputs {
+            name_fts: vec![(excluded, 2.0), (kept.clone(), 1.0)],
+            text_fts: Vec::new(),
+            semantic: vec![vec![kept.clone()]],
+            allowed: Some(&allowed),
+            limit: 10,
+        });
         let ids: Vec<&AssetId> = merged.iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![&kept]);
     }
 
     #[test]
-    fn fuse_ranked_without_semantic_hits_is_fts_scores_and_order() {
+    fn fuse_n_hard_filters_every_list() {
+        let allowed: BTreeSet<AssetId> = [AssetId("xxh3:aa".into())].into();
+        let name_fts = vec![
+            (AssetId("xxh3:aa".into()), -1.0),
+            (AssetId("xxh3:zz".into()), -2.0),
+        ];
+        let text_fts = vec![(AssetId("xxh3:zz".into()), -3.0)];
+        let semantic_lists = vec![
+            vec![AssetId("xxh3:zz".into())],
+            vec![AssetId("xxh3:zz".into()), AssetId("xxh3:aa".into())],
+        ];
+        let fused = fuse_ranked_n(&FuseInputs {
+            name_fts,
+            text_fts,
+            semantic: semantic_lists,
+            allowed: Some(&allowed),
+            limit: 10,
+        });
+        assert!(!fused.is_empty(), "the allowed asset itself must survive");
+        assert!(
+            fused.iter().all(|(asset, _)| asset.0 == "xxh3:aa"),
+            "the phase-4 BLOCKER: zz is filtered out of EVERY list, ranked or semantic"
+        );
+    }
+
+    #[test]
+    fn fuse_n_reduces_to_bm25_when_only_name_fts_has_results() {
+        let name_fts = vec![
+            (AssetId("xxh3:aa".into()), -1.5),
+            (AssetId("xxh3:bb".into()), -0.5),
+        ];
+        let fused = fuse_ranked_n(&FuseInputs {
+            name_fts: name_fts.clone(),
+            text_fts: vec![],
+            semantic: vec![],
+            allowed: None,
+            limit: 10,
+        });
+        assert_eq!(
+            fused, name_fts,
+            "bm25 scores and order preserved (phase-4 behavior at N=1)"
+        );
+    }
+
+    /// Migrated from the phase-4 `fuse_ranked_without_semantic_hits...`:
+    /// the bm25 fallback also truncates at `limit`.
+    #[test]
+    fn fuse_n_bm25_fallback_truncates_at_limit() {
         let a = AssetId("xxh3:aaa".into());
         let b = AssetId("xxh3:bbb".into());
-        let merged = fuse_ranked(vec![(b.clone(), 9.0), (a, 1.0)], Vec::new(), None, 1);
+        let fused = fuse_ranked_n(&FuseInputs {
+            name_fts: vec![(b.clone(), 9.0), (a, 1.0)],
+            text_fts: vec![],
+            semantic: vec![],
+            allowed: None,
+            limit: 1,
+        });
         assert_eq!(
-            merged,
+            fused,
             vec![(b, 9.0)],
             "fts-only keeps bm25 scores and order"
+        );
+    }
+
+    #[test]
+    fn fuse_n_rrf_merges_all_nonempty_lists() {
+        // An asset ranked in three lists beats one ranked in a single list.
+        let name_fts = vec![(AssetId("xxh3:aa".into()), -1.0)];
+        let text_fts = vec![
+            (AssetId("xxh3:bb".into()), -1.0),
+            (AssetId("xxh3:aa".into()), -0.5),
+        ];
+        let semantic = vec![vec![AssetId("xxh3:aa".into()), AssetId("xxh3:bb".into())]];
+        let fused = fuse_ranked_n(&FuseInputs {
+            name_fts,
+            text_fts,
+            semantic,
+            allowed: None,
+            limit: 10,
+        });
+        assert_eq!(fused[0].0.0, "xxh3:aa");
+    }
+
+    #[test]
+    fn fuse_n_limit_truncates() {
+        let name_fts: Vec<_> = (0..20)
+            .map(|i| (AssetId(format!("xxh3:{i:02}")), -f64::from(i)))
+            .collect();
+        // A nonempty text list forces the RRF path (not the bm25 fallback),
+        // so this pins rrf-side truncation specifically.
+        let fused = fuse_ranked_n(&FuseInputs {
+            name_fts,
+            text_fts: vec![(AssetId("xxh3:00".into()), -1.0)],
+            semantic: vec![],
+            allowed: None,
+            limit: 5,
+        });
+        assert_eq!(fused.len(), 5);
+    }
+
+    fn raw(key: &str, value: &str, negated: bool) -> crate::query::RawFilter {
+        crate::query::RawFilter {
+            key: key.into(),
+            value: value.into(),
+            negated,
+        }
+    }
+
+    #[test]
+    fn image_semantic_enabled_only_without_an_in_restriction() {
+        assert!(
+            super::image_semantic_enabled(None),
+            "an unrestricted query includes the image-vector layer"
+        );
+        let transcript: BTreeSet<String> = ["transcript".to_string()].into();
+        assert!(
+            !super::image_semantic_enabled(Some(&transcript)),
+            "in:transcript must not surface image-vector hits"
+        );
+        let name: BTreeSet<String> = ["name".to_string()].into();
+        assert!(
+            !super::image_semantic_enabled(Some(&name)),
+            "in:name means names — no image-vector hits"
+        );
+    }
+
+    #[test]
+    fn in_sources_unions_values_and_ignores_other_keys() {
+        let filters = vec![
+            raw("in", "transcript", false),
+            raw("tag", "pets", false),
+            raw("in", "ocr", false),
+        ];
+        let sources = in_sources(&filters).expect("valid").expect("restricted");
+        let got: Vec<&str> = sources.iter().map(String::as_str).collect();
+        assert_eq!(got, vec!["ocr", "transcript"]);
+    }
+
+    #[test]
+    fn in_sources_without_in_filters_is_unrestricted() {
+        let filters = vec![raw("tag", "pets", false)];
+        assert!(in_sources(&filters).expect("valid").is_none());
+    }
+
+    #[test]
+    fn in_sources_rejects_negation() {
+        let err = in_sources(&[raw("in", "ocr", true)]).expect_err("must fail");
+        assert!(err.to_string().contains("negation"), "{err}");
+    }
+
+    #[test]
+    fn in_sources_rejects_unknown_values_naming_the_valid_set() {
+        let err = in_sources(&[raw("in", "subtitles", false)]).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("subtitles") && msg.contains("transcript"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn snippet_text_trims_and_truncates_on_a_char_boundary() {
+        assert_eq!(snippet_text("  short  "), "short");
+        let long = "é".repeat(200);
+        let cut = snippet_text(&long);
+        assert!(cut.chars().count() == 81 && cut.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn dedupe_text_chunk_hits_keeps_the_nearest_chunk_per_asset() {
+        let hit = |ms: i64, text: &str| TextChunkHit {
+            asset_hex: "aa11".into(),
+            source: "transcript".into(),
+            start_ms: ms,
+            end_ms: ms + 1000,
+            text: text.into(),
+            distance: 0.1,
+        };
+        let (ranked, meta) = dedupe_text_chunk_hits(vec![hit(5000, "best"), hit(9000, "worse")]);
+        let asset = AssetId("xxh3:aa11".into());
+        assert_eq!(ranked, vec![asset.clone()]);
+        let kept = meta.get(&asset).expect("meta");
+        assert_eq!((kept.locator, kept.snippet.as_str()), (5000, "best"));
+    }
+
+    #[test]
+    fn render_text_meta_formats_each_locator_kind() {
+        let meta = |source: &str, locator: i64| super::TextMeta {
+            source: source.into(),
+            locator,
+            snippet: "quarterly budget".into(),
+        };
+        assert_eq!(
+            render_text_meta(&meta("transcript", 5000)),
+            "  @0m05s  \"quarterly budget\""
+        );
+        assert_eq!(
+            render_text_meta(&meta("pdf", 3)),
+            "  p3  \"quarterly budget\""
+        );
+        assert_eq!(
+            render_text_meta(&meta("caption", -1)),
+            "  \"quarterly budget\"",
+            "locator -1 renders no position"
         );
     }
 

@@ -150,13 +150,15 @@ pub(crate) fn file_url(spec: &ModelSpec, file: &ModelFile) -> String {
     )
 }
 
-/// Cheap presence check: every [`MODEL_FILES`] entry exists at its exact
-/// byte size. Hashes are verified at fetch time, not here — re-hashing
-/// hundreds of megabytes on every `index status` call would be far too slow
-/// for a check that runs on every invocation.
+/// Cheap presence check: every one of `spec`'s files exists in `dir` at its
+/// exact byte size. Hashes are verified at fetch time, not here —
+/// re-hashing hundreds of megabytes on every `index status` call would be
+/// far too slow for a check that runs on every invocation. The single
+/// "installed" definition for every model: capability checks, remedies, and
+/// search-time gates must all go through this so they can never disagree.
 #[must_use]
-pub fn model_present(dir: &Path) -> bool {
-    MODEL_FILES.iter().all(|file| {
+pub fn model_present_for(spec: &ModelSpec, dir: &Path) -> bool {
+    spec.files.iter().all(|file| {
         std::fs::metadata(dir.join(file.name)).is_ok_and(|meta| meta.len() == file.bytes)
     })
 }
@@ -224,7 +226,7 @@ fn already_present(spec: &FetchSpec<'_>, dest: &Path) -> Result<bool, IndexError
     }
     // Right size, wrong hash: remove it now. Otherwise, if the redownload
     // below also fails, this corrupt file would stay behind at `dest` and
-    // `model_present`'s size-only check would wrongly accept it later.
+    // `model_present_for`'s size-only check would wrongly accept it later.
     std::fs::remove_file(dest).map_err(|source| {
         IndexError::Model(format!("removing corrupt {}: {source}", dest.display()))
     })?;
@@ -547,30 +549,68 @@ mod tests {
         assert!(url.ends_with("ggml-large-v3-turbo-q5_0.bin"));
     }
 
+    /// A tiny two-file spec so the presence rule is pinned independently of
+    /// any real model's registry entry.
+    const TWO_FILE_SPEC: ModelSpec = ModelSpec {
+        tag: "test-two-files",
+        repo: "example/repo",
+        revision: "deadbeef",
+        files: &[
+            ModelFile {
+                name: "a.bin",
+                repo_path: "a.bin",
+                sha256: "00",
+                bytes: 8,
+            },
+            ModelFile {
+                name: "b.bin",
+                repo_path: "b.bin",
+                sha256: "11",
+                bytes: 16,
+            },
+        ],
+    };
+
+    fn write_at_len(dir: &Path, name: &str, len: u64) {
+        let f = std::fs::File::create(dir.join(name)).expect("create");
+        f.set_len(len).expect("set_len");
+    }
+
     #[test]
-    fn model_present_requires_every_file_at_its_size() {
+    fn model_present_for_requires_every_spec_file_at_its_exact_size() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for file in &MODEL_FILES {
-            let path = dir.path().join(file.name);
-            let f = std::fs::File::create(&path).expect("create");
-            let wrong_len = if file.name == MODEL_FILES[0].name {
-                file.bytes + 1
-            } else {
-                file.bytes
-            };
-            f.set_len(wrong_len).expect("set_len");
-        }
+        write_at_len(dir.path(), "a.bin", 8);
         assert!(
-            !model_present(dir.path()),
+            !model_present_for(&TWO_FILE_SPEC, dir.path()),
+            "a missing file must fail presence"
+        );
+
+        write_at_len(dir.path(), "b.bin", 17);
+        assert!(
+            !model_present_for(&TWO_FILE_SPEC, dir.path()),
             "one wrong-sized file must fail presence"
         );
 
-        let fixed = dir.path().join(MODEL_FILES[0].name);
-        let f = std::fs::File::create(&fixed).expect("recreate");
-        f.set_len(MODEL_FILES[0].bytes).expect("set_len");
+        write_at_len(dir.path(), "b.bin", 16);
         assert!(
-            model_present(dir.path()),
-            "every file now at its exact size"
+            model_present_for(&TWO_FILE_SPEC, dir.path()),
+            "every file at its exact size passes"
+        );
+    }
+
+    #[test]
+    fn model_present_for_checks_the_given_specs_own_file_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for file in &MODEL_FILES {
+            write_at_len(dir.path(), file.name, file.bytes);
+        }
+        assert!(
+            model_present_for(&SIGLIP, dir.path()),
+            "the siglip file list at exact sizes passes"
+        );
+        assert!(
+            !model_present_for(&MINILM, dir.path()),
+            "a different spec's files are not satisfied by siglip's"
         );
     }
 }

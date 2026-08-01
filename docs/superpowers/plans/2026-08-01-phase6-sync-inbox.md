@@ -1325,13 +1325,15 @@ fn transfer_one(
     }
 }
 
-/// Prints per-location rows and enforces the exit policy: nonzero only
-/// when EVERY requested location failed or was skipped. A location whose
-/// outcome carries per-file `failures` still counts as progress (the
-/// engine records and continues past per-file errors — Task 4 as-built);
-/// its row appends ", N failed" and each failure prints to stderr as
-/// `<location>: failed <path>: <reason>` so partial syncs are loud but
-/// non-fatal.
+/// Prints per-location rows and enforces the exit policy: nonzero when
+/// EVERY requested location failed or was skipped, and ALSO when any
+/// per-file `failures` occurred (partial progress is kept and reported —
+/// the engine records and continues past per-file errors, Task 4
+/// as-built — but a sync that could not move everything must not exit 0
+/// under cron). A failure-carrying row appends ", N failed" and each
+/// failure prints to stderr as `<location>: failed <path>: <reason>`; the
+/// final ensure message names the failing locations and says progress was
+/// kept and the next run retries.
 fn report_and_check(results: &[LocationResult], verb: &str, json: bool) -> Result<()> {
     if json {
         let rows: Vec<serde_json::Value> = results

@@ -219,9 +219,15 @@ All `--json`, like the rest of the CLI.
   (with remedy).
 
 Partial failure policy: push/pull collect per-location results and keep
-going; exit code is nonzero only when every requested location fails.
-Unreachable (unmounted NAS, ejected shuttle) is a skip-with-notice naming
-the path, not an abort.
+going; the transfer engine records per-file failures and continues, so a
+partially-reachable location still makes progress every run. Exit code is
+nonzero when every requested location fails or was skipped, AND when any
+per-file failures occurred — partial progress is kept and reported, but a
+sync that could not move everything must not exit 0, or cron/agents would
+never notice (decided during Task 4-5 execution; supersedes the original
+"only when every location fails" wording, which predates the per-file
+failures concept). Unreachable (unmounted NAS, ejected shuttle) is a
+skip-with-notice naming the path, not an abort.
 
 `maj index status`'s per-derivation coverage already counts real rows and
 blobs, so pulled blobs surface there naturally with the existing remedies

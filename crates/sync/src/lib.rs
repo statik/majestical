@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 /// Rotation threshold: an append that would grow the active segment past
 /// this starts the next `NNNN.jsonl` instead, bounding the whole-file
 /// re-copy cost of `maj sync push` (segments transfer longer-wins as whole
-/// files). Rotated segments are immutable thereafter.
+/// files). Rotated segments are immutable thereafter, for as long as the
+/// tip segment they rotated away from continues to exist — a fresh append
+/// after that tip is deleted or replaced falls back to re-evaluating
+/// whatever `NNNN.jsonl` is now the highest-numbered survivor.
 pub(crate) const ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 /// Segment names are zero-padded width-4 so lexicographic order is numeric
 /// order (see `list_segments`); 9999 is therefore the namespace's end.
@@ -38,7 +41,7 @@ pub enum LogError {
         offset: u64,
     },
     #[error(
-        "machine {machine} reached segment 9999 — the log segment namespace is exhausted; this catalog needs a new machine id"
+        "machine {machine} reached segment {MAX_SEGMENT} — the log segment namespace is exhausted; this catalog needs a new machine id"
     )]
     SegmentOverflow { machine: String },
 }
@@ -53,9 +56,14 @@ impl LogError {
     }
 }
 
+/// Single writer per machine directory: two processes appending under the
+/// same machine id can interleave their batches mid-line, corrupting both.
+/// Multiple machine ids under one catalog root are fine — each gets its own
+/// directory and its own writer.
 pub struct FileEventLog {
     root: PathBuf,
     machine_dir: PathBuf,
+    machine: String,
 }
 
 impl FileEventLog {
@@ -75,6 +83,7 @@ impl FileEventLog {
         Ok(Self {
             root: root.to_path_buf(),
             machine_dir,
+            machine: machine.0.clone(),
         })
     }
 
@@ -98,13 +107,18 @@ impl FileEventLog {
         Ok(Self {
             root: root.to_path_buf(),
             machine_dir,
+            machine: machine.0.clone(),
         })
     }
 
     /// Append to this machine's active segment. Batches that would grow the
     /// active segment past [`ROTATE_BYTES`] start the next `NNNN.jsonl`
-    /// instead; a fresh machine directory starts at `0001.jsonl`. Rotated
-    /// segments are never appended to again.
+    /// instead — except when the active segment is still empty, in which
+    /// case the batch lands there regardless of size: an over-threshold
+    /// batch has to land somewhere, and an empty segment can't be made to
+    /// hold it by rotating again. A fresh machine directory starts at
+    /// `0001.jsonl`. Rotated segments are never appended to again while the
+    /// tip segment they rotated away from still exists.
     ///
     /// No fsync: a crash mid-write may drop the tail of the batch. See
     /// [`Self::read_segment_since`] for how readers handle the resulting
@@ -112,10 +126,13 @@ impl FileEventLog {
     ///
     /// # Errors
     /// Returns [`LogError::Serde`] if an event can't be serialized,
-    /// [`LogError::Io`] if the segment file can't be opened or written to,
-    /// or [`LogError::SegmentOverflow`] if this machine has already filled
-    /// segment 9999.
+    /// [`LogError::Io`] if the segment file can't be opened, written to, or
+    /// stat'd, or [`LogError::SegmentOverflow`] if this machine has already
+    /// filled segment 9999.
     pub fn append(&mut self, events: &[Event]) -> Result<(), LogError> {
+        if events.is_empty() {
+            return Ok(());
+        }
         let mut batch = String::new();
         for e in events {
             let line = serde_json::to_string(e)?;
@@ -135,33 +152,39 @@ impl FileEventLog {
     /// The segment this append should write: the highest-numbered existing
     /// `NNNN.jsonl` unless this batch would push it past [`ROTATE_BYTES`],
     /// in which case the next number starts fresh. A brand-new machine dir
-    /// starts at `0001.jsonl`. Non-numeric `.jsonl` names (a sync tool's
-    /// "conflicted copy") never become the active tip, though readers
-    /// still read them.
+    /// starts at `0001.jsonl`. Non-numeric or non-width-4 `.jsonl` names (a
+    /// sync tool's "conflicted copy", or a stray `9.jsonl`/`10000.jsonl`)
+    /// never become the active tip, though readers still read them.
+    ///
+    /// The `len == 0` exception below is also a crash-recovery guarantee:
+    /// if a rotation's new segment file got created but the crash happened
+    /// before any bytes landed in it, the next append sees it as the
+    /// existing tip at length 0 and reuses it rather than rotating past a
+    /// segment that was never written to. Do not remove this guard.
     fn active_segment(&self, batch_len: u64) -> Result<PathBuf, LogError> {
         let segments = Self::list_segments(&self.machine_dir)?;
         let current = segments
             .iter()
             .filter_map(|(name, path)| {
-                let n: u32 = name.strip_suffix(".jsonl")?.parse().ok()?;
+                let stem = name.strip_suffix(".jsonl")?;
+                if stem.len() != 4 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let n: u32 = stem.parse().ok()?;
                 Some((n, path.clone()))
             })
             .next_back();
         let Some((num, path)) = current else {
             return Ok(self.machine_dir.join("0001.jsonl"));
         };
-        let len = fs::metadata(&path).map_or(0, |m| m.len());
-        if len == 0 || len + batch_len <= ROTATE_BYTES {
+        let len = fs::metadata(&path).map_err(LogError::io(&path))?.len();
+        if len == 0 || len.saturating_add(batch_len) <= ROTATE_BYTES {
             return Ok(path);
         }
         let next = num + 1;
         if next > MAX_SEGMENT {
             return Err(LogError::SegmentOverflow {
-                machine: self
-                    .machine_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                machine: self.machine.clone(),
             });
         }
         Ok(self.machine_dir.join(format!("{next:04}.jsonl")))
@@ -360,6 +383,10 @@ mod tests {
     use majestical_core::event::{AssetId, Event, EventId, Op};
 
     fn ev(n: u64) -> Event {
+        ev_with_tag(n, "t".into())
+    }
+
+    fn ev_with_tag(n: u64, tag: String) -> Event {
         Event {
             id: EventId(ulid::Ulid::from_parts(n, u128::from(n))),
             hlc: Hlc {
@@ -370,7 +397,7 @@ mod tests {
             author: "t".into(),
             op: Op::TagAdd {
                 asset: AssetId("xxh3:aa".into()),
-                tag: "t".into(),
+                tag,
             },
         }
     }
@@ -667,10 +694,15 @@ mod tests {
         let seg = dir.path().join("events/m1/9999.jsonl");
         let f = std::fs::File::create(&seg).expect("create");
         f.set_len(ROTATE_BYTES + 1).expect("grow");
-        assert!(matches!(
-            log.append(&[ev(1)]),
-            Err(LogError::SegmentOverflow { .. })
-        ));
+        let err = log.append(&[ev(1)]);
+        assert!(matches!(err, Err(LogError::SegmentOverflow { .. })));
+        let Err(LogError::SegmentOverflow { machine }) = err else {
+            unreachable!("just matched Err(SegmentOverflow)")
+        };
+        assert_eq!(
+            machine, "m1",
+            "the error must name the machine that overflowed"
+        );
     }
 
     #[test]
@@ -685,12 +717,9 @@ mod tests {
         // forever, since no single segment can ever hold the batch.
         let seg = dir.path().join("events/m1/0001.jsonl");
         std::fs::File::create(&seg).expect("pre-create empty 0001.jsonl");
-        let mut oversized = ev(1);
-        let Op::TagAdd { tag, .. } = &mut oversized.op else {
-            unreachable!("ev() always builds a TagAdd")
-        };
-        *tag = "x".repeat(usize::try_from(ROTATE_BYTES).expect("fits usize") + 1);
-        log.append(&[oversized]).expect("append oversized batch");
+        let huge_tag = "x".repeat(usize::try_from(ROTATE_BYTES).expect("fits usize") + 1);
+        log.append(&[ev_with_tag(1, huge_tag)])
+            .expect("append oversized batch");
         assert!(
             !dir.path().join("events/m1/0002.jsonl").exists(),
             "an oversized batch must land in the empty active segment, not rotate forever"

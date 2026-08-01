@@ -129,12 +129,13 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
-/// prefixed, or whose kind is [`MediaKind::Other`], [`MediaKind::Audio`], or
-/// [`MediaKind::Pdf`], are skipped entirely — the planner has no derivation
-/// to offer them yet (audio has no visual thumbnail; PDF thumbnailing lands
-/// in a later task).
+/// prefixed are skipped entirely. [`MediaKind::Other`] has no derivation at
+/// all; [`MediaKind::Audio`] and [`MediaKind::Pdf`] are skipped only by the
+/// thumbnail/image-embed/keyframe passes (no visual thumbnail for audio; PDF
+/// thumbnailing lands in a later task) — both are covered by their own
+/// passes below (transcribe for audio, PDF text/OCR/captions for PDF).
 ///
-/// Nine passes over `sources` (rather than one) so `items` comes out
+/// Ten passes over `sources` (rather than one) so `items` comes out
 /// globally priority-ordered — every thumbnail before every image embedding
 /// before every keyframe set before every transcript before every transcript
 /// embedding before every OCR item before every PDF text item before every
@@ -404,7 +405,14 @@ fn plan_transcript_embed(
 }
 
 /// OCR, STILLS (`MediaKind::Image` only): no capability gate (Vision ships
-/// with macOS). Blob exists -> done; else offline (no path) / pending+item.
+/// with macOS). Blob exists -> done; else offline (no path) / unsupported
+/// (RAW/AVIF ext) / pending+item, in that order — same precedence as
+/// `plan_thumb`. The unsupported gate matters here too, not just for
+/// thumbs/embeddings: `ocr::recognize_text` takes an already-decoded
+/// `image::RgbImage`, so the runner decodes via the same `image` crate
+/// pipeline that can't handle RAW/AVIF/JXL — without this gate those
+/// formats would retry forever every `--watch` pass instead of settling
+/// into `unsupported`.
 fn plan_ocr_image(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut WorkPlan) {
     let path = blobs.path_for(
         hex,
@@ -420,6 +428,10 @@ fn plan_ocr_image(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut
         plan.ocr.offline += 1;
         return;
     };
+    if is_undecodable(abs_path) {
+        plan.ocr.unsupported += 1;
+        return;
+    }
     plan.ocr.pending += 1;
     plan.items.push(WorkItem {
         asset: source.asset.clone(),
@@ -719,10 +731,16 @@ mod tests {
         assert_eq!(plan.embeddings.unsupported, 2);
         assert_eq!(plan.embeddings.pending, 1, "aa11 embedding is embeddable");
         assert_eq!(
+            plan.ocr.unsupported, 2,
+            "RAW and AVIF are unsupported for OCR too"
+        );
+        assert_eq!(
             plan.items.len(),
-            4,
-            "aa11's ImageEmbed, plus an ungated OcrImage item for all three assets \
-             — OCR has no unsupported gate (see plan_ocr_image)"
+            2,
+            "aa11's ImageEmbed and OcrImage — ee55/ff66 are undecodable for both \
+             (recognize_text takes an already-decoded image::RgbImage, same as \
+             embeddings): {:?}",
+            plan.items
         );
         assert_eq!(
             plan.items
@@ -736,8 +754,8 @@ mod tests {
                 .iter()
                 .filter(|i| i.kind == WorkKind::OcrImage)
                 .count(),
-            3,
-            "RAW/AVIF being undecodable for thumbs/embeddings doesn't block Vision OCR"
+            1,
+            "only aa11 (the decodable PNG) gets an OcrImage item"
         );
     }
 
@@ -778,10 +796,14 @@ mod tests {
             "pef, iiq, 3fr, and jxl must all classify as unsupported, not pending"
         );
         assert_eq!(plan.thumbs.pending, 0);
+        assert_eq!(
+            plan.ocr.unsupported, 4,
+            "the same extensions must also be unsupported for OCR, not pending — \
+             recognize_text takes an already-decoded image::RgbImage, same as thumbs"
+        );
         assert!(
-            plan.items.iter().all(|i| i.kind == WorkKind::OcrImage),
-            "no Thumb/ImageEmbed work should be queued for any of them (OCR has no \
-             unsupported gate, so it's the only kind still queued here): {:?}",
+            plan.items.is_empty(),
+            "no work item should be queued for any of them: {:?}",
             plan.items
         );
     }

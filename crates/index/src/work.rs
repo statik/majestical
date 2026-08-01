@@ -545,8 +545,11 @@ fn plan_pdf_text(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut 
 /// renders like a still): no describer configured -> `needs_model` (checked
 /// first: the [`Derivation::Caption`] blob path depends on the describer's
 /// tag, so done can't be checked without it, same reasoning as
-/// `plan_image_embed`'s model gate). Blob exists -> done; else offline (no
-/// path) / pending+item.
+/// `plan_image_embed`'s model gate). BOTH the caption and
+/// [`Derivation::Tags`] blobs exist -> done — a caption blob alone means a
+/// run died (or hit a backend failure) between the two writes, and counting
+/// it done would leave the tags blob missing forever; the runner skips the
+/// completed caption half on retry. Else offline (no path) / pending+item.
 fn plan_caption_still(
     source: &AssetSource,
     hex: &str,
@@ -558,13 +561,19 @@ fn plan_caption_still(
         plan.captions.needs_model += 1;
         return;
     };
-    let path = blobs.path_for(
+    let caption_path = blobs.path_for(
         hex,
         &Derivation::Caption {
             model_tag: describer_tag,
         },
     );
-    if path.is_file() {
+    let tags_path = blobs.path_for(
+        hex,
+        &Derivation::Tags {
+            model_tag: describer_tag,
+        },
+    );
+    if caption_path.is_file() && tags_path.is_file() {
         plan.captions.done += 1;
         return;
     }
@@ -585,8 +594,10 @@ fn plan_caption_still(
 /// (under the vision `caps.model_tag`, including when that capability is
 /// itself missing) -> skip entirely, silently — waits for the keyframes
 /// pass, same precedent as `plan_ocr_keyframes`. Manifest present -> no
-/// describer configured -> `needs_model`; [`Derivation::Captions`] blob
-/// exists -> done; else offline (no path) / pending+item.
+/// describer configured -> `needs_model`; BOTH the [`Derivation::Captions`]
+/// and [`Derivation::Tags`] blobs exist -> done (the same two-blob rule as
+/// [`plan_caption_still`], for the same partial-run reason); else offline
+/// (no path) / pending+item.
 fn plan_caption_video(
     source: &AssetSource,
     hex: &str,
@@ -605,13 +616,19 @@ fn plan_caption_video(
         plan.captions.needs_model += 1;
         return;
     };
-    let path = blobs.path_for(
+    let captions_path = blobs.path_for(
         hex,
         &Derivation::Captions {
             model_tag: describer_tag,
         },
     );
-    if path.is_file() {
+    let tags_path = blobs.path_for(
+        hex,
+        &Derivation::Tags {
+            model_tag: describer_tag,
+        },
+    );
+    if captions_path.is_file() && tags_path.is_file() {
         plan.captions.done += 1;
         return;
     }
@@ -1429,12 +1446,65 @@ mod tests {
     }
 
     #[test]
-    fn caption_done_when_caption_blob_exists() {
+    fn caption_done_when_caption_and_tags_blobs_both_exist() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
         let describer_tag = "describe-qwen3-vl-8b";
 
         let still_hex = "aa22aa22aa22aa22aa22aa22aa22aa22";
+        for derivation in [
+            Derivation::Caption {
+                model_tag: describer_tag,
+            },
+            Derivation::Tags {
+                model_tag: describer_tag,
+            },
+        ] {
+            store
+                .write_atomic(&store.path_for(still_hex, &derivation), b"{}")
+                .expect("seed still blob");
+        }
+        let still_asset = format!("xxh3:{still_hex}");
+
+        let video_hex = "bb22bb22bb22bb22bb22bb22bb22bb22";
+        let manifest = store.path_for(video_hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+        store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        for derivation in [
+            Derivation::Captions {
+                model_tag: describer_tag,
+            },
+            Derivation::Tags {
+                model_tag: describer_tag,
+            },
+        ] {
+            store
+                .write_atomic(&store.path_for(video_hex, &derivation), b"{}")
+                .expect("seed video blob");
+        }
+        let video_asset = format!("xxh3:{video_hex}");
+
+        let sources = vec![
+            source(&still_asset, MediaKind::Image, Some("/tmp/i.jpg")),
+            source(&video_asset, MediaKind::Video, Some("/tmp/v.mov")),
+        ];
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert_eq!(plan.captions.done, 2, "{:?}", plan.items);
+        assert!(!plan.items.iter().any(|i| i.kind == WorkKind::Caption));
+    }
+
+    /// The partial-item invariant: a caption derivation blob WITHOUT its
+    /// tags blob means a run that died (or hit a backend failure) between
+    /// the two writes — the item must re-plan as pending, never count done,
+    /// or the tags blob stays missing forever. Pins both the still and the
+    /// video shape of the two-blob done check.
+    #[test]
+    fn caption_blob_without_tags_blob_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let describer_tag = "describe-qwen3-vl-8b";
+
+        let still_hex = "cc22cc22cc22cc22cc22cc22cc22cc22";
         let caption_blob = store.path_for(
             still_hex,
             &Derivation::Caption {
@@ -1446,7 +1516,7 @@ mod tests {
             .expect("seed caption blob");
         let still_asset = format!("xxh3:{still_hex}");
 
-        let video_hex = "bb22bb22bb22bb22bb22bb22bb22bb22";
+        let video_hex = "dd33dd33dd33dd33dd33dd33dd33dd33";
         let manifest = store.path_for(video_hex, &Derivation::KeyframeManifest { model_tag: "m1" });
         store.write_atomic(&manifest, b"[]").expect("seed manifest");
         let captions_blob = store.path_for(
@@ -1466,8 +1536,17 @@ mod tests {
         ];
         let plan = plan_work(&sources, &store, &full_caps());
 
-        assert_eq!(plan.captions.done, 2, "{:?}", plan.items);
-        assert!(!plan.items.iter().any(|i| i.kind == WorkKind::Caption));
+        assert_eq!(plan.captions.done, 0, "{:?}", plan.items);
+        assert_eq!(plan.captions.pending, 2);
+        assert_eq!(
+            plan.items
+                .iter()
+                .filter(|i| i.kind == WorkKind::Caption)
+                .count(),
+            2,
+            "both half-finished items must re-plan: {:?}",
+            plan.items
+        );
     }
 
     #[test]

@@ -1552,9 +1552,9 @@ fn caption_one_item(
 /// Captions + tag-suggests one still from its thumbnail blob — already
 /// WebP, exactly the MIME type the client's data URL claims, and derived
 /// identically for images and PDF page-1 renders, so no re-decode here.
-/// The caption blob (the planner's done marker) is written before the tags
-/// call, so a tags-side failure never forces a pointless re-caption; the
-/// cost is that such an item counts done with its tags blob missing.
+/// Done (in the planner) means BOTH blobs exist, so an item retried after a
+/// partial run — caption written, tags call failed — skips the caption
+/// round-trip and goes straight to the missing tags half.
 fn caption_still(
     blobs: &BlobStore,
     describer: &HttpDescriber,
@@ -1566,11 +1566,14 @@ fn caption_still(
     let webp = std::fs::read(&thumb_path).map_err(|_| {
         CaptionFailure::Item("thumbnail missing (thumbs pass must run first)".to_string())
     })?;
-    let caption = describer
-        .caption(&webp)
-        .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
-    write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
-        .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
+    if !caption_path.is_file() {
+        let caption = describer
+            .caption(&webp)
+            .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
+            .map_err(|e| CaptionFailure::Item(e.to_string()))?;
+    }
     let suggestions = describer
         .suggest_tags(TagSubject::Image(&webp), vocab)
         .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
@@ -1578,11 +1581,13 @@ fn caption_still(
         .map_err(|e| CaptionFailure::Item(e.to_string()))
 }
 
-/// Captions a sample of one video's manifest keyframes (up to
-/// [`MAX_DESCRIBED_KEYFRAMES`], evenly spaced), writes the `Captions` blob
-/// (the planner's done marker), then tag-suggests from the pooled caption
-/// texts — a text-only call. A video whose manifest lists zero keyframes
-/// still gets its (empty) blobs; without them it would re-plan forever.
+/// Captions one video's keyframes, then tag-suggests from the pooled
+/// caption texts — a text-only call. Done (in the planner) means BOTH the
+/// `Captions` and `Tags` blobs exist, so a video retried after a partial
+/// run — captions written, tags call failed — reuses the existing captions
+/// blob's texts rather than re-extracting and re-captioning every keyframe.
+/// A video whose manifest lists zero keyframes still gets its (empty)
+/// blobs; without them it would re-plan forever.
 fn caption_video(
     blobs: &BlobStore,
     describer: &HttpDescriber,
@@ -1590,6 +1595,40 @@ fn caption_video(
     model_tag: &str,
     vocab: &[String],
 ) -> Result<(), CaptionFailure> {
+    let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
+    let texts: Vec<String> = if captions_path.is_file() {
+        read_video_captions_blob(&captions_path)
+            .map_err(|e| CaptionFailure::Item(e.to_string()))?
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    } else {
+        describe_video_keyframes(blobs, describer, item, model_tag)?
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    };
+    let suggestions = if texts.is_empty() {
+        Vec::new()
+    } else {
+        describer
+            .suggest_tags(TagSubject::Captions(&texts), vocab)
+            .map_err(|e| CaptionFailure::Backend(e.to_string()))?
+    };
+    write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
+        .map_err(|e| CaptionFailure::Item(e.to_string()))
+}
+
+/// The caption half of one video item: samples up to
+/// [`MAX_DESCRIBED_KEYFRAMES`] evenly-spaced manifest timestamps, extracts
+/// and captions each, and writes the `Captions` blob before returning the
+/// described rows.
+fn describe_video_keyframes(
+    blobs: &BlobStore,
+    describer: &HttpDescriber,
+    item: &work::WorkItem,
+    model_tag: &str,
+) -> Result<Vec<(u64, String)>, CaptionFailure> {
     let manifest_path = blobs.path_for(
         &item.asset_hex,
         &Derivation::KeyframeManifest {
@@ -1613,16 +1652,7 @@ fn caption_video(
     let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
     write_json_blob(blobs, &captions_path, &json)
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
-    let texts: Vec<String> = described.into_iter().map(|(_, text)| text).collect();
-    let suggestions = if texts.is_empty() {
-        Vec::new()
-    } else {
-        describer
-            .suggest_tags(TagSubject::Captions(&texts), vocab)
-            .map_err(|e| CaptionFailure::Backend(e.to_string()))?
-    };
-    write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
-        .map_err(|e| CaptionFailure::Item(e.to_string()))
+    Ok(described)
 }
 
 /// Extracts one keyframe and downsizes it through the same 320px WebP

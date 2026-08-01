@@ -203,12 +203,18 @@ fn caption_backend_outage_mid_run_skips_remaining_and_reports() {
         .assert()
         .success();
 
+    // One real backend failure plus one abandoned item — the skipped-reason
+    // text only ever appears when the abort-after-first-failure path runs,
+    // so a mutant that keeps hammering the dead backend (recording two real
+    // errors instead) fails these pins.
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())
         .args(["index", "run", "--kinds", "captions"])
         .assert()
         .success()
-        .stdout(contains("captions: 0 written, 2 failed"));
+        .stdout(contains("captions: 0 written, 2 failed"))
+        .stderr(contains("500"))
+        .stderr(contains("skipped after first failure"));
 
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())
@@ -217,6 +223,136 @@ fn caption_backend_outage_mid_run_skips_remaining_and_reports() {
         .success()
         .stdout(contains("captions failed last run: 2"))
         .stdout(contains("captions: 0 done, 2 pending"));
+}
+
+/// A partial item — caption blob written, tags call failed — must re-plan
+/// (done requires BOTH blobs) and, on retry, skip the already-completed
+/// caption half: the caption endpoint is hit exactly once across both runs.
+#[test]
+fn caption_written_but_tags_failed_replans_and_completes_without_recaption() {
+    let server = MockServer::start();
+    let caption_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_includes("Describe this image");
+        then.status(200).json_body(caption_response());
+    });
+    let mut tags_down = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_includes("Suggest tags");
+        then.status(500);
+    });
+    let media = tempfile::tempdir().unwrap();
+    write_red_png(&media.path().join("red.png"));
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    configure_describer(&root, &state, &server.base_url());
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+
+    // Run 1: caption succeeds, tags fails — the item fails but the caption
+    // blob (the completed half) lands on disk.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "captions"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 0 written, 1 failed"));
+    assert_eq!(walkdir_find(&root, "caption.json.zst").len(), 1);
+    assert_eq!(
+        walkdir_find(&root, "tags.json.zst").len(),
+        0,
+        "no tags blob after the failed tags call"
+    );
+
+    // The half-finished item must count pending, not done.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 0 done, 1 pending"));
+
+    // Backend recovers for tags; run 2 completes the item.
+    tags_down.delete();
+    server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_includes("Suggest tags");
+        then.status(200).json_body(tags_response());
+    });
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "captions"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 1 written"));
+
+    assert_eq!(walkdir_find(&root, "caption.json.zst").len(), 1);
+    assert_eq!(walkdir_find(&root, "tags.json.zst").len(), 1);
+    caption_mock.assert_calls(1);
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 1 done"));
+}
+
+/// A garbage `describer.toml` must degrade, not kill indexing: `index
+/// status` still succeeds, notes the unparsable config on stderr, and
+/// counts captions as needing a model (unconfigured).
+#[test]
+fn broken_describer_toml_degrades_to_needs_model_with_note() {
+    let media = tempfile::tempdir().unwrap();
+    write_red_png(&media.path().join("red.png"));
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    configure_describer(&root, &state, "http://127.0.0.1:1");
+
+    let toml_paths = walkdir_find(&state, "describer.toml");
+    assert_eq!(toml_paths.len(), 1, "exactly one describer config");
+    std::fs::write(&toml_paths[0], "not valid toml [[[").unwrap();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "captions: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, 1 need model",
+        ))
+        .stderr(contains("describer config"));
 }
 
 /// The same pass that writes a caption blob heals it into `text_fts` under

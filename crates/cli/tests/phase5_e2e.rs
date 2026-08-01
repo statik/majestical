@@ -161,7 +161,7 @@ fn semantic_transcript_search_resolves_paraphrase_with_timestamp() {
 /// `in:ocr`, through real scene detection and Vision OCR — no hand-planted
 /// manifests or blobs.
 #[test]
-#[ignore = "needs ffmpeg on PATH"]
+#[ignore = "needs fetched siglip model, ffmpeg and ImageMagick on PATH"]
 fn keyframe_ocr_text_found_via_in_ocr() {
     assert!(majestical_index::video::ffmpeg_available());
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -214,7 +214,7 @@ fn keyframe_ocr_text_found_via_in_ocr() {
 /// this against a hand-planted `KeyframeManifest`/`Captions` blob; this is
 /// the real-keyframes closure of that gap.
 #[test]
-#[ignore = "needs fetched siglip model and ffmpeg on PATH"]
+#[ignore = "needs fetched siglip model, ffmpeg and ImageMagick on PATH"]
 fn video_captions_describe_real_keyframes() {
     assert!(majestical_index::video::ffmpeg_available());
     let server = MockServer::start();

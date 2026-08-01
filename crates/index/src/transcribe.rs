@@ -6,8 +6,13 @@ use std::path::Path;
 
 use crate::error::IndexError;
 
-pub const WHISPER_MODEL_TAG: &str = "whisper-large-v3-turbo-q5-v1";
-pub const MODEL_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
+/// Blob model tag for transcripts — derived from the model registry so a
+/// registry bump can never silently diverge from the tag blobs are written
+/// under.
+pub const WHISPER_MODEL_TAG: &str = crate::model::WHISPER.tag;
+/// The single ggml weights file [`Transcriber::load`] opens — derived from
+/// the registry for the same no-drift reason as [`WHISPER_MODEL_TAG`].
+pub const MODEL_FILE: &str = crate::model::WHISPER.files[0].name;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptSegment {

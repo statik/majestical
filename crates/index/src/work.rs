@@ -54,6 +54,11 @@ pub enum WorkKind {
 pub struct WorkItem {
     pub asset: String,
     pub asset_hex: String,
+    /// Readable absolute path to the asset's bytes. For
+    /// [`WorkKind::TranscriptEmbed`] items this may be an empty `PathBuf`
+    /// sentinel: the runner reads the transcript blob, not the source file,
+    /// so the item is planned even when no instance is reachable here (a
+    /// teammate-synced transcript on a machine without the original media).
     pub abs_path: PathBuf,
     pub kind: WorkKind,
 }
@@ -86,7 +91,11 @@ pub struct Capabilities {
 }
 
 /// Counts for one derivation kind across every planned asset. Every asset
-/// eligible for the kind lands in exactly one bucket.
+/// eligible for the kind lands in exactly one bucket — per planning pass.
+/// Aggregate fields cover more than one pass (`WorkPlan::transcripts` sums
+/// the transcribe and transcript-embed passes), so their totals are
+/// derivation counts, not asset counts: one audio asset can contribute two
+/// increments to the same `KindStatus`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KindStatus {
     /// Blob already exists.
@@ -113,7 +122,9 @@ pub struct WorkPlan {
     pub thumbs: KindStatus,
     pub embeddings: KindStatus,
     pub keyframes: KindStatus,
-    /// Covers both [`WorkKind::Transcribe`] and [`WorkKind::TranscriptEmbed`].
+    /// Covers both [`WorkKind::Transcribe`] and [`WorkKind::TranscriptEmbed`]
+    /// — totals are derivation counts, not asset counts: one audio asset with
+    /// a transcript blob and its chunk vectors counts `done` twice here.
     pub transcripts: KindStatus,
     /// Covers both [`WorkKind::OcrImage`] and [`WorkKind::OcrKeyframes`].
     pub ocr: KindStatus,
@@ -130,10 +141,11 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
 /// prefixed are skipped entirely. [`MediaKind::Other`] has no derivation at
-/// all; [`MediaKind::Audio`] and [`MediaKind::Pdf`] are skipped only by the
-/// thumbnail/image-embed/keyframe passes (no visual thumbnail for audio; PDF
-/// thumbnailing lands in a later task) — both are covered by their own
-/// passes below (transcribe for audio, PDF text/OCR/captions for PDF).
+/// all; [`MediaKind::Audio`] is skipped by the thumbnail/image-embed/keyframe
+/// passes (no visual thumbnail for audio) and covered by transcribe instead.
+/// [`MediaKind::Pdf`] joins the thumbnail and image-embed passes (page 1
+/// renders like a still — see `pdf::render_first_page`) on top of its own
+/// PDF-text/caption passes.
 ///
 /// Ten passes over `sources` (rather than one) so `items` comes out
 /// globally priority-ordered — every thumbnail before every image embedding
@@ -144,14 +156,17 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities) -> WorkPlan {
     let mut plan = WorkPlan::default();
     for source in sources.iter().filter(|s| match s.kind {
-        MediaKind::Image | MediaKind::Video => true,
-        MediaKind::Audio | MediaKind::Pdf | MediaKind::Other => false,
+        MediaKind::Image | MediaKind::Video | MediaKind::Pdf => true,
+        MediaKind::Audio | MediaKind::Other => false,
     }) {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_thumb(source, hex, blobs, caps, &mut plan);
         }
     }
-    for source in sources.iter().filter(|s| s.kind == MediaKind::Image) {
+    for source in sources.iter().filter(|s| match s.kind {
+        MediaKind::Image | MediaKind::Pdf => true,
+        MediaKind::Video | MediaKind::Audio | MediaKind::Other => false,
+    }) {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_image_embed(source, hex, blobs, caps, &mut plan);
         }
@@ -245,8 +260,9 @@ fn plan_thumb(
     });
 }
 
-/// IMAGE EMBED (`MediaKind::Image` only): no model -> `needs_model`; blob
-/// exists -> done; else offline/unsupported/pending+item.
+/// IMAGE EMBED (`MediaKind::Image | MediaKind::Pdf` — a PDF's first page
+/// renders like a still): no model -> `needs_model`; blob exists -> done;
+/// else offline/unsupported/pending+item.
 fn plan_image_embed(
     source: &AssetSource,
     hex: &str,
@@ -319,10 +335,13 @@ fn plan_keyframes(
     });
 }
 
-/// TRANSCRIBE (`MediaKind::Video | MediaKind::Audio`): no whisper ->
-/// `needs_model` (checked first, mirroring `plan_image_embed`'s model gate);
-/// blob exists -> done; else offline (no path) / `needs_ffmpeg` (audio/video
-/// bytes need ffmpeg to decode to PCM) / pending+item, in that order.
+/// TRANSCRIBE (`MediaKind::Video | MediaKind::Audio`): blob exists -> done
+/// (checked BEFORE the whisper gate — the transcript blob path doesn't
+/// depend on any capability, and a transcript synced in from a teammate
+/// must count done even on a whisper-less machine, or status lies on
+/// sync-consumer machines); else no whisper -> `needs_model`; else offline
+/// (no path) / `needs_ffmpeg` (audio/video bytes need ffmpeg to decode to
+/// PCM) / pending+item, in that order.
 fn plan_transcribe(
     source: &AssetSource,
     hex: &str,
@@ -330,10 +349,6 @@ fn plan_transcribe(
     caps: &Capabilities,
     plan: &mut WorkPlan,
 ) {
-    if !caps.whisper {
-        plan.transcripts.needs_model += 1;
-        return;
-    }
     let path = blobs.path_for(
         hex,
         &Derivation::Transcript {
@@ -342,6 +357,10 @@ fn plan_transcribe(
     );
     if path.is_file() {
         plan.transcripts.done += 1;
+        return;
+    }
+    if !caps.whisper {
+        plan.transcripts.needs_model += 1;
         return;
     }
     let Some(abs_path) = &source.abs_path else {
@@ -1033,6 +1052,61 @@ mod tests {
 
         assert_eq!(plan.transcripts.needs_ffmpeg, 1);
         assert!(!plan.items.iter().any(|i| i.kind == WorkKind::Transcribe));
+    }
+
+    /// F4: a transcript blob synced in from a teammate counts `done` even on
+    /// a whisper-less machine — the done check must precede the whisper
+    /// gate, or status lies on sync-consumer machines.
+    #[test]
+    fn transcript_blob_counts_done_without_whisper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hex = "dd22dd22dd22dd22dd22dd22dd22dd22";
+        let transcript = store.path_for(
+            hex,
+            &Derivation::Transcript {
+                model_tag: WHISPER_MODEL_TAG,
+            },
+        );
+        store
+            .write_atomic(&transcript, b"{}")
+            .expect("seed transcript");
+        // whisper=false; text_model=true so the transcript-embed pass plans
+        // an item rather than muddying needs_model.
+        let caps = Capabilities {
+            text_model: true,
+            ..base_caps()
+        };
+        let asset = format!("xxh3:{hex}");
+        let sources = vec![source(&asset, MediaKind::Audio, None)];
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(
+            plan.transcripts.done, 1,
+            "the synced transcript blob must count done, not needs_model"
+        );
+        assert_eq!(plan.transcripts.needs_model, 0);
+    }
+
+    /// PDF preview feeds the existing pipeline: with every capability on, a
+    /// Pdf asset plans Thumb + `ImageEmbed` items alongside its own
+    /// `PdfText`.
+    #[test]
+    fn pdf_assets_plan_thumb_image_embed_and_pdf_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let sources = vec![source("xxh3:pdf1", MediaKind::Pdf, Some("/tmp/doc.pdf"))];
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        for kind in [WorkKind::Thumb, WorkKind::ImageEmbed, WorkKind::PdfText] {
+            assert!(
+                plan.items
+                    .iter()
+                    .any(|i| i.asset == "xxh3:pdf1" && i.kind == kind),
+                "expected a {kind:?} item for the pdf: {:?}",
+                plan.items
+            );
+        }
     }
 
     #[test]

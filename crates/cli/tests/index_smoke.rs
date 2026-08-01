@@ -587,6 +587,267 @@ fn generate_three_segment_clip(path: &std::path::Path) {
     assert!(status.success(), "ffmpeg clip generation failed");
 }
 
+/// Absolute path to a fixture shared with the index crate's own tests.
+#[cfg(test)]
+fn index_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../index/tests/fixtures")
+        .join(name)
+}
+
+/// `index status` covers the phase-5 kinds with honest, named gaps: a
+/// scanned audio clip with no whisper model installed reports the
+/// transcripts kind as needing a model (with a `model fetch` remedy), never
+/// as merely pending.
+#[test]
+fn index_status_reports_new_kinds_with_named_gaps() {
+    let media = tempfile::tempdir().unwrap();
+    // Status only diffs against the blob store — never decodes.
+    std::fs::write(media.path().join("clip.wav"), b"not real audio").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    // Empty model cache: whisper (and every other model) absent.
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .args(["--volume", "maj-test-never-mounted"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("transcripts"))
+        .stdout(contains("needs model"));
+}
+
+/// `--kinds` accepts every phase-5 kind name (captions is accepted but runs
+/// nothing until a describer is configured), and still rejects unknown
+/// names by name.
+#[test]
+fn index_run_kinds_accepts_new_names_and_rejects_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cat");
+    let state = tmp.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "transcripts,ocr,pdf,captions"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "bogus"])
+        .assert()
+        .failure()
+        .stderr(contains("bogus"));
+}
+
+/// A real PDF flows end to end: `index run --kinds pdf` writes the `PdfText`
+/// blob, heals the `text_fts` table from that blob in the same pass, and a
+/// second run is a no-op with status reporting the pdf kind done.
+#[test]
+fn pdf_indexing_end_to_end_heals_text_fts() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        index_fixture("fixture.pdf"),
+        media.path().join("fixture.pdf"),
+    )
+    .unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "pdf"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        walkdir_find(&root, "text.json.zst").len(),
+        1,
+        "exactly one PdfText blob under the sync root's blob store"
+    );
+
+    // The heal ran in the same pass: the state-dir sqlite catalog now has
+    // text_fts rows sourced from the pdf blob.
+    let db_paths = walkdir_find(&state, "catalog.db");
+    assert_eq!(db_paths.len(), 1, "exactly one state-dir sqlite catalog");
+    let db = majestical_catalog_sqlite::SqliteCatalog::open(&db_paths[0]).unwrap();
+    assert_eq!(
+        db.text_assets("pdf").unwrap().len(),
+        1,
+        "text_fts must have pdf rows for the scanned fixture"
+    );
+
+    // Idempotent: the blob exists, so a second run re-plans nothing.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "pdf"])
+        .assert()
+        .success();
+    assert_eq!(walkdir_find(&root, "text.json.zst").len(), 1);
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("pdf: 1 done"));
+}
+
+/// A real still image flows through Vision OCR end to end: the `OcrImage`
+/// blob lands on disk and status reports the ocr kind done.
+#[test]
+fn ocr_indexing_still_image_end_to_end() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        index_fixture("ocr-hello.png"),
+        media.path().join("ocr-hello.png"),
+    )
+    .unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "ocr"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        walkdir_find(&root, "image.json.zst").len(),
+        1,
+        "exactly one OcrImage blob under the sync root's blob store"
+    );
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("ocr: 1 done"));
+}
+
+/// An item-level failure (a file that isn't really a PDF) is a run-level
+/// success: the run exits 0, records the failure in the per-run failure
+/// marker (surfaced by `index status`), writes no done-blob, and re-plans
+/// the same item on the next run instead of dropping it.
+#[test]
+fn failed_derivations_are_reported_and_replanned() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.pdf"), b"not a pdf").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "pdf"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("failed last run"));
+
+    // Re-planned, not dropped: the second run fails on the same item again.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "pdf", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("broken.pdf"));
+}
+
+/// `index run --kinds transcripts` with no whisper model is a graceful
+/// skip, not an error — and status names the gap with the fetch remedy.
+#[test]
+fn transcribe_run_without_model_skips_with_named_gap() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.wav"), b"not real audio").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "transcripts"])
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("transcripts"))
+        .stdout(contains("needs model"))
+        .stdout(contains("model fetch"));
+}
+
 /// Full pipeline through the real CLI, with a real fetched model and real
 /// ffmpeg: scan a three-segment color clip, `index run` it (video
 /// thumbnail + scene-detected keyframes + embeddings), then confirm

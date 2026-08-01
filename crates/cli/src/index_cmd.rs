@@ -6,18 +6,43 @@ use crate::app::FsApp;
 use crate::commands::open_catalog;
 use crate::volume_identity;
 use anyhow::{Context, Result};
+use majestical_catalog_sqlite::SqliteCatalog;
+use majestical_core::event::AssetId;
 use majestical_core::media_kind::{MediaKind, media_kind};
 use majestical_core::projection::Projection;
 use majestical_index::blob::{BlobStore, Derivation};
+use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
-use majestical_index::vector_store::{VectorRow, VectorStore};
+use majestical_index::model::{MINILM, WHISPER};
+use majestical_index::ocr::{OCR_MODEL_TAG, OcrResult};
+use majestical_index::pdf::{PDF_MODEL_TAG, PdfContent};
+use majestical_index::text_encoder::TextEncoder;
+use majestical_index::transcribe::{Transcriber, Transcript, WHISPER_MODEL_TAG};
+use majestical_index::vector_store::{TextChunkRow, TextVectorStore, VectorRow, VectorStore};
 use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKind, WorkPlan};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const VALID_KINDS: &[&str] = &["thumbs", "embeddings", "keyframes"];
+const VALID_KINDS: &[&str] = &[
+    "thumbs",
+    "embeddings",
+    "keyframes",
+    "transcripts",
+    "ocr",
+    "pdf",
+    "captions",
+];
+
+/// zstd level for JSON derivation blobs (transcripts, OCR, PDF text) —
+/// matches the level `BlobStore::write_vector` uses for vector blobs.
+const BLOB_ZSTD_LEVEL: i32 = 3;
+
+/// The state-dir file `run_once` overwrites every pass with the pass's
+/// per-item failures, and `index status` reads back — see
+/// [`failure_report_json`].
+const FAILURES_FILE: &str = "index-failures.json";
 
 /// Args for `maj index run`, bundled to keep `cmd_index_run`'s own signature
 /// within the house 5-positional-parameter limit.
@@ -31,7 +56,8 @@ pub(crate) struct IndexRunArgs {
 
 /// What this machine can currently produce: the encoder model if it's been
 /// fetched into the cache (see `maj model fetch`) and present at every
-/// file's exact size, and whether `ffmpeg`/`ffprobe` are on `PATH`.
+/// file's exact size, whether `ffmpeg`/`ffprobe` are on `PATH`, and whether
+/// the whisper/`MiniLM` models are installed.
 fn capabilities() -> Capabilities {
     let model_tag = majestical_index::model::model_dir()
         .ok()
@@ -40,13 +66,28 @@ fn capabilities() -> Capabilities {
     Capabilities {
         model_tag,
         ffmpeg: majestical_index::video::ffmpeg_available(),
-        // Task 17 wires real detection (whisper/minilm model-present checks
-        // and a configured describer tag); hardcoded here only to keep this
-        // crate compiling against work.rs's expanded Capabilities.
-        whisper: false,
-        text_model: false,
+        whisper: whisper_model_dir_if_present().is_some(),
+        text_model: minilm_model_dir_if_present().is_some(),
+        // Task 18 wires the configured describer's tag; until then captions
+        // plan as needs_model and no Caption item is ever produced.
         describer_tag: None,
     }
+}
+
+/// The whisper cache dir, only if the single ggml weights file is present.
+/// A file-presence check (not size/hash) — mirrors the spirit of
+/// `model_present` without re-hashing half a gigabyte per invocation.
+fn whisper_model_dir_if_present() -> Option<PathBuf> {
+    let dir = majestical_index::model::model_dir_for(&WHISPER).ok()?;
+    dir.join(majestical_index::transcribe::MODEL_FILE)
+        .is_file()
+        .then_some(dir)
+}
+
+/// The `MiniLM` cache dir, only if its ONNX graph is present.
+fn minilm_model_dir_if_present() -> Option<PathBuf> {
+    let dir = majestical_index::model::model_dir_for(&MINILM).ok()?;
+    dir.join("model.onnx").is_file().then_some(dir)
 }
 
 /// Validates `--kinds`, defaulting to every kind when omitted.
@@ -98,19 +139,31 @@ fn default_index_jobs() -> usize {
         .min(4)
 }
 
-/// Decodes a source frame for a thumbnail: the image itself for
-/// `MediaKind::Image`, or a frame one-tenth of the way into a video for
-/// `MediaKind::Video` (early enough to usually avoid a black open/fade-in,
-/// late enough to usually avoid a title card).
+/// Edge length for PDF page-1 renders feeding the thumbnail/embedding
+/// pipeline — comfortably above both the thumbnail edge and the encoder's
+/// input resolution, so one render serves both consumers.
+const PDF_RENDER_EDGE: u32 = 1024;
+
+/// Decodes a source frame for a thumbnail, routed by media kind: the image
+/// itself for stills, a frame one-tenth of the way into a video (early
+/// enough to usually avoid a black open/fade-in, late enough to usually
+/// avoid a title card), or a page-1 render for a PDF.
 fn decode_thumb_source(path: &Path) -> Result<image::RgbImage> {
-    if media_kind(&path.to_string_lossy()) == MediaKind::Video {
-        let info = majestical_index::video::probe(path)?;
-        Ok(majestical_index::video::extract_frame(
+    match media_kind(&path.to_string_lossy()) {
+        MediaKind::Video => {
+            let info = majestical_index::video::probe(path)?;
+            Ok(majestical_index::video::extract_frame(
+                path,
+                info.duration_ms / 10,
+            )?)
+        }
+        MediaKind::Pdf => Ok(majestical_index::pdf::render_first_page(
             path,
-            info.duration_ms / 10,
-        )?)
-    } else {
-        Ok(majestical_index::thumbs::decode_image(path)?)
+            PDF_RENDER_EDGE,
+        )?),
+        MediaKind::Image | MediaKind::Audio | MediaKind::Other => {
+            Ok(majestical_index::thumbs::decode_image(path)?)
+        }
     }
 }
 
@@ -170,16 +223,14 @@ fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> 
     }
 }
 
+/// The `--kinds` name each [`WorkKind`] answers to. One CLI kind can cover
+/// two work kinds: `transcripts` spans Transcribe + `TranscriptEmbed`, and
+/// `ocr` spans stills + video keyframes.
 fn workkind_name(kind: WorkKind) -> &'static str {
     match kind {
         WorkKind::Thumb => "thumbs",
         WorkKind::ImageEmbed => "embeddings",
         WorkKind::Keyframes => "keyframes",
-        // Not in VALID_KINDS yet — their runners land in Task 17. Named here
-        // only so `build_plan`'s `--kinds` filter (which calls this fn) has
-        // an exhaustive match; since no `--kinds` value ever matches these
-        // names, `retain` drops any such item before it reaches
-        // `split_and_cap_items`.
         WorkKind::Transcribe | WorkKind::TranscriptEmbed => "transcripts",
         WorkKind::OcrImage | WorkKind::OcrKeyframes => "ocr",
         WorkKind::PdfText => "pdf",
@@ -244,70 +295,107 @@ struct RunOnceArgs<'a> {
     json: bool,
 }
 
-/// One `index run` pass: builds the plan, works every thumbnail, embedding,
-/// and keyframe item, and prints the result.
+/// One `index run` pass: builds the plan, works every kind's items, heals
+/// `text_fts` from blobs, writes the per-run failure marker, and prints the
+/// result.
 ///
 /// # Errors
-/// Returns an error if the catalog can't be opened/synced, or if the Lance
-/// vector store can't be opened even after one corruption-recovery retry.
+/// Returns an error if the catalog can't be opened/synced, a model that
+/// passed its presence check fails to load, the Lance vector store can't be
+/// opened even after one corruption-recovery retry, or the failure marker
+/// can't be written.
 fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<()> {
-    let (_, projection) = open_catalog(app, catalog_dir)?;
+    let (mut db, projection) = open_catalog(app, catalog_dir)?;
     let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let plan = build_plan(&projection, &blobs, args.kinds);
-    let (thumb_items, embed_items, keyframe_items) = split_and_cap_items(plan.items, args.limit);
+    let items = split_and_cap_items(plan.items, args.limit);
 
     let jobs = args.threads.unwrap_or_else(default_index_jobs);
-    let thumb_outcome = run_thumb_items(&blobs, &thumb_items, jobs);
-
     let embed_paths = EmbedPaths {
         lance_dir: state_dir.join("lance"),
         coreml_cache_dir: state_dir.join("coreml-cache"),
     };
-    let embed_outcome = run_embed_items(&embed_paths, &blobs, &embed_items)?;
-    let keyframe_outcome = run_keyframe_items(&embed_paths, &blobs, &keyframe_items)?;
+    let outcomes = run_all_kinds(&embed_paths, &blobs, &items, jobs)?;
 
-    print_run_result(&thumb_outcome, &embed_outcome, &keyframe_outcome, args.json);
+    heal_text_fts(&mut db, &blobs)?;
+    write_failure_report(&state_dir, &failure_report_json(&outcomes))?;
+    print_run_result(&outcomes, args.json);
     Ok(())
 }
 
+/// Executes every kind's items in priority order. Kinds whose capability is
+/// missing (a runner's own model-presence re-check) or whose item list is
+/// empty are cheap no-ops.
+fn run_all_kinds(
+    paths: &EmbedPaths,
+    blobs: &BlobStore,
+    items: &KindItems,
+    jobs: usize,
+) -> Result<RunOutcomes> {
+    Ok(RunOutcomes {
+        thumbs: run_thumb_items(blobs, &items.thumbs, jobs),
+        embed: run_embed_items(paths, blobs, &items.embeds)?,
+        keyframes: run_keyframe_items(paths, blobs, &items.keyframes)?,
+        transcribe: run_transcribe_items(blobs, &items.transcribes)?,
+        transcript_embed: run_transcript_embed_items(paths, blobs, &items.transcript_embeds)?,
+        ocr: run_ocr_items(blobs, &items.ocr_images, &items.ocr_keyframes),
+        pdf: run_pdf_text_items(blobs, &items.pdfs),
+    })
+}
+
+/// Every kind's items for one pass, split so each executor gets exactly its
+/// own queue. No `Caption` bucket: the planner produces no Caption items
+/// while `describer_tag` is `None` (Task 18 wires the describer).
+#[derive(Default)]
+struct KindItems {
+    thumbs: Vec<work::WorkItem>,
+    embeds: Vec<work::WorkItem>,
+    keyframes: Vec<work::WorkItem>,
+    transcribes: Vec<work::WorkItem>,
+    transcript_embeds: Vec<work::WorkItem>,
+    ocr_images: Vec<work::WorkItem>,
+    ocr_keyframes: Vec<work::WorkItem>,
+    pdfs: Vec<work::WorkItem>,
+}
+
+impl KindItems {
+    fn cap_each(&mut self, limit: usize) {
+        self.thumbs.truncate(limit);
+        self.embeds.truncate(limit);
+        self.keyframes.truncate(limit);
+        self.transcribes.truncate(limit);
+        self.transcript_embeds.truncate(limit);
+        self.ocr_images.truncate(limit);
+        self.ocr_keyframes.truncate(limit);
+        self.pdfs.truncate(limit);
+    }
+}
+
 /// Splits `items` by kind, then caps each kind independently at `limit` —
-/// thumbs/embeddings/keyframes each have an executor, so `--limit` bounds
-/// each one's own per-pass budget rather than one kind starving another.
-/// The transcript/OCR/PDF/caption kinds aren't reachable here yet:
-/// `build_plan`'s `--kinds` filter (`workkind_name`) never matches them
-/// since they're not in `VALID_KINDS`, so `plan.items.retain(..)` drops them
-/// before `split_and_cap_items` runs — their runners land in Task 17.
-fn split_and_cap_items(
-    items: Vec<work::WorkItem>,
-    limit: Option<usize>,
-) -> (
-    Vec<work::WorkItem>,
-    Vec<work::WorkItem>,
-    Vec<work::WorkItem>,
-) {
-    let mut thumbs = Vec::new();
-    let mut embeds = Vec::new();
-    let mut keyframes = Vec::new();
+/// every kind has its own executor, so `--limit` bounds each one's own
+/// per-pass budget rather than one kind starving another.
+fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> KindItems {
+    let mut split = KindItems::default();
     for item in items {
         match item.kind {
-            WorkKind::Thumb => thumbs.push(item),
-            WorkKind::ImageEmbed => embeds.push(item),
-            WorkKind::Keyframes => keyframes.push(item),
-            WorkKind::Transcribe
-            | WorkKind::TranscriptEmbed
-            | WorkKind::OcrImage
-            | WorkKind::OcrKeyframes
-            | WorkKind::PdfText
-            | WorkKind::Caption => {}
+            WorkKind::Thumb => split.thumbs.push(item),
+            WorkKind::ImageEmbed => split.embeds.push(item),
+            WorkKind::Keyframes => split.keyframes.push(item),
+            WorkKind::Transcribe => split.transcribes.push(item),
+            WorkKind::TranscriptEmbed => split.transcript_embeds.push(item),
+            WorkKind::OcrImage => split.ocr_images.push(item),
+            WorkKind::OcrKeyframes => split.ocr_keyframes.push(item),
+            WorkKind::PdfText => split.pdfs.push(item),
+            // Unreachable while the planner gates captions on a configured
+            // describer (`describer_tag: None` until Task 18).
+            WorkKind::Caption => {}
         }
     }
     if let Some(limit) = limit {
-        thumbs.truncate(limit);
-        embeds.truncate(limit);
-        keyframes.truncate(limit);
+        split.cap_each(limit);
     }
-    (thumbs, embeds, keyframes)
+    split
 }
 
 /// Resolves the encoder model dir only if it's actually present at every
@@ -385,8 +473,22 @@ fn open_or_rebuild(dir: &Path) -> Result<VectorStore> {
         .map_err(|reason| anyhow::anyhow!("rebuilding lance store at {}: {reason}", dir.display()))
 }
 
+/// Decodes an `ImageEmbed` item's pixels: a page-1 render for a PDF (the
+/// same route `decode_thumb_source` takes, so PDFs flow through the
+/// existing embedding kind), the decoded image otherwise.
+fn decode_embed_source(path: &Path) -> Result<image::RgbImage> {
+    if media_kind(&path.to_string_lossy()) == MediaKind::Pdf {
+        Ok(majestical_index::pdf::render_first_page(
+            path,
+            PDF_RENDER_EDGE,
+        )?)
+    } else {
+        Ok(majestical_index::thumbs::decode_image(path)?)
+    }
+}
+
 fn embed_one(blobs: &BlobStore, encoder: &mut Encoder, item: &work::WorkItem) -> Result<VectorRow> {
-    let rgb = majestical_index::thumbs::decode_image(&item.abs_path)?;
+    let rgb = decode_embed_source(&item.abs_path)?;
     let vector = encoder.embed_image(&rgb)?;
     let model_tag = majestical_index::model::MODEL_TAG;
     let path = blobs.path_for(&item.asset_hex, &Derivation::ImageEmbedding { model_tag });
@@ -677,6 +779,35 @@ fn keyframes_manifest_json(model_tag: &str, detected: usize, timestamps: &[u64])
         .into_bytes()
 }
 
+/// Parses a keyframe manifest written by [`keyframes_manifest_json`] back
+/// into `(model_tag, detected, timestamps)` — the reader the keyframe-OCR
+/// runner uses to diff a video's detected timestamps against its OCR blobs.
+///
+/// # Errors
+/// Returns an error naming the missing/mistyped field on malformed bytes.
+fn keyframes_manifest_read(bytes: &[u8]) -> Result<(String, usize, Vec<u64>)> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing keyframe manifest json")?;
+    let model_tag = value["model_tag"]
+        .as_str()
+        .context("keyframe manifest missing string field 'model_tag'")?
+        .to_string();
+    let detected = value["detected"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .context("keyframe manifest missing integer field 'detected'")?;
+    let timestamps = value["timestamps"]
+        .as_array()
+        .context("keyframe manifest missing array field 'timestamps'")?
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .context("keyframe manifest timestamp is not a non-negative integer")
+        })
+        .collect::<Result<Vec<u64>>>()?;
+    Ok((model_tag, detected, timestamps))
+}
+
 /// Works every `Keyframes` item in `items`: per video, detects scenes, then
 /// works each timestamp (extract+embed, or skip a blob that already exists —
 /// see [`keyframe_at_timestamp`]). The manifest blob is written LAST, only
@@ -776,6 +907,429 @@ fn run_keyframe_items(
     Ok(outcome)
 }
 
+/// One pass's transcribe-kind result: `written` new transcript blobs and
+/// per-item `failed` (path, reason).
+#[derive(Default)]
+struct TranscribeOutcome {
+    written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// Timeout-sizing fallback for sources ffprobe can't report a duration for
+/// — audio-only containers have no video stream, which `video::probe`
+/// requires. One hour keeps `audio_timeout` generous without letting a hung
+/// ffmpeg block a pass for the better part of a day.
+const FALLBACK_AUDIO_DURATION_MS: u64 = 60 * 60 * 1000;
+
+fn transcribe_one(
+    blobs: &BlobStore,
+    transcriber: &Transcriber,
+    item: &work::WorkItem,
+) -> Result<()> {
+    let duration_ms = majestical_index::video::probe(&item.abs_path)
+        .map_or(FALLBACK_AUDIO_DURATION_MS, |info| info.duration_ms);
+    let pcm = majestical_index::video::extract_audio_pcm(&item.abs_path, duration_ms)?;
+    let transcript = transcriber.transcribe(&pcm)?;
+    let json = transcript.to_json()?;
+    let bytes = zstd::encode_all(&json[..], BLOB_ZSTD_LEVEL)
+        .with_context(|| format!("compressing transcript for {}", item.abs_path.display()))?;
+    let path = blobs.path_for(
+        &item.asset_hex,
+        &Derivation::Transcript {
+            model_tag: WHISPER_MODEL_TAG,
+        },
+    );
+    blobs.write_atomic(&path, &bytes)?;
+    Ok(())
+}
+
+/// Works every `Transcribe` item serially: the whisper context is loaded
+/// ONCE before the loop (model-bound kinds don't get a worker pool — one
+/// Metal-backed inference already saturates the machine), then each item is
+/// probed for duration (audio-only files fall back to
+/// [`FALLBACK_AUDIO_DURATION_MS`] for the extract timeout), decoded to PCM,
+/// transcribed, and written as a zstd JSON blob.
+///
+/// # Errors
+/// Returns an error only if the whisper model fails to load — per-item
+/// failures land in the outcome's `failed` list instead.
+fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<TranscribeOutcome> {
+    let mut outcome = TranscribeOutcome::default();
+    if items.is_empty() {
+        return Ok(outcome);
+    }
+    let Some(model_dir) = whisper_model_dir_if_present() else {
+        return Ok(outcome);
+    };
+    let transcriber = Transcriber::load(&model_dir)?;
+    for item in items {
+        match transcribe_one(blobs, &transcriber, item) {
+            Ok(()) => outcome.written += 1,
+            Err(err) => outcome
+                .failed
+                .push((item.abs_path.clone(), err.to_string())),
+        }
+    }
+    Ok(outcome)
+}
+
+/// One pass's transcript-embed result: `chunks_written` chunk vectors,
+/// `empty` transcripts that chunked to nothing (their `ChunksEmpty` marker
+/// written), and per-item `failed` (transcript blob path, reason — the
+/// item's own `abs_path` can be the empty sentinel, see
+/// `work::WorkItem::abs_path`).
+#[derive(Default)]
+struct TranscriptEmbedOutcome {
+    chunks_written: u64,
+    empty: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// What embedding one transcript's chunks produced.
+enum ChunkEmbedResult {
+    Written(u64),
+    Empty,
+}
+
+fn embed_transcript_chunks(
+    blobs: &BlobStore,
+    encoder: &mut TextEncoder,
+    store: &TextVectorStore,
+    item: &work::WorkItem,
+) -> Result<ChunkEmbedResult> {
+    let transcript_path = blobs.path_for(
+        &item.asset_hex,
+        &Derivation::Transcript {
+            model_tag: WHISPER_MODEL_TAG,
+        },
+    );
+    let transcript = read_transcript_blob(&transcript_path)?;
+    let chunks = chunk_segments(&transcript.segments);
+    let mut rows = Vec::new();
+    for chunk in &chunks {
+        // Whitespace-only segments can chunk to empty text — nothing to
+        // embed, and the encoder would just produce a meaningless vector.
+        if chunk.text.trim().is_empty() {
+            continue;
+        }
+        let vector = encoder.embed(&chunk.text)?;
+        let path = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::TranscriptChunk {
+                model_tag: MINILM.tag,
+                start_ms: chunk.start_ms,
+            },
+        );
+        blobs.write_vector(&path, &vector)?;
+        rows.push(TextChunkRow {
+            asset_hex: item.asset_hex.clone(),
+            source: "transcript".to_string(),
+            start_ms: ts_ms_i64(chunk.start_ms),
+            end_ms: ts_ms_i64(chunk.end_ms),
+            model_tag: MINILM.tag.to_string(),
+            text: chunk.text.clone(),
+            vector,
+        });
+    }
+    if rows.is_empty() {
+        let marker = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::ChunksEmpty {
+                model_tag: MINILM.tag,
+            },
+        );
+        blobs.write_atomic(&marker, b"{}")?;
+        return Ok(ChunkEmbedResult::Empty);
+    }
+    let written = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    store.add(rows)?;
+    Ok(ChunkEmbedResult::Written(written))
+}
+
+/// Works every `TranscriptEmbed` item serially: reads the transcript blob
+/// (never the source file), chunks it, embeds each non-empty chunk with a
+/// `MiniLM` encoder loaded ONCE, writes chunk vector blobs, and indexes the
+/// chunks (text included) into the local text Lance table. A transcript
+/// with zero non-empty chunks gets the `ChunksEmpty` done-marker instead.
+///
+/// # Errors
+/// Returns an error if the `MiniLM` model fails to load or the text vector
+/// store can't be opened even after one corruption-recovery retry —
+/// per-item failures land in the outcome's `failed` list instead.
+fn run_transcript_embed_items(
+    paths: &EmbedPaths,
+    blobs: &BlobStore,
+    items: &[work::WorkItem],
+) -> Result<TranscriptEmbedOutcome> {
+    let mut outcome = TranscriptEmbedOutcome::default();
+    if items.is_empty() {
+        return Ok(outcome);
+    }
+    let Some(model_dir) = minilm_model_dir_if_present() else {
+        return Ok(outcome);
+    };
+    let mut encoder = TextEncoder::load(&model_dir)?;
+    let store = open_or_rebuild_text(&paths.lance_dir)?;
+    for item in items {
+        let transcript_path = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::Transcript {
+                model_tag: WHISPER_MODEL_TAG,
+            },
+        );
+        match embed_transcript_chunks(blobs, &mut encoder, &store, item) {
+            Ok(ChunkEmbedResult::Written(n)) => outcome.chunks_written += n,
+            Ok(ChunkEmbedResult::Empty) => outcome.empty += 1,
+            Err(err) => outcome.failed.push((transcript_path, err.to_string())),
+        }
+    }
+    Ok(outcome)
+}
+
+/// One pass's OCR-kind result across stills and video keyframes.
+#[derive(Default)]
+struct OcrOutcome {
+    images_written: u64,
+    videos_done: u64,
+    keyframes_written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+fn ocr_one_still(blobs: &BlobStore, item: &work::WorkItem) -> Result<()> {
+    let rgb = majestical_index::thumbs::decode_image(&item.abs_path)?;
+    let result = majestical_index::ocr::recognize_text(&rgb)?;
+    write_json_blob(
+        blobs,
+        &blobs.path_for(
+            &item.asset_hex,
+            &Derivation::OcrImage {
+                model_tag: OCR_MODEL_TAG,
+            },
+        ),
+        &result.to_json()?,
+    )
+}
+
+/// One video's keyframe-OCR pass result.
+struct VideoOcrResult {
+    keyframes_written: u64,
+    failures: usize,
+    total: usize,
+    first_failure: Option<String>,
+}
+
+fn ocr_one_keyframe(blobs: &BlobStore, item: &work::WorkItem, ts_ms: u64) -> Result<()> {
+    let frame = majestical_index::video::extract_frame(&item.abs_path, ts_ms)?;
+    let result = majestical_index::ocr::recognize_text(&frame)?;
+    write_json_blob(
+        blobs,
+        &blobs.path_for(
+            &item.asset_hex,
+            &Derivation::OcrKeyframe {
+                model_tag: OCR_MODEL_TAG,
+                timestamp_ms: ts_ms,
+            },
+        ),
+        &result.to_json()?,
+    )
+}
+
+/// Works one `OcrKeyframes` video: diffs the keyframe manifest's timestamps
+/// against existing per-frame OCR blobs, OCRs each missing one, and — only
+/// once EVERY timestamp has a blob — writes the `OcrComplete` done-marker.
+/// The marker body carries the manifest's timestamp list so a future
+/// manifest change stays auditable against what was actually OCR'd.
+fn ocr_video_keyframes(blobs: &BlobStore, item: &work::WorkItem) -> Result<VideoOcrResult> {
+    let manifest_path = blobs.path_for(
+        &item.asset_hex,
+        &Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    let bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading keyframe manifest {}", manifest_path.display()))?;
+    let (_, _, timestamps) = keyframes_manifest_read(&bytes)?;
+
+    let mut result = VideoOcrResult {
+        keyframes_written: 0,
+        failures: 0,
+        total: timestamps.len(),
+        first_failure: None,
+    };
+    for &ts_ms in &timestamps {
+        let blob_path = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::OcrKeyframe {
+                model_tag: OCR_MODEL_TAG,
+                timestamp_ms: ts_ms,
+            },
+        );
+        if blob_path.is_file() {
+            continue;
+        }
+        match ocr_one_keyframe(blobs, item, ts_ms) {
+            Ok(()) => result.keyframes_written += 1,
+            Err(err) => {
+                result.failures += 1;
+                result.first_failure.get_or_insert(err.to_string());
+            }
+        }
+    }
+    if result.failures == 0 {
+        let marker = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::OcrComplete {
+                model_tag: OCR_MODEL_TAG,
+            },
+        );
+        write_json_blob_uncompressed(
+            blobs,
+            &marker,
+            &serde_json::json!({ "timestamps": timestamps }),
+        )?;
+    }
+    Ok(result)
+}
+
+/// Works every OCR item — stills first, then videos whose keyframe manifest
+/// is ready. Vision ships with macOS, so there's no capability re-check
+/// here; per-item failures are collected, never propagated.
+fn run_ocr_items(
+    blobs: &BlobStore,
+    stills: &[work::WorkItem],
+    videos: &[work::WorkItem],
+) -> OcrOutcome {
+    let mut outcome = OcrOutcome::default();
+    for item in stills {
+        match ocr_one_still(blobs, item) {
+            Ok(()) => outcome.images_written += 1,
+            Err(err) => outcome
+                .failed
+                .push((item.abs_path.clone(), err.to_string())),
+        }
+    }
+    for item in videos {
+        match ocr_video_keyframes(blobs, item) {
+            Ok(result) => {
+                outcome.keyframes_written += result.keyframes_written;
+                if result.failures == 0 {
+                    outcome.videos_done += 1;
+                } else {
+                    let first = result.first_failure.as_deref().unwrap_or("<no reason>");
+                    outcome.failed.push((
+                        item.abs_path.clone(),
+                        format!(
+                            "{}: {}/{} keyframes failed OCR — first failure: {first} — \
+                             video incomplete, will retry",
+                            item.abs_path.display(),
+                            result.failures,
+                            result.total,
+                        ),
+                    ));
+                }
+            }
+            Err(err) => outcome
+                .failed
+                .push((item.abs_path.clone(), err.to_string())),
+        }
+    }
+    outcome
+}
+
+/// One pass's PDF-text result.
+#[derive(Default)]
+struct PdfOutcome {
+    written: u64,
+    failed: Vec<(PathBuf, String)>,
+}
+
+fn pdf_text_one(blobs: &BlobStore, item: &work::WorkItem) -> Result<()> {
+    let content = majestical_index::pdf::extract_text(&item.abs_path)?;
+    write_json_blob(
+        blobs,
+        &blobs.path_for(
+            &item.asset_hex,
+            &Derivation::PdfText {
+                model_tag: PDF_MODEL_TAG,
+            },
+        ),
+        &content.to_json()?,
+    )
+}
+
+/// Works every `PdfText` item — `PDFKit` ships with macOS, so there's no
+/// capability re-check; per-item failures are collected, never propagated.
+fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome {
+    let mut outcome = PdfOutcome::default();
+    for item in items {
+        match pdf_text_one(blobs, item) {
+            Ok(()) => outcome.written += 1,
+            Err(err) => outcome
+                .failed
+                .push((item.abs_path.clone(), err.to_string())),
+        }
+    }
+    outcome
+}
+
+/// zstd-compresses `json` and writes it atomically at `path`.
+fn write_json_blob(blobs: &BlobStore, path: &Path, json: &[u8]) -> Result<()> {
+    let bytes = zstd::encode_all(json, BLOB_ZSTD_LEVEL)
+        .with_context(|| format!("compressing json blob {}", path.display()))?;
+    blobs.write_atomic(path, &bytes)?;
+    Ok(())
+}
+
+/// Writes a small marker/manifest JSON value atomically, uncompressed —
+/// same convention as the keyframe manifest.
+fn write_json_blob_uncompressed(
+    blobs: &BlobStore,
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<()> {
+    blobs.write_atomic(path, value.to_string().as_bytes())?;
+    Ok(())
+}
+
+/// Reads and parses a zstd JSON transcript blob.
+fn read_transcript_blob(path: &Path) -> Result<Transcript> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading transcript blob {}", path.display()))?;
+    let json = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing transcript blob {}", path.display()))?;
+    Ok(Transcript::from_json(&json)?)
+}
+
+/// Opens the text-chunk Lance table with the same probe + corruption
+/// recovery policy as [`open_or_rebuild`]. The text table shares the lance
+/// dataset directory with the image-vector table, so a rebuild here removes
+/// both — both are disposable, rebuilt from blobs by later passes.
+fn open_or_rebuild_text(dir: &Path) -> Result<TextVectorStore> {
+    match open_and_probe_text(dir) {
+        Ok(store) => return Ok(store),
+        Err(reason) => eprintln!(
+            "note: lance text store at {} is unreadable ({reason}) — removing and \
+             rebuilding from blobs",
+            dir.display()
+        ),
+    }
+    remove_lance_state(dir)?;
+    open_and_probe_text(dir).map_err(|reason| {
+        anyhow::anyhow!("rebuilding lance text store at {}: {reason}", dir.display())
+    })
+}
+
+/// Text-store variant of [`open_and_probe`]: open plus a cheap probe scan,
+/// with lance's manifest-reader panics caught as corruption.
+fn open_and_probe_text(dir: &Path) -> Result<TextVectorStore, String> {
+    let owned = dir.to_path_buf();
+    majestical_index::vector_store::catch_corruption(move || {
+        let store = TextVectorStore::open(&owned)?;
+        store.existing_keys(MINILM.tag)?;
+        Ok(store)
+    })
+}
+
 fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
     failed
         .iter()
@@ -783,61 +1337,324 @@ fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn print_run_result(
-    thumbs: &ThumbOutcome,
-    embed: &EmbedOutcome,
-    keyframes: &KeyframeOutcome,
-    json: bool,
-) {
+/// Every kind's outcome for one pass, bundled so the printers and the
+/// failure report take one value instead of seven.
+struct RunOutcomes {
+    thumbs: ThumbOutcome,
+    embed: EmbedOutcome,
+    keyframes: KeyframeOutcome,
+    transcribe: TranscribeOutcome,
+    transcript_embed: TranscriptEmbedOutcome,
+    ocr: OcrOutcome,
+    pdf: PdfOutcome,
+}
+
+impl RunOutcomes {
+    /// The transcripts CLI kind spans two executors — their failures merge
+    /// for reporting.
+    fn transcript_failures(&self) -> Vec<(PathBuf, String)> {
+        let mut merged = self.transcribe.failed.clone();
+        merged.extend(self.transcript_embed.failed.iter().cloned());
+        merged
+    }
+}
+
+fn run_result_json(o: &RunOutcomes) -> serde_json::Value {
+    serde_json::json!({
+        "thumbnails": { "written": o.thumbs.written, "failed": failed_json(&o.thumbs.failed) },
+        "embeddings": {
+            "written": o.embed.written,
+            "loaded_from_blobs": o.embed.loaded,
+            "failed": failed_json(&o.embed.failed),
+        },
+        "keyframes": {
+            "videos_done": o.keyframes.videos_done,
+            "keyframes_written": o.keyframes.keyframes_written,
+            "keyframes_failed": o.keyframes.keyframes_failed,
+            "failed": failed_json(&o.keyframes.failed),
+        },
+        "transcripts": {
+            "transcribed": o.transcribe.written,
+            "chunks_written": o.transcript_embed.chunks_written,
+            "chunks_empty": o.transcript_embed.empty,
+            "failed": failed_json(&o.transcript_failures()),
+        },
+        "ocr": {
+            "images_written": o.ocr.images_written,
+            "videos_done": o.ocr.videos_done,
+            "keyframes_written": o.ocr.keyframes_written,
+            "failed": failed_json(&o.ocr.failed),
+        },
+        "pdf": { "written": o.pdf.written, "failed": failed_json(&o.pdf.failed) },
+        // Task 18 wires the describer; the key exists now so consumers see a
+        // stable shape.
+        "captions": { "written": 0, "failed": [] },
+    })
+}
+
+fn print_run_result(o: &RunOutcomes, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "thumbnails": { "written": thumbs.written, "failed": failed_json(&thumbs.failed) },
-                "embeddings": {
-                    "written": embed.written,
-                    "loaded_from_blobs": embed.loaded,
-                    "failed": failed_json(&embed.failed),
-                },
-                "keyframes": {
-                    "videos_done": keyframes.videos_done,
-                    "keyframes_written": keyframes.keyframes_written,
-                    "keyframes_failed": keyframes.keyframes_failed,
-                    "failed": failed_json(&keyframes.failed),
-                },
-            })
-        );
+        println!("{}", run_result_json(o));
     } else {
         println!(
             "thumbnails: {} written, {} failed",
-            thumbs.written,
-            thumbs.failed.len()
+            o.thumbs.written,
+            o.thumbs.failed.len()
         );
         println!(
             "embeddings: {} written, {} loaded from blobs, {} failed",
-            embed.written,
-            embed.loaded,
-            embed.failed.len()
+            o.embed.written,
+            o.embed.loaded,
+            o.embed.failed.len()
         );
         println!(
             "keyframes: {} videos, {} frames embedded, {} frame failures, {} videos failed",
-            keyframes.videos_done,
-            keyframes.keyframes_written,
-            keyframes.keyframes_failed,
-            keyframes.failed.len()
+            o.keyframes.videos_done,
+            o.keyframes.keyframes_written,
+            o.keyframes.keyframes_failed,
+            o.keyframes.failed.len()
+        );
+        println!(
+            "transcripts: {} transcribed, {} chunks embedded, {} empty, {} failed",
+            o.transcribe.written,
+            o.transcript_embed.chunks_written,
+            o.transcript_embed.empty,
+            o.transcribe.failed.len() + o.transcript_embed.failed.len()
+        );
+        println!(
+            "ocr: {} images, {} videos completed, {} keyframes, {} failed",
+            o.ocr.images_written,
+            o.ocr.videos_done,
+            o.ocr.keyframes_written,
+            o.ocr.failed.len()
+        );
+        println!(
+            "pdf: {} written, {} failed",
+            o.pdf.written,
+            o.pdf.failed.len()
         );
     }
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
     // `--json` branch above, for callers that want it out-of-band).
-    for (_, err) in thumbs
+    for (_, err) in o
+        .thumbs
         .failed
         .iter()
-        .chain(&embed.failed)
-        .chain(&keyframes.failed)
+        .chain(&o.embed.failed)
+        .chain(&o.keyframes.failed)
+        .chain(&o.transcribe.failed)
+        .chain(&o.transcript_embed.failed)
+        .chain(&o.ocr.failed)
+        .chain(&o.pdf.failed)
     {
         eprintln!("failed: {err}");
     }
+}
+
+/// The per-run failure marker's JSON body: `{kind: [{path, error}, ..]}`,
+/// kinds with no failures omitted. An empty pass writes `{}` — the file is
+/// always overwritten, so a clean run clears the previous run's failures.
+fn failure_report_json(o: &RunOutcomes) -> serde_json::Value {
+    let kinds: [(&str, Vec<(PathBuf, String)>); 6] = [
+        ("thumbs", o.thumbs.failed.clone()),
+        ("embeddings", o.embed.failed.clone()),
+        ("keyframes", o.keyframes.failed.clone()),
+        ("transcripts", o.transcript_failures()),
+        ("ocr", o.ocr.failed.clone()),
+        ("pdf", o.pdf.failed.clone()),
+    ];
+    let mut map = serde_json::Map::new();
+    for (kind, failed) in kinds {
+        if !failed.is_empty() {
+            map.insert(kind.to_string(), failed_json(&failed).into());
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("creating state dir {}", state_dir.display()))?;
+    let path = state_dir.join(FAILURES_FILE);
+    std::fs::write(&path, report.to_string())
+        .with_context(|| format!("writing failure report {}", path.display()))
+}
+
+/// Reads the last run's failure marker; a missing or unparsable file is an
+/// empty report (a fresh catalog has no last run to report on).
+fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(state_dir.join(FAILURES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// The blob↔`text_fts` diff, run at the end of EVERY pass (mirroring
+/// `load_missing_vectors_from_blobs`'s role for Lance): any asset with a
+/// transcript/OCR/PDF-text blob but no `text_fts` rows for that source gets
+/// its rows rebuilt from the blob. `db.text_assets(source)` makes the pass
+/// cheap when nothing changed; a blob that decodes to no usable text is
+/// re-examined each pass rather than tracked (rare, and decoding one small
+/// blob is cheap). Caption healing lands with the describer in Task 18.
+///
+/// # Errors
+/// Returns an error on a blob-walk or sqlite failure; an individual
+/// undecodable blob is reported to stderr and skipped instead.
+fn heal_text_fts(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+    heal_transcript_rows(db, blobs)?;
+    heal_ocr_rows(db, blobs)?;
+    heal_pdf_rows(db, blobs)?;
+    Ok(())
+}
+
+fn heal_transcript_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+    let covered = db.text_assets("transcript")?;
+    for (hex, _, path) in blobs.iter_named("transcript.json.zst")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        let transcript = match read_transcript_blob(&path) {
+            Ok(transcript) => transcript,
+            Err(err) => {
+                eprintln!("note: skipping unreadable transcript blob: {err}");
+                continue;
+            }
+        };
+        let chunks = chunk_segments(&transcript.segments);
+        let rows: Vec<(i64, &str)> = chunks
+            .iter()
+            .filter(|c| !c.text.trim().is_empty())
+            .map(|c| (ts_ms_i64(c.start_ms), c.text.as_str()))
+            .collect();
+        if !rows.is_empty() {
+            db.upsert_text_rows(&asset, "transcript", &rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads and joins one OCR blob's recognized lines into a single content
+/// string (newline-separated, preserving line order).
+fn read_ocr_blob_text(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading ocr blob {}", path.display()))?;
+    let json = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing ocr blob {}", path.display()))?;
+    let result = OcrResult::from_json(&json)?;
+    Ok(result
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Heals OCR rows from stills (`image.json.zst`, locator -1) and from
+/// completed videos. Video enumeration rides the `ocr-complete.json`
+/// markers: kf blobs have variable names, so instead of a new `BlobStore`
+/// walker, each marker's sibling `kf-<ts>.json.zst` files are read directly
+/// — partially-OCR'd videos (no marker yet) are picked up once complete.
+fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+    let covered = db.text_assets("ocr")?;
+    for (hex, _, path) in blobs.iter_named("image.json.zst")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        match read_ocr_blob_text(&path) {
+            Ok(text) if !text.trim().is_empty() => {
+                db.upsert_text_rows(&asset, "ocr", &[(-1, text.as_str())])?;
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("note: skipping unreadable ocr blob: {err}"),
+        }
+    }
+    for (hex, _, marker_path) in blobs.iter_named("ocr-complete.json")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        let rows = keyframe_ocr_rows(&marker_path);
+        let row_refs: Vec<(i64, &str)> =
+            rows.iter().map(|(ts, text)| (*ts, text.as_str())).collect();
+        if !row_refs.is_empty() {
+            db.upsert_text_rows(&asset, "ocr", &row_refs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collects `(ts_ms, text)` rows from the `kf-<ts>.json.zst` OCR blobs
+/// sitting beside a video's `ocr-complete.json` marker, sorted by
+/// timestamp; unreadable entries are reported and skipped.
+fn keyframe_ocr_rows(marker_path: &Path) -> Vec<(i64, String)> {
+    let Some(dir) = marker_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(ts_ms) = name
+            .strip_prefix("kf-")
+            .and_then(|rest| rest.strip_suffix(".json.zst"))
+            .and_then(|ms| ms.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        match read_ocr_blob_text(&entry.path()) {
+            Ok(text) if !text.trim().is_empty() => rows.push((ts_ms, text)),
+            Ok(_) => {}
+            Err(err) => eprintln!("note: skipping unreadable keyframe ocr blob: {err}"),
+        }
+    }
+    rows.sort_unstable_by_key(|(ts, _)| *ts);
+    rows
+}
+
+fn heal_pdf_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+    let covered = db.text_assets("pdf")?;
+    for (hex, _, path) in blobs.iter_named("text.json.zst")? {
+        let asset = AssetId(format!("xxh3:{hex}"));
+        if covered.contains(&asset) {
+            continue;
+        }
+        let content = match read_pdf_blob(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("note: skipping unreadable pdf text blob: {err}");
+                continue;
+            }
+        };
+        let rows: Vec<(i64, &str)> = content
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| !page.trim().is_empty())
+            .map(|(index, page)| {
+                // Locator is the 1-based page number.
+                (i64::try_from(index + 1).unwrap_or(i64::MAX), page.as_str())
+            })
+            .collect();
+        if !rows.is_empty() {
+            db.upsert_text_rows(&asset, "pdf", &rows)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_pdf_blob(path: &Path) -> Result<PdfContent> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading pdf text blob {}", path.display()))?;
+    let json = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing pdf text blob {}", path.display()))?;
+    Ok(PdfContent::from_json(&json)?)
 }
 
 /// True when `--kinds` was passed explicitly and names `keyframes` — the one
@@ -904,16 +1721,61 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
     })
 }
 
+/// Remedy lines for capability gaps, printed under the per-kind status
+/// lines: each names the exact command that closes the gap.
+fn print_status_remedies(plan: &WorkPlan, caps: &Capabilities) {
+    if plan.transcripts.needs_model > 0 {
+        let mut fetches = Vec::new();
+        if !caps.whisper {
+            fetches.push(format!("--only {}", WHISPER.tag));
+        }
+        if !caps.text_model {
+            fetches.push(format!("--only {}", MINILM.tag));
+        }
+        if !fetches.is_empty() {
+            println!(
+                "transcripts needs model: run `maj model fetch {}`",
+                fetches.join(" ")
+            );
+        }
+    }
+    if plan.captions.needs_model > 0 {
+        println!("captions needs model: run `maj describer set` to configure a backend");
+    }
+}
+
+/// Per-kind failure lines from the last run's marker, e.g.
+/// `pdf failed last run: 1 (broken.pdf: not a valid pdf)`.
+fn print_last_run_failures(failures: &serde_json::Map<String, serde_json::Value>) {
+    for (kind, list) in failures {
+        let Some(entries) = list.as_array() else {
+            continue;
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        let first = entries[0]["error"].as_str().unwrap_or("<unknown reason>");
+        println!("{kind} failed last run: {} ({first})", entries.len());
+    }
+}
+
 /// Reports the queue's current state per derivation kind without doing any
-/// work — a diff against the blob store, same as `run`, just not executed.
+/// work — a diff against the blob store, same as `run`, just not executed —
+/// plus the last run's per-item failures from the failure marker.
 ///
 /// # Errors
-/// Returns an error if the catalog can't be opened/synced.
+/// Returns an error if the catalog can't be opened/synced or the state dir
+/// can't be resolved.
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
+    // `build_plan` computes capabilities internally; recomputed here only to
+    // phrase the remedy lines (which model is actually missing).
+    let caps = capabilities();
     let plan = build_plan(&projection, &blobs, &kinds);
+    let failures = read_failure_report(&state_dir);
     if json {
         println!(
             "{}",
@@ -921,12 +1783,23 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
                 "thumbs": kind_status_json(&plan.thumbs),
                 "embeddings": kind_status_json(&plan.embeddings),
                 "keyframes": kind_status_json(&plan.keyframes),
+                "transcripts": kind_status_json(&plan.transcripts),
+                "ocr": kind_status_json(&plan.ocr),
+                "pdf": kind_status_json(&plan.pdf),
+                "captions": kind_status_json(&plan.captions),
+                "failed_last_run": serde_json::Value::Object(failures),
             })
         );
     } else {
         print_kind_status("thumbs", &plan.thumbs);
         print_kind_status("embeddings", &plan.embeddings);
         print_kind_status("keyframes", &plan.keyframes);
+        print_kind_status("transcripts", &plan.transcripts);
+        print_kind_status("ocr", &plan.ocr);
+        print_kind_status("pdf", &plan.pdf);
+        print_kind_status("captions", &plan.captions);
+        print_status_remedies(&plan, &caps);
+        print_last_run_failures(&failures);
     }
     Ok(())
 }
@@ -969,10 +1842,59 @@ mod tests {
     #[test]
     fn parse_kinds_defaults_to_every_kind() {
         let kinds = parse_kinds(None).expect("default kinds");
-        assert_eq!(kinds.len(), 3);
-        assert!(kinds.contains("thumbs"));
-        assert!(kinds.contains("embeddings"));
-        assert!(kinds.contains("keyframes"));
+        assert_eq!(kinds.len(), VALID_KINDS.len());
+        for kind in VALID_KINDS {
+            assert!(kinds.contains(*kind), "default must include {kind}");
+        }
+    }
+
+    #[test]
+    fn keyframes_manifest_round_trips_through_the_reader() {
+        let bytes = keyframes_manifest_json("m1", 5, &[1500, 4500, 7500]);
+        let (model_tag, detected, timestamps) =
+            keyframes_manifest_read(&bytes).expect("round trip");
+        assert_eq!(model_tag, "m1");
+        assert_eq!(detected, 5);
+        assert_eq!(timestamps, vec![1500, 4500, 7500]);
+    }
+
+    #[test]
+    fn keyframes_manifest_read_rejects_malformed_bytes() {
+        let err = keyframes_manifest_read(b"not json").expect_err("must reject non-json");
+        assert!(err.to_string().contains("keyframe manifest"));
+        let err =
+            keyframes_manifest_read(b"{\"detected\": 2}").expect_err("must name the missing field");
+        assert!(err.to_string().contains("model_tag"), "{err}");
+    }
+
+    #[test]
+    fn failure_report_json_includes_only_kinds_with_failures() {
+        let outcomes = RunOutcomes {
+            thumbs: ThumbOutcome {
+                written: 1,
+                failed: Vec::new(),
+            },
+            embed: EmbedOutcome {
+                written: 0,
+                loaded: 0,
+                failed: Vec::new(),
+            },
+            keyframes: KeyframeOutcome::default(),
+            transcribe: TranscribeOutcome::default(),
+            transcript_embed: TranscriptEmbedOutcome::default(),
+            ocr: OcrOutcome::default(),
+            pdf: PdfOutcome {
+                written: 0,
+                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+            },
+        };
+        let report = failure_report_json(&outcomes);
+        let map = report.as_object().expect("object");
+        assert_eq!(map.len(), 1, "only the pdf kind failed: {report}");
+        let entries = map["pdf"].as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["path"], "/media/broken.pdf");
+        assert_eq!(entries[0]["error"], "not a valid pdf");
     }
 
     #[test]

@@ -204,8 +204,8 @@ enum MetaCmd {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    /// Work the derivation queue (thumbnails now; embeddings and keyframes
-    /// once their capabilities are installed).
+    /// Work the derivation queue (thumbnails, embeddings, keyframes,
+    /// transcripts, OCR, PDF text; captions once a describer is configured).
     Run {
         /// Keep working the queue, polling every 5s for newly scanned assets.
         #[arg(long)]
@@ -216,7 +216,8 @@ enum IndexCmd {
         /// Stop after this many items.
         #[arg(long)]
         limit: Option<usize>,
-        /// Comma-separated subset: thumbs,embeddings,keyframes.
+        /// Comma-separated subset:
+        /// thumbs,embeddings,keyframes,transcripts,ocr,pdf,captions.
         #[arg(long, value_delimiter = ',')]
         kinds: Option<Vec<String>>,
         #[arg(long)]

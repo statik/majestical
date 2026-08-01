@@ -1,6 +1,7 @@
-//! `maj sync push` end to end over real temp-dir catalogs and locations.
+//! `maj sync push`/`maj sync pull` end to end over real temp-dir catalogs
+//! and locations.
 mod common;
-use common::maj;
+use common::{maj, maj_as};
 use std::path::{Path, PathBuf};
 
 // `#[cfg(test)]` on these helpers is not redundant despite every file under
@@ -12,11 +13,16 @@ use std::path::{Path, PathBuf};
 // it here makes `cargo clippy --test sync_smoke` fail). Same pattern as
 // `tests/common/mod.rs`'s helpers.
 #[cfg(test)]
-fn init_catalog(catalog: &Path, state: &Path) {
-    maj(catalog, state)
+fn init_catalog_as(catalog: &Path, state: &Path, machine: &str) {
+    maj_as(catalog, state, machine)
         .args(["catalog", "init"])
         .assert()
         .success();
+}
+
+#[cfg(test)]
+fn init_catalog(catalog: &Path, state: &Path) {
+    init_catalog_as(catalog, state, "test-machine");
 }
 
 /// state/catalogs/<key>/sync.toml — exactly one catalog key exists per test.
@@ -39,29 +45,40 @@ struct Fixture {
     catalog: PathBuf,
     state: PathBuf,
     media: PathBuf,
+    machine: String,
 }
 
+/// Builds a fixture identified as `machine` — the two-machine pull tests
+/// need distinct machine ids (segments land under `events/<machine>/`, and
+/// a pull's report names whose events it applied), unlike every push test,
+/// which only ever needs one machine and gets it via [`fixture`].
 #[cfg(test)]
-fn fixture(root: &Path, name: &str) -> Fixture {
+fn fixture_as(root: &Path, name: &str, machine: &str) -> Fixture {
     let catalog = root.join(format!("{name}-cat"));
     let state = root.join(format!("{name}-state"));
     let media = root.join(format!("{name}-media"));
-    init_catalog(&catalog, &state);
+    init_catalog_as(&catalog, &state, machine);
     Fixture {
         catalog,
         state,
         media,
+        machine: machine.to_string(),
     }
+}
+
+#[cfg(test)]
+fn fixture(root: &Path, name: &str) -> Fixture {
+    fixture_as(root, name, "test-machine")
 }
 
 #[cfg(test)]
 impl Fixture {
     /// Scans a single real file into this fixture's catalog, producing one
-    /// real segment (`events/test-machine/0001.jsonl`) with actual content.
+    /// real segment (`events/<machine>/0001.jsonl`) with actual content.
     fn scan_one_file(&self) {
         std::fs::create_dir_all(&self.media).expect("mkdir");
         std::fs::write(self.media.join("a.jpg"), b"jpeg-bytes").expect("write");
-        maj(&self.catalog, &self.state)
+        maj_as(&self.catalog, &self.state, &self.machine)
             .args(["scan"])
             .arg(&self.media)
             .args(["--volume", "vol1"])
@@ -78,7 +95,7 @@ impl Fixture {
 
     /// Registers `path` as a sync location named `name` on this fixture.
     fn add_location(&self, name: &str, path: &Path) {
-        maj(&self.catalog, &self.state)
+        maj_as(&self.catalog, &self.state, &self.machine)
             .args(["sync", "location", "add", name])
             .arg(path)
             .assert()
@@ -483,5 +500,128 @@ fn push_errors_name_their_remedies() {
     assert!(
         stderr.contains("no sync locations configured") && stderr.contains("maj sync location add"),
         "push with no locations configured must name the remedy: {stderr}"
+    );
+}
+
+#[test]
+fn pull_applies_a_teammates_events_and_names_the_index_remedy() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    // Machine 1: its own catalog root + state, scans a file and a blob,
+    // pushes both to the shared location.
+    let m1 = fixture_as(root.path(), "m1", "m1");
+    m1.scan_one_file();
+    m1.write_blob("ab/abcd/thumb-320.webp", b"w");
+    m1.add_location("nas", &location);
+    maj_as(&m1.catalog, &m1.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Machine 2: a separate catalog root + state, pulling from the same
+    // location.
+    let m2 = fixture_as(root.path(), "m2", "m2");
+    m2.add_location("nas", &location);
+    let out = maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "pull"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("applied") && stdout.contains("m1"),
+        "pull must report applied events and the machines they came from: {stdout}"
+    );
+    assert!(
+        stdout.contains("maj index run"),
+        "fetched blobs must carry the index remedy notice: {stdout}"
+    );
+    assert!(
+        m2.catalog.join("blobs/ab/abcd/thumb-320.webp").is_file(),
+        "the pulled blob must land in machine 2's own catalog"
+    );
+
+    // The pulled events are actually in machine 2's catalog: search sees
+    // the scanned asset.
+    let out = maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["search", "a.jpg"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("a.jpg"),
+        "pulled catalog must be searchable: {stdout}"
+    );
+
+    // A second pull after full convergence reports zero applied, not an
+    // error — the manual round-trip check this pins automatically.
+    let out = maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "pull"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("applied 0 new event"),
+        "a converged pull reports zero applied: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pull_applies_events_despite_a_blob_failure_then_exits_nonzero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    let m1 = fixture_as(root.path(), "m1", "m1");
+    m1.scan_one_file();
+    m1.write_blob("ab/abcd/thumb-320.webp", b"w");
+    m1.add_location("nas", &location);
+    maj_as(&m1.catalog, &m1.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Sabotage the pulled blob AT THE LOCATION: unreadable, so `execute`'s
+    // copy of that one file fails while the segment (containing the real
+    // event) still lands — pinning that a per-file blob failure must never
+    // block an already-transferred segment from being applied.
+    let blob = location.join("blobs/ab/abcd/thumb-320.webp");
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let m2 = fixture_as(root.path(), "m2", "m2");
+    m2.add_location("nas", &location);
+    let out = maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "pull"])
+        .assert()
+        .failure();
+
+    // Restore permissions so the tempdir can be cleaned up regardless of
+    // what the assertions below find.
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).expect("restore perms");
+
+    let output = out.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stdout.contains("applied") && stdout.contains("m1"),
+        "the event must still apply despite the blob failure: {stdout}"
+    );
+    assert!(
+        stderr.contains("progress was kept") && stderr.contains("retries"),
+        "the final error must say progress was kept and the next run retries: {stderr}"
+    );
+
+    let out = maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["search", "a.jpg"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("a.jpg"),
+        "the applied event must be searchable despite the blob failure: {stdout}"
     );
 }

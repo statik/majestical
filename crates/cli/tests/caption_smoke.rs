@@ -695,3 +695,103 @@ fn confirm_unknown_asset_errors_actionably() {
         .failure()
         .stderr(contains("unknown asset").and(contains("scan its volume first")));
 }
+
+/// A corrupt rejections log must fail loudly, not silently drop the bad
+/// line: this file is append-only and owned entirely by `tags reject`, so a
+/// line that doesn't parse means something else corrupted it, and quietly
+/// skipping it would silently resurface a tag the user already rejected.
+/// The error must name the file, the 1-based line number, and the garbage
+/// content, so the fix is obvious without re-deriving it.
+#[test]
+fn corrupt_rejections_line_fails_loudly_with_path_and_line() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    // A first run with no rejections file yet forces the state dir (and
+    // its `runs/` subdir) into existence, so the rejections file's exact
+    // path can be located without hard-coding the per-catalog hash
+    // directory `state_dir_for` derives.
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success();
+    let runs_dirs = walkdir_find(&state, "runs");
+    assert_eq!(runs_dirs.len(), 1, "exactly one state dir's runs/ subdir");
+    let state_dir = runs_dirs[0].parent().unwrap();
+    let rejections_path = state_dir.join("tag-rejections.jsonl");
+
+    std::fs::write(
+        &rejections_path,
+        "{\"asset\":\"xxh3:aaaa\",\"tag\":\"color/red\"}\nGARBAGE-NOT-JSON\n",
+    )
+    .unwrap();
+
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .failure()
+        .stderr(
+            contains(rejections_path.display().to_string())
+                .and(contains(":2:"))
+                .and(contains("GARBAGE-NOT-JSON")),
+        );
+}
+
+/// An unreadable `tags.json.zst` blob (garbage, not real zstd) must not
+/// wedge `tags suggestions` for every other asset: it's skipped with a
+/// stderr note — it may be mid-write by another process — and a second,
+/// valid blob for a different asset still lists normally.
+#[test]
+fn unreadable_tags_blob_skips_with_a_note_and_others_still_list() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+
+    let blobs = majestical_index::blob::BlobStore::new(&root);
+
+    let garbage_hex = "deadbeefdeadbeefdeadbeefdeadbeef";
+    let garbage_path = blobs.path_for(
+        garbage_hex,
+        &majestical_index::blob::Derivation::Tags {
+            model_tag: "describe-m",
+        },
+    );
+    blobs
+        .write_atomic(&garbage_path, b"not zstd at all")
+        .unwrap();
+
+    let valid_hex = "cafebabecafebabecafebabecafebabe";
+    let valid_path = blobs.path_for(
+        valid_hex,
+        &majestical_index::blob::Derivation::Tags {
+            model_tag: "describe-m",
+        },
+    );
+    let suggestions = vec![majestical_core::ports::TagSuggestion {
+        tag: "topic/valid".to_string(),
+        confidence: 0.7,
+        in_vocab: false,
+        model_tag: "describe-m".to_string(),
+    }];
+    let json = serde_json::to_vec(&suggestions).unwrap();
+    let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+    blobs.write_atomic(&valid_path, &compressed).unwrap();
+
+    maj(&root, &state)
+        .args(["tags", "suggestions"])
+        .assert()
+        .success()
+        .stderr(contains("skipping unreadable"))
+        .stdout(contains("topic/valid"));
+}

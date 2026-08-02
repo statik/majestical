@@ -150,8 +150,35 @@ pub fn plan_source(
     known: &KnownAssets,
     mode: DedupeMode,
 ) -> Result<IngestPlan, IngestError> {
+    plan_source_filtered(source, known, mode, &|_| true)
+}
+
+/// [`plan_source`], but skips any entry — and never descends into any
+/// directory — for which `filter` returns `false`. `filter` is consulted
+/// before the walk enters each entry under `source` (the walk root itself
+/// is always visited regardless of what `filter` says about it — `filter`
+/// only prunes things found underneath it); when it rejects a directory,
+/// that directory's contents are never read, stat'd, or hashed at all, not
+/// merely discarded from the result afterward. A caller that only wants a
+/// known set of top-level files (e.g. `maj inbox process`'s loose-file
+/// triage, which must not re-walk an inbox's ever-growing `.processed/`
+/// archive on every pass) gets that by excluding every other subtree
+/// structurally, rather than planning everything and filtering the plan.
+///
+/// # Errors
+/// Same as [`plan_source`].
+pub fn plan_source_filtered(
+    source: &Path,
+    known: &KnownAssets,
+    mode: DedupeMode,
+    filter: &dyn Fn(&Path) -> bool,
+) -> Result<IngestPlan, IngestError> {
     let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(source).sort_by_file_name() {
+    let walk = walkdir::WalkDir::new(source)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || filter(entry.path()));
+    for entry in walk {
         let entry = entry.map_err(|source_err| IngestError::Walk {
             path: source_err
                 .path()
@@ -347,5 +374,96 @@ mod tests {
         // end-to-end coverage of the lossy-path fix if a Linux runner
         // (ext4/tmpfs, which allow raw-byte names) ever runs this suite.
         serde_json::to_string(&plan).expect("a plan with a non-UTF-8 rejection must serialize");
+    }
+
+    #[test]
+    fn plan_source_delegates_to_plan_source_filtered_with_an_always_true_filter() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "a.txt", b"a");
+        write(src.path(), "sub/b.txt", b"b");
+        let known = KnownAssets::from_pairs(vec![]);
+        let plan = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan");
+        let mut rels: Vec<&str> = plan.files.iter().map(|f| f.rel.as_str()).collect();
+        rels.sort_unstable();
+        assert_eq!(rels, vec!["a.txt", "sub/b.txt"]);
+    }
+
+    #[test]
+    fn a_filtered_out_directorys_contents_are_absent_from_the_plan() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "keep.txt", b"keep");
+        write(src.path(), "skip/nested.txt", b"nested");
+        let known = KnownAssets::from_pairs(vec![]);
+        let filter = |path: &Path| path.file_name().and_then(|n| n.to_str()) != Some("skip");
+        let plan = plan_source_filtered(src.path(), &known, DedupeMode::Skip, &filter)
+            .expect("filtered plan");
+        let rels: Vec<&str> = plan.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["keep.txt"],
+            "the excluded directory's contents must never appear in the plan"
+        );
+    }
+
+    /// Stronger proof that the filter is consulted before descending, not
+    /// after: an excluded directory that is unreadable must never surface a
+    /// `Walk` error, because the walk must never call `read_dir` on it in
+    /// the first place. If a filtered-out directory were merely dropped
+    /// from the result afterward (rather than never entered), this would
+    /// fail with `IngestError::Walk`.
+    #[test]
+    #[cfg(unix)]
+    fn a_filtered_out_directory_is_never_entered_even_when_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "keep.txt", b"keep");
+        let locked = src.path().join("locked");
+        fs::create_dir_all(&locked).expect("mkdir");
+        fs::write(locked.join("secret.txt"), b"secret").expect("write");
+        let mut perms = fs::metadata(&locked).expect("meta").permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&locked, perms).expect("chmod 000");
+
+        // Some environments (root, certain containers/filesystems) don't
+        // enforce this restriction — skip rather than false-fail there.
+        // Checked BEFORE restoring permissions below: this is the actual
+        // condition under test.
+        if fs::read_dir(&locked).is_ok() {
+            let mut perms = fs::metadata(&locked).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&locked, perms).expect("chmod restore");
+            // ingest's Cargo.toml inherits the workspace's print_stderr =
+            // "deny" (unlike cli's, which allows it crate-wide since CLI
+            // diagnostics are the product) — `#[expect]` documents the
+            // exception locally instead of weakening the lint crate-wide.
+            #[expect(
+                clippy::print_stderr,
+                reason = "environment-detection notice for a permission test that doesn't apply \
+                          when running as root or on a filesystem that ignores mode bits"
+            )]
+            {
+                eprintln!(
+                    "skipping: this environment does not enforce a mode-000 directory (likely root)"
+                );
+            }
+            return;
+        }
+
+        let known = KnownAssets::from_pairs(vec![]);
+        let filter = |path: &Path| path.file_name().and_then(|n| n.to_str()) != Some("locked");
+        let result = plan_source_filtered(src.path(), &known, DedupeMode::Skip, &filter);
+
+        // Restore permissions unconditionally so the tempdir can be cleaned
+        // up even if the assertion below panics.
+        let mut perms = fs::metadata(&locked).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).expect("chmod restore");
+
+        let plan = result.expect(
+            "a filtered-out directory must never be entered, so an unreadable one must never \
+             surface a Walk error",
+        );
+        let rels: Vec<&str> = plan.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["keep.txt"]);
     }
 }

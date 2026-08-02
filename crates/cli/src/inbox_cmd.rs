@@ -2,11 +2,13 @@
 //! Contribution = a subfolder with a `contribution.json` manifest (the
 //! documented integration point for the share-sheet Shortcut and future
 //! iOS app). Manifest-less entries (a subfolder with no manifest, or a
-//! bare file) are skipped this release — no triage flow exists yet.
-//! Reuses the verified-ingest pipeline end to end. Manifest parsing and
-//! the read-only validation gates live in `inbox_manifest.rs`; this module
-//! is the orchestration: the pass loop, hash gate, routing, ingest, and
-//! the failure-marker store.
+//! bare top-level file) triage instead: once quiescent (no contained mtime
+//! younger than [`quiescence_ms`]), they ingest to `--triage-target`,
+//! tagged `source/inbox`, no contributor identity claimed. Reuses the
+//! verified-ingest pipeline end to end. Manifest parsing and the read-only
+//! validation gates live in `inbox_manifest.rs`; this module is the
+//! orchestration: the pass loop, hash gate, routing, ingest, quiescence,
+//! and the failure-marker store.
 use crate::app::FsApp;
 use crate::commands::{self, ExecuteIngest, IngestReport};
 use crate::inbox_manifest::{ContributionManifest, MANIFEST_NAME, check_files, load_manifest};
@@ -22,9 +24,23 @@ use xxhash_rust::xxh3::xxh3_128;
 pub(crate) struct InboxArgs {
     pub inbox: PathBuf,
     pub dest: Vec<PathBuf>,
+    /// PARA node for manifest-less drops; required once any quiescent
+    /// manifest-less item is present — see [`process_manifest_less`].
+    pub triage_target: Option<String>,
     pub keep: bool,
     pub json: bool,
 }
+
+/// Tag every manifest-less asset gets, in place of a contributor identity
+/// that was never claimed.
+const TRIAGE_TAG: &str = "source/inbox";
+
+/// The report row name every triaged loose file shares — used both as the
+/// `IngestSite::row_name` [`triage_loose_files_ingest`] passes down (so a
+/// bad loose file's stderr line is attributed consistently) and as the row
+/// key [`process_manifest_less`] pushes onto the report, so the two can't
+/// drift apart.
+const LOOSE_FILES_ROW: &str = "(loose files)";
 
 /// Catalog root + inbox flags, threaded through every contribution —
 /// bundled so `process_contribution`/`ingest_contribution` stay within the
@@ -195,6 +211,18 @@ enum ContribOutcome {
         placed: usize,
         skipped_duplicates: usize,
     },
+    /// The `(loose files)` group only: some files placed, some failed or
+    /// were rejected (e.g. 0 bytes). Unlike a contribution (manifested or a
+    /// manifest-less folder), a loose-files group shares nothing but having
+    /// landed in the inbox root at once — see [`process_triage_loose_files`]
+    /// for why one bad file must never wedge the good ones in the same
+    /// group forever. A fresh failure here still fails the pass (per-file
+    /// reasons already reached stderr by the time this is constructed).
+    PartlyIngested {
+        placed: usize,
+        skipped_duplicates: usize,
+        failed: usize,
+    },
     Waiting {
         reasons: Vec<String>,
     },
@@ -206,11 +234,101 @@ enum ContribOutcome {
     },
 }
 
+/// Default quiescence window for manifest-less drops: nothing with a
+/// contained mtime younger than this is touched, so a mid-upload file (or
+/// folder still receiving files) is never grabbed. `MAJ_INBOX_QUIESCENCE_MS`
+/// overrides it — tests force `0`; an impatient operator can shorten it.
+const QUIESCENCE_MS: u64 = 5 * 60 * 1000;
+
+/// Reads `MAJ_INBOX_QUIESCENCE_MS`, falling back to [`QUIESCENCE_MS`] when
+/// unset. Called once per pass ([`process_manifest_less`] threads the
+/// result through) rather than once per item, so every item in one pass is
+/// judged against the same window even if the env var were somehow read at
+/// slightly different instants. A value that's set but doesn't parse as a
+/// `u64` is a likely operator typo — warned loudly, naming the bad value,
+/// rather than silently falling back to a default that would otherwise
+/// look like a working override doing nothing.
+fn quiescence_ms() -> u64 {
+    let Ok(value) = std::env::var("MAJ_INBOX_QUIESCENCE_MS") else {
+        return QUIESCENCE_MS;
+    };
+    value.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "warning: MAJ_INBOX_QUIESCENCE_MS={value:?} is not a valid number of milliseconds \
+             — falling back to the default {QUIESCENCE_MS}ms"
+        );
+        QUIESCENCE_MS
+    })
+}
+
+/// Renders a quiescence window for a human-facing message: milliseconds
+/// when sub-second (tests force small or zero windows, where "0s" would be
+/// misleading), whole seconds otherwise.
+fn format_window(window_ms: u64) -> String {
+    if window_ms < 1000 {
+        format!("{window_ms}ms")
+    } else {
+        format!("{}s", window_ms / 1000)
+    }
+}
+
+/// Newest mtime under `path`: a file's own mtime, or the max across
+/// everything nested inside a folder. `None` on any unreadable entry —
+/// unreadable means "not ready to judge", never "ready" — including a
+/// subdirectory that becomes unreadable partway through the walk.
+///
+/// Iterative (explicit stack), not recursive: this walks a
+/// contributor-controlled tree, same as `inbox_manifest::collect_unlisted`,
+/// and unbounded recursion on a deep or adversarial directory tree is a
+/// stack overflow (SIGSEGV), not a catchable error. Uses `symlink_metadata`
+/// throughout (never follows a symlink into its target), so a symlinked
+/// directory is judged by its own mtime and not descended into.
+fn newest_mtime_ms(path: &Path) -> Option<u64> {
+    let top = std::fs::symlink_metadata(path).ok()?;
+    if !top.is_dir() {
+        return Some(commands::mtime_ms_of(&top));
+    }
+    let mut newest = commands::mtime_ms_of(&top);
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            // `DirEntry::metadata` does not follow symlinks, matching
+            // `symlink_metadata` above.
+            let meta = entry.metadata().ok()?;
+            newest = newest.max(commands::mtime_ms_of(&meta));
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Some(newest)
+}
+
+/// Whether `path` (a manifest-less folder or a loose file) has had no
+/// activity for at least `window_ms`. `false` on any unreadable entry
+/// underneath it — see [`newest_mtime_ms`].
+fn is_quiescent(path: &Path, window_ms: u64) -> bool {
+    let Some(newest) = newest_mtime_ms(path) else {
+        return false;
+    };
+    crate::app::physical_now_ms().saturating_sub(newest) >= window_ms
+}
+
+/// A path's final component as a display string — used everywhere a report
+/// row needs the bare name of a contribution folder or loose file.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// One converging pass over `args.inbox`: every manifested subfolder is
 /// validated, verified-ingested, tagged with provenance, and (unless
 /// `--keep`) moved to `.processed/`. Manifest-less entries (a subfolder
-/// with no `contribution.json`, or a bare file) are skipped this release —
-/// no triage flow exists yet.
+/// with no `contribution.json`, or a bare top-level file) triage instead —
+/// see [`process_manifest_less`].
 ///
 /// # Errors
 /// Returns an error if `inbox` isn't a directory or can't be canonicalized,
@@ -254,17 +372,15 @@ fn run_pass(
     markers: &mut FailureMarkers,
 ) -> Result<Vec<(String, ContribOutcome)>> {
     let mut report = Vec::new();
+    let mut triage_dirs = Vec::new();
     for path in list_contribution_dirs(&ctx.args.inbox)? {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = display_name(&path);
         match load_manifest(&path) {
             Ok(Some(manifest)) => {
                 let outcome = process_contribution(app, ctx, &path, &manifest, markers)?;
                 report.push((name, outcome));
             }
-            Ok(None) => {} // manifest-less: a follow-up task
+            Ok(None) => triage_dirs.push(path),
             Err(e) => {
                 let fingerprint = contribution_fingerprint(&path, None);
                 let outcome = if let Some(outcome) =
@@ -280,13 +396,14 @@ fn run_pass(
             }
         }
     }
+    let loose_files = list_loose_files(&ctx.args.inbox)?;
+    process_manifest_less(app, ctx, &triage_dirs, &loose_files, &mut report)?;
     Ok(report)
 }
 
-/// Sorted, non-dot, directory-only entries directly under `inbox`. Bare
-/// files are a follow-up task's manifest-less flow; `.processed/`,
-/// `.DS_Store`, and any other dot-entry (including a sync tool's droppings)
-/// are skipped so a completed pass is never re-walked.
+/// Sorted, non-dot, directory-only entries directly under `inbox`.
+/// `.processed/`, `.DS_Store`, and any other dot-entry (including a sync
+/// tool's droppings) are skipped so a completed pass is never re-walked.
 fn list_contribution_dirs(inbox: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(inbox).with_context(|| format!("reading {}", inbox.display()))? {
@@ -294,6 +411,41 @@ fn list_contribution_dirs(inbox: &Path) -> Result<Vec<PathBuf>> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        entries.push(path);
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Sorted, non-dot, regular-file entries directly under `inbox` — the
+/// manifest-less "bare file" shape: a contributor drops files straight
+/// into the inbox root instead of a `contribution.json` folder.
+///
+/// Candidacy is decided by `entry.file_type()`, which — like
+/// `symlink_metadata` — does not follow symlinks: a symlinked file is never
+/// a loose-file candidate at all. This matters because a symlink pointing
+/// at a real file used to pass a `Path::is_file()` check (which follows
+/// symlinks) here while `plan_source`'s walk (which also never follows
+/// symlinks) silently excluded it from the actual ingest plan — the net
+/// effect was a symlinked loose file getting swept into `.processed/`
+/// without ever having been cataloged. Excluding it from candidacy up
+/// front means it simply sits inert in the inbox instead.
+fn list_loose_files(inbox: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(inbox).with_context(|| format!("reading {}", inbox.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", inbox.display()))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_regular_file = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", path.display()))?
+            .is_file();
+        if !is_regular_file {
             continue;
         }
         entries.push(path);
@@ -316,10 +468,7 @@ fn process_contribution(
     manifest: &ContributionManifest,
     markers: &mut FailureMarkers,
 ) -> Result<ContribOutcome> {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = display_name(dir);
     let fingerprint = contribution_fingerprint(dir, Some(manifest));
     if let Some(outcome) = recorded_failure(markers, &ctx.inbox_key, &name, &fingerprint) {
         return Ok(outcome);
@@ -434,16 +583,26 @@ fn validate_and_ingest(
     node: (String, ParaKind, String),
 ) -> Result<ContribOutcome> {
     let outcome = ingest_contribution(app, ctx, dir, manifest, node)?;
+    let contrib = require_clean_outcome(&outcome)?;
+    if !ctx.args.keep {
+        move_into_processed(&ctx.args.inbox, dir)?;
+    }
+    Ok(contrib)
+}
+
+/// Converts a raw engine outcome into the report row, or an error naming
+/// how many files failed/were rejected/produced a diagnostic — shared by
+/// every ingest call site (manifested, triage folder, triage loose files)
+/// so the "what counts as a clean placement" policy can't drift between
+/// them.
+fn require_clean_outcome(outcome: &engine::Outcome) -> Result<ContribOutcome> {
     anyhow::ensure!(
         outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
-        "{} failed, {} rejected, {} diagnostic(s) placing this contribution's files — see stderr",
+        "{} failed, {} rejected, {} diagnostic(s) placing files — see stderr",
         outcome.failed.len(),
         outcome.rejected.len(),
         outcome.diagnostics.len()
     );
-    if !ctx.args.keep {
-        move_to_processed(&ctx.args.inbox, dir)?;
-    }
     Ok(ContribOutcome::Ingested {
         placed: outcome.placed.len(),
         skipped_duplicates: outcome.skipped_duplicates.len(),
@@ -487,7 +646,8 @@ fn resolve_contribution_node(
     commands::resolve_ingest_node(projection, para)
 }
 
-/// Plans, verified-ingests, and provenance-tags one contribution's files.
+/// Plans and verified-ingests one contribution's files, then tags every
+/// touched asset with contributor + optional source provenance.
 /// `load_manifest` has already validated `manifest.contributor`/`source`/
 /// `para_target` (no absolute path, no `..`) — this function must not
 /// re-validate them, only consume them. `node` is `route_contribution`'s
@@ -501,7 +661,6 @@ fn ingest_contribution(
     manifest: &ContributionManifest,
     node: (String, ParaKind, String),
 ) -> Result<engine::Outcome> {
-    let (node_id, kind, name) = node;
     let projection = app.projection()?;
     let known = commands::known_assets_from_projection(&projection);
     let mut ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
@@ -516,16 +675,129 @@ fn ingest_contribution(
     ingest_plan
         .files
         .retain(|f| listed.contains(f.rel.as_str()));
-    let (vol_id, vol_label) = commands::resolve_volume(dir, None);
-    // Same default layout `maj ingest` uses — the contributor lands as a
-    // tag below, not a subdirectory, so a manifested drop and a manual
-    // ingest of the same PARA node share one layout.
+    let mut tags = vec![format!("contributor/{}", manifest.contributor)];
+    if let Some(source) = &manifest.source {
+        tags.push(format!("source/{source}"));
+    }
+    let row_name = display_name(dir);
+    run_shared_ingest(
+        app,
+        ctx,
+        &ingest_plan,
+        node,
+        IngestSite {
+            probe_dir: dir,
+            row_name: &row_name,
+            tags: &tags,
+        },
+    )
+}
+
+/// Plans and verified-ingests one manifest-less folder's files (the whole
+/// folder — there is no manifest to filter against), tagged only
+/// [`TRIAGE_TAG`].
+fn triage_folder_ingest(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    dir: &Path,
+    node: (String, ParaKind, String),
+) -> Result<engine::Outcome> {
+    let projection = app.projection()?;
+    let known = commands::known_assets_from_projection(&projection);
+    let ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
+        .with_context(|| format!("planning manifest-less folder {}", dir.display()))?;
+    let row_name = display_name(dir);
+    run_shared_ingest(
+        app,
+        ctx,
+        &ingest_plan,
+        node,
+        IngestSite {
+            probe_dir: dir,
+            row_name: &row_name,
+            tags: &[TRIAGE_TAG.to_string()],
+        },
+    )
+}
+
+/// Plans and verified-ingests exactly `files` — quiescent, manifest-less,
+/// top-level loose files — tagged only [`TRIAGE_TAG`]. `plan_source` has no
+/// single-file entry point, so this plans the inbox root but with a filter
+/// (`plan_source_filtered`) accepting only these exact paths: the walk
+/// never enters `.processed/`, a manifested contribution's folder, another
+/// manifest-less folder, or any dot-entry — it doesn't merely discard their
+/// results afterward, it never reads, stats, or hashes anything under them
+/// at all. This matters in practice: without it, every pass re-walks and
+/// re-hashes the inbox's ever-growing `.processed/` archive, which measured
+/// a 5x slowdown at 300 MB and only gets worse as the archive grows. No
+/// post-hoc `retain` is needed on top — the filter's exact-path membership
+/// check is already the complete, precise criterion.
+fn triage_loose_files_ingest(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    files: &[PathBuf],
+    node: (String, ParaKind, String),
+) -> Result<engine::Outcome> {
+    let projection = app.projection()?;
+    let known = commands::known_assets_from_projection(&projection);
+    let wanted: BTreeSet<PathBuf> = files.iter().cloned().collect();
+    let filter = move |path: &Path| wanted.contains(path);
+    let ingest_plan =
+        plan::plan_source_filtered(&ctx.args.inbox, &known, plan::DedupeMode::Skip, &filter)
+            .with_context(|| format!("planning inbox {}", ctx.args.inbox.display()))?;
+    run_shared_ingest(
+        app,
+        ctx,
+        &ingest_plan,
+        node,
+        IngestSite {
+            probe_dir: &ctx.args.inbox,
+            row_name: LOOSE_FILES_ROW,
+            tags: &[TRIAGE_TAG.to_string()],
+        },
+    )
+}
+
+/// Where an ingest run reads from and how its output is attributed —
+/// bundled so [`run_shared_ingest`] stays within the house
+/// 5-positional-parameter limit. `probe_dir` is what `resolve_volume`
+/// auto-detects the source volume from; `row_name` is the report row this
+/// run belongs to (a contribution/folder name, or [`LOOSE_FILES_ROW`]),
+/// used to prefix each per-file failure line in [`print_failure_detail`] so
+/// two folders that each have a bad `clip.mov` print two attributed lines,
+/// not two identical, unattributed ones.
+#[derive(Clone, Copy)]
+struct IngestSite<'a> {
+    probe_dir: &'a Path,
+    row_name: &'a str,
+    tags: &'a [String],
+}
+
+/// The ingest-orchestration body shared by every call site above: run the
+/// verified copy at `node`'s target, then tag every touched asset with
+/// `site.tags`. Parameterizing on the tag list — rather than three
+/// near-copies of "plan, resolve subdir, `run_ingest`, tag" — is what keeps
+/// a manifested contribution, a triage folder, and triage loose files from
+/// diverging in how they place files, only in what they tag them with.
+fn run_shared_ingest(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    ingest_plan: &plan::IngestPlan,
+    node: (String, ParaKind, String),
+    site: IngestSite<'_>,
+) -> Result<engine::Outcome> {
+    let (node_id, kind, name) = node;
+    let (vol_id, vol_label) = commands::resolve_volume(site.probe_dir, None);
+    // Same default layout `maj ingest` uses — the contributor (or, for
+    // triage, nothing) lands as a tag, not a subdirectory, so a manifested
+    // drop, a triaged drop, and a manual ingest of the same PARA node share
+    // one layout.
     let subdir = commands::render_ingest_subdir(kind, &name, "{date}/{source-label}", &vol_label)?;
     let run = commands::run_ingest(
         app,
         ctx.catalog,
         &ExecuteIngest {
-            plan: &ingest_plan,
+            plan: ingest_plan,
             dest: &ctx.args.dest,
             subdir: &subdir,
             node_id: &node_id,
@@ -534,42 +806,62 @@ fn ingest_contribution(
             resume: None,
             // Silent in both text and JSON mode: the pass-level report
             // this module prints already carries the outcome, and stderr
-            // carries any failure detail — a per-contribution engine
-            // summary interleaved ahead of it is preamble noise in text
-            // mode, and would break `--json`'s one-document guarantee.
+            // carries any failure detail (via `print_failure_detail`
+            // below) — a per-contribution engine summary interleaved ahead
+            // of it is preamble noise in text mode, and would break
+            // `--json`'s one-document guarantee.
             report: IngestReport::Silent,
         },
     )?;
-    tag_provenance(app, manifest, &ingest_plan, &run.outcome)?;
+    print_failure_detail(site.row_name, &run.outcome);
+    tag_assets(app, ingest_plan, &run.outcome, site.tags)?;
     Ok(run.outcome)
 }
 
-/// Contributor + optional source, as plain `TagAdd`s on every distinct asset
-/// this contribution touched — both newly placed files AND files the
-/// planner found already known (`Decision::Duplicate`). Skipping duplicates
-/// would silently drop provenance whenever a second contributor re-drops
-/// content someone else already ingested: the asset is real and this
-/// contribution genuinely vouches for it too, even though nothing new was
-/// copied.
-fn tag_provenance(
+/// Per-file failure/rejection detail, printed to stderr — prefixed with
+/// `row_name` so two rows that each have a bad `clip.mov` don't print two
+/// identical, unattributed lines — from the one place every ingest call
+/// site (manifested, triage folder, triage loose files) shares.
+/// `run_shared_ingest` always runs with `IngestReport::Silent`, so without
+/// this nothing ever prints WHICH file failed and why —
+/// [`require_clean_outcome`]'s error only reports counts, which would
+/// otherwise be a circular "see stderr" pointing at a line that just
+/// repeats the same counts back. Diagnostics are deliberately NOT printed
+/// here: `commands::print_ingest_outcome` (inside `commands::run_ingest`,
+/// called just above) already prints every diagnostic regardless of
+/// `IngestReport` variant — printing them again here would be two
+/// functions claiming the same responsibility.
+fn print_failure_detail(row_name: &str, outcome: &engine::Outcome) {
+    for bad in outcome.failed.iter().chain(&outcome.rejected) {
+        eprintln!("{row_name}: {}: {}", bad.rel, bad.reason);
+    }
+}
+
+/// Every distinct asset this run touched — both newly placed files AND
+/// files the planner found already known (`Decision::Duplicate`) — gets
+/// every tag in `tags`. Skipping duplicates would silently drop provenance
+/// whenever a second contributor (or a second triage pass) re-drops content
+/// someone else already ingested: the asset is real and this run genuinely
+/// vouches for it too, even though nothing new was copied.
+fn tag_assets(
     app: &mut FsApp,
-    manifest: &ContributionManifest,
     ingest_plan: &plan::IngestPlan,
     outcome: &engine::Outcome,
+    tags: &[String],
 ) -> Result<()> {
     let mut ops = Vec::new();
     let mut seen = BTreeSet::new();
     for placed in &outcome.placed {
-        push_provenance_tag(
+        push_tags(
             &mut ops,
             &mut seen,
-            AssetId(format!("xxh3:{}", placed.xxh3)),
-            manifest,
+            &AssetId(format!("xxh3:{}", placed.xxh3)),
+            tags,
         );
     }
     for file in &ingest_plan.files {
         if let plan::Decision::Duplicate { asset, .. } = &file.decision {
-            push_provenance_tag(&mut ops, &mut seen, asset.clone(), manifest);
+            push_tags(&mut ops, &mut seen, asset, tags);
         }
     }
     if ops.is_empty() {
@@ -582,44 +874,211 @@ fn tag_provenance(
     Ok(())
 }
 
-fn push_provenance_tag(
-    ops: &mut Vec<Op>,
-    seen: &mut BTreeSet<AssetId>,
-    asset: AssetId,
-    manifest: &ContributionManifest,
-) {
+fn push_tags(ops: &mut Vec<Op>, seen: &mut BTreeSet<AssetId>, asset: &AssetId, tags: &[String]) {
     if !seen.insert(asset.clone()) {
         return;
     }
-    ops.push(Op::TagAdd {
-        asset: asset.clone(),
-        tag: format!("contributor/{}", manifest.contributor),
-    });
-    if let Some(source) = &manifest.source {
+    for tag in tags {
         ops.push(Op::TagAdd {
-            asset,
-            tag: format!("source/{source}"),
+            asset: asset.clone(),
+            tag: tag.clone(),
         });
     }
 }
 
-/// Atomic rename into `.processed/`, numeric suffix on collision.
-fn move_to_processed(inbox: &Path, dir: &Path) -> Result<()> {
-    let processed = inbox.join(".processed");
-    std::fs::create_dir_all(&processed)
-        .with_context(|| format!("creating {}", processed.display()))?;
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut target = processed.join(&name);
+/// Manifest-less entries — folders `run_pass` found via `load_manifest`
+/// returning `Ok(None)`, and bare top-level files from [`list_loose_files`]
+/// — quiesce before they're touched, then triage to `ctx.args.triage_target`
+/// tagged [`TRIAGE_TAG`]. Rows are appended onto `report` directly, rather
+/// than returned, so the missing-`--triage-target` case (an operator-side
+/// fault, same class as a nonexistent PARA target in the manifested flow)
+/// can add exactly one row and return without disturbing anything the
+/// manifested loop already recorded earlier in this pass — and, crucially,
+/// without using `?` to propagate it, which would abort the whole pass.
+fn process_manifest_less(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    triage_dirs: &[PathBuf],
+    loose_files: &[PathBuf],
+    report: &mut Vec<(String, ContribOutcome)>,
+) -> Result<()> {
+    let window_ms = quiescence_ms();
+    let (quiescent_dirs, waiting_dirs): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        triage_dirs.iter().partition(|d| is_quiescent(d, window_ms));
+    let (quiescent_files, waiting_files): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        loose_files.iter().partition(|f| is_quiescent(f, window_ms));
+    push_waiting_row(report, &waiting_dirs, &waiting_files, window_ms);
+    if quiescent_dirs.is_empty() && quiescent_files.is_empty() {
+        return Ok(());
+    }
+    let Some(triage) = ctx.args.triage_target.as_deref() else {
+        report.push((
+            "(manifest-less)".to_string(),
+            ContribOutcome::Failed {
+                reason: "manifest-less items are in the inbox but no --triage-target was given \
+                          — pass one (e.g. --triage-target resource/inbox-triage); nothing is \
+                          invented silently"
+                    .to_string(),
+            },
+        ));
+        return Ok(());
+    };
+    let node = {
+        let projection = app.projection()?;
+        resolve_contribution_node(&projection, triage)
+    };
+    let node = match node {
+        Ok(node) => node,
+        Err(e) => {
+            report.push((
+                "(manifest-less)".to_string(),
+                ContribOutcome::Failed {
+                    reason: format!("{e:#}"),
+                },
+            ));
+            return Ok(());
+        }
+    };
+    for dir in quiescent_dirs {
+        let outcome =
+            process_triage_dir(app, ctx, dir, &node).unwrap_or_else(|e| ContribOutcome::Failed {
+                reason: format!("{e:#}"),
+            });
+        report.push((display_name(dir), outcome));
+    }
+    if !quiescent_files.is_empty() {
+        let files: Vec<PathBuf> = quiescent_files.into_iter().cloned().collect();
+        let outcome = process_triage_loose_files(app, ctx, &files, &node).unwrap_or_else(|e| {
+            ContribOutcome::Failed {
+                reason: format!("{e:#}"),
+            }
+        });
+        report.push((LOOSE_FILES_ROW.to_string(), outcome));
+    }
+    Ok(())
+}
+
+/// Appends the single aggregate `(manifest-less)` waiting row, naming every
+/// still-quiescing folder/file, when there is at least one — split out of
+/// [`process_manifest_less`] purely to keep it under the house
+/// function-length limit.
+fn push_waiting_row(
+    report: &mut Vec<(String, ContribOutcome)>,
+    waiting_dirs: &[&PathBuf],
+    waiting_files: &[&PathBuf],
+    window_ms: u64,
+) {
+    if waiting_dirs.is_empty() && waiting_files.is_empty() {
+        return;
+    }
+    let reasons = waiting_dirs
+        .iter()
+        .chain(waiting_files.iter())
+        .map(|p| {
+            format!(
+                "{}: modified within the last {} — letting it quiesce",
+                display_name(p),
+                format_window(window_ms)
+            )
+        })
+        .collect();
+    report.push((
+        "(manifest-less)".to_string(),
+        ContribOutcome::Waiting { reasons },
+    ));
+}
+
+/// One manifest-less folder's ingest + `.processed/` move, mirroring
+/// [`validate_and_ingest`] for the manifested flow.
+fn process_triage_dir(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    dir: &Path,
+    node: &(String, ParaKind, String),
+) -> Result<ContribOutcome> {
+    let outcome = triage_folder_ingest(app, ctx, dir, node.clone())?;
+    let contrib = require_clean_outcome(&outcome)?;
+    if !ctx.args.keep {
+        move_into_processed(&ctx.args.inbox, dir)?;
+    }
+    Ok(contrib)
+}
+
+/// The quiescent loose files' ingest. Unlike a contribution (manifested or
+/// a manifest-less folder — see [`require_clean_outcome`]), a
+/// `(loose files)` row groups files that share nothing but having landed in
+/// the inbox root at the same time, so this deliberately does NOT require a
+/// clean outcome: one bad file (a 0-byte file, a permission problem) must
+/// never wedge every good file in the same group forever.
+///
+/// Every file the engine drained out of the inbox — both newly `placed`
+/// AND `skipped_duplicates` (content the catalog already had; re-dropping
+/// identical bytes is still a successful outcome, just not a new copy) —
+/// moves to `.processed/`. Leaving a duplicate behind would re-hash it and
+/// re-emit its `TagAdd`s every single pass forever, an unbounded write to
+/// the event log every peer replicates. Every file that `failed` or was
+/// `rejected` (e.g. 0 bytes) is left in the inbox for the operator to fix
+/// or remove — named on stderr by `run_shared_ingest`'s
+/// `print_failure_detail`, since this call uses `IngestReport::Silent` —
+/// and picked back up as a loose file on the next pass. A fresh
+/// failure/rejection still fails the whole run's exit code, the same
+/// polarity as any other operator fault, but never blocks the files that
+/// drained.
+fn process_triage_loose_files(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    files: &[PathBuf],
+    node: &(String, ParaKind, String),
+) -> Result<ContribOutcome> {
+    let outcome = triage_loose_files_ingest(app, ctx, files, node.clone())?;
+    if !ctx.args.keep {
+        let drained: BTreeSet<&str> = outcome
+            .placed
+            .iter()
+            .map(|p| p.rel.as_str())
+            .chain(outcome.skipped_duplicates.iter().map(String::as_str))
+            .collect();
+        for file in files {
+            if drained.contains(display_name(file).as_str()) {
+                move_into_processed(&ctx.args.inbox, file)?;
+            }
+        }
+    }
+    let failed = outcome.failed.len() + outcome.rejected.len();
+    if failed > 0 {
+        return Ok(ContribOutcome::PartlyIngested {
+            placed: outcome.placed.len(),
+            skipped_duplicates: outcome.skipped_duplicates.len(),
+            failed,
+        });
+    }
+    Ok(ContribOutcome::Ingested {
+        placed: outcome.placed.len(),
+        skipped_duplicates: outcome.skipped_duplicates.len(),
+    })
+}
+
+/// The `.processed/<name>` target for a move, with a numeric suffix on
+/// collision.
+fn processed_target(processed: &Path, name: &str) -> PathBuf {
+    let mut target = processed.join(name);
     let mut suffix = 2u32;
     while target.exists() {
         target = processed.join(format!("{name}-{suffix}"));
         suffix += 1;
     }
-    std::fs::rename(dir, &target)
-        .with_context(|| format!("moving {} to {}", dir.display(), target.display()))
+    target
+}
+
+/// Atomic rename of a contribution folder or one loose file into
+/// `.processed/` — `path` may be either, `std::fs::rename` doesn't care.
+fn move_into_processed(inbox: &Path, path: &Path) -> Result<()> {
+    let processed = inbox.join(".processed");
+    std::fs::create_dir_all(&processed)
+        .with_context(|| format!("creating {}", processed.display()))?;
+    let target = processed_target(&processed, &display_name(path));
+    std::fs::rename(path, &target)
+        .with_context(|| format!("moving {} to {}", path.display(), target.display()))
 }
 
 /// Prints the pass report, then applies the exit policy: a FRESH failure
@@ -637,14 +1096,23 @@ fn print_report(report: &[(String, ContribOutcome)], json: bool) -> Result<()> {
     }
     let mut any_failed = false;
     for (name, outcome) in report {
-        if let ContribOutcome::Failed { reason } = outcome {
-            eprintln!("{name}: {reason}");
-            any_failed = true;
+        match outcome {
+            ContribOutcome::Failed { reason } => {
+                eprintln!("{name}: {reason}");
+                any_failed = true;
+            }
+            // Per-file reasons already reached stderr when this was
+            // constructed (see `process_triage_loose_files`) — nothing more
+            // to print here, but it must still fail the pass.
+            ContribOutcome::PartlyIngested { .. } => any_failed = true,
+            ContribOutcome::Ingested { .. }
+            | ContribOutcome::Waiting { .. }
+            | ContribOutcome::RecordedFailure { .. } => {}
         }
     }
     anyhow::ensure!(
         !any_failed,
-        "one or more contributions failed — see stdout for the full per-contribution report"
+        "one or more items failed — see stdout for the full report"
     );
     Ok(())
 }
@@ -659,6 +1127,20 @@ fn print_report_json(report: &[(String, ContribOutcome)]) -> Result<()> {
             } => {
                 let mut row = serde_json::json!({
                     "contribution": name, "status": "ingested", "placed": placed
+                });
+                if *skipped_duplicates > 0 {
+                    row["skipped_duplicates"] = serde_json::json!(skipped_duplicates);
+                }
+                row
+            }
+            ContribOutcome::PartlyIngested {
+                placed,
+                skipped_duplicates,
+                failed,
+            } => {
+                let mut row = serde_json::json!({
+                    "contribution": name, "status": "partly_ingested",
+                    "placed": placed, "failed": failed
                 });
                 if *skipped_duplicates > 0 {
                     row["skipped_duplicates"] = serde_json::json!(skipped_duplicates);
@@ -694,6 +1176,21 @@ fn print_report_text(report: &[(String, ContribOutcome)]) {
             ContribOutcome::Ingested { placed, .. } => {
                 println!("{name}: ingested {placed} file(s)");
             }
+            ContribOutcome::PartlyIngested {
+                placed,
+                skipped_duplicates,
+                failed,
+            } if *skipped_duplicates > 0 => {
+                println!(
+                    "{name}: PARTIAL — ingested {placed} file(s), {skipped_duplicates} already \
+                     known, {failed} FAILED — see stderr"
+                );
+            }
+            ContribOutcome::PartlyIngested { placed, failed, .. } => {
+                println!(
+                    "{name}: PARTIAL — ingested {placed} file(s), {failed} FAILED — see stderr"
+                );
+            }
             ContribOutcome::Waiting { reasons } => {
                 println!("{name}: waiting — {}", reasons.join("; "));
             }
@@ -702,5 +1199,86 @@ fn print_report_text(report: &[(String, ContribOutcome)]) {
             }
             ContribOutcome::Failed { reason } => println!("{name}: FAILED — {reason}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inbox_manifest::ManifestFile;
+
+    #[test]
+    fn inbox_key_is_stable_and_distinguishes_different_inboxes() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let key_a1 = inbox_key(a.path()).expect("key a");
+        let key_a2 = inbox_key(a.path()).expect("key a again");
+        let key_b = inbox_key(b.path()).expect("key b");
+        assert_eq!(key_a1, key_a2, "the same inbox path must key the same");
+        assert_ne!(key_a1, key_b, "different inboxes must not collide");
+        assert_eq!(key_a1.len(), 32, "xxh3-128 hex is 32 chars");
+    }
+
+    #[test]
+    fn inbox_key_errors_on_a_path_that_cannot_be_canonicalized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert!(inbox_key(&missing).is_err());
+    }
+
+    fn one_file_manifest(name: &str, size: u64) -> ContributionManifest {
+        ContributionManifest {
+            version: 1,
+            contributor: "dana".to_string(),
+            para_target: None,
+            source: None,
+            note: None,
+            files: vec![ManifestFile {
+                name: name.to_string(),
+                xxh64: "deadbeef00000000".to_string(),
+                size,
+            }],
+        }
+    }
+
+    #[test]
+    fn contribution_fingerprint_changes_when_a_listed_file_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("contribution.json"), b"{}").expect("write manifest");
+        std::fs::write(dir.path().join("clip.mov"), b"one").expect("write file");
+        let manifest = one_file_manifest("clip.mov", 3);
+        let before = contribution_fingerprint(dir.path(), Some(&manifest));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.path().join("clip.mov"), b"two").expect("rewrite file");
+        let after = contribution_fingerprint(dir.path(), Some(&manifest));
+
+        assert_ne!(
+            before, after,
+            "changing a listed file's mtime/size must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn contribution_fingerprint_is_deterministic_for_unchanged_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("contribution.json"), b"{not valid").expect("write");
+        let a = contribution_fingerprint(dir.path(), None);
+        let b = contribution_fingerprint(dir.path(), None);
+        assert_eq!(a, b, "fingerprinting the same file state twice must agree");
+    }
+
+    #[test]
+    fn contribution_fingerprint_ignores_files_when_manifest_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("contribution.json"), b"{}").expect("write manifest");
+        std::fs::write(dir.path().join("clip.mov"), b"one").expect("write file");
+        let manifest = one_file_manifest("clip.mov", 3);
+        let with_files = contribution_fingerprint(dir.path(), Some(&manifest));
+        let manifest_only = contribution_fingerprint(dir.path(), None);
+        assert_ne!(
+            with_files, manifest_only,
+            "None must fingerprint the manifest alone, distinct from folding in listed files"
+        );
     }
 }

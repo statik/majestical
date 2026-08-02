@@ -711,7 +711,7 @@ pub(crate) struct ExecuteIngest<'a> {
 /// a per-run engine summary is preamble noise once the caller's own report
 /// already carries the outcome. Diagnostics reach stderr regardless of
 /// which variant is chosen.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum IngestReport {
     Text,
     Json,
@@ -737,7 +737,14 @@ pub(crate) fn run_ingest(
     if exec.resume.is_some() {
         check_resume_journal_exists(catalog_dir, &run_id)?;
     }
-    eprintln!("run {run_id} — resume with: --resume {run_id}");
+    // Suppressed for `Silent`: a caller that runs this more than once per
+    // process (`maj inbox process`, once per contribution) would otherwise
+    // print one resume line per contribution, and `--resume` isn't a flag
+    // `maj inbox process` accepts anyway — the advice would be actionable
+    // only for `maj ingest`, which uses `Text`/`Json`.
+    if !matches!(exec.report, IngestReport::Silent) {
+        eprintln!("run {run_id} — resume with: --resume {run_id}");
+    }
     let dests = build_dest_specs(exec.dest, exec.subdir);
     let outcome = run_ingest_engine(catalog_dir, &run_id, exec.plan, &dests, exec.jobs)?;
     let hashdate_ms = physical_now_ms();

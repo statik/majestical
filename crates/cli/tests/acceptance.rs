@@ -452,5 +452,9 @@ fn lists_saved_search(
 }
 
 fn main() {
-    futures::executor::block_on(SearchWorld::run("tests/features"));
+    futures::executor::block_on(
+        SearchWorld::cucumber()
+            .fail_on_skipped()
+            .run_and_exit("tests/features/search"),
+    );
 }

@@ -2,6 +2,8 @@
 mod app;
 mod commands;
 mod describer_cmd;
+mod inbox_cmd;
+mod inbox_manifest;
 mod index_cmd;
 mod iso8601;
 mod query;
@@ -106,6 +108,12 @@ enum Cmd {
     Sync {
         #[command(subcommand)]
         cmd: SyncCmd,
+    },
+    /// Process a shared inbox folder: validated contributions plus
+    /// manifest-less drops.
+    Inbox {
+        #[command(subcommand)]
+        cmd: InboxCmd,
     },
     /// List every volume the catalog has ever seen.
     Volumes {
@@ -334,6 +342,24 @@ enum SyncCmd {
 }
 
 #[derive(Subcommand)]
+enum InboxCmd {
+    /// One converging pass: validate, verified-ingest, tag provenance,
+    /// move to .processed/. Manifest-less drops are collected and ignored
+    /// this release — triage for them lands in a follow-up.
+    Process {
+        inbox: PathBuf,
+        /// Destination root(s), like `maj ingest --dest`.
+        #[arg(long, required = true)]
+        dest: Vec<PathBuf>,
+        /// Leave processed contributions in place.
+        #[arg(long)]
+        keep: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SyncLocationCmd {
     /// Add a named location and initialize its events/ + blobs/ layout.
     Add { name: String, path: PathBuf },
@@ -485,6 +511,27 @@ fn dispatch_sync(catalog: &Path, machine_id: &str, author: &str, cmd: SyncCmd) -
     }
 }
 
+/// Dispatches `maj inbox`'s subcommands. Split out of `main` purely to stay
+/// under the crate's max-function-length lint, matching [`dispatch_index`].
+fn dispatch_inbox(app: &mut FsApp, catalog: &Path, cmd: InboxCmd) -> Result<()> {
+    match cmd {
+        InboxCmd::Process {
+            inbox,
+            dest,
+            keep,
+            json,
+        } => {
+            let args = inbox_cmd::InboxArgs {
+                inbox,
+                dest,
+                keep,
+                json,
+            };
+            inbox_cmd::cmd_inbox_process(app, catalog, &args)
+        }
+    }
+}
+
 /// Dispatches `maj tags`'s subcommands. Split out of `main` purely to stay
 /// under the crate's max-function-length lint, matching [`dispatch_index`].
 fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
@@ -554,6 +601,10 @@ fn main() -> Result<()> {
         // config lives in the per-machine state dir, not the event log —
         // `Pull` opens the catalog internally, once it needs to apply.
         Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, &cli.machine_id, &author, cmd)?,
+        Cmd::Inbox { cmd } => {
+            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
+            dispatch_inbox(&mut app, &cli.catalog, cmd)?;
+        }
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {

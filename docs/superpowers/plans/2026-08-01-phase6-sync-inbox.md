@@ -2247,6 +2247,18 @@ git commit -m "feat: contribution.json manifest schema and validation"
 
 ### Task 10: `maj inbox process` — manifested flow
 
+> **CONTRACT CHANGES from Task 9's review (supersede the sketches below):**
+> 1. `load_manifest` now validates ALL contributor-controlled strings
+>    (contributor/source/para_target: no absolute, no `..`, non-empty;
+>    xxh64: 16 lowercase hex) — Task 10 must NOT re-validate, and the
+>    `subdir` construction interpolating `manifest.contributor` is safe
+>    ONLY because of that load-time guard; do not bypass `load_manifest`.
+> 2. `check_files` returns `FileCheck { waiting, unlisted, refused }` —
+>    refusals are VALUES (map to the contribution's Failed outcome with
+>    the reasons), and `Err` from it is pass-fatal I/O only (propagate).
+>    The sketch's `check_files(dir, manifest)?` + waiting-only handling
+>    below predates this; adapt accordingly.
+
 **Files:**
 - Modify: `crates/cli/src/commands.rs` (extract `run_ingest` from `cmd_ingest`)
 - Modify: `crates/cli/src/inbox_cmd.rs`, `crates/cli/src/main.rs`
@@ -2572,8 +2584,13 @@ pub(crate) struct InboxArgs {
 
 /// Per-machine record of contributions that failed hash validation, so a
 /// later pass skips them with a notice instead of re-hashing forever.
-/// Keyed by folder name; cleared automatically when the manifest changes
-/// (mtime+size fingerprint) — a re-upload re-validates.
+/// Keyed by (inbox identity, folder name) — inbox identity = xxh3-128 of
+/// the canonicalized inbox path, the state_dir pattern — because two
+/// inboxes sharing one catalog with same-named folders would otherwise
+/// evict each other's markers and oscillate (Task 10 review finding;
+/// as-built supersedes the bare-name sketch below). Cleared automatically
+/// when the manifest OR any listed file's (mtime, size) changes — a
+/// re-upload re-validates.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FailureMarkers {
     #[serde(default)]

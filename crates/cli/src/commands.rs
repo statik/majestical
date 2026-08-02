@@ -340,7 +340,7 @@ pub(crate) fn print_volumes_table(
     }
 }
 
-fn parse_kind(kind: &str) -> Result<ParaKind> {
+pub(crate) fn parse_kind(kind: &str) -> Result<ParaKind> {
     match kind {
         "project" => Ok(ParaKind::Project),
         "area" => Ok(ParaKind::Area),
@@ -654,7 +654,7 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         return Ok(());
     }
 
-    let outcome = run_ingest(
+    let run = run_ingest(
         app,
         catalog_dir,
         &ExecuteIngest {
@@ -666,18 +666,30 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
             jobs: args.jobs,
             resume: args.resume.as_deref(),
             json: args.json,
+            quiet: false,
         },
     )?;
-    let _ = outcome;
+    anyhow::ensure!(
+        run.outcome.failed.is_empty()
+            && run.outcome.rejected.is_empty()
+            && run.outcome.diagnostics.is_empty(),
+        "ingest run {}: {} failed, {} rejected, {} diagnostic(s)",
+        run.run_id,
+        run.outcome.failed.len(),
+        run.outcome.rejected.len(),
+        run.outcome.diagnostics.len()
+    );
     Ok(())
 }
 
 /// The verified-copy pipeline shared by `maj ingest` and `maj inbox
 /// process`: journal + engine + ASC MHL generations + catalog events +
 /// outcome print. The caller has already planned and resolved the PARA
-/// node. Returns the outcome so callers can act on what was placed
-/// (inbox adds provenance tags); the failure `ensure` stays with the
-/// caller so inbox can fail one contribution without aborting its pass.
+/// node. Returns the outcome (never erroring just because some files
+/// failed/were rejected/produced a diagnostic) so callers decide for
+/// themselves what a failed file means — `maj ingest` aborts the process,
+/// `maj inbox process` fails only that one contribution without aborting
+/// its pass.
 pub(crate) struct ExecuteIngest<'a> {
     pub plan: &'a plan::IngestPlan,
     pub dest: &'a [PathBuf],
@@ -687,13 +699,27 @@ pub(crate) struct ExecuteIngest<'a> {
     pub jobs: Option<usize>,
     pub resume: Option<&'a str>,
     pub json: bool,
+    /// Suppresses this run's own stdout summary (JSON or text) — set by a
+    /// caller that runs `run_ingest` more than once per process and prints
+    /// its own combined summary at the end, so stdout in `--json` mode
+    /// stays exactly one document. Diagnostics still reach stderr either
+    /// way.
+    pub quiet: bool,
+}
+
+/// One `run_ingest` call's identity plus its engine result — the run id is
+/// needed by `cmd_ingest`'s own failure message, which lives outside this
+/// function (see `ExecuteIngest`'s doc).
+pub(crate) struct IngestRun {
+    pub run_id: String,
+    pub outcome: engine::Outcome,
 }
 
 pub(crate) fn run_ingest(
     app: &mut FsApp,
     catalog_dir: &Path,
     exec: &ExecuteIngest<'_>,
-) -> Result<engine::Outcome> {
+) -> Result<IngestRun> {
     let run_id = exec
         .resume
         .map_or_else(|| ulid::Ulid::generate().to_string(), str::to_string);
@@ -717,15 +743,8 @@ pub(crate) fn run_ingest(
     ));
     ops.extend(manifest_ops(&dest_volumes, &generations));
     app.emit(ops)?;
-    print_ingest_outcome(&run_id, &outcome, &generations, exec.json);
-    anyhow::ensure!(
-        outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
-        "ingest run {run_id}: {} failed, {} rejected, {} diagnostic(s)",
-        outcome.failed.len(),
-        outcome.rejected.len(),
-        outcome.diagnostics.len()
-    );
-    Ok(outcome)
+    print_ingest_outcome(&run_id, &outcome, &generations, exec.json, exec.quiet);
+    Ok(IngestRun { run_id, outcome })
 }
 
 /// Resolves `para` to an active PARA node's (id, kind, name). Ingest targets
@@ -1069,16 +1088,23 @@ fn manifest_ops(
         .collect()
 }
 
+/// `quiet` suppresses only the stdout summary (JSON or text) — diagnostics
+/// still go to stderr regardless, since suppressing them too would silently
+/// drop detail a caller building its own `Failed` row needs to have
+/// surfaced somewhere.
 fn print_ingest_outcome(
     run_id: &str,
     outcome: &engine::Outcome,
     generations: &[(PathBuf, mhl::WrittenGeneration)],
     json: bool,
+    quiet: bool,
 ) {
-    if json {
-        print_ingest_outcome_json(run_id, outcome, generations);
-    } else {
-        print_ingest_outcome_text(run_id, outcome, generations);
+    if !quiet {
+        if json {
+            print_ingest_outcome_json(run_id, outcome, generations);
+        } else {
+            print_ingest_outcome_text(run_id, outcome, generations);
+        }
     }
     for note in &outcome.diagnostics {
         eprintln!("diagnostic: {note}");

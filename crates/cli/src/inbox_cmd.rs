@@ -14,10 +14,12 @@
 use crate::app::FsApp;
 use crate::commands::{self, ExecuteIngest};
 use anyhow::{Context, Result};
-use majestical_core::event::{AssetId, Op};
-use majestical_ingest::{hashing, plan};
+use majestical_core::event::{AssetId, Op, ParaKind};
+use majestical_core::projection::Projection;
+use majestical_ingest::{engine, hashing, plan};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use xxhash_rust::xxh3::xxh3_128;
 
 pub(crate) const MANIFEST_NAME: &str = "contribution.json";
 const SUPPORTED_VERSION: u32 = 1;
@@ -297,15 +299,6 @@ fn collect_unlisted(
 pub(crate) struct InboxArgs {
     pub inbox: PathBuf,
     pub dest: Vec<PathBuf>,
-    /// PARA node for manifest-less drops. Accepted and stored starting this
-    /// task so the clap surface is stable; not yet read anywhere — Task 11
-    /// wires manifest-less triage against it.
-    #[expect(
-        dead_code,
-        reason = "manifest-less triage lands in Task 11; the flag is wired now so the CLI \
-                  surface doesn't change again when it does"
-    )]
-    pub triage_target: Option<String>,
     pub keep: bool,
     pub json: bool,
 }
@@ -318,10 +311,11 @@ struct InboxCtx<'a> {
     args: &'a InboxArgs,
 }
 
-/// Per-machine record of contributions that failed hash validation or were
-/// refused, so a later pass skips them with a notice instead of re-checking
-/// forever. Keyed by folder name; cleared automatically when the manifest
-/// changes (mtime+size fingerprint) — a re-upload re-validates.
+/// Per-machine record of contributions that failed validation, so a later
+/// pass skips them with a notice instead of re-checking forever. Keyed by
+/// folder name; cleared automatically when the fingerprint changes — the
+/// manifest OR any listed file's mtime/size — so both a re-export and
+/// fixing just the corrupt file re-validate.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FailureMarkers {
     #[serde(default)]
@@ -331,8 +325,7 @@ struct FailureMarkers {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct FailureMarker {
     reason: String,
-    manifest_mtime_ms: u64,
-    manifest_size: u64,
+    fingerprint: String,
 }
 
 fn markers_path(catalog: &Path) -> Result<PathBuf> {
@@ -356,49 +349,96 @@ fn store_markers(catalog: &Path, markers: &FailureMarkers) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-/// `(mtime_ms, size)` of a contribution's manifest — cheap enough to check
-/// on every pass, and changes whenever the manifest is re-exported, which is
-/// exactly when a recorded failure should be re-validated instead of
-/// trusted forever. A missing manifest fingerprints as `(0, 0)`, which can
-/// never match a real marker (every recorded marker was written from a
-/// manifest that existed at record time).
-fn manifest_fingerprint(dir: &Path) -> (u64, u64) {
-    std::fs::metadata(dir.join(MANIFEST_NAME))
-        .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()))
+/// Combined fingerprint over the manifest file's own `(mtime_ms, size)` and,
+/// when `manifest` is available, every listed file's `(mtime_ms, size)` too.
+/// Folding in the listed files matters: a fingerprint of the manifest alone
+/// would make "re-upload it" (the hash-mismatch remedy) a lie, since fixing
+/// only the corrupt file — never touching `contribution.json` — would then
+/// never re-validate. `manifest: None` (the manifest itself failed to
+/// parse) fingerprints on the manifest file alone; there is no listed-file
+/// set to enumerate yet. A missing file's metadata reads as `(0, 0)`, same
+/// convention as a missing manifest.
+fn contribution_fingerprint(dir: &Path, manifest: Option<&ContributionManifest>) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::new();
+    let (mtime, size) = std::fs::metadata(dir.join(MANIFEST_NAME))
+        .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
+    let _ = write!(encoded, "m:{mtime}:{size}");
+    if let Some(manifest) = manifest {
+        for file in &manifest.files {
+            let (mtime, size) = std::fs::metadata(dir.join(&file.name))
+                .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
+            let _ = write!(encoded, "|{}:{mtime}:{size}", file.name);
+        }
+    }
+    format!("{:032x}", xxh3_128(encoded.as_bytes()))
 }
 
-fn record_failure(markers: &mut FailureMarkers, name: &str, reason: &str, fingerprint: (u64, u64)) {
+/// A marker recorded from exactly this fingerprint means nothing about this
+/// contribution needs re-checking this pass — returns the notice-only
+/// outcome to reuse, without re-hashing or re-attempting anything. A marker
+/// whose fingerprint no longer matches (the manifest or a listed file
+/// changed since it was recorded) is stale and removed here, so the caller
+/// falls through to a fresh check instead of trusting it.
+fn recorded_failure(
+    markers: &mut FailureMarkers,
+    name: &str,
+    fingerprint: &str,
+) -> Option<ContribOutcome> {
+    let marker = markers.failures.get(name)?;
+    if marker.fingerprint == fingerprint {
+        return Some(ContribOutcome::RecordedFailure {
+            reason: marker.reason.clone(),
+        });
+    }
+    markers.failures.remove(name);
+    None
+}
+
+fn record_failure(markers: &mut FailureMarkers, name: &str, reason: &str, fingerprint: &str) {
     markers.failures.insert(
         name.to_string(),
         FailureMarker {
             reason: reason.to_string(),
-            manifest_mtime_ms: fingerprint.0,
-            manifest_size: fingerprint.1,
+            fingerprint: fingerprint.to_string(),
         },
     );
 }
 
 /// One contribution's outcome for the pass report.
 enum ContribOutcome {
-    Ingested { files: usize },
-    Waiting { reasons: Vec<String> },
-    RecordedFailure { reason: String },
-    Failed { reason: String },
+    Ingested {
+        placed: usize,
+        skipped_duplicates: usize,
+    },
+    Waiting {
+        reasons: Vec<String>,
+    },
+    RecordedFailure {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 /// One converging pass over `args.inbox`: every manifested subfolder is
 /// validated, verified-ingested, tagged with provenance, and (unless
 /// `--keep`) moved to `.processed/`. Manifest-less entries (a subfolder
 /// with no `contribution.json`, or a bare file) are collected and silently
-/// ignored this task — `Task 11` adds the quiescence-gated triage flow that
-/// consumes `args.triage_target`.
+/// ignored this task — a follow-up adds the quiescence-gated triage flow
+/// for them.
 ///
 /// # Errors
-/// Returns an error if `inbox` isn't a directory, if reading it or the
-/// failure-marker store fails, or if any contribution froze the pass with a
-/// pass-fatal I/O error. After a full pass, also returns an error if any
-/// contribution freshly failed this run (a previously recorded failure is
-/// only a notice, not an error — see `print_report`).
+/// Returns an error if `inbox` isn't a directory, or if loading or storing
+/// the failure-marker store fails. Reading the inbox directory itself is
+/// the one per-contribution-loop failure that still aborts the pass (an
+/// operator-facing I/O problem, not any one contribution's fault) — markers
+/// recorded by contributions processed earlier in the same pass are always
+/// persisted first, so that failure never discards them. Also returns an
+/// error, after the report prints, if any contribution freshly failed this
+/// run — a previously recorded failure is only a notice, not an error (see
+/// `print_report`).
 pub(crate) fn cmd_inbox_process(app: &mut FsApp, catalog: &Path, args: &InboxArgs) -> Result<()> {
     anyhow::ensure!(
         args.inbox.is_dir(),
@@ -406,35 +446,58 @@ pub(crate) fn cmd_inbox_process(app: &mut FsApp, catalog: &Path, args: &InboxArg
         args.inbox.display()
     );
     let mut markers = load_markers(catalog)?;
-    let mut report: Vec<(String, ContribOutcome)> = Vec::new();
     let ctx = InboxCtx { catalog, args };
-    for path in list_contribution_dirs(&args.inbox)? {
+    let result = run_pass(app, &ctx, &mut markers);
+    store_markers(catalog, &markers)?;
+    print_report(&result?, args.json)
+}
+
+/// The per-contribution loop, split out of `cmd_inbox_process` purely so
+/// that function can store markers before propagating any error this
+/// returns — a pass-fatal I/O error must never discard markers other
+/// contributions already recorded earlier in the same pass. A manifest that
+/// fails to load (malformed JSON, a validation refusal) is itself recorded
+/// under a manifest-only fingerprint, same as any other failure, so a
+/// hand-broken manifest converges to a notice on the next pass instead of
+/// failing forever.
+fn run_pass(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    markers: &mut FailureMarkers,
+) -> Result<Vec<(String, ContribOutcome)>> {
+    let mut report = Vec::new();
+    for path in list_contribution_dirs(&ctx.args.inbox)? {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         match load_manifest(&path) {
             Ok(Some(manifest)) => {
-                let outcome = process_contribution(app, &ctx, &path, &manifest, &mut markers)?;
+                let outcome = process_contribution(app, ctx, &path, &manifest, markers)?;
                 report.push((name, outcome));
             }
-            Ok(None) => {} // manifest-less: Task 11
-            Err(e) => report.push((
-                name,
-                ContribOutcome::Failed {
-                    reason: format!("{e:#}"),
-                },
-            )),
+            Ok(None) => {} // manifest-less: a follow-up task
+            Err(e) => {
+                let fingerprint = contribution_fingerprint(&path, None);
+                let outcome = if let Some(outcome) = recorded_failure(markers, &name, &fingerprint)
+                {
+                    outcome
+                } else {
+                    let reason = format!("{e:#}");
+                    record_failure(markers, &name, &reason, &fingerprint);
+                    ContribOutcome::Failed { reason }
+                };
+                report.push((name, outcome));
+            }
         }
     }
-    store_markers(catalog, &markers)?;
-    print_report(&report, args.json)
+    Ok(report)
 }
 
 /// Sorted, non-dot, directory-only entries directly under `inbox`. Bare
-/// files are Task 11's manifest-less flow; `.processed/`, `.DS_Store`, and
-/// any other dot-entry (including a sync tool's droppings) are skipped so a
-/// completed pass is never re-walked.
+/// files are a follow-up task's manifest-less flow; `.processed/`,
+/// `.DS_Store`, and any other dot-entry (including a sync tool's droppings)
+/// are skipped so a completed pass is never re-walked.
 fn list_contribution_dirs(inbox: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(inbox).with_context(|| format!("reading {}", inbox.display()))? {
@@ -450,9 +513,13 @@ fn list_contribution_dirs(inbox: &Path) -> Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
-/// Validates, hash-gates, and ingests one manifested contribution. A marker
-/// recorded on an earlier pass short-circuits everything below the
-/// fingerprint check — a recorded failure is never re-hashed.
+/// Validates and hash-gates one manifested contribution, then delegates the
+/// routing + ingest tail to [`validate_and_ingest`]. A marker recorded on
+/// an earlier pass short-circuits everything below the fingerprint check —
+/// a recorded failure is never re-hashed. Past that point, only a real I/O
+/// failure walking the contribution folder (inside [`check_files`]) stays
+/// pass-fatal; every other problem here is scoped to this one contribution
+/// and reported as a `Failed` row instead of aborting the rest of the pass.
 fn process_contribution(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
@@ -464,14 +531,9 @@ fn process_contribution(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let fingerprint = manifest_fingerprint(dir);
-    if let Some(marker) = markers.failures.get(&name) {
-        if (marker.manifest_mtime_ms, marker.manifest_size) == fingerprint {
-            return Ok(ContribOutcome::RecordedFailure {
-                reason: marker.reason.clone(),
-            });
-        }
-        markers.failures.remove(&name); // manifest changed — re-validate
+    let fingerprint = contribution_fingerprint(dir, Some(manifest));
+    if let Some(outcome) = recorded_failure(markers, &name, &fingerprint) {
+        return Ok(outcome);
     }
     let check = check_files(dir, manifest)?;
     if !check.waiting.is_empty() {
@@ -484,26 +546,36 @@ fn process_contribution(
     }
     if !check.refused.is_empty() {
         let reason = check.refused.join("; ");
-        record_failure(markers, &name, &reason, fingerprint);
+        record_failure(markers, &name, &reason, &fingerprint);
         return Ok(ContribOutcome::Failed { reason });
     }
-    if let Some(reason) = hash_mismatch_reason(dir, manifest)? {
-        record_failure(markers, &name, &reason, fingerprint);
-        return Ok(ContribOutcome::Failed { reason });
+    match hash_mismatch_reason(dir, manifest) {
+        Ok(Some(reason)) => {
+            record_failure(markers, &name, &reason, &fingerprint);
+            return Ok(ContribOutcome::Failed { reason });
+        }
+        Ok(None) => {}
+        // A genuine I/O failure reading a file that already passed
+        // check_files' presence/size gate (permissions, a mid-read fault):
+        // not recorded, since nothing about the contribution itself is
+        // wrong — the next pass should simply try again.
+        Err(e) => {
+            return Ok(ContribOutcome::Failed {
+                reason: format!("{e:#}"),
+            });
+        }
     }
-    let para = manifest.para_target.as_deref().with_context(|| {
-        format!(
-            "{name}: manifest has no para_target and no default exists — add one or use the \
-             manifest-less triage path"
-        )
-    })?;
-    ingest_contribution(app, ctx, dir, manifest, para)?;
-    if !ctx.args.keep {
-        move_to_processed(&ctx.args.inbox, dir)?;
+    // Everything past this point (routing, planning, the verified copy
+    // itself) is likewise contribution-scoped and never recorded: a
+    // nonexistent PARA node or a transient copy failure isn't fixed by
+    // touching the manifest, so recording it against the fingerprint would
+    // leave it stuck even after the operator fixes the real cause.
+    match validate_and_ingest(app, ctx, dir, manifest) {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => Ok(ContribOutcome::Failed {
+            reason: format!("{e:#}"),
+        }),
     }
-    Ok(ContribOutcome::Ingested {
-        files: manifest.files.len(),
-    })
 }
 
 /// End-to-end hash gate: the contributor's client-side xxh64 against a
@@ -528,6 +600,71 @@ fn hash_mismatch_reason(dir: &Path, manifest: &ContributionManifest) -> Result<O
     Ok(None)
 }
 
+/// The routing + verified-ingest + `.processed/` move tail of
+/// [`process_contribution`], split out purely to stay under the house
+/// function-length limit. Every error here is contribution-scoped — the
+/// caller converts it into a `Failed` row rather than propagating it.
+fn validate_and_ingest(
+    app: &mut FsApp,
+    ctx: &InboxCtx<'_>,
+    dir: &Path,
+    manifest: &ContributionManifest,
+) -> Result<ContribOutcome> {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // para_target is optional in the wire format — a well-formed manifest
+    // that simply hasn't been routed yet must fail only itself, not halt
+    // every other contribution in the same pass.
+    let Some(para) = manifest.para_target.as_deref() else {
+        anyhow::bail!(
+            "{name}: manifest has no para_target — add one to the manifest, or wait for the \
+             manifest-less triage flow"
+        );
+    };
+    let outcome = ingest_contribution(app, ctx, dir, manifest, para)?;
+    anyhow::ensure!(
+        outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
+        "{} failed, {} rejected, {} diagnostic(s) placing this contribution's files — see stderr",
+        outcome.failed.len(),
+        outcome.rejected.len(),
+        outcome.diagnostics.len()
+    );
+    if !ctx.args.keep {
+        move_to_processed(&ctx.args.inbox, dir)?;
+    }
+    Ok(ContribOutcome::Ingested {
+        placed: outcome.placed.len(),
+        skipped_duplicates: outcome.skipped_duplicates.len(),
+    })
+}
+
+/// Resolves `para` (validated by `load_manifest` to at most one interior
+/// `/`) to an active ingest target. When it's in `<kind>/<name>` form and
+/// simply doesn't exist yet — the common inbox case, a contributor naming a
+/// project nobody created — this names the exact fix instead of
+/// [`commands::resolve_ingest_node`]'s generic "see `maj para list`" (which
+/// doesn't tell the operator they need `add`, not `list`).
+fn resolve_contribution_node(
+    projection: &Projection,
+    para: &str,
+) -> Result<(String, ParaKind, String)> {
+    if let Some((kind_str, name)) = para.split_once('/')
+        && let Ok(kind) = commands::parse_kind(kind_str)
+    {
+        let exists = projection
+            .para_nodes()
+            .any(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
+        anyhow::ensure!(
+            exists,
+            "PARA target '{para}' does not exist yet — create it first: \
+             `maj para add {kind_str} {name}`"
+        );
+    }
+    commands::resolve_ingest_node(projection, para)
+}
+
 /// Plans, verified-ingests, and provenance-tags one contribution's files.
 /// `load_manifest` has already validated `manifest.contributor`/`source`/
 /// `para_target` (no absolute path, no `..`) — this function must not
@@ -538,21 +675,28 @@ fn ingest_contribution(
     dir: &Path,
     manifest: &ContributionManifest,
     para: &str,
-) -> Result<()> {
+) -> Result<engine::Outcome> {
     let projection = app.projection()?;
-    let (node_id, kind, name) = commands::resolve_ingest_node(&projection, para)?;
+    let (node_id, kind, name) = resolve_contribution_node(&projection, para)?;
     let known = commands::known_assets_from_projection(&projection);
     let mut ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
         .with_context(|| format!("planning contribution {}", dir.display()))?;
-    // contribution.json describes the contribution; it must never itself
-    // become a placed, verified, or tagged catalog asset.
-    ingest_plan.files.retain(|f| f.rel != MANIFEST_NAME);
+    // Only files the manifest actually lists may ever be placed, verified,
+    // or provenance-tagged — an unlisted file (a stray drop alongside the
+    // real ones, or something added after the manifest was written) must
+    // never cross the trust boundary just because it happened to sit in the
+    // same folder. This also drops contribution.json itself, which is never
+    // a listed entry.
+    let listed: BTreeSet<&str> = manifest.files.iter().map(|f| f.name.as_str()).collect();
+    ingest_plan
+        .files
+        .retain(|f| listed.contains(f.rel.as_str()));
     let (vol_id, vol_label) = commands::resolve_volume(dir, None);
     // Same default layout `maj ingest` uses — the contributor lands as a
     // tag below, not a subdirectory, so a manifested drop and a manual
     // ingest of the same PARA node share one layout.
     let subdir = commands::render_ingest_subdir(kind, &name, "{date}/{source-label}", &vol_label)?;
-    let outcome = commands::run_ingest(
+    let run = commands::run_ingest(
         app,
         ctx.catalog,
         &ExecuteIngest {
@@ -564,30 +708,67 @@ fn ingest_contribution(
             jobs: None,
             resume: None,
             json: ctx.args.json,
+            // Suppresses this run's own stdout summary: `maj inbox process
+            // --json` must print exactly one JSON document (the final
+            // report), never one blob per ingested contribution.
+            quiet: ctx.args.json,
         },
     )?;
-    // Provenance: contributor + optional source, as plain TagAdds on every
-    // distinct placed asset — no new op variants this phase.
+    tag_provenance(app, manifest, &ingest_plan, &run.outcome)?;
+    Ok(run.outcome)
+}
+
+/// Contributor + optional source, as plain `TagAdd`s on every distinct asset
+/// this contribution touched — both newly placed files AND files the
+/// planner found already known (`Decision::Duplicate`). Skipping duplicates
+/// would silently drop provenance whenever a second contributor re-drops
+/// content someone else already ingested: the asset is real and this
+/// contribution genuinely vouches for it too, even though nothing new was
+/// copied.
+fn tag_provenance(
+    app: &mut FsApp,
+    manifest: &ContributionManifest,
+    ingest_plan: &plan::IngestPlan,
+    outcome: &engine::Outcome,
+) -> Result<()> {
     let mut ops = Vec::new();
     let mut seen = BTreeSet::new();
     for placed in &outcome.placed {
-        let asset = AssetId(format!("xxh3:{}", placed.xxh3));
-        if !seen.insert(asset.clone()) {
-            continue;
-        }
-        ops.push(Op::TagAdd {
-            asset: asset.clone(),
-            tag: format!("contributor/{}", manifest.contributor),
-        });
-        if let Some(source) = &manifest.source {
-            ops.push(Op::TagAdd {
-                asset,
-                tag: format!("source/{source}"),
-            });
+        push_provenance_tag(
+            &mut ops,
+            &mut seen,
+            AssetId(format!("xxh3:{}", placed.xxh3)),
+            manifest,
+        );
+    }
+    for file in &ingest_plan.files {
+        if let plan::Decision::Duplicate { asset, .. } = &file.decision {
+            push_provenance_tag(&mut ops, &mut seen, asset.clone(), manifest);
         }
     }
     app.emit(ops)?;
     Ok(())
+}
+
+fn push_provenance_tag(
+    ops: &mut Vec<Op>,
+    seen: &mut BTreeSet<AssetId>,
+    asset: AssetId,
+    manifest: &ContributionManifest,
+) {
+    if !seen.insert(asset.clone()) {
+        return;
+    }
+    ops.push(Op::TagAdd {
+        asset: asset.clone(),
+        tag: format!("contributor/{}", manifest.contributor),
+    });
+    if let Some(source) = &manifest.source {
+        ops.push(Op::TagAdd {
+            asset,
+            tag: format!("source/{source}"),
+        });
+    }
 }
 
 /// Atomic rename into `.processed/`, numeric suffix on collision.
@@ -640,8 +821,17 @@ fn print_report_json(report: &[(String, ContribOutcome)]) -> Result<()> {
     let rows: Vec<serde_json::Value> = report
         .iter()
         .map(|(name, outcome)| match outcome {
-            ContribOutcome::Ingested { files } => {
-                serde_json::json!({"contribution": name, "status": "ingested", "files": files})
+            ContribOutcome::Ingested {
+                placed,
+                skipped_duplicates,
+            } => {
+                let mut row = serde_json::json!({
+                    "contribution": name, "status": "ingested", "placed": placed
+                });
+                if *skipped_duplicates > 0 {
+                    row["skipped_duplicates"] = serde_json::json!(skipped_duplicates);
+                }
+                row
             }
             ContribOutcome::Waiting { reasons } => {
                 serde_json::json!({"contribution": name, "status": "waiting", "reasons": reasons})
@@ -663,7 +853,15 @@ fn print_report_json(report: &[(String, ContribOutcome)]) -> Result<()> {
 fn print_report_text(report: &[(String, ContribOutcome)]) {
     for (name, outcome) in report {
         match outcome {
-            ContribOutcome::Ingested { files } => println!("{name}: ingested {files} file(s)"),
+            ContribOutcome::Ingested {
+                placed,
+                skipped_duplicates,
+            } if *skipped_duplicates > 0 => {
+                println!("{name}: ingested {placed} file(s), {skipped_duplicates} already known");
+            }
+            ContribOutcome::Ingested { placed, .. } => {
+                println!("{name}: ingested {placed} file(s)");
+            }
             ContribOutcome::Waiting { reasons } => {
                 println!("{name}: waiting — {}", reasons.join("; "));
             }

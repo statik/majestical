@@ -350,10 +350,6 @@ enum InboxCmd {
         /// Destination root(s), like `maj ingest --dest`.
         #[arg(long, required = true)]
         dest: Vec<PathBuf>,
-        /// PARA node for manifest-less drops (required if any exist; not
-        /// yet consumed — see the variant doc).
-        #[arg(long)]
-        triage_target: Option<String>,
         /// Leave processed contributions in place.
         #[arg(long)]
         keep: bool,
@@ -521,14 +517,12 @@ fn dispatch_inbox(app: &mut FsApp, catalog: &Path, cmd: InboxCmd) -> Result<()> 
         InboxCmd::Process {
             inbox,
             dest,
-            triage_target,
             keep,
             json,
         } => {
             let args = inbox_cmd::InboxArgs {
                 inbox,
                 dest,
-                triage_target,
                 keep,
                 json,
             };

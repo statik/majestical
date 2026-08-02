@@ -4560,6 +4560,7 @@ name = "majestical-sync"
 version = "0.1.0"
 dependencies = [
  "majestical-core",
+ "proptest",
  "serde_json",
  "tempfile",
  "thiserror",

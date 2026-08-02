@@ -1,17 +1,11 @@
-//! `maj sync push`/`maj sync pull` end to end over real temp-dir catalogs
-//! and locations.
+//! `maj sync` push/pull/status end to end over real temp-dir catalogs and
+//! locations.
 mod common;
-use common::{maj, maj_as};
+use common::{first_asset_id, maj, maj_as};
 use std::path::{Path, PathBuf};
 
-// `#[cfg(test)]` on these helpers is not redundant despite every file under
-// `tests/` already building with `--cfg test`: this repo's `clippy.toml`
-// sets `allow-expect-in-tests`/`allow-unwrap-in-tests`, and clippy's
-// in-test detection for that config keys off `#[test]`/`#[cfg(test)]`
-// directly on the item, not on the ambient test-binary cfg — dropping it
-// reintroduces `expect_used` errors under `-D warnings` (verified: removing
-// it here makes `cargo clippy --test sync_smoke` fail). Same pattern as
-// `tests/common/mod.rs`'s helpers.
+// `#[cfg(test)]` on these helpers is required, not redundant — see
+// `tests/common/mod.rs`'s `maj_as` doc comment for the full rationale.
 #[cfg(test)]
 fn init_catalog_as(catalog: &Path, state: &Path, machine: &str) {
     maj_as(catalog, state, machine)
@@ -63,6 +57,42 @@ fn asset_count(db_path: &Path) -> i64 {
         .expect("count assets")
 }
 
+/// Recursively snapshots every entry under `root` — files as
+/// `Some((size, mtime))`, directories as `None` (so a new EMPTY directory,
+/// e.g. an `execute`-created `tmp/` staging dir, still shows up as a map
+/// diff even though it has no size or mtime of its own to compare). Two
+/// snapshots taken around a command that must be read-only compare equal
+/// via plain `assert_eq!` — any added/removed path, size change, or mtime
+/// change (a rewrite-in-place that happens to keep the same length) shows
+/// up as a diff, which is a stronger proof than spot-checking a couple of
+/// paths that are "supposed" to change.
+#[cfg(test)]
+fn tree_snapshot(
+    root: &Path,
+) -> std::collections::BTreeMap<PathBuf, Option<(u64, std::time::SystemTime)>> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                snapshot.insert(path.clone(), None);
+                stack.push(path);
+            } else {
+                let mtime = meta.modified().expect("mtime");
+                snapshot.insert(path, Some((meta.len(), mtime)));
+            }
+        }
+    }
+    snapshot
+}
+
 /// A `maj` catalog + state dir pair, initialized and ready for `sync`
 /// commands — the common preamble every push test needs. Built from a
 /// shared `root` plus a `name` so two fixtures (e.g. Task 6's two-machine
@@ -99,6 +129,36 @@ fn fixture(root: &Path, name: &str) -> Fixture {
 
 #[cfg(test)]
 impl Fixture {
+    /// A `maj` invocation scoped to this fixture's catalog, state, and
+    /// machine id — the machine id no longer needs re-typing (and risking a
+    /// typo that silently runs as a different machine) at every call site
+    /// that already has a `Fixture` in hand.
+    fn maj(&self) -> assert_cmd::Command {
+        maj_as(&self.catalog, &self.state, &self.machine)
+    }
+
+    /// Scans `name` (written with `contents`) into this fixture's catalog
+    /// under `volume` — the general form of [`Self::scan_one_file`], for
+    /// tests that need a specific filename instead of the fixed `a.jpg`.
+    fn scan_named_file(&self, name: &str, contents: &[u8], volume: &str) {
+        std::fs::create_dir_all(&self.media).expect("mkdir");
+        std::fs::write(self.media.join(name), contents).expect("write");
+        self.maj()
+            .args(["scan"])
+            .arg(&self.media)
+            .args(["--volume", volume])
+            .assert()
+            .success();
+    }
+
+    /// Runs `maj search <query>` and asserts stdout contains `needle` —
+    /// shared by the shuttle test's repeated search-and-check steps.
+    fn assert_search_finds(&self, query: &str, needle: &str, msg: &str) {
+        let out = self.maj().args(["search", query]).assert().success();
+        let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+        assert!(stdout.contains(needle), "{msg}: {stdout}");
+    }
+
     /// Scans a single real file into this fixture's catalog, producing one
     /// real segment (`events/<machine>/0001.jsonl`) with actual content.
     fn scan_one_file(&self) {
@@ -762,6 +822,592 @@ fn pull_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
 }
 
 #[test]
+fn status_counts_are_walked_not_cached() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let synced = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let synced: serde_json::Value =
+        serde_json::from_slice(&synced.get_output().stdout).expect("json");
+    assert_eq!(
+        synced[0]["ahead"]["blobs"]["thumbs"], 0,
+        "in sync after push: {synced}"
+    );
+
+    // Sabotage: delete the remote blob. Status must see it — no cache.
+    std::fs::remove_file(location.join("blobs/ab/abcd/thumb-320.webp")).expect("rm");
+    let after = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let after: serde_json::Value =
+        serde_json::from_slice(&after.get_output().stdout).expect("json");
+    assert_eq!(
+        after[0]["ahead"]["blobs"]["thumbs"], 1,
+        "a deleted remote blob must reappear in ahead-counts: {after}"
+    );
+}
+
+#[test]
+fn status_reports_an_unreachable_location_and_exits_zero() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let gone = root.path().join("shuttle");
+    std::fs::create_dir_all(&gone).expect("mkdir");
+    fx.add_location("shuttle", &gone);
+    let canonical_gone = gone.canonicalize().expect("canonicalize before eject");
+    std::fs::remove_dir_all(&gone).expect("eject the shuttle");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let row = &rows[0];
+    assert_eq!(row["location"], "shuttle");
+    assert_eq!(row["reachable"], false);
+    assert_eq!(
+        row["path"].as_str(),
+        canonical_gone.to_str(),
+        "the unreachable row: {row}"
+    );
+    let keys: std::collections::BTreeSet<&str> = row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "reachable", "path"].into_iter().collect(),
+        "an unreachable row's keys are exactly {{location, reachable, path}}: {row}"
+    );
+
+    // Text mode also names the location and the path, and still exits 0.
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("shuttle") && stdout.contains(canonical_gone.to_str().expect("utf8")),
+        "unreachable text row must name the location and path: {stdout}"
+    );
+}
+
+#[test]
+fn status_reports_behind_when_the_location_has_what_the_catalog_lacks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    let a = fixture_as(root.path(), "a", "m1");
+    a.write_blob("ab/abcd/thumb-320.webp", b"w");
+    a.add_location("nas", &location);
+    maj_as(&a.catalog, &a.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let b = fixture_as(root.path(), "b", "m2");
+    b.add_location("nas", &location);
+    let out = maj_as(&b.catalog, &b.state, "m2")
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    assert_eq!(
+        rows[0]["behind"]["blobs"]["thumbs"], 1,
+        "b's catalog lacks what a already pushed to the shared location: {rows}"
+    );
+    assert_eq!(
+        rows[0]["ahead"]["blobs"]["thumbs"], 0,
+        "b has pushed nothing of its own: {rows}"
+    );
+}
+
+#[test]
+fn status_never_mutates_the_location_or_catalog_tree() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+    // Push once first so both trees hold real content for status to walk —
+    // an empty location can't distinguish "status wrote nothing" from
+    // "status wrote nothing because there was nothing to diff".
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+    // The push above leaves its own `tmp/` staging dir behind at the
+    // location (by design — `execute` never cleans up its own successful
+    // run, only stale leftovers from an interrupted one). Remove it before
+    // snapshotting so a status regression that (re)creates a `tmp/` dir is
+    // visible as a diff, not masked by one push already having left it
+    // there.
+    let stray_tmp = location.join("tmp");
+    if stray_tmp.is_dir() {
+        std::fs::remove_dir_all(&stray_tmp).expect("remove push's own tmp/ leftover");
+    }
+
+    let before_location = tree_snapshot(&location);
+    let before_catalog = tree_snapshot(&fx.catalog);
+    assert!(
+        !before_location.is_empty() && !before_catalog.is_empty(),
+        "the fixture must have produced real files in both trees before status runs"
+    );
+
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+
+    let after_location = tree_snapshot(&location);
+    let after_catalog = tree_snapshot(&fx.catalog);
+    assert_eq!(
+        before_location, after_location,
+        "status (json or text) must not add, remove, resize, or touch any file at the location"
+    );
+    assert_eq!(
+        before_catalog, after_catalog,
+        "status (json or text) must not add, remove, resize, or touch any file in the catalog"
+    );
+}
+
+#[test]
+fn status_groups_ahead_segments_per_machine() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+
+    // Two machines each push their own segment straight to the shared
+    // location — no third fixture yet.
+    let m1 = fixture_as(root.path(), "m1", "m1");
+    m1.scan_one_file();
+    m1.add_location("nas", &location);
+    maj_as(&m1.catalog, &m1.state, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    let m2 = fixture_as(root.path(), "m2", "m2");
+    m2.scan_one_file();
+    m2.add_location("nas", &location);
+    maj_as(&m2.catalog, &m2.state, "m2")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // A third, empty fixture is behind both machines' segments — this is
+    // where per-machine grouping is observable: collapsing the two
+    // machines' entries into one key (e.g. keying by segment name instead
+    // of machine id) would leave only one entry here instead of two.
+    let m3 = fixture_as(root.path(), "m3", "m3");
+    m3.add_location("nas", &location);
+    let out = maj_as(&m3.catalog, &m3.state, "m3")
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let segments = rows[0]["behind"]["segments"]
+        .as_object()
+        .expect("segments object");
+    let keys: std::collections::BTreeSet<&str> = segments.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["m1", "m2"].into_iter().collect(),
+        "both machines' segments must appear as distinct keys, not collapsed: {segments:?}"
+    );
+    assert_eq!(
+        segments["m1"]["files"], 1,
+        "m1 pushed exactly one segment file: {segments:?}"
+    );
+    assert_eq!(
+        segments["m2"]["files"], 1,
+        "m2 pushed exactly one segment file: {segments:?}"
+    );
+}
+
+#[test]
+fn status_segment_bytes_are_the_destination_shortfall() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
+    fx.add_location("nas", &location);
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Truncate the just-pushed remote copy to a known, small size: the
+    // location is now behind by exactly `full_len - truncated_len` bytes,
+    // not by the full source length (`src_len`) and not by nothing.
+    let remote_segment = location.join("events/test-machine/0001.jsonl");
+    let full_len = std::fs::metadata(&remote_segment).expect("meta").len();
+    let truncated_len = 10u64;
+    assert!(
+        truncated_len < full_len,
+        "the fixture's segment must be longer than the truncation target: {full_len}"
+    );
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&remote_segment)
+        .expect("open");
+    f.set_len(truncated_len).expect("truncate");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let entry = &rows[0]["ahead"]["segments"]["test-machine"];
+    assert_eq!(
+        entry["files"], 1,
+        "the truncated segment is still pending: {entry}"
+    );
+    assert_eq!(
+        entry["bytes"],
+        full_len - truncated_len,
+        "bytes must be the destination shortfall (full_len - truncated_len), \
+         not the full source length and not zero: {entry}"
+    );
+}
+
+#[test]
+fn status_readonly_notice_is_text_only() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.add_location("nas", &location);
+    let config = find_sync_toml(&fx.state);
+    let text = std::fs::read_to_string(&config).expect("read");
+    let flipped = text.replace("readonly = false", "readonly = true");
+    assert_ne!(
+        flipped, text,
+        "sync.toml must already contain readonly = false: {text}"
+    );
+    std::fs::write(&config, flipped).expect("write");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("readonly = true — this machine never pushes"),
+        "text status must print the readonly notice: {stdout}"
+    );
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        !stdout.contains("readonly"),
+        "--json status must never print the text-mode readonly notice: {stdout}"
+    );
+}
+
+#[test]
+fn status_against_an_uninitialized_directory_names_the_catalog_init_remedy() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // mkdir'd but never `maj catalog init`ed — the directory exists, but
+    // has no `events/`.
+    let catalog = root.path().join("cat");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&catalog).expect("mkdir");
+
+    let out = maj(&catalog, &state)
+        .args(["sync", "status"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no catalog at") && stderr.contains("maj catalog init"),
+        "status against an uninitialized catalog must name the remedy: {stderr}"
+    );
+}
+
+#[test]
+fn status_json_pins_the_agent_facing_contract() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.scan_one_file();
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success();
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let rows = rows.as_array().expect("array of rows");
+    assert_eq!(rows.len(), 1, "one row per configured location: {rows:?}");
+    let row = &rows[0];
+
+    let keys: std::collections::BTreeSet<&str> = row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "reachable", "ahead", "behind"]
+            .into_iter()
+            .collect(),
+        "a reachable row's keys: {row}"
+    );
+
+    let ahead = &row["ahead"];
+    let ahead_keys: std::collections::BTreeSet<&str> = ahead
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        ahead_keys,
+        ["segments", "blobs"].into_iter().collect(),
+        "a direction's keys: {ahead}"
+    );
+
+    let blob_keys: std::collections::BTreeSet<&str> = ahead["blobs"]
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        blob_keys,
+        ["thumbs", "metadata", "vectors", "transcripts"]
+            .into_iter()
+            .collect(),
+        "blob class keys are always present, zero-filled: {ahead}"
+    );
+
+    let segments = ahead["segments"].as_object().expect("segments object");
+    assert_eq!(
+        segments.len(),
+        1,
+        "one machine ahead by its one pushed segment: {ahead}"
+    );
+    let seg = &segments["test-machine"];
+    let seg_keys: std::collections::BTreeSet<&str> = seg
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        seg_keys,
+        ["files", "bytes"].into_iter().collect(),
+        "a per-machine segment entry's keys: {seg}"
+    );
+    assert_eq!(seg["files"], 1);
+    assert!(seg["bytes"].as_u64().is_some_and(|b| b > 0));
+
+    assert!(
+        row["behind"]["segments"]
+            .as_object()
+            .expect("segments object")
+            .is_empty(),
+        "nothing behind yet — nothing has ever been pulled: {row}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn status_reports_a_failed_location_alongside_a_healthy_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let healthy = root.path().join("nas");
+    let broken = root.path().join("denied");
+    std::fs::create_dir_all(&healthy).expect("mkdir");
+    std::fs::create_dir_all(&broken).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &healthy);
+    fx.add_location("denied", &broken);
+    // The location root itself stays listable (it must, or it would just
+    // read as unreachable), but its `events/` subdirectory becomes
+    // unreadable — a permission error `plan_transfer` hits mid-walk, not a
+    // missing mount.
+    std::fs::set_permissions(
+        broken.join("events"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod 000 the events dir");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status", "--json"])
+        .assert()
+        .success(); // one location failing must not abort the report, and must not fail the exit code
+
+    // Text mode names the location and says status failed, on its own
+    // line, without aborting the rest of the report. Run this WHILE
+    // permissions are still broken — restoring them before this second
+    // invocation would make "denied" healthy again and defeat the point.
+    let text_out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&text_out.get_output().stdout).into_owned();
+
+    // Restore permissions so the tempdir can be cleaned up regardless of
+    // what the assertions below find.
+    std::fs::set_permissions(
+        broken.join("events"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("restore perms");
+
+    assert!(
+        stdout.contains("denied: status failed"),
+        "the text report must name the failed location: {stdout}"
+    );
+    assert!(
+        stdout.contains("nas:"),
+        "the healthy location must still be reported in text mode: {stdout}"
+    );
+
+    let rows: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).expect("json");
+    let rows = rows.as_array().expect("array of rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both locations must still get a row: {rows:?}"
+    );
+
+    let healthy_row = rows
+        .iter()
+        .find(|r| r["location"] == "nas")
+        .expect("a row for nas");
+    assert_eq!(
+        healthy_row["reachable"], true,
+        "the healthy location's row must be unaffected by the other's failure: {healthy_row}"
+    );
+
+    let failed_row = rows
+        .iter()
+        .find(|r| r["location"] == "denied")
+        .expect("a row for denied");
+    let keys: std::collections::BTreeSet<&str> = failed_row
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["location", "error"].into_iter().collect(),
+        "a failed row carries only {{location, error}}, distinct from reachable/unreachable: {failed_row}"
+    );
+    assert!(
+        failed_row["error"].is_string()
+            && !failed_row["error"].as_str().unwrap_or_default().is_empty(),
+        "error must be a non-empty string: {failed_row}"
+    );
+}
+
+#[test]
+fn status_text_mode_collapses_in_sync_and_headers_reachable_rows() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let location = root.path().join("nas");
+    std::fs::create_dir_all(&location).expect("mkdir");
+    fx.write_blob("ab/abcd/thumb-320.webp", b"w");
+    fx.add_location("nas", &location);
+
+    // Before any push: the catalog is ahead by one blob — not converged,
+    // so the report must be the `<name>:` header plus indented direction
+    // lines, never the old `{name}: {label}:` prefix repeated per line.
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("nas:\n"),
+        "an out-of-sync location gets its own header line: {stdout}"
+    );
+    assert!(
+        stdout.contains("  ahead (push would send):")
+            && stdout.contains("  behind (pull would fetch):"),
+        "each direction is one indented line under the header: {stdout}"
+    );
+    assert!(
+        !stdout.contains("nas: ahead") && !stdout.contains("nas: behind"),
+        "the old per-line '{{name}}: {{label}}:' prefix must be gone: {stdout}"
+    );
+    assert!(
+        !stdout.contains("in sync"),
+        "an out-of-sync location must not also print the collapsed line: {stdout}"
+    );
+
+    // After a push, both directions are empty: the report collapses to one
+    // line.
+    maj(&fx.catalog, &fx.state)
+        .args(["sync", "push"])
+        .assert()
+        .success();
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("nas: in sync"),
+        "a fully converged location collapses to a single line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ahead") && !stdout.contains("behind"),
+        "a converged location must not also print the direction lines: {stdout}"
+    );
+}
+
+#[test]
+fn status_fails_when_no_locations_are_configured() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+
+    let out = maj(&fx.catalog, &fx.state)
+        .args(["sync", "status"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("no sync locations configured") && stderr.contains("maj sync location add"),
+        "status with no locations configured must name the remedy: {stderr}"
+    );
+}
+
+#[test]
 fn a_readonly_member_can_still_pull() {
     let root = tempfile::tempdir().expect("tempdir");
     let location = root.path().join("nas");
@@ -792,4 +1438,114 @@ fn a_readonly_member_can_still_pull() {
         .args(["sync", "pull"])
         .assert()
         .success();
+}
+
+/// The spec's `§Testing` topology: site A is TWO machines (A1, A2) sharing a
+/// local NAS location dir, plus a `shuttle` location that carries state to
+/// site B, a single machine that never touches the NAS. Two sites that
+/// never share a live network connection still converge purely through the
+/// traveling shuttle drive — both A1 and B register the SAME directory as
+/// their `shuttle` location (standing in for a physical drive that visits
+/// each site in turn) — and the gossip hop through A1 proves out: A2's
+/// asset, known to A1 only via A1's own NAS pull, still reaches site B
+/// through A1's shuttle push, which must carry every machine dir under
+/// A1's catalog root, not just A1's own. Finally, site B's tag on A1's
+/// asset travels back on the same drive, proving the round trip in both
+/// directions. A1 then relays that tag on to A2 via the NAS, so both of
+/// site A's machines converge with site B, not just A1.
+#[test]
+fn a_shuttle_drive_converges_two_sites_that_never_meet() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let shuttle = root.path().join("shuttle");
+    let nas = root.path().join("nas");
+    std::fs::create_dir_all(&shuttle).expect("mkdir");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+
+    let site_a1 = fixture_as(root.path(), "site-a1", "site-a1");
+    let site_a2 = fixture_as(root.path(), "site-a2", "site-a2");
+    let site_b = fixture_as(root.path(), "site-b", "site-b");
+    site_a1.add_location("nas", &nas);
+    site_a1.add_location("shuttle", &shuttle);
+    site_a2.add_location("nas", &nas);
+    site_b.add_location("shuttle", &shuttle);
+
+    // A1 catalogs its own file, but does not push yet — its push below
+    // must carry this alongside whatever it gossips in from A2 via NAS. A2
+    // catalogs a second, distinct file and pushes it to the local NAS only
+    // — A1 and B never see this push directly.
+    site_a1.scan_named_file("interview.mov", b"mov-bytes", "vol-a1");
+    site_a2.scan_named_file("b-roll.mov", b"broll-bytes", "vol-a2");
+    site_a2.maj().args(["sync", "push"]).assert().success();
+
+    // The gossip hop: A1 pulls from the NAS, learning A2's asset, THEN
+    // pushes to the shuttle. That push's events/ tree now holds both A1's
+    // and A2's machine dirs, so it carries A2's segment onward even though
+    // A2 never touched the shuttle itself.
+    site_a1
+        .maj()
+        .args(["sync", "pull", "--location", "nas"])
+        .assert()
+        .success();
+    site_a1
+        .maj()
+        .args(["sync", "push", "--location", "shuttle"])
+        .assert()
+        .success();
+
+    // The drive travels. Site B pulls the shuttle ONLY — it never touches
+    // the NAS — and must see BOTH A1's and A2's assets: finding only A1's
+    // would mean the gossip hop above didn't actually carry A2's segment.
+    site_b.maj().args(["sync", "pull"]).assert().success();
+    site_b.assert_search_finds(
+        "interview",
+        "interview.mov",
+        "site B must see A1's asset after the shuttle round trip",
+    );
+    site_b.assert_search_finds(
+        "b-roll",
+        "b-roll.mov",
+        "site B must see A2's asset gossiped through A1's NAS pull + shuttle push",
+    );
+
+    // Site B tags A1's asset and pushes its own change back to the shuttle.
+    let out = site_b
+        .maj()
+        .args(["search", "interview", "--json"])
+        .output()
+        .expect("run search --json");
+    let asset = first_asset_id(&out);
+    site_b
+        .maj()
+        .args(["tag", "add", &asset, "status/select"])
+        .assert()
+        .success();
+    site_b.maj().args(["sync", "push"]).assert().success();
+
+    // The drive travels back. A1 pulls and sees site B's tag — a
+    // tag-filter search proves the round trip, not just a raw event count.
+    site_a1
+        .maj()
+        .args(["sync", "pull", "--location", "shuttle"])
+        .assert()
+        .success();
+    site_a1.assert_search_finds(
+        "tag:status/select",
+        "interview.mov",
+        "A1 must see site B's tag after the shuttle round trip",
+    );
+
+    // Close A2's loop: A1 relays the tag onward to the NAS, and A2 pulls it
+    // from there — both of site A's machines converge with site B, not
+    // just the one that happened to carry the shuttle.
+    site_a1
+        .maj()
+        .args(["sync", "push", "--location", "nas"])
+        .assert()
+        .success();
+    site_a2.maj().args(["sync", "pull"]).assert().success();
+    site_a2.assert_search_finds(
+        "tag:status/select",
+        "interview.mov",
+        "A2 must see site B's tag after A1 relays it through the NAS",
+    );
 }

@@ -75,3 +75,7 @@ filetime.workspace = true
 [[test]]
 name = "acceptance"
 harness = false
+
+[[test]]
+name = "inbox_acceptance"
+harness = false

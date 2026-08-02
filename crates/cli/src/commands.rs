@@ -654,36 +654,70 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         return Ok(());
     }
 
-    let run_id = args
+    let outcome = run_ingest(
+        app,
+        catalog_dir,
+        &ExecuteIngest {
+            plan: &ingest_plan,
+            dest: &args.dest,
+            subdir: &subdir,
+            node_id: &node_id,
+            source_volume: (&source_volume_id, &source_volume_label),
+            jobs: args.jobs,
+            resume: args.resume.as_deref(),
+            json: args.json,
+        },
+    )?;
+    let _ = outcome;
+    Ok(())
+}
+
+/// The verified-copy pipeline shared by `maj ingest` and `maj inbox
+/// process`: journal + engine + ASC MHL generations + catalog events +
+/// outcome print. The caller has already planned and resolved the PARA
+/// node. Returns the outcome so callers can act on what was placed
+/// (inbox adds provenance tags); the failure `ensure` stays with the
+/// caller so inbox can fail one contribution without aborting its pass.
+pub(crate) struct ExecuteIngest<'a> {
+    pub plan: &'a plan::IngestPlan,
+    pub dest: &'a [PathBuf],
+    pub subdir: &'a str,
+    pub node_id: &'a str,
+    pub source_volume: (&'a str, &'a str),
+    pub jobs: Option<usize>,
+    pub resume: Option<&'a str>,
+    pub json: bool,
+}
+
+pub(crate) fn run_ingest(
+    app: &mut FsApp,
+    catalog_dir: &Path,
+    exec: &ExecuteIngest<'_>,
+) -> Result<engine::Outcome> {
+    let run_id = exec
         .resume
-        .clone()
-        .unwrap_or_else(|| ulid::Ulid::generate().to_string());
-    if args.resume.is_some() {
+        .map_or_else(|| ulid::Ulid::generate().to_string(), str::to_string);
+    if exec.resume.is_some() {
         check_resume_journal_exists(catalog_dir, &run_id)?;
     }
     eprintln!("run {run_id} — resume with: --resume {run_id}");
-
-    let dests = build_dest_specs(&args.dest, &subdir);
-    let outcome = run_ingest_engine(catalog_dir, &run_id, &ingest_plan, &dests, args.jobs)?;
-
+    let dests = build_dest_specs(exec.dest, exec.subdir);
+    let outcome = run_ingest_engine(catalog_dir, &run_id, exec.plan, &dests, exec.jobs)?;
     let hashdate_ms = physical_now_ms();
     let hashdate = iso8601_ms(hashdate_ms);
     let generations = write_ingest_generations(&dests, &outcome, &hashdate)
         .context("writing ASC MHL generations")?;
-
-    let dest_volumes = dest_volume_identities(&args.dest);
-    let mut ops = volume_seen_ops((&source_volume_id, &source_volume_label), &dest_volumes);
+    let dest_volumes = dest_volume_identities(exec.dest);
+    let mut ops = volume_seen_ops((exec.source_volume.0, exec.source_volume.1), &dest_volumes);
     ops.extend(asset_and_para_ops(
         &outcome,
         &dest_volumes,
-        &node_id,
+        exec.node_id,
         hashdate_ms,
     ));
     ops.extend(manifest_ops(&dest_volumes, &generations));
     app.emit(ops)?;
-
-    print_ingest_outcome(&run_id, &outcome, &generations, args.json);
-
+    print_ingest_outcome(&run_id, &outcome, &generations, exec.json);
     anyhow::ensure!(
         outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
         "ingest run {run_id}: {} failed, {} rejected, {} diagnostic(s)",
@@ -691,7 +725,7 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         outcome.rejected.len(),
         outcome.diagnostics.len()
     );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Resolves `para` to an active PARA node's (id, kind, name). Ingest targets
@@ -699,7 +733,10 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
 /// `resolve_para_node`'s general allowance for archived nodes (needed so an
 /// already-archived node can still be renamed by id), silently copying new
 /// content into an archived node would resurrect it as a live destination.
-fn resolve_ingest_node(projection: &Projection, para: &str) -> Result<(String, ParaKind, String)> {
+pub(crate) fn resolve_ingest_node(
+    projection: &Projection,
+    para: &str,
+) -> Result<(String, ParaKind, String)> {
     let node_id = resolve_para_node(projection, para)?;
     let state = projection
         .para_node(&node_id)
@@ -722,7 +759,7 @@ fn resolve_ingest_node(projection: &Projection, para: &str) -> Result<(String, P
 /// against every asset the catalog knows about. Asset ids are stored as
 /// `xxh3:<hex>` (the only format `scan`/`ingest` ever mint); the planner's
 /// dedupe hashes are bare hex, so the prefix is stripped here.
-fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
+pub(crate) fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
     let mut pairs = Vec::new();
     for (asset, state) in projection.assets() {
         let Some(hash) = asset.0.strip_prefix("xxh3:") else {
@@ -736,7 +773,7 @@ fn known_assets_from_projection(projection: &Projection) -> plan::KnownAssets {
 }
 
 /// Renders the destination-relative subdir: `<KindDir>/<name>/<template>`.
-fn render_ingest_subdir(
+pub(crate) fn render_ingest_subdir(
     kind: ParaKind,
     name: &str,
     template_str: &str,

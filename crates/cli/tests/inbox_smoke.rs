@@ -581,3 +581,117 @@ fn markers_are_scoped_per_inbox_not_shared_across_inboxes() {
         "inbox B must converge independently of inbox A: {stdout}"
     );
 }
+
+/// A manifest-less folder and a bare top-level file both wait out the
+/// (default, 5-minute) quiescence window, then — once `MAJ_INBOX_QUIESCENCE_MS`
+/// forces the window to zero — triage into the given `--triage-target`,
+/// tagged `source/inbox` and searchable.
+#[test]
+fn manifest_less_drops_triage_after_quiescence() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let folder = s.inbox().join("beach-shoot");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    std::fs::write(folder.join("wave.heic"), b"heic-bytes").expect("write");
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+
+    // Not yet quiescent (default 5 min): both wait, exit 0.
+    let out = maj(&s.catalog(), &s.state())
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("quiesce"),
+        "young files must wait: {stdout}"
+    );
+    assert!(
+        !s.inbox().join(".processed").exists(),
+        "nothing should have moved while waiting"
+    );
+
+    // Quiescence window forced to zero: both ingest to the triage target.
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    for query in ["wave.heic", "loose.jpg"] {
+        let out = maj(&s.catalog(), &s.state())
+            .args(["search", &format!("{query} tag:source/inbox")])
+            .assert()
+            .success();
+        let found = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+        assert!(found.contains(query), "{query} must be triaged: {found}");
+    }
+    // Both moved to .processed/: the folder as a whole, the loose file by
+    // itself.
+    assert!(s.inbox().join(".processed/beach-shoot/wave.heic").is_file());
+    assert!(!s.inbox().join("beach-shoot").exists());
+    assert!(s.inbox().join(".processed/loose.jpg").is_file());
+    assert!(!s.inbox().join("loose.jpg").exists());
+}
+
+/// No default triage target is ever invented: with manifest-less items
+/// present and quiescent, the pass fails, naming the missing flag.
+#[test]
+fn manifest_less_items_without_a_triage_target_are_an_error() {
+    let s = Setup::new();
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("--triage-target"),
+        "the error must name the missing flag: {stderr}"
+    );
+}
+
+/// The missing-`--triage-target` failure is an operator-side fault scoped to
+/// the manifest-less rows — like a nonexistent PARA target (Task 10), it
+/// must not block a good manifested contribution processed in the same
+/// pass, even though the pass as a whole still exits nonzero.
+#[test]
+fn missing_triage_target_fails_only_manifest_less_rows_not_a_good_manifested_sibling() {
+    let s = Setup::new();
+    let payload = b"good-manifested-bytes";
+    s.write_contribution("drop-good", payload, &xxh64_hex(payload));
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("--triage-target"), "{stderr}");
+    assert!(
+        stdout.contains("drop-good") && stdout.contains("ingested"),
+        "a good manifested contribution must still ingest: {stdout}"
+    );
+    assert!(
+        s.inbox().join(".processed/drop-good").exists(),
+        "the good contribution must still be moved to .processed/"
+    );
+}

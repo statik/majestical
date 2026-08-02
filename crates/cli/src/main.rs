@@ -344,13 +344,19 @@ enum SyncCmd {
 #[derive(Subcommand)]
 enum InboxCmd {
     /// One converging pass: validate, verified-ingest, tag provenance,
-    /// move to .processed/. Manifest-less drops are collected and ignored
-    /// this release — triage for them lands in a follow-up.
+    /// move to .processed/. Manifest-less drops (a folder with no
+    /// `contribution.json`, or a bare top-level file) triage to
+    /// `--triage-target` once quiescent, tagged `source/inbox`.
     Process {
         inbox: PathBuf,
         /// Destination root(s), like `maj ingest --dest`.
         #[arg(long, required = true)]
         dest: Vec<PathBuf>,
+        /// PARA node for manifest-less drops (`<kind>/<name>` or a raw node
+        /// id). Required once any quiescent manifest-less item is present —
+        /// never invented silently.
+        #[arg(long)]
+        triage_target: Option<String>,
         /// Leave processed contributions in place.
         #[arg(long)]
         keep: bool,
@@ -518,12 +524,14 @@ fn dispatch_inbox(app: &mut FsApp, catalog: &Path, cmd: InboxCmd) -> Result<()> 
         InboxCmd::Process {
             inbox,
             dest,
+            triage_target,
             keep,
             json,
         } => {
             let args = inbox_cmd::InboxArgs {
                 inbox,
                 dest,
+                triage_target,
                 keep,
                 json,
             };

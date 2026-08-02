@@ -711,7 +711,7 @@ pub(crate) struct ExecuteIngest<'a> {
 /// a per-run engine summary is preamble noise once the caller's own report
 /// already carries the outcome. Diagnostics reach stderr regardless of
 /// which variant is chosen.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum IngestReport {
     Text,
     Json,

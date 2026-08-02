@@ -140,7 +140,7 @@ documented as a reference page (the Shortcut and future iOS app target it):
 {
   "version": 1,
   "contributor": "dana",
-  "para_target": "Projects/spring-campaign",
+  "para_target": "project/spring-campaign",
   "source": "iphone",
   "note": "free-form capture context",
   "files": [

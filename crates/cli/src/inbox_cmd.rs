@@ -73,7 +73,7 @@ pub(crate) struct ManifestFile {
 /// declares an unsupported `version`; or has a `contributor`, `source`, or
 /// `para_target` that is empty or escapes the contribution folder (absolute
 /// path or a `..` component; `para_target` may additionally contain at most
-/// one interior `/`, e.g. `Projects/spring`). Also errors if any
+/// one interior `/`, e.g. `project/spring`). Also errors if any
 /// `files[]` entry has a name that is empty, names a directory (trailing
 /// `/`), escapes the contribution folder, repeats a name already listed, or
 /// has an `xxh64` that isn't exactly 16 lowercase hex characters.
@@ -100,7 +100,9 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> 
         validate_identity_field("para_target", target)?;
         anyhow::ensure!(
             target.matches('/').count() <= 1,
-            "manifest 'para_target' '{target}' has more than one '/' — expected kind/name form (e.g. Projects/spring){REMEDY}"
+            "manifest 'para_target' '{target}' has more than one '/' — expected \
+             <kind>/<name> form (kind is project, area, resource, or archive; \
+             e.g. project/spring){REMEDY}"
         );
     }
     let mut seen_names = BTreeSet::new();
@@ -293,7 +295,7 @@ mod tests {
 
     fn manifest_json(files: &str) -> String {
         format!(
-            r#"{{"version":1,"contributor":"dana","para_target":"Projects/spring","source":"iphone","files":{files}}}"#
+            r#"{{"version":1,"contributor":"dana","para_target":"project/spring","source":"iphone","files":{files}}}"#
         )
     }
 
@@ -460,7 +462,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
-            manifest_json(r#"[{"name":"","xxh64":"00","size":1}]"#),
+            manifest_json(r#"[{"name":"","xxh64":"deadbeef00000000","size":1}]"#),
         )
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("empty name must fail");
@@ -472,7 +474,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
-            manifest_json(r#"[{"name":"sub/","xxh64":"00","size":1}]"#),
+            manifest_json(r#"[{"name":"sub/","xxh64":"deadbeef00000000","size":1}]"#),
         )
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("trailing slash must fail");
@@ -493,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn a_traversal_contributor_is_rejected_absolute_and_parent_dir() {
+    fn an_absolute_contributor_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
@@ -502,7 +504,12 @@ mod tests {
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("absolute contributor must fail");
         assert!(err.to_string().contains("contributor"), "{err}");
+        assert!(err.to_string().contains("escapes"), "{err}");
+    }
 
+    #[test]
+    fn a_parent_dir_contributor_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
             r#"{"version":1,"contributor":"../evil","files":[]}"#,
@@ -510,10 +517,11 @@ mod tests {
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("parent-dir contributor must fail");
         assert!(err.to_string().contains("contributor"), "{err}");
+        assert!(err.to_string().contains("escapes"), "{err}");
     }
 
     #[test]
-    fn an_empty_or_multi_slash_para_target_is_rejected() {
+    fn an_empty_para_target_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
@@ -522,7 +530,12 @@ mod tests {
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("empty para_target must fail");
         assert!(err.to_string().contains("para_target"), "{err}");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
 
+    #[test]
+    fn a_multi_slash_para_target_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
             r#"{"version":1,"contributor":"dana","para_target":"a/b/c","files":[]}"#,
@@ -530,6 +543,7 @@ mod tests {
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("multi-slash para_target must fail");
         assert!(err.to_string().contains("para_target"), "{err}");
+        assert!(err.to_string().contains("more than one"), "{err}");
     }
 
     #[test]
@@ -550,7 +564,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
-            manifest_json(r#"[{"name":"../escape.mov","xxh64":"00","size":1}]"#),
+            manifest_json(r#"[{"name":"../escape.mov","xxh64":"deadbeef00000000","size":1}]"#),
         )
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("traversal must fail");

@@ -596,19 +596,59 @@ mod tests {
         assert!(load_manifest(dir.path()).expect("load").is_none());
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn a_permission_denied_manifest_is_a_hard_error_not_treated_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        std::fs::write(&manifest_path, manifest_json("[]")).expect("write");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // Same reasoning as `check_files`'s permission test: verify the OS
+        // actually enforces the block independently of `load_manifest`'s
+        // own result, so a mutant that folds every io error into "absent"
+        // can't hide behind an environment that doesn't enforce mode 000.
+        let os_enforces_the_block = std::fs::read_to_string(&manifest_path)
+            .err()
+            .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+
+        let result = load_manifest(dir.path());
+
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms");
+
+        if !os_enforces_the_block {
+            eprintln!("skipping: this environment does not enforce a mode-000 file");
+            return;
+        }
+        assert!(
+            result.is_err(),
+            "a permission-denied manifest must be a hard error, not Ok(None): {result:?}"
+        );
+    }
+
     /// A stat failure other than "not found" (permission denied) on a
     /// listed file must surface loudly, not sit in `waiting` forever —
     /// "not yet present" would tell the operator to just wait, which is
-    /// never going to resolve a permissions problem. Denying execute on
-    /// the contribution folder itself (rather than the listed file) makes
-    /// every stat inside it fail with `PermissionDenied`, not `NotFound`,
-    /// which is exactly the distinction under test.
+    /// never going to resolve a permissions problem. This is deliberately
+    /// NOT tested by denying execute on the contribution folder (chmod
+    /// 000): that approach is structurally unable to fail — `Ok` triggers
+    /// an environment-hedge skip and `Err` satisfies the assertion, so a
+    /// mutant that silently folds every io error into `waiting` also
+    /// returns `Ok` and vacuously skips instead of failing the test.
+    /// Listing a file *through* a path component that is itself a plain
+    /// file (`plain-file/IMG_1.HEIC`) makes `symlink_metadata` fail with
+    /// `NotADirectory`/`Other`, never `NotFound`, deterministically and
+    /// without relying on permission enforcement at all — and
+    /// `collect_unlisted`'s separate walk never descends into `plain-file`
+    /// (it isn't a directory), so this is the ONLY error source in the
+    /// call, isolating the guard completely.
     #[test]
-    #[cfg(unix)]
-    fn a_permission_denied_listed_file_is_a_hard_error_not_waiting_forever() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_listed_path_through_a_non_directory_component_is_a_hard_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("IMG_1.HEIC"), b"abcd").expect("write");
+        std::fs::write(dir.path().join("plain-file"), b"not a directory").expect("write");
         let manifest = ContributionManifest {
             version: 1,
             contributor: "dana".to_string(),
@@ -616,31 +656,16 @@ mod tests {
             source: None,
             note: None,
             files: vec![ManifestFile {
-                name: "IMG_1.HEIC".to_string(),
+                name: "plain-file/IMG_1.HEIC".to_string(),
                 xxh64: "deadbeef00000000".to_string(),
                 size: 4,
             }],
         };
-
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o000);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod 000");
-
         let result = check_files(dir.path(), &manifest);
-
-        // Restoring works even with the folder still locked: stat/chmod on
-        // a path is gated by the PARENT's execute bit, not the path's own.
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
-
-        if result.is_ok() {
-            eprintln!("skipping: this environment does not enforce a mode-000 directory");
-            return;
-        }
         assert!(
             result.is_err(),
-            "a permission failure must be a hard error, not silently waiting"
+            "a path through a non-directory component must be a hard error, \
+             not silently waiting: {result:?}"
         );
     }
 }

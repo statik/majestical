@@ -6,8 +6,6 @@ order. Items marked "(Done in phase 2)" are resolved and listed for the record.
 
 ## Open
 
-- **Segment rotation** must keep zero-padded `NNNN` names — lexicographic sort
-  constraint documented at `crates/sync/src/lib.rs` next to `segments.sort()`.
 - **Incremental SQLite apply** — full projection rebuild per search won't scale
   (documented in catalog-sqlite's module doc).
 - **Local-state vs sync-root layout split** — `catalog.db` currently lives beside
@@ -193,16 +191,6 @@ Recorded during Task 7 (`maj ingest` end to end) and its reviews.
   (`crates/cli/src/state_dir.rs:16-19`) returns an empty `PathBuf` instead of
   falling through to `dirs::data_dir()`, and the catalog dir ends up
   relative to the process's cwd (PR1).
-- **sync's two read paths diverge in walk and UTF-8 handling.**
-  `read_all_reporting` and `read_since_reporting`
-  (`crates/sync/src/lib.rs:152-169`, `:283-301`) duplicate the same segment
-  walk; `read_all_reporting` uses `fs::read_to_string` and fails the *whole
-  segment* on one bad byte, while `read_since_reporting`'s line-by-line path
-  degrades one line at a time via `on_bad_line` — contradicting
-  `read_all_reporting`'s own doc comment, which claims the same per-line
-  tolerance. Separately, `LogError::Io` is hand-built via `map_err` at 13
-  call sites; a `LogError::io(path, source)` constructor would remove the
-  repetition (PR2 quality).
 - **The para-node incomplete-node guard lives in the shared insert helper,
   so no direct test pins it.** `insert_one_para_node`'s
   `let (Some(kind), Some(name)) = (...) else { return Ok(()) }`
@@ -853,6 +841,208 @@ caught, 1 unviable, 0 missed. `chunk.rs`'s existing property test
 segment durations and word counts) together with its direct unit tests
 already discriminates every mutant cargo-mutants tried in this scope; no
 action needed.
+
+## Phase 6 deferrals
+
+Recorded during the phase 6 PR chain (#55-#62) and its reviews. Items marked
+"(phase 6 spec)" come from that spec's own Deferred list; the rest were found
+during execution and fed into this closing task via a scratchpad note.
+
+- **`SyncTransport` port is not built** — arrives with the first
+  non-filesystem transport (self-hosted server / iOS app integration point)
+  (phase 6 spec).
+- **Divergence detection within one machine's segments is not built** —
+  equal-length, different-bytes segments (a reused machine-id after a
+  reinstall) go undetected (phase 6 spec).
+- **The share-sheet Shortcut that generates `contribution.json` on-device is
+  not built** — `maj inbox process` validates and ingests a manifest, but
+  nothing produces one yet outside hand-authoring (phase 6 spec).
+- **A resident inbox watcher (FSEvents) is not built** — `maj inbox process`
+  is a one-shot pass; a GUI-phase concern (phase 6 spec).
+- **Auto-import of pulled blobs into Lance/`text_fts` as part of `maj sync
+  pull` is deliberately not built** — left to `maj index run` for
+  composability; revisit if the two-step trips real users (phase 6 spec).
+- **Permanently truncated segment tail is invisible to both readers** —
+  deferred indefinitely, no diagnostic. The doc states this honestly; a `maj
+  doctor`-style residue check (compare cursor offsets to segment lengths,
+  report unparsed tail bytes) is the real fix (Task 1 code-quality review).
+- **`read_all_reporting` hot-path cost** — an extra per-segment `fs::metadata`
+  stat, a discarded cursor `Vec`, and two `String` clones per segment for an
+  always-empty map lookup. Negligible at one segment per machine; revisit
+  once 4 MiB rotation grows segment counts (`App::events()` runs on ~every
+  CLI command, twice on emit) (Task 1 code-quality review).
+- **`FileEventLog::read_all` is public API with no non-test callers** —
+  production goes through the `EventLog` trait (confirmed again by this
+  closing task's mutation triage: the trait impl's forwarding methods are
+  exercised only through `crates/cli`, never through this inherent method).
+  Remove or demote when the seam is next touched (Task 1 code-quality
+  review).
+- **`TransferError::io` should mirror, not generalize** — a reviewer note for
+  Task 4: don't build a generic error-constructor abstraction over
+  `LogError`/`TransferError` (already the plan's shape; noted so nobody
+  "improves" it) (Task 1 code-quality review).
+- **`count_landed_events`'s doc should note the read-back cost on push** — a
+  delta re-read over the wire; the full segment on first push; bounded by the
+  4 MiB rotation (Task 4 quality re-review).
+- **A segment whose copy lands but read-back fails records a failure row and
+  is not counted in `segments_copied`** — self-clears next run; worth a
+  clarifying comment or reorder (Task 4 quality re-review).
+- **`transfer.rs`'s module-doc skip list should mention broken symlinks
+  explicitly**, and **`is_effectively_file`'s doc says "one symlink hop" but
+  actually follows the whole chain** — both cosmetic, fold in when the file
+  is next touched (Task 4 quality re-review).
+- **NFC/NFD Unicode normalization in `inbox_manifest`'s unlisted-file
+  comparison** — iOS exports emit NFD; APFS resolves lookups, but the raw
+  string-equality comparison reports false "unlisted" strays for an
+  NFD-manifest/NFC-disk name mismatch. Deferred (report-only noise); revisit
+  when the share-sheet Shortcut lands and real NFD manifests exist.
+  Documented in `inbox_cmd`'s module doc (Task 9 spec review).
+- **Windows-authored `contribution.json` manifests are not handled** —
+  `C:\evil` parses as a relative `Normal` path component on macOS, so the
+  traversal guard is Unix-scoped. Fine until a Windows contributor exists
+  (Task 9 spec review).
+- **`crates/core` and `crates/ingest` cucumber mains lack
+  `fail_on_skipped()`** — an unmatched step in those suites reports as
+  skipped and passes. Bring all four cucumber mains to the CLI suites' shape
+  (`fail_on_skipped` + `run_and_exit`). Cheap follow-up, next time either
+  crate's tests are touched (Task 12 quality review).
+- **Stuck operator-fault contributions re-hash every pass** — a contribution
+  parked on a typo'd `para_target` re-reads every listed byte per cron tick
+  (the hash gate runs after routing now, so this is only the still
+  uploading→ready→bad-target sequence; bounded by operator action). Revisit
+  if real inboxes hit it (Task 12 quality review).
+
+### cargo-mutants triage (phase 6)
+
+Five scoped runs, each `--in-place` with the test command narrowed to
+`--bin maj --test sync_smoke --test inbox_smoke --test inbox_acceptance` (the
+default full-package `cargo test` reruns the CLI's whole suite — every
+gated/model-bound integration binary included — per mutant, which does not
+finish in a practical session window; the three phase-6 suites are the ones
+that actually exercise these files). Every count below is the final,
+post-fix run.
+
+```bash
+cargo mutants -p majestical-sync --in-place
+cargo mutants -p majestical-cli --in-place -f crates/cli/src/sync_cmd.rs \
+  -- --bin maj --test sync_smoke --test inbox_smoke --test inbox_acceptance
+cargo mutants -p majestical-cli --in-place -f crates/cli/src/inbox_cmd.rs \
+  -- --bin maj --test sync_smoke --test inbox_smoke --test inbox_acceptance
+cargo mutants -p majestical-cli --in-place -f crates/cli/src/inbox_manifest.rs \
+  -- --bin maj --test sync_smoke --test inbox_smoke --test inbox_acceptance
+cargo mutants -p majestical-ingest --in-place -f crates/ingest/src/plan.rs
+```
+
+**`majestical-sync`** (own crate, `transfer.rs` + `lib.rs`): 112 mutants
+tested, 93 caught, 15 unviable, **4 missed, all triaged, none chased with a
+new test**:
+
+- `<impl EventLog for FileEventLog>::append`/`read_all_reporting`/
+  `read_since_reporting` replaced with a no-op/empty return (3 mutants,
+  `lib.rs:362,369,378`) — **covered by a sibling crate's own suite**, the
+  same category phase 4's triage documented for `model.rs::fetch`.
+  `App<L: EventLog>` (`crates/cli/src/app.rs`) calls these three methods
+  through the trait bound on every CLI command that reads or appends events,
+  but `cargo mutants -p majestical-sync` only runs this crate's own tests,
+  which call the *inherent* methods of the same name directly and never
+  construct a `&dyn EventLog`/generic `EventLog` bound. Confirmed by hand
+  (not just assumed): applying each mutation and running
+  `cargo test -p majestical-cli --test cli_smoke` fails 1, 17, and 19 tests
+  respectively.
+- `sweep_stale_temps`'s `age_ms > STALE_TEMP_MS` boundary (`transfer.rs:423`,
+  `>` → `>=`) — a millisecond-exact boundary test would need a real
+  `filetime`-crate mtime write (the existing `backdate` test helper shells
+  out to `touch -t`, which only has minute resolution); not worth a new
+  dependency for one boundary. Timing-precision, not chased.
+
+**`crates/cli/src/sync_cmd.rs`**: 73 mutants tested, 69 caught, 4 unviable,
+**0 missed** (12 closed). Fixes: `SyncConfig::load`'s `NotFound`-guard test
+(permission-denied config file); `check_exit_policy`/`summarize_pull`/
+`BlobCounts::from_blobs` had no direct unit test at all (each is pure logic,
+now tested inline); `cmd_location_rm`/`cmd_location_list` had **zero**
+CLI-level coverage (only their inner `remove_location`/config-read logic was
+unit-tested) — closed with `location_list_and_rm_reflect_the_real_config`
+(`crates/cli/tests/sync_smoke.rs`), a real gap this task fixed rather than
+worked around.
+
+**`crates/cli/src/inbox_manifest.rs`**: 30 mutants tested, 28 caught, 2
+unviable, **0 missed** (2 closed). `load_manifest`'s `NotFound` guard got a
+permission-denied test. `check_files`' *existing* permission-denied test
+(`a_permission_denied_listed_file_is_a_hard_error_not_waiting_forever`) had a
+latent bug this task found and fixed: it used `check_files`'s own return
+value to decide whether the OS enforced `chmod 000`, so a mutant that folds
+every io error into "waiting" also returns `Ok`, which looks identical to
+"this environment doesn't enforce mode 000" from the outside — the test
+would vacuously skip past exactly the mutant it existed to catch. Confirmed
+by hand: applying the mutation still passed the un-fixed test on this
+machine, even though a raw `chmod 000` + `stat` proves this environment does
+enforce the permission. Fixed with a new, deterministic test
+(`a_listed_path_through_a_non_directory_component_is_a_hard_error`) that
+doesn't depend on permission enforcement at all: a manifest entry whose path
+runs *through* a plain file (`plain-file/IMG_1.HEIC`) makes `symlink_metadata`
+fail with `NotADirectory`/`Other`, never `NotFound`, and — unlike a
+chmod'd directory — doesn't also break `collect_unlisted`'s separate walk,
+so it isolates the guard completely. Confirmed to fail exactly as expected
+with the mutation hand-applied, then reverted.
+
+**`crates/cli/src/inbox_cmd.rs`**: 116 mutants tested, 98 caught, 17
+unviable, 1 timeout, **0 missed** (24 closed, largest cluster this phase):
+
+- `QUIESCENCE_MS`'s `5 * 60 * 1000` and `format_window`'s `< 1000` boundary
+  (6 mutants) — untested pure functions; closed with direct literal-pin and
+  boundary tests.
+- `resolve_contribution_node`'s archived-node detection (`st.archived() &&
+  st.kind() == Some(kind) && st.name() == Some(name)`, 2 mutants, both
+  `&&` → `||`) — the existing `an_archived_para_target_names_unarchive_not_add`
+  test only ever archives the exact target node, so every sub-condition is
+  true for that one node either way and can't tell `&&` from `||` apart.
+  Closed by `an_archived_node_of_a_different_kind_is_not_mistaken_for_the_target`
+  (archives a node with the target's name but a DIFFERENT kind — real code
+  correctly falls through to "does not exist yet"; either single-operator
+  mutation wrongly reports "exists but is archived"). Confirmed by hand
+  against both operators individually.
+- `processed_target`'s `suffix += 1` (2 mutants) — no test exercised a
+  *second* collision (only ever 0 or 1 existing `.processed/<name>`).
+  `+=`→`-=` closed by a direct 3-collision test; `+=`→`*=` (suffix frozen at
+  its start value forever) **times out** rather than being reported missed —
+  the mutated loop spins forever re-testing the same already-existing target
+  — the same "a hang is louder than a silently wrong assertion" reasoning
+  phase 3's `Event::Eof`-deletion timeouts used; not chased further, and the
+  new test's own timeout confirms it genuinely reaches this code path.
+- `print_report_json`/`print_report_text`'s `skipped_duplicates > 0`
+  boundaries (12 mutants across both `Ingested` and `PartlyIngested` arms, in
+  both text and JSON rendering) — no test exercised the zero-vs-nonzero
+  boundary in either output mode for either outcome shape. Closed with four
+  paired zero/nonzero e2e tests (`crates/cli/tests/inbox_smoke.rs`):
+  `json_output_is_a_single_parseable_document`/
+  `json_output_includes_skipped_duplicates_only_when_nonzero` (JSON,
+  `Ingested`), `a_partial_batch_with_a_duplicate_reports_both_counts`/the
+  negative assertion added to
+  `a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group` (text,
+  `PartlyIngested`), and
+  `json_output_includes_skipped_duplicates_on_a_partial_row`/
+  `json_output_omits_skipped_duplicates_on_a_partial_row_with_none` (JSON,
+  `PartlyIngested`) — the last pair needed a real duplicate-plus-failure
+  batch in the same triage pass, not just a duplicate alone.
+
+**`crates/ingest/src/plan.rs`** (the `plan_source_filtered` inbox-triage
+filter): 13 mutants tested, 12 caught, 1 unviable, **0 missed** — the
+task's own TDD tests (`a_filtered_out_directorys_contents_are_absent_from_
+the_plan`, `a_filtered_out_directory_is_never_entered_even_when_unreadable`)
+already discriminated everything; no gaps found, no action needed.
+
+## Done in phase 6
+
+- **Segment rotation** (was Open, phase 2): landed with zero-padded `NNNN`
+  segment names as designed — `ROTATE_BYTES`/`active_segment` in
+  `crates/sync/src/lib.rs`, next to `list_segments`'s numeric-sort
+  assumption (phase 6 Task 2).
+- **Sync's two read paths diverging in walk and UTF-8 handling** (was a
+  phase 4 deferral): `read_all_reporting` is now literally
+  `read_since_reporting` called with empty cursors and the cursors
+  discarded, so the two can no longer disagree — plus the `LogError::io`
+  constructor removing the 13-call-site `map_err` repetition the same
+  deferral named (`crates/sync/src/lib.rs`, phase 6 Task 1).
 
 ## Done in phase 5
 

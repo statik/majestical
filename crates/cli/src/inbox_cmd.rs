@@ -1281,4 +1281,34 @@ mod tests {
             "None must fingerprint the manifest alone, distinct from folding in listed files"
         );
     }
+
+    #[test]
+    fn quiescence_ms_default_is_five_minutes() {
+        // The default is only ever used symbolically elsewhere (env unset
+        // -> QUIESCENCE_MS, formatted with format_window); pin the literal.
+        assert_eq!(QUIESCENCE_MS, 300_000);
+    }
+
+    #[test]
+    fn format_window_is_exact_at_the_millisecond_second_boundary() {
+        assert_eq!(format_window(0), "0ms");
+        assert_eq!(format_window(999), "999ms");
+        assert_eq!(format_window(1000), "1s");
+        assert_eq!(format_window(1500), "1s");
+        assert_eq!(format_window(300_000), "300s");
+    }
+
+    #[test]
+    fn processed_target_appends_a_numeric_suffix_on_repeated_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("drop"), b"x").expect("write");
+        std::fs::write(dir.path().join("drop-2"), b"x").expect("write");
+        std::fs::write(dir.path().join("drop-3"), b"x").expect("write");
+        let target = processed_target(dir.path(), "drop");
+        assert_eq!(
+            target,
+            dir.path().join("drop-4"),
+            "the suffix must climb past every existing collision, not just the first"
+        );
+    }
 }

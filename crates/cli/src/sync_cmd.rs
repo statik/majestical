@@ -1026,4 +1026,107 @@ mod tests {
         let cfg = SyncConfig::load(&path).expect("load");
         assert_eq!(cfg.locations[0].name, "nas");
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_propagates_a_non_not_found_io_error() {
+        // Mirrors DescriberConfig::load's own NotFound guard test (phase 5
+        // triage): a mutant that widens the guard to match every error
+        // would fold a permission-denied config into "no config yet"
+        // instead of surfacing it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.toml");
+        std::fs::write(&path, "readonly = false\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let result = SyncConfig::load(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms");
+        assert!(
+            result.is_err(),
+            "a permission-denied config must not be treated as absent: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_exit_policy_names_every_location_when_all_fail() {
+        let results = vec![
+            LocationResult::Skipped {
+                name: "shuttle-drive".into(),
+                reason: "unreachable".into(),
+            },
+            LocationResult::Failed {
+                name: "attic-nas".into(),
+                error: "boom".into(),
+            },
+        ];
+        let err = check_exit_policy(&results, "push").expect_err("all failed must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shuttle-drive") && msg.contains("attic-nas"),
+            "the all-failed message must name every location: {msg}"
+        );
+    }
+
+    #[test]
+    fn summarize_pull_sums_events_across_locations() {
+        let results = vec![
+            LocationResult::Outcome {
+                name: "a".into(),
+                outcome: transfer::TransferOutcome {
+                    events_added: vec![("m1".into(), 3)],
+                    blobs_copied: 2,
+                    ..Default::default()
+                },
+            },
+            LocationResult::Outcome {
+                name: "b".into(),
+                outcome: transfer::TransferOutcome {
+                    events_added: vec![("m1".into(), 4), ("m2".into(), 1)],
+                    blobs_copied: 5,
+                    ..Default::default()
+                },
+            },
+        ];
+        let summary = summarize_pull(&results);
+        assert_eq!(summary.applied, 8, "events must sum across locations");
+        assert_eq!(summary.blobs_fetched, 7, "blobs must sum across locations");
+        assert_eq!(summary.machines, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[test]
+    fn blob_counts_from_blobs_counts_each_class_independently() {
+        let blobs = vec![
+            transfer::BlobCopy {
+                rel: "a".into(),
+                class: transfer::BlobClass::Metadata,
+                size: 1,
+            },
+            transfer::BlobCopy {
+                rel: "b".into(),
+                class: transfer::BlobClass::Metadata,
+                size: 1,
+            },
+            transfer::BlobCopy {
+                rel: "c".into(),
+                class: transfer::BlobClass::Vectors,
+                size: 1,
+            },
+            transfer::BlobCopy {
+                rel: "d".into(),
+                class: transfer::BlobClass::Transcripts,
+                size: 1,
+            },
+        ];
+        let counts = BlobCounts::from_blobs(&blobs);
+        assert_eq!(
+            counts,
+            BlobCounts {
+                thumbs: 0,
+                metadata: 2,
+                vectors: 1,
+                transcripts: 1,
+            }
+        );
+    }
 }

@@ -407,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn rotate_bytes_is_four_mebibytes() {
+        // Every other test only ever uses ROTATE_BYTES symbolically
+        // (`ROTATE_BYTES + 1`, `ROTATE_BYTES - 1`, …), so an arithmetic slip
+        // in the constant's own definition (`4 * 1024 * 1024` mutated to
+        // `4 * 1024 + 1024`, etc.) would be self-consistent with every one
+        // of them. Pin the actual value.
+        assert_eq!(ROTATE_BYTES, 4_194_304);
+    }
+
+    #[test]
     fn open_errors_when_root_not_initialized() {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = FileEventLog::open(dir.path(), &MachineId("m1".into()));

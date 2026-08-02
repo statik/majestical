@@ -1,8 +1,8 @@
 //! `crates/cli/tests/services_parity.rs` — byte-identical CLI output through
-//! the services extraction, proven by diffing this build's stdout against
-//! the pre-extraction reference binary (`/tmp/maj-ref`, built at each PR
-//! chunk's start). Skips (with a loud message) when the reference is
-//! absent — CI rebuilds it in the job.
+//! the services extraction, proven by diffing this build's stdout, stderr,
+//! and exit code against the pre-extraction reference binary (`/tmp/maj-ref`,
+//! built at each PR chunk's start). Skips (with a loud message) when the
+//! reference is absent — CI rebuilds it in the job.
 mod common;
 
 use assert_cmd::Command; // both arms below are assert_cmd::Command
@@ -29,9 +29,17 @@ fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
     };
     let (new, old) = (run("new"), run("ref"));
     assert_eq!(
-        (String::from_utf8_lossy(&new.stdout), new.status.code()),
-        (String::from_utf8_lossy(&old.stdout), old.status.code()),
-        "stdout/exit diverged for {args:?}"
+        (
+            String::from_utf8_lossy(&new.stdout),
+            String::from_utf8_lossy(&new.stderr),
+            new.status.code()
+        ),
+        (
+            String::from_utf8_lossy(&old.stdout),
+            String::from_utf8_lossy(&old.stderr),
+            old.status.code()
+        ),
+        "stdout/stderr/exit diverged for {args:?}"
     );
 }
 

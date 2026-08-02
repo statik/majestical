@@ -1214,6 +1214,12 @@ mod tests {
         assert_eq!(out.count, 1);
         assert_eq!(out.results[0].name, "clip.txt");
         assert!(out.results[0].asset.starts_with("xxh3:"));
+        // A plain text asset is not eligible for any text/semantic layer
+        // (see TEXT_SOURCE_INFO's kinds and image_semantic_enabled), so a
+        // text-only fixture must never carry a coverage notice — pins "no
+        // spurious notices for text-only catalogs".
+        assert!(out.text_coverage.is_empty());
+        assert!(out.semantic_coverage.is_none());
     }
 }
 

@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0  # full history: origin/main must be resolvable for the parity-reference merge-base below
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable (branch tip 2026-07-29)
         with:
           components: rustfmt, clippy
@@ -26,6 +27,15 @@ jobs:
         run: brew install protobuf
       - run: brew install just
       - run: just check
+      - name: Build pre-extraction reference binary for the parity harness
+        run: |
+          set -euo pipefail
+          orig_sha=$(git rev-parse HEAD)
+          merge_base=$(git merge-base origin/main HEAD)
+          git checkout --detach "$merge_base"
+          cargo build -p majestical-cli
+          cp target/debug/maj /tmp/maj-ref
+          git checkout --detach "$orig_sha"
       - run: just test
   mhl-conformance:
     name: ASC MHL conformance (Python reference)

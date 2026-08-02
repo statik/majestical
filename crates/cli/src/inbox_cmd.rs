@@ -549,6 +549,15 @@ fn process_contribution(
         record_failure(markers, &name, &reason, &fingerprint);
         return Ok(ContribOutcome::Failed { reason });
     }
+    // Route before hashing: resolving the target is a cheap in-memory
+    // projection lookup, while the hash gate below reads every listed byte.
+    // A contribution parked on a typo'd or archived target must fail here,
+    // not after re-reading a multi-hundred-gigabyte drop on every pass.
+    if let Err(e) = route_contribution(app, manifest) {
+        return Ok(ContribOutcome::Failed {
+            reason: format!("{e:#}"),
+        });
+    }
     match hash_mismatch_reason(dir, manifest) {
         Ok(Some(reason)) => {
             record_failure(markers, &name, &reason, &fingerprint);
@@ -576,6 +585,25 @@ fn process_contribution(
             reason: format!("{e:#}"),
         }),
     }
+}
+
+/// A cheap, no-file-I/O check that this contribution's `para_target`
+/// resolves to somewhere ingestible — no file bytes are read. Called before
+/// [`hash_mismatch_reason`] purely to fail fast on a routing problem
+/// (missing `para_target`, a typo'd or archived node) before that gate
+/// re-reads every listed byte. [`ingest_contribution`] resolves the target
+/// again once ingestion actually proceeds; a second cheap lookup costs
+/// nothing next to the hash gate it's meant to guard.
+fn route_contribution(app: &mut FsApp, manifest: &ContributionManifest) -> Result<()> {
+    let Some(para) = manifest.para_target.as_deref() else {
+        anyhow::bail!(
+            "manifest has no para_target — add one to the manifest, or wait for the \
+             manifest-less triage flow"
+        );
+    };
+    let projection = app.projection()?;
+    resolve_contribution_node(&projection, para)?;
+    Ok(())
 }
 
 /// End-to-end hash gate: the contributor's client-side xxh64 against a
@@ -610,16 +638,16 @@ fn validate_and_ingest(
     dir: &Path,
     manifest: &ContributionManifest,
 ) -> Result<ContribOutcome> {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     // para_target is optional in the wire format — a well-formed manifest
     // that simply hasn't been routed yet must fail only itself, not halt
-    // every other contribution in the same pass.
+    // every other contribution in the same pass. `route_contribution`
+    // (called before the hash gate, earlier in `process_contribution`) has
+    // already checked this in the common case; re-checked here too since
+    // this function must stand on its own. The report line prepends the
+    // contribution's name, so this message must not repeat it.
     let Some(para) = manifest.para_target.as_deref() else {
         anyhow::bail!(
-            "{name}: manifest has no para_target — add one to the manifest, or wait for the \
+            "manifest has no para_target — add one to the manifest, or wait for the \
              manifest-less triage flow"
         );
     };
@@ -642,10 +670,13 @@ fn validate_and_ingest(
 
 /// Resolves `para` (validated by `load_manifest` to at most one interior
 /// `/`) to an active ingest target. When it's in `<kind>/<name>` form and
-/// simply doesn't exist yet — the common inbox case, a contributor naming a
-/// project nobody created — this names the exact fix instead of
+/// doesn't resolve to an active node, this names the exact fix instead of
 /// [`commands::resolve_ingest_node`]'s generic "see `maj para list`" (which
-/// doesn't tell the operator they need `add`, not `list`).
+/// doesn't tell the operator what to do next) — distinguishing the two ways
+/// "not active" happens matters: a target that was never created needs
+/// `maj para add`, but a target that exists and is merely archived would
+/// get a DUPLICATE node from that same advice, so it gets its own message
+/// naming un-archiving instead.
 fn resolve_contribution_node(
     projection: &Projection,
     para: &str,
@@ -653,14 +684,23 @@ fn resolve_contribution_node(
     if let Some((kind_str, name)) = para.split_once('/')
         && let Ok(kind) = commands::parse_kind(kind_str)
     {
-        let exists = projection
+        let active = projection
             .para_nodes()
             .any(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
-        anyhow::ensure!(
-            exists,
-            "PARA target '{para}' does not exist yet — create it first: \
-             `maj para add {kind_str} {name}`"
-        );
+        if !active {
+            let archived = projection
+                .para_nodes()
+                .any(|(_, st)| st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
+            anyhow::ensure!(
+                !archived,
+                "PARA target '{para}' exists but is archived — un-archive it or target another \
+                 node; see `maj para list`"
+            );
+            anyhow::bail!(
+                "PARA target '{para}' does not exist yet — create it first: \
+                 `maj para add {kind_str} {name}`"
+            );
+        }
     }
     commands::resolve_ingest_node(projection, para)
 }

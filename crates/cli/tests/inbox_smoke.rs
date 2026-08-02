@@ -303,6 +303,10 @@ fn a_missing_para_target_fails_only_that_contribution() {
         "{stdout}"
     );
     assert!(
+        !stdout.contains("drop-no-target: FAILED — drop-no-target:"),
+        "the report line already prepends the name — the message must not repeat it: {stdout}"
+    );
+    assert!(
         stdout.contains("drop-good-2") && stdout.contains("ingested"),
         "a manifest missing para_target must not block others: {stdout}"
     );
@@ -412,4 +416,101 @@ fn a_redrop_under_a_different_contributor_still_gets_tagged() {
             "{query} must find the clip: {found}"
         );
     }
+}
+
+/// A `para_target` naming a node that exists but is archived must never get
+/// the "does not exist yet — `maj para add`" remedy: following that advice
+/// creates a duplicate, indistinguishable node. It gets its own message
+/// naming un-archiving instead.
+#[test]
+fn an_archived_para_target_names_unarchive_not_add() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "archive", "project/spring"])
+        .assert()
+        .success();
+    let payload = b"archived-target-bytes";
+    s.write_contribution("drop-archived", payload, &xxh64_hex(payload));
+
+    let out = s.process().failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("exists but is archived") && stdout.contains("un-archive"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("maj para add"),
+        "an archived target must not suggest creating a duplicate node: {stdout}"
+    );
+}
+
+/// state/catalogs/<key>/inbox-failures.json — exactly one catalog key
+/// exists per test. Mirrors `sync_smoke.rs`'s `find_sync_toml` pattern.
+#[cfg(test)]
+#[cfg(unix)]
+fn find_inbox_markers(state: &Path) -> std::path::PathBuf {
+    let catalogs = state.join("catalogs");
+    let entry = std::fs::read_dir(&catalogs)
+        .expect("state dir")
+        .next()
+        .expect("one catalog key")
+        .expect("entry");
+    entry.path().join("inbox-failures.json")
+}
+
+/// A later-sorting contribution whose folder contains an unreadable
+/// subdirectory makes the whole pass fatal (a real I/O failure walking for
+/// unlisted files, inside `check_files`) — but an earlier contribution's
+/// freshly recorded failure marker must survive that fatal exit: markers
+/// are stored before any pass-fatal error propagates, never only at a
+/// clean end of the loop.
+#[test]
+#[cfg(unix)]
+fn markers_persist_even_when_a_later_contribution_is_pass_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Setup::new();
+    // "a-bad" sorts before "b-fatal" — its hash-mismatch failure must be
+    // recorded even though b-fatal blows up the rest of the pass.
+    s.write_contribution("a-bad", b"actual-bytes", "0000000000000000");
+
+    let dir = s.inbox().join("b-fatal");
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).expect("mkdir");
+    let mut perms = std::fs::metadata(&locked).expect("meta").permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&locked, perms).expect("chmod 000");
+
+    // Some environments (root, certain containers/filesystems) don't
+    // enforce this restriction — skip rather than false-fail there.
+    if std::fs::read_dir(&locked).is_ok() {
+        let mut perms = std::fs::metadata(&locked).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&locked, perms).expect("chmod restore");
+        eprintln!("skipping: this environment does not enforce a mode-000 directory (likely root)");
+        return;
+    }
+
+    let payload = b"clip-bytes-for-fatal";
+    std::fs::write(dir.join("clip.mov"), payload).expect("write");
+    let manifest = format!(
+        r#"{{"version":1,"contributor":"dana","para_target":"project/spring","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
+        xxh64_hex(payload),
+        payload.len()
+    );
+    std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+
+    s.process().failure();
+
+    // Restore permissions so the tempdir can be cleaned up afterward.
+    let mut perms = std::fs::metadata(&locked).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&locked, perms).expect("chmod restore");
+
+    let markers_path = find_inbox_markers(&s.state());
+    let text = std::fs::read_to_string(&markers_path).expect("read inbox-failures.json");
+    assert!(
+        text.contains("a-bad"),
+        "the earlier contribution's marker must survive a later pass-fatal error: {text}"
+    );
 }

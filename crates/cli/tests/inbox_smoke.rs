@@ -754,8 +754,8 @@ fn a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group() {
         "the bad file's reason must reach stderr: {stderr}"
     );
     assert!(
-        stdout.contains("ingested 1") && stdout.contains("1 failed"),
-        "the row must report the partial result: {stdout}"
+        stdout.contains("PARTIAL") && stdout.contains("ingested 1") && stdout.contains("1 FAILED"),
+        "the row must report the partial result with a greppable marker: {stdout}"
     );
     assert!(
         s.inbox().join(".processed/good.jpg").is_file(),
@@ -799,6 +799,12 @@ fn a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group() {
 /// The quiescence check walks a folder's full depth, not just its
 /// top-level entries: a young file two levels deep must block the whole
 /// folder from triaging, the same as a young top-level file would.
+///
+/// Every ancestor and the sibling file are backdated deterministically with
+/// `filetime` (std has no portable way to set a directory's mtime) to well
+/// outside a generous window, so only the deeply nested file's real,
+/// just-written mtime can be why the folder isn't quiescent — no sleep, no
+/// race margin against subprocess startup time.
 #[test]
 fn a_young_file_nested_two_levels_deep_blocks_folder_quiescence() {
     let s = Setup::new();
@@ -806,16 +812,25 @@ fn a_young_file_nested_two_levels_deep_blocks_folder_quiescence() {
         .args(["para", "add", "resource", "inbox-triage"])
         .assert()
         .success();
-    let nested = s.inbox().join("archive/a/b");
-    std::fs::create_dir_all(&nested).expect("mkdir");
-    std::fs::write(s.inbox().join("archive/old.txt"), b"old-bytes").expect("write");
-    // Give the rest of the tree a comfortable head start on the window
-    // before the deeply nested file is written right before the check.
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    std::fs::write(nested.join("young.txt"), b"young-bytes").expect("write");
+    let root = s.inbox().join("archive");
+    let a = root.join("a");
+    let b = a.join("b");
+    std::fs::create_dir_all(&b).expect("mkdir");
+    let old_txt = root.join("old.txt");
+    std::fs::write(&old_txt, b"old-bytes").expect("write");
 
+    let old = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+    let old_ft = filetime::FileTime::from_system_time(old);
+    for path in [&root, &a, &b, &old_txt] {
+        filetime::set_file_mtime(path, old_ft).expect("backdate mtime");
+    }
+    std::fs::write(b.join("young.txt"), b"young-bytes").expect("write");
+
+    // A minute-wide window is astronomically larger than the ~3600s
+    // backdating margin above and any plausible subprocess startup delay,
+    // so this can never flake in either direction.
     let out = maj(&s.catalog(), &s.state())
-        .env("MAJ_INBOX_QUIESCENCE_MS", "1000")
+        .env("MAJ_INBOX_QUIESCENCE_MS", "60000")
         .args(["inbox", "process"])
         .arg(s.inbox())
         .args(["--dest"])
@@ -902,5 +917,116 @@ fn triaged_loose_files_are_tagged_with_exactly_source_inbox() {
         tags,
         vec!["source/inbox".to_string()],
         "no contributor identity may be claimed for a triaged asset"
+    );
+}
+
+/// A re-dropped duplicate loose file must drain out of the inbox to
+/// `.processed/` like any other successfully processed item — leaving it
+/// behind would re-hash it and re-emit its `TagAdd`s on every single pass
+/// forever, an unbounded write to the event log every sync peer replicates.
+/// A third, fully-converged pass (nothing left to process) must emit no new
+/// events at all — checked directly against the event segment's byte size,
+/// not just behaviorally.
+#[test]
+fn a_redropped_duplicate_loose_file_drains_and_a_converged_pass_emits_nothing() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let payload = b"duplicate-loose-bytes";
+    std::fs::write(s.inbox().join("first.jpg"), payload).expect("write");
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    assert!(s.inbox().join(".processed/first.jpg").is_file());
+
+    // Re-drop identical bytes under a new name: a content-addressed
+    // duplicate, not a new copy.
+    std::fs::write(s.inbox().join("second.jpg"), payload).expect("write");
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("already known"),
+        "the duplicate must be reported as already known: {stdout}"
+    );
+    assert!(
+        s.inbox().join(".processed/second.jpg").is_file(),
+        "a duplicate must still drain to .processed/, not sit in the inbox forever"
+    );
+    assert!(!s.inbox().join("second.jpg").exists());
+
+    let segment = s.catalog().join("events/test-machine/0001.jsonl");
+    let size_before_third = std::fs::metadata(&segment).expect("meta").len();
+
+    // Third pass: nothing left in the inbox — a converged pass must not
+    // touch the event log at all.
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(stdout.contains("nothing to process"), "{stdout}");
+    let size_after_third = std::fs::metadata(&segment).expect("meta").len();
+    assert_eq!(
+        size_before_third, size_after_third,
+        "a converged pass with nothing left to drain must emit no new events"
+    );
+}
+
+/// Per-file failure detail must reach stderr from every ingest path, not
+/// just loose files: a 0-byte file inside a manifest-less FOLDER (which,
+/// unlike a `(loose files)` group, requires a clean outcome — one bad file
+/// fails the whole folder) must still be named, with its rejection reason,
+/// on stderr — not just a count in an error message that has nothing to
+/// point at.
+#[test]
+fn a_zero_byte_file_inside_a_manifest_less_folder_is_named_on_stderr() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let folder = s.inbox().join("bad-folder");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    std::fs::write(folder.join("good.jpg"), b"good-bytes").expect("write");
+    std::fs::write(folder.join("empty.jpg"), b"").expect("write 0-byte file");
+
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("empty.jpg") && stderr.contains("0-byte"),
+        "the rejected file's name and reason must reach stderr, not just a count: {stderr}"
+    );
+    assert!(
+        s.inbox().join("bad-folder").exists(),
+        "the whole folder fails atomically — nothing partially moves"
     );
 }

@@ -213,6 +213,7 @@ enum ContribOutcome {
     /// reasons already reached stderr by the time this is constructed).
     PartlyIngested {
         placed: usize,
+        skipped_duplicates: usize,
         failed: usize,
     },
     Waiting {
@@ -232,15 +233,40 @@ enum ContribOutcome {
 /// overrides it — tests force `0`; an impatient operator can shorten it.
 const QUIESCENCE_MS: u64 = 5 * 60 * 1000;
 
+/// Reads `MAJ_INBOX_QUIESCENCE_MS`, falling back to [`QUIESCENCE_MS`] when
+/// unset. Called once per pass ([`process_manifest_less`] threads the
+/// result through) rather than once per item, so every item in one pass is
+/// judged against the same window even if the env var were somehow read at
+/// slightly different instants. A value that's set but doesn't parse as a
+/// `u64` is a likely operator typo — warned loudly, naming the bad value,
+/// rather than silently falling back to a default that would otherwise
+/// look like a working override doing nothing.
 fn quiescence_ms() -> u64 {
-    std::env::var("MAJ_INBOX_QUIESCENCE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(QUIESCENCE_MS)
+    let Ok(value) = std::env::var("MAJ_INBOX_QUIESCENCE_MS") else {
+        return QUIESCENCE_MS;
+    };
+    value.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "warning: MAJ_INBOX_QUIESCENCE_MS={value:?} is not a valid number of milliseconds \
+             — falling back to the default {QUIESCENCE_MS}ms"
+        );
+        QUIESCENCE_MS
+    })
+}
+
+/// Renders a quiescence window for a human-facing message: milliseconds
+/// when sub-second (tests force small or zero windows, where "0s" would be
+/// misleading), whole seconds otherwise.
+fn format_window(window_ms: u64) -> String {
+    if window_ms < 1000 {
+        format!("{window_ms}ms")
+    } else {
+        format!("{}s", window_ms / 1000)
+    }
 }
 
 /// Newest mtime under `path`: a file's own mtime, or the max across
-/// everything nested inside a folder. `u64::MAX` on any unreadable entry —
+/// everything nested inside a folder. `None` on any unreadable entry —
 /// unreadable means "not ready to judge", never "ready" — including a
 /// subdirectory that becomes unreadable partway through the walk.
 ///
@@ -250,46 +276,45 @@ fn quiescence_ms() -> u64 {
 /// stack overflow (SIGSEGV), not a catchable error. Uses `symlink_metadata`
 /// throughout (never follows a symlink into its target), so a symlinked
 /// directory is judged by its own mtime and not descended into.
-fn newest_mtime_ms(path: &Path) -> u64 {
-    let Ok(top) = std::fs::symlink_metadata(path) else {
-        return u64::MAX;
-    };
+fn newest_mtime_ms(path: &Path) -> Option<u64> {
+    let top = std::fs::symlink_metadata(path).ok()?;
     if !top.is_dir() {
-        return commands::mtime_ms_of(&top);
+        return Some(commands::mtime_ms_of(&top));
     }
     let mut newest = commands::mtime_ms_of(&top);
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return u64::MAX;
-        };
+        let entries = std::fs::read_dir(&dir).ok()?;
         for entry in entries {
-            let Ok(entry) = entry else {
-                return u64::MAX;
-            };
+            let entry = entry.ok()?;
             // `DirEntry::metadata` does not follow symlinks, matching
             // `symlink_metadata` above.
-            let Ok(meta) = entry.metadata() else {
-                return u64::MAX;
-            };
+            let meta = entry.metadata().ok()?;
             newest = newest.max(commands::mtime_ms_of(&meta));
             if meta.is_dir() {
                 stack.push(entry.path());
             }
         }
     }
-    newest
+    Some(newest)
 }
 
 /// Whether `path` (a manifest-less folder or a loose file) has had no
-/// activity for at least [`quiescence_ms`]. `false` on any unreadable
-/// entry underneath it — see [`newest_mtime_ms`].
-fn is_quiescent(path: &Path) -> bool {
-    let newest = newest_mtime_ms(path);
-    if newest == u64::MAX {
+/// activity for at least `window_ms`. `false` on any unreadable entry
+/// underneath it — see [`newest_mtime_ms`].
+fn is_quiescent(path: &Path, window_ms: u64) -> bool {
+    let Some(newest) = newest_mtime_ms(path) else {
         return false;
-    }
-    crate::app::physical_now_ms().saturating_sub(newest) >= quiescence_ms()
+    };
+    crate::app::physical_now_ms().saturating_sub(newest) >= window_ms
+}
+
+/// A path's final component as a display string — used everywhere a report
+/// row needs the bare name of a contribution folder or loose file.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// One converging pass over `args.inbox`: every manifested subfolder is
@@ -342,10 +367,7 @@ fn run_pass(
     let mut report = Vec::new();
     let mut triage_dirs = Vec::new();
     for path in list_contribution_dirs(&ctx.args.inbox)? {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = display_name(&path);
         match load_manifest(&path) {
             Ok(Some(manifest)) => {
                 let outcome = process_contribution(app, ctx, &path, &manifest, markers)?;
@@ -439,10 +461,7 @@ fn process_contribution(
     manifest: &ContributionManifest,
     markers: &mut FailureMarkers,
 ) -> Result<ContribOutcome> {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = display_name(dir);
     let fingerprint = contribution_fingerprint(dir, Some(manifest));
     if let Some(outcome) = recorded_failure(markers, &ctx.inbox_key, &name, &fingerprint) {
         return Ok(outcome);
@@ -559,7 +578,7 @@ fn validate_and_ingest(
     let outcome = ingest_contribution(app, ctx, dir, manifest, node)?;
     let contrib = require_clean_outcome(&outcome)?;
     if !ctx.args.keep {
-        move_to_processed(&ctx.args.inbox, dir)?;
+        move_into_processed(&ctx.args.inbox, dir)?;
     }
     Ok(contrib)
 }
@@ -741,14 +760,32 @@ fn run_shared_ingest(
             resume: None,
             // Silent in both text and JSON mode: the pass-level report
             // this module prints already carries the outcome, and stderr
-            // carries any failure detail — a per-contribution engine
-            // summary interleaved ahead of it is preamble noise in text
-            // mode, and would break `--json`'s one-document guarantee.
+            // carries any failure detail (via `print_failure_detail`
+            // below) — a per-contribution engine summary interleaved ahead
+            // of it is preamble noise in text mode, and would break
+            // `--json`'s one-document guarantee.
             report: IngestReport::Silent,
         },
     )?;
+    print_failure_detail(&run.outcome);
     tag_assets(app, ingest_plan, &run.outcome, tags)?;
     Ok(run.outcome)
+}
+
+/// Per-file failure/rejection/diagnostic detail, printed to stderr from the
+/// one place every ingest call site (manifested, triage folder, triage
+/// loose files) shares. `run_shared_ingest` always runs with
+/// `IngestReport::Silent`, so without this nothing ever prints WHICH file
+/// failed and why — [`require_clean_outcome`]'s error only reports counts,
+/// which would otherwise be a circular "see stderr" pointing at a line that
+/// just repeats the same counts back.
+fn print_failure_detail(outcome: &engine::Outcome) {
+    for bad in outcome.failed.iter().chain(&outcome.rejected) {
+        eprintln!("{}: {}", bad.rel, bad.reason);
+    }
+    for note in &outcome.diagnostics {
+        eprintln!("diagnostic: {note}");
+    }
 }
 
 /// Every distinct asset this run touched — both newly placed files AND
@@ -816,21 +853,12 @@ fn process_manifest_less(
     loose_files: &[PathBuf],
     report: &mut Vec<(String, ContribOutcome)>,
 ) -> Result<()> {
-    let quiescent_dirs: Vec<&PathBuf> = triage_dirs.iter().filter(|d| is_quiescent(d)).collect();
-    let quiescent_files: Vec<&PathBuf> = loose_files.iter().filter(|f| is_quiescent(f)).collect();
-    let waiting =
-        (triage_dirs.len() - quiescent_dirs.len()) + (loose_files.len() - quiescent_files.len());
-    if waiting > 0 {
-        report.push((
-            "(manifest-less)".to_string(),
-            ContribOutcome::Waiting {
-                reasons: vec![format!(
-                    "{waiting} item(s) modified within the last {}s — letting them quiesce",
-                    quiescence_ms() / 1000
-                )],
-            },
-        ));
-    }
+    let window_ms = quiescence_ms();
+    let (quiescent_dirs, waiting_dirs): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        triage_dirs.iter().partition(|d| is_quiescent(d, window_ms));
+    let (quiescent_files, waiting_files): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        loose_files.iter().partition(|f| is_quiescent(f, window_ms));
+    push_waiting_row(report, &waiting_dirs, &waiting_files, window_ms);
     if quiescent_dirs.is_empty() && quiescent_files.is_empty() {
         return Ok(());
     }
@@ -863,15 +891,11 @@ fn process_manifest_less(
         }
     };
     for dir in quiescent_dirs {
-        let name = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let outcome =
             process_triage_dir(app, ctx, dir, &node).unwrap_or_else(|e| ContribOutcome::Failed {
                 reason: format!("{e:#}"),
             });
-        report.push((name, outcome));
+        report.push((display_name(dir), outcome));
     }
     if !quiescent_files.is_empty() {
         let files: Vec<PathBuf> = quiescent_files.into_iter().cloned().collect();
@@ -885,6 +909,36 @@ fn process_manifest_less(
     Ok(())
 }
 
+/// Appends the single aggregate `(manifest-less)` waiting row, naming every
+/// still-quiescing folder/file, when there is at least one — split out of
+/// [`process_manifest_less`] purely to keep it under the house
+/// function-length limit.
+fn push_waiting_row(
+    report: &mut Vec<(String, ContribOutcome)>,
+    waiting_dirs: &[&PathBuf],
+    waiting_files: &[&PathBuf],
+    window_ms: u64,
+) {
+    if waiting_dirs.is_empty() && waiting_files.is_empty() {
+        return;
+    }
+    let reasons = waiting_dirs
+        .iter()
+        .chain(waiting_files.iter())
+        .map(|p| {
+            format!(
+                "{}: modified within the last {} — letting it quiesce",
+                display_name(p),
+                format_window(window_ms)
+            )
+        })
+        .collect();
+    report.push((
+        "(manifest-less)".to_string(),
+        ContribOutcome::Waiting { reasons },
+    ));
+}
+
 /// One manifest-less folder's ingest + `.processed/` move, mirroring
 /// [`validate_and_ingest`] for the manifested flow.
 fn process_triage_dir(
@@ -896,7 +950,7 @@ fn process_triage_dir(
     let outcome = triage_folder_ingest(app, ctx, dir, node.clone())?;
     let contrib = require_clean_outcome(&outcome)?;
     if !ctx.args.keep {
-        move_to_processed(&ctx.args.inbox, dir)?;
+        move_into_processed(&ctx.args.inbox, dir)?;
     }
     Ok(contrib)
 }
@@ -906,14 +960,21 @@ fn process_triage_dir(
 /// `(loose files)` row groups files that share nothing but having landed in
 /// the inbox root at the same time, so this deliberately does NOT require a
 /// clean outcome: one bad file (a 0-byte file, a permission problem) must
-/// never wedge every good file in the same group forever. Every file the
-/// engine actually placed is moved to `.processed/` and counts toward
-/// `placed`; every file it failed or rejected is left in the inbox for the
-/// operator to fix or remove, named on stderr (`run_shared_ingest` uses
-/// `IngestReport::Silent`, so nothing else prints them), and picked back up
-/// as a loose file on the next pass. A fresh failure/rejection still fails
-/// the whole run's exit code — the same polarity as any other operator
-/// fault — but never blocks the files that succeeded.
+/// never wedge every good file in the same group forever.
+///
+/// Every file the engine drained out of the inbox — both newly `placed`
+/// AND `skipped_duplicates` (content the catalog already had; re-dropping
+/// identical bytes is still a successful outcome, just not a new copy) —
+/// moves to `.processed/`. Leaving a duplicate behind would re-hash it and
+/// re-emit its `TagAdd`s every single pass forever, an unbounded write to
+/// the event log every peer replicates. Every file that `failed` or was
+/// `rejected` (e.g. 0 bytes) is left in the inbox for the operator to fix
+/// or remove — named on stderr by `run_shared_ingest`'s
+/// `print_failure_detail`, since this call uses `IngestReport::Silent` —
+/// and picked back up as a loose file on the next pass. A fresh
+/// failure/rejection still fails the whole run's exit code, the same
+/// polarity as any other operator fault, but never blocks the files that
+/// drained.
 fn process_triage_loose_files(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
@@ -921,18 +982,16 @@ fn process_triage_loose_files(
     node: &(String, ParaKind, String),
 ) -> Result<ContribOutcome> {
     let outcome = triage_loose_files_ingest(app, ctx, files, node.clone())?;
-    for bad in outcome.failed.iter().chain(&outcome.rejected) {
-        eprintln!("(loose files): {}: {}", bad.rel, bad.reason);
-    }
     if !ctx.args.keep {
-        let placed: BTreeSet<&str> = outcome.placed.iter().map(|p| p.rel.as_str()).collect();
+        let drained: BTreeSet<&str> = outcome
+            .placed
+            .iter()
+            .map(|p| p.rel.as_str())
+            .chain(outcome.skipped_duplicates.iter().map(String::as_str))
+            .collect();
         for file in files {
-            let name = file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if placed.contains(name.as_str()) {
-                move_file_to_processed(&ctx.args.inbox, file)?;
+            if drained.contains(display_name(file).as_str()) {
+                move_into_processed(&ctx.args.inbox, file)?;
             }
         }
     }
@@ -940,6 +999,7 @@ fn process_triage_loose_files(
     if failed > 0 {
         return Ok(ContribOutcome::PartlyIngested {
             placed: outcome.placed.len(),
+            skipped_duplicates: outcome.skipped_duplicates.len(),
             failed,
         });
     }
@@ -950,9 +1010,7 @@ fn process_triage_loose_files(
 }
 
 /// The `.processed/<name>` target for a move, with a numeric suffix on
-/// collision — shared by [`move_to_processed`] (a whole contribution
-/// folder) and [`move_file_to_processed`] (one loose file), so the
-/// collision-suffix policy can't drift between the two.
+/// collision.
 fn processed_target(processed: &Path, name: &str) -> PathBuf {
     let mut target = processed.join(name);
     let mut suffix = 2u32;
@@ -963,32 +1021,15 @@ fn processed_target(processed: &Path, name: &str) -> PathBuf {
     target
 }
 
-/// Atomic rename of a whole contribution folder into `.processed/`.
-fn move_to_processed(inbox: &Path, dir: &Path) -> Result<()> {
+/// Atomic rename of a contribution folder or one loose file into
+/// `.processed/` — `path` may be either, `std::fs::rename` doesn't care.
+fn move_into_processed(inbox: &Path, path: &Path) -> Result<()> {
     let processed = inbox.join(".processed");
     std::fs::create_dir_all(&processed)
         .with_context(|| format!("creating {}", processed.display()))?;
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let target = processed_target(&processed, &name);
-    std::fs::rename(dir, &target)
-        .with_context(|| format!("moving {} to {}", dir.display(), target.display()))
-}
-
-/// Atomic rename of one loose file into `.processed/`.
-fn move_file_to_processed(inbox: &Path, file: &Path) -> Result<()> {
-    let processed = inbox.join(".processed");
-    std::fs::create_dir_all(&processed)
-        .with_context(|| format!("creating {}", processed.display()))?;
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let target = processed_target(&processed, &name);
-    std::fs::rename(file, &target)
-        .with_context(|| format!("moving {} to {}", file.display(), target.display()))
+    let target = processed_target(&processed, &display_name(path));
+    std::fs::rename(path, &target)
+        .with_context(|| format!("moving {} to {}", path.display(), target.display()))
 }
 
 /// Prints the pass report, then applies the exit policy: a FRESH failure
@@ -1022,7 +1063,7 @@ fn print_report(report: &[(String, ContribOutcome)], json: bool) -> Result<()> {
     }
     anyhow::ensure!(
         !any_failed,
-        "one or more contributions failed — see stdout for the full per-contribution report"
+        "one or more items failed — see stdout for the full report"
     );
     Ok(())
 }
@@ -1043,9 +1084,20 @@ fn print_report_json(report: &[(String, ContribOutcome)]) -> Result<()> {
                 }
                 row
             }
-            ContribOutcome::PartlyIngested { placed, failed } => serde_json::json!({
-                "contribution": name, "status": "partly_ingested", "placed": placed, "failed": failed
-            }),
+            ContribOutcome::PartlyIngested {
+                placed,
+                skipped_duplicates,
+                failed,
+            } => {
+                let mut row = serde_json::json!({
+                    "contribution": name, "status": "partly_ingested",
+                    "placed": placed, "failed": failed
+                });
+                if *skipped_duplicates > 0 {
+                    row["skipped_duplicates"] = serde_json::json!(skipped_duplicates);
+                }
+                row
+            }
             ContribOutcome::Waiting { reasons } => {
                 serde_json::json!({"contribution": name, "status": "waiting", "reasons": reasons})
             }
@@ -1075,8 +1127,20 @@ fn print_report_text(report: &[(String, ContribOutcome)]) {
             ContribOutcome::Ingested { placed, .. } => {
                 println!("{name}: ingested {placed} file(s)");
             }
-            ContribOutcome::PartlyIngested { placed, failed } => {
-                println!("{name}: ingested {placed} file(s), {failed} failed — see stderr");
+            ContribOutcome::PartlyIngested {
+                placed,
+                skipped_duplicates,
+                failed,
+            } if *skipped_duplicates > 0 => {
+                println!(
+                    "{name}: PARTIAL — ingested {placed} file(s), {skipped_duplicates} already \
+                     known, {failed} FAILED — see stderr"
+                );
+            }
+            ContribOutcome::PartlyIngested { placed, failed, .. } => {
+                println!(
+                    "{name}: PARTIAL — ingested {placed} file(s), {failed} FAILED — see stderr"
+                );
             }
             ContribOutcome::Waiting { reasons } => {
                 println!("{name}: waiting — {}", reasons.join("; "));

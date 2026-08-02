@@ -2,6 +2,7 @@
 mod app;
 mod commands;
 mod describer_cmd;
+mod inbox_cmd;
 mod index_cmd;
 mod iso8601;
 mod query;

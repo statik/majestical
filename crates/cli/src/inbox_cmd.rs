@@ -7,18 +7,35 @@
 //! Name comparisons (manifest entries vs. the folder listing) are raw
 //! UTF-8 byte equality with no Unicode NFC/NFD normalization — an iOS
 //! export that writes NFD-normalized file names can misreport a real,
-//! APFS-resolvable file as "unlisted"; watchlisted, not fixed here.
+//! APFS-resolvable file as "unlisted". A related case, also deferred: on
+//! the default case-insensitive APFS, two manifest entries differing only
+//! in case collide on the same real file. Both are watchlisted pending
+//! real-world signal on which normalization strategy (if any) is worth it.
 #![expect(
     dead_code,
     reason = "manifest types and load/check functions are unused until `maj inbox process` \
               wires them up in Task 10; narrow or remove this once that lands"
 )]
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Component, Path};
 
 pub(crate) const MANIFEST_NAME: &str = "contribution.json";
 const SUPPORTED_VERSION: u32 = 1;
 
+/// Shared tail on every hard-refusal message below: `contribution.json` is
+/// written by the share-sheet Shortcut (or a future iOS app), never
+/// hand-authored in the normal flow, so a validation failure here means
+/// the export broke or the file was hand-edited — either way the
+/// contributor (or whoever is triaging the inbox) needs a next step, not
+/// just a diagnosis.
+const REMEDY: &str = " — contribution.json is machine-generated; re-export the contribution \
+                       from the share sheet, or fix the manifest by hand";
+
+/// `contribution.json` — the manifest at the root of a contribution folder.
+/// Wire format: `files[].name` is a `/`-separated path relative to the
+/// contribution folder; `files[].xxh64` is the xxHash64 of the file's
+/// bytes (seed 0) as 16 lowercase hex digits; `files[].size` is in bytes.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ContributionManifest {
     pub version: u32,
@@ -35,21 +52,31 @@ pub(crate) struct ContributionManifest {
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ManifestFile {
+    /// `/`-separated path relative to the contribution folder.
     pub name: String,
+    /// xxHash64 of the file's bytes, seed 0, as 16 lowercase hex digits.
     pub xxh64: String,
+    /// Size in bytes.
     pub size: u64,
 }
 
 /// `Ok(None)` when the folder has no manifest (the manifest-less path).
-/// Unknown versions, degenerate names, duplicate names, and path-traversal
-/// names are hard errors — a manifest we cannot fully honor must never be
-/// half-honored.
+/// Unknown versions, degenerate or escaping names (files, contributor,
+/// source, `para_target`), duplicate file entries, and malformed hashes are
+/// all hard errors — a manifest we cannot fully honor must never be
+/// half-honored. Every one of these strings is contributor-controlled and
+/// Task 10 splices some of them (`contributor`, `para_target`) straight
+/// into the destination path and tag names, so this is the trust boundary.
 ///
 /// # Errors
-/// Returns an error if the manifest exists but cannot be read or parsed,
-/// declares an unsupported `version`, or lists a file name that is empty,
-/// names a directory (trailing `/`), escapes the contribution folder
-/// (absolute path or a `..` component), or repeats a name already listed.
+/// Returns an error if the manifest exists but cannot be read or parsed;
+/// declares an unsupported `version`; or has a `contributor`, `source`, or
+/// `para_target` that is empty or escapes the contribution folder (absolute
+/// path or a `..` component; `para_target` may additionally contain at most
+/// one interior `/`, e.g. `Projects/spring`). Also errors if any
+/// `files[]` entry has a name that is empty, names a directory (trailing
+/// `/`), escapes the contribution folder, repeats a name already listed, or
+/// has an `xxh64` that isn't exactly 16 lowercase hex characters.
 pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> {
     let path = dir.join(MANIFEST_NAME);
     let text = match std::fs::read_to_string(&path) {
@@ -65,69 +92,125 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> 
         path.display(),
         manifest.version
     );
-    let mut seen_names = std::collections::BTreeSet::new();
+    validate_identity_field("contributor", &manifest.contributor)?;
+    if let Some(source) = &manifest.source {
+        validate_identity_field("source", source)?;
+    }
+    if let Some(target) = &manifest.para_target {
+        validate_identity_field("para_target", target)?;
+        anyhow::ensure!(
+            target.matches('/').count() <= 1,
+            "manifest 'para_target' '{target}' has more than one '/' — expected kind/name form (e.g. Projects/spring){REMEDY}"
+        );
+    }
+    let mut seen_names = BTreeSet::new();
     for file in &manifest.files {
         anyhow::ensure!(
             !file.name.is_empty(),
-            "manifest lists an entry with an empty name — refusing the whole contribution"
+            "manifest lists an entry with an empty name — refusing the whole contribution{REMEDY}"
         );
         anyhow::ensure!(
             !file.name.ends_with('/'),
-            "manifest entry '{}' names a directory, not a file — refusing the whole contribution",
+            "manifest entry '{}' names a directory, not a file — refusing the whole contribution{REMEDY}",
             file.name
         );
-        let name_path = Path::new(&file.name);
-        let escapes = name_path.is_absolute()
-            || name_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
         anyhow::ensure!(
-            !escapes,
-            "manifest entry '{}' escapes the contribution folder — refusing the whole contribution",
+            !escapes_folder(&file.name),
+            "manifest entry '{}' escapes the contribution folder — refusing the whole contribution{REMEDY}",
             file.name
+        );
+        anyhow::ensure!(
+            is_lower_hex16(&file.xxh64),
+            "manifest entry '{}' has xxh64 '{}' — expected exactly 16 lowercase hex characters — refusing the whole contribution{REMEDY}",
+            file.name,
+            file.xxh64
         );
         anyhow::ensure!(
             seen_names.insert(file.name.clone()),
-            "manifest entry '{}' is listed more than once — refusing the whole contribution",
+            "manifest entry '{}' is listed more than once — refusing the whole contribution{REMEDY}",
             file.name
         );
     }
     Ok(Some(manifest))
 }
 
-/// Presence/size gate ("still uploading" detection) + the unlisted-file
-/// report. Hash checking is deliberately NOT here — it reads every byte,
-/// so it runs once, later, only on contributions that pass this gate.
+/// `contributor`/`source`/`para_target` share this check: non-empty, and
+/// doesn't escape the contribution folder. `Path::join` with an absolute
+/// component discards everything before it, so an unchecked `contributor`
+/// of e.g. `/tmp/evil` would silently redirect wherever it's later joined
+/// onto a destination path — this is what stands between that and a hard,
+/// named refusal.
+fn validate_identity_field(field: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(!value.is_empty(), "manifest '{field}' is empty{REMEDY}");
+    anyhow::ensure!(
+        !escapes_folder(value),
+        "manifest '{field}' '{value}' escapes the contribution folder{REMEDY}"
+    );
+    Ok(())
+}
+
+/// True if `name`, joined onto some base path, could resolve outside it:
+/// an absolute path (which `Path::join` lets override the base entirely)
+/// or any `..` component.
+fn escapes_folder(name: &str) -> bool {
+    let name_path = Path::new(name);
+    name_path.is_absolute()
+        || name_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+}
+
+fn is_lower_hex16(hash: &str) -> bool {
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Presence/size gate ("still uploading" detection), the not-a-regular-file
+/// refusal, and the unlisted-file report. Hash checking is deliberately NOT
+/// here — it reads every byte, so it runs once, later, only on
+/// contributions that pass this gate.
 #[derive(Debug)]
 pub(crate) struct FileCheck {
-    /// Human-readable per-file reasons the contribution isn't ready.
+    /// Human-readable per-file reasons the contribution isn't ready yet
+    /// (missing or short files). Transient — the next pass may find them
+    /// resolved.
     pub waiting: Vec<String>,
     /// Files in the folder the manifest doesn't list (reported, left
     /// untouched, never ingested from a manifested contribution).
     pub unlisted: Vec<String>,
+    /// Listed entries that resolve to something other than a regular file
+    /// (a symlink, a directory, ...) — named, not silently followed or
+    /// ingested. Unlike `waiting`, this is not transient: Task 10 must
+    /// treat any non-empty `refused` as the whole contribution failing,
+    /// the same policy as a hash mismatch, and never partially ingest.
+    /// This is a value, not an `Err`, on purpose — it's a fact about the
+    /// contribution's contents, not an operational failure of the check
+    /// itself; `Err` here is reserved for real I/O failures (an unreadable
+    /// directory) that the operator, not the contributor, must fix.
+    pub refused: Vec<String>,
 }
 
 /// # Errors
-/// Returns an error if the contribution folder (or any subdirectory) can't
-/// be read while walking for unlisted files, or if a manifest-listed name
-/// resolves to anything other than a regular file — a symlink (which could
-/// point outside the contribution folder), a directory, or other special
-/// file. That case fails the whole contribution, same as a traversal name:
-/// Task 10 hashes and ingests listed files sight-unseen, so "looks like the
-/// right file" is not enough — it must BE the file, in place, unlinked.
+/// Returns an error only for real I/O failures — the contribution folder
+/// (or a subdirectory) can't be read while walking for unlisted files. A
+/// listed entry that isn't a regular file is reported in
+/// [`FileCheck::refused`], not returned as an `Err`.
 pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result<FileCheck> {
     let mut waiting = Vec::new();
-    let mut listed = std::collections::BTreeSet::new();
+    let mut refused = Vec::new();
+    let mut listed = BTreeSet::new();
     for file in &manifest.files {
         listed.insert(file.name.clone());
         let path = dir.join(&file.name);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_file() => {
-                anyhow::bail!(
-                    "manifest entry '{}' is {}, not a regular file — refusing the whole contribution",
+                refused.push(format!(
+                    "{}: {}, not a regular file — refusing the whole contribution{REMEDY}",
                     file.name,
                     describe_non_file(meta.file_type())
-                );
+                ));
             }
             Ok(meta) if meta.len() == file.size => {}
             Ok(meta) => waiting.push(format!(
@@ -141,7 +224,11 @@ pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result
     }
     let mut unlisted = Vec::new();
     collect_unlisted(dir, dir, &listed, &mut unlisted)?;
-    Ok(FileCheck { waiting, unlisted })
+    Ok(FileCheck {
+        waiting,
+        unlisted,
+        refused,
+    })
 }
 
 fn describe_non_file(file_type: std::fs::FileType) -> &'static str {
@@ -161,29 +248,39 @@ fn describe_non_file(file_type: std::fs::FileType) -> &'static str {
 /// its own name in the contribution folder, never through the link.
 /// `entry.file_type()` (unlike `Path::is_dir`/`is_file`) reports the entry
 /// itself and does not follow symlinks, which is what makes this safe.
+///
+/// Iterative (explicit stack), not recursive: this walks a
+/// contributor-controlled tree, and unbounded recursion on an attacker- or
+/// tool-crafted deep directory tree is a stack overflow (SIGSEGV), not a
+/// catchable error.
 fn collect_unlisted(
     root: &Path,
-    dir: &Path,
-    listed: &std::collections::BTreeSet<String>,
+    start: &Path,
+    listed: &BTreeSet<String>,
     out: &mut Vec<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading file type of {}", path.display()))?;
-        if file_type.is_dir() {
-            collect_unlisted(root, &path, listed, out)?;
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        if rel != MANIFEST_NAME && !listed.contains(&rel) {
-            out.push(rel);
+    let mut stack = vec![start.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("reading file type of {}", path.display()))?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if rel != MANIFEST_NAME && !listed.contains(&rel) {
+                out.push(rel);
+            }
         }
     }
     out.sort();
@@ -214,6 +311,7 @@ mod tests {
         let check = check_files(dir.path(), &manifest).expect("check");
         assert!(check.waiting.is_empty());
         assert!(check.unlisted.is_empty());
+        assert!(check.refused.is_empty());
     }
 
     #[test]
@@ -298,7 +396,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_symlinked_listed_file_is_a_hard_error() {
+    fn a_symlinked_listed_file_is_refused_not_erred() {
         let dir = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("tempdir");
         let real = outside.path().join("real.HEIC");
@@ -310,10 +408,35 @@ mod tests {
         )
         .expect("write");
         let manifest = load_manifest(dir.path()).expect("load").expect("present");
-        let err = check_files(dir.path(), &manifest)
-            .expect_err("a symlinked listed file must be refused, matching size or not");
-        assert!(err.to_string().contains("IMG_1.HEIC"), "{err}");
-        assert!(err.to_string().contains("symlink"), "{err}");
+        let check = check_files(dir.path(), &manifest)
+            .expect("a symlinked listed file is a refusal, not an I/O error");
+        assert_eq!(check.refused.len(), 1, "{:?}", check.refused);
+        assert!(
+            check.refused[0].contains("IMG_1.HEIC"),
+            "{:?}",
+            check.refused
+        );
+        assert!(check.refused[0].contains("symlink"), "{:?}", check.refused);
+    }
+
+    #[test]
+    fn a_listed_name_that_is_a_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("subdir")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(r#"[{"name":"subdir","xxh64":"deadbeef00000000","size":4}]"#),
+        )
+        .expect("write");
+        let manifest = load_manifest(dir.path()).expect("load").expect("present");
+        let check = check_files(dir.path(), &manifest).expect("check");
+        assert_eq!(check.refused.len(), 1, "{:?}", check.refused);
+        assert!(check.refused[0].contains("subdir"), "{:?}", check.refused);
+        assert!(
+            check.refused[0].contains("directory"),
+            "{:?}",
+            check.refused
+        );
     }
 
     #[test]
@@ -323,7 +446,7 @@ mod tests {
             dir.path().join("contribution.json"),
             manifest_json(
                 r#"[{"name":"IMG_1.HEIC","xxh64":"deadbeef00000000","size":4},
-                    {"name":"IMG_1.HEIC","xxh64":"11111111","size":9}]"#,
+                    {"name":"IMG_1.HEIC","xxh64":"1111111111111111","size":9}]"#,
             ),
         )
         .expect("write");
@@ -357,7 +480,60 @@ mod tests {
     }
 
     #[test]
-    fn unknown_version_and_traversal_names_are_rejected() {
+    fn a_malformed_xxh64_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(r#"[{"name":"IMG_1.HEIC","xxh64":"DEADBEEF00000000","size":4}]"#),
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("uppercase hex must fail");
+        assert!(err.to_string().contains("xxh64"), "{err}");
+        assert!(err.to_string().contains("16 lowercase hex"), "{err}");
+    }
+
+    #[test]
+    fn a_traversal_contributor_is_rejected_absolute_and_parent_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            r#"{"version":1,"contributor":"/etc/passwd","files":[]}"#,
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("absolute contributor must fail");
+        assert!(err.to_string().contains("contributor"), "{err}");
+
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            r#"{"version":1,"contributor":"../evil","files":[]}"#,
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("parent-dir contributor must fail");
+        assert!(err.to_string().contains("contributor"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_or_multi_slash_para_target_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            r#"{"version":1,"contributor":"dana","para_target":"","files":[]}"#,
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("empty para_target must fail");
+        assert!(err.to_string().contains("para_target"), "{err}");
+
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            r#"{"version":1,"contributor":"dana","para_target":"a/b/c","files":[]}"#,
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("multi-slash para_target must fail");
+        assert!(err.to_string().contains("para_target"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_version_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
@@ -367,7 +543,11 @@ mod tests {
         let err = load_manifest(dir.path()).expect_err("unknown version must fail");
         assert!(err.to_string().contains("version 99"), "{err}");
         assert!(err.to_string().contains("supports version 1"), "{err}");
+    }
 
+    #[test]
+    fn a_traversal_file_name_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("contribution.json"),
             manifest_json(r#"[{"name":"../escape.mov","xxh64":"00","size":1}]"#),
@@ -375,6 +555,14 @@ mod tests {
         .expect("write");
         let err = load_manifest(dir.path()).expect_err("traversal must fail");
         assert!(err.to_string().contains("escape"), "{err}");
+    }
+
+    #[test]
+    fn malformed_json_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("contribution.json"), b"{not valid json").expect("write");
+        let err = load_manifest(dir.path()).expect_err("malformed JSON must fail");
+        assert!(err.to_string().contains("contribution.json"), "{err}");
     }
 
     #[test]

@@ -665,8 +665,11 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
             source_volume: (&source_volume_id, &source_volume_label),
             jobs: args.jobs,
             resume: args.resume.as_deref(),
-            json: args.json,
-            quiet: false,
+            report: if args.json {
+                IngestReport::Json
+            } else {
+                IngestReport::Text
+            },
         },
     )?;
     anyhow::ensure!(
@@ -698,13 +701,21 @@ pub(crate) struct ExecuteIngest<'a> {
     pub source_volume: (&'a str, &'a str),
     pub jobs: Option<usize>,
     pub resume: Option<&'a str>,
-    pub json: bool,
-    /// Suppresses this run's own stdout summary (JSON or text) — set by a
-    /// caller that runs `run_ingest` more than once per process and prints
-    /// its own combined summary at the end, so stdout in `--json` mode
-    /// stays exactly one document. Diagnostics still reach stderr either
-    /// way.
-    pub quiet: bool,
+    pub report: IngestReport,
+}
+
+/// This run's stdout summary. `Silent` is for a caller that runs
+/// `run_ingest` more than once per process and prints its own combined
+/// summary at the end (`maj inbox process`, once per contribution) — with
+/// `--json`, stdout must stay exactly one document, and even in text mode
+/// a per-run engine summary is preamble noise once the caller's own report
+/// already carries the outcome. Diagnostics reach stderr regardless of
+/// which variant is chosen.
+#[derive(Clone, Copy)]
+pub(crate) enum IngestReport {
+    Text,
+    Json,
+    Silent,
 }
 
 /// One `run_ingest` call's identity plus its engine result — the run id is
@@ -743,7 +754,7 @@ pub(crate) fn run_ingest(
     ));
     ops.extend(manifest_ops(&dest_volumes, &generations));
     app.emit(ops)?;
-    print_ingest_outcome(&run_id, &outcome, &generations, exec.json, exec.quiet);
+    print_ingest_outcome(&run_id, &outcome, &generations, exec.report);
     Ok(IngestRun { run_id, outcome })
 }
 
@@ -1088,23 +1099,19 @@ fn manifest_ops(
         .collect()
 }
 
-/// `quiet` suppresses only the stdout summary (JSON or text) — diagnostics
-/// still go to stderr regardless, since suppressing them too would silently
-/// drop detail a caller building its own `Failed` row needs to have
-/// surfaced somewhere.
+/// `Silent` suppresses only the stdout summary — diagnostics still go to
+/// stderr regardless, since suppressing them too would silently drop detail
+/// a caller building its own `Failed` row needs to have surfaced somewhere.
 fn print_ingest_outcome(
     run_id: &str,
     outcome: &engine::Outcome,
     generations: &[(PathBuf, mhl::WrittenGeneration)],
-    json: bool,
-    quiet: bool,
+    report: IngestReport,
 ) {
-    if !quiet {
-        if json {
-            print_ingest_outcome_json(run_id, outcome, generations);
-        } else {
-            print_ingest_outcome_text(run_id, outcome, generations);
-        }
+    match report {
+        IngestReport::Text => print_ingest_outcome_text(run_id, outcome, generations),
+        IngestReport::Json => print_ingest_outcome_json(run_id, outcome, generations),
+        IngestReport::Silent => {}
     }
     for note in &outcome.diagnostics {
         eprintln!("diagnostic: {note}");

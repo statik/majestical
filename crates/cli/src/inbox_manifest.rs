@@ -190,16 +190,21 @@ pub(crate) struct FileCheck {
     /// mismatch, and never partially ingest. This is a value, not an
     /// `Err`, on purpose — it's a fact about the contribution's contents,
     /// not an operational failure of the check itself; `Err` here is
-    /// reserved for real I/O failures (an unreadable directory) that the
-    /// operator, not the contributor, must fix.
+    /// reserved for real I/O failures (an unreadable directory, a stat
+    /// failure that isn't "not found") that the operator, not the
+    /// contributor, must fix.
     pub refused: Vec<String>,
 }
 
 /// # Errors
-/// Returns an error only for real I/O failures — the contribution folder
-/// (or a subdirectory) can't be read while walking for unlisted files. A
-/// listed entry that isn't a regular file is reported in
-/// [`FileCheck::refused`], not returned as an `Err`.
+/// Returns an error for real I/O failures: the contribution folder (or a
+/// subdirectory) can't be read while walking for unlisted files, or
+/// stat'ing a listed file fails for a reason other than "not found" (e.g.
+/// permission denied) — surfaced loudly rather than reported as
+/// [`FileCheck::waiting`] forever, which "not found" alone would wrongly
+/// suggest is just an in-progress upload. A listed entry that isn't a
+/// regular file is reported in [`FileCheck::refused`], not returned as an
+/// `Err`.
 pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result<FileCheck> {
     let mut waiting = Vec::new();
     let mut refused = Vec::new();
@@ -222,7 +227,12 @@ pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result
                 meta.len(),
                 file.size
             )),
-            Err(_) => waiting.push(format!("{}: not yet present", file.name)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                waiting.push(format!("{}: not yet present", file.name));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("checking {}", path.display()));
+            }
         }
     }
     let mut unlisted = Vec::new();
@@ -584,5 +594,53 @@ mod tests {
     fn a_folder_without_a_manifest_loads_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(load_manifest(dir.path()).expect("load").is_none());
+    }
+
+    /// A stat failure other than "not found" (permission denied) on a
+    /// listed file must surface loudly, not sit in `waiting` forever —
+    /// "not yet present" would tell the operator to just wait, which is
+    /// never going to resolve a permissions problem. Denying execute on
+    /// the contribution folder itself (rather than the listed file) makes
+    /// every stat inside it fail with `PermissionDenied`, not `NotFound`,
+    /// which is exactly the distinction under test.
+    #[test]
+    #[cfg(unix)]
+    fn a_permission_denied_listed_file_is_a_hard_error_not_waiting_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("IMG_1.HEIC"), b"abcd").expect("write");
+        let manifest = ContributionManifest {
+            version: 1,
+            contributor: "dana".to_string(),
+            para_target: None,
+            source: None,
+            note: None,
+            files: vec![ManifestFile {
+                name: "IMG_1.HEIC".to_string(),
+                xxh64: "deadbeef00000000".to_string(),
+                size: 4,
+            }],
+        };
+
+        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod 000");
+
+        let result = check_files(dir.path(), &manifest);
+
+        // Restoring works even with the folder still locked: stat/chmod on
+        // a path is gated by the PARENT's execute bit, not the path's own.
+        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
+
+        if result.is_ok() {
+            eprintln!("skipping: this environment does not enforce a mode-000 directory");
+            return;
+        }
+        assert!(
+            result.is_err(),
+            "a permission failure must be a hard error, not silently waiting"
+        );
     }
 }

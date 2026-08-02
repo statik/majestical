@@ -2,7 +2,7 @@
 //! real ASC MHL, real provenance tags.
 mod common;
 
-use common::maj;
+use common::{maj, walkdir_find};
 use std::path::Path;
 
 #[cfg(test)]
@@ -54,6 +54,35 @@ impl Setup {
             payload.len()
         );
         std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    }
+
+    /// Writes just `contribution.json` (creating the folder), for tests
+    /// that need to deviate from `write_contribution`'s fixed shape — a
+    /// custom contributor, no `para_target`, a mismatched hash, no
+    /// `source`. Callers write the listed files' actual bytes themselves,
+    /// into the same folder, after calling this.
+    fn write_manifest(
+        &self,
+        folder: &str,
+        contributor: &str,
+        para_target: Option<&str>,
+        files: &[(&str, &str, u64)],
+    ) -> std::path::PathBuf {
+        let dir = self.inbox().join(folder);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = para_target.map_or_else(String::new, |t| format!(r#","para_target":"{t}""#));
+        let files_json: Vec<String> = files
+            .iter()
+            .map(|(name, hash, size)| {
+                format!(r#"{{"name":"{name}","xxh64":"{hash}","size":{size}}}"#)
+            })
+            .collect();
+        let manifest = format!(
+            r#"{{"version":1,"contributor":"{contributor}"{target},"files":[{}]}}"#,
+            files_json.join(",")
+        );
+        std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+        dir
     }
 
     fn process(&self) -> assert_cmd::assert::Assert {
@@ -127,29 +156,8 @@ fn keep_leaves_the_contribution_and_a_redrop_dedupes() {
     let out = s.process().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(stdout.contains("drop-again"), "{stdout}");
-    let copies = walkdir_count(&s.dest(), "clip.mov");
+    let copies = walkdir_find(&s.dest(), "clip.mov").len();
     assert_eq!(copies, 1, "a re-dropped duplicate must not copy again");
-}
-
-/// Counts files named `name` under `root`, recursively.
-#[cfg(test)]
-fn walkdir_count(root: &Path, name: &str) -> usize {
-    let mut count = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if entry.file_name().to_string_lossy() == name {
-                count += 1;
-            }
-        }
-    }
-    count
 }
 
 #[test]
@@ -184,15 +192,13 @@ fn hash_mismatch_fails_the_contribution_records_it_and_skips_next_pass() {
 fn incomplete_upload_is_skipped_and_converges_when_complete() {
     let s = Setup::new();
     let payload = b"full-payload-bytes";
-    let dir = s.inbox().join("drop-slow");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("clip.mov"), &payload[..4]).expect("partial write");
-    let manifest = format!(
-        r#"{{"version":1,"contributor":"dana","para_target":"project/spring","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
-        xxh64_hex(payload),
-        payload.len()
+    let dir = s.write_manifest(
+        "drop-slow",
+        "dana",
+        Some("project/spring"),
+        &[("clip.mov", &xxh64_hex(payload), payload.len() as u64)],
     );
-    std::fs::write(dir.join("contribution.json"), manifest).expect("write");
+    std::fs::write(dir.join("clip.mov"), &payload[..4]).expect("partial write");
     let out = s.process().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(
@@ -222,7 +228,7 @@ fn unlisted_files_in_the_folder_are_never_ingested_or_tagged() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(stdout.contains("drop-unlisted"), "{stdout}");
     assert_eq!(
-        walkdir_count(&s.dest(), "stray.mov"),
+        walkdir_find(&s.dest(), "stray.mov").len(),
         0,
         "an unlisted file must never be copied into a destination"
     );
@@ -244,15 +250,17 @@ fn unlisted_files_in_the_folder_are_never_ingested_or_tagged() {
 fn a_nonexistent_para_target_fails_only_that_contribution() {
     let s = Setup::new();
     let bad_payload = b"ghost-node-bytes";
-    let dir = s.inbox().join("drop-ghost");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("clip.mov"), bad_payload).expect("write");
-    let manifest = format!(
-        r#"{{"version":1,"contributor":"dana","para_target":"project/ghost","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
-        xxh64_hex(bad_payload),
-        bad_payload.len()
+    let dir = s.write_manifest(
+        "drop-ghost",
+        "dana",
+        Some("project/ghost"),
+        &[(
+            "clip.mov",
+            &xxh64_hex(bad_payload),
+            bad_payload.len() as u64,
+        )],
     );
-    std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    std::fs::write(dir.join("clip.mov"), bad_payload).expect("write");
     let good_payload = b"good-node-bytes";
     s.write_contribution("drop-good", good_payload, &xxh64_hex(good_payload));
 
@@ -284,15 +292,17 @@ fn a_nonexistent_para_target_fails_only_that_contribution() {
 fn a_missing_para_target_fails_only_that_contribution() {
     let s = Setup::new();
     let untargeted_payload = b"untargeted-clip-bytes";
-    let dir = s.inbox().join("drop-no-target");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("clip.mov"), untargeted_payload).expect("write");
-    let manifest = format!(
-        r#"{{"version":1,"contributor":"dana","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
-        xxh64_hex(untargeted_payload),
-        untargeted_payload.len()
+    let dir = s.write_manifest(
+        "drop-no-target",
+        "dana",
+        None,
+        &[(
+            "clip.mov",
+            &xxh64_hex(untargeted_payload),
+            untargeted_payload.len() as u64,
+        )],
     );
-    std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    std::fs::write(dir.join("clip.mov"), untargeted_payload).expect("write");
     let good_payload = b"targeted-clip-bytes";
     s.write_contribution("drop-good-2", good_payload, &xxh64_hex(good_payload));
 
@@ -353,15 +363,13 @@ fn fixing_only_the_file_after_a_hash_mismatch_reconverges() {
         corrupt.len(),
         "same declared size, different content"
     );
-    let dir = s.inbox().join("drop-fix");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("clip.mov"), corrupt).expect("write corrupt");
-    let manifest = format!(
-        r#"{{"version":1,"contributor":"dana","para_target":"project/spring","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
-        xxh64_hex(correct),
-        correct.len()
+    let dir = s.write_manifest(
+        "drop-fix",
+        "dana",
+        Some("project/spring"),
+        &[("clip.mov", &xxh64_hex(correct), correct.len() as u64)],
     );
-    std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    std::fs::write(dir.join("clip.mov"), corrupt).expect("write corrupt");
 
     s.process().failure();
     let out = s.process().success();
@@ -394,15 +402,13 @@ fn a_redrop_under_a_different_contributor_still_gets_tagged() {
     s.write_contribution("drop-dana", payload, &xxh64_hex(payload));
     s.process().success();
 
-    let dir = s.inbox().join("drop-sam");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("clip.mov"), payload).expect("write");
-    let manifest = format!(
-        r#"{{"version":1,"contributor":"sam","para_target":"project/spring","files":[{{"name":"clip.mov","xxh64":"{}","size":{}}}]}}"#,
-        xxh64_hex(payload),
-        payload.len()
+    let dir = s.write_manifest(
+        "drop-sam",
+        "sam",
+        Some("project/spring"),
+        &[("clip.mov", &xxh64_hex(payload), payload.len() as u64)],
     );
-    std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    std::fs::write(dir.join("clip.mov"), payload).expect("write");
     s.process().success();
 
     for query in ["tag:contributor/dana", "tag:contributor/sam"] {
@@ -445,7 +451,8 @@ fn an_archived_para_target_names_unarchive_not_add() {
 }
 
 /// state/catalogs/<key>/inbox-failures.json — exactly one catalog key
-/// exists per test. Mirrors `sync_smoke.rs`'s `find_sync_toml` pattern.
+/// exists per test (single catalog per `Setup`). Mirrors `sync_smoke.rs`'s
+/// `find_sync_toml` pattern.
 #[cfg(test)]
 #[cfg(unix)]
 fn find_inbox_markers(state: &Path) -> std::path::PathBuf {
@@ -512,5 +519,65 @@ fn markers_persist_even_when_a_later_contribution_is_pass_fatal() {
     assert!(
         text.contains("a-bad"),
         "the earlier contribution's marker must survive a later pass-fatal error: {text}"
+    );
+}
+
+/// Two inboxes sharing one catalog, each with a same-named failing
+/// contribution: a marker store keyed by folder name alone would let each
+/// inbox's fresh failure evict the other's marker, so alternating passes
+/// would never converge — whichever inbox ran last "owns" the shared key
+/// slot, and the other always sees a mismatch and re-fails fresh. Keyed by
+/// inbox identity, each inbox must converge to a recorded notice (exit 0)
+/// independently of what the other inbox is doing.
+#[test]
+fn markers_are_scoped_per_inbox_not_shared_across_inboxes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let catalog = root.path().join("cat");
+    let state = root.path().join("state");
+    let dest = root.path().join("dest");
+    let inbox_a = root.path().join("inbox-a");
+    let inbox_b = root.path().join("inbox-b");
+    maj(&catalog, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&catalog, &state)
+        .args(["para", "add", "project", "spring"])
+        .assert()
+        .success();
+    for inbox in [&inbox_a, &inbox_b] {
+        let dir = inbox.join("drop-bad");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("clip.mov"), b"actual-bytes").expect("write");
+        let manifest = r#"{"version":1,"contributor":"dana","para_target":"project/spring","files":[{"name":"clip.mov","xxh64":"0000000000000000","size":12}]}"#;
+        std::fs::write(dir.join("contribution.json"), manifest).expect("write manifest");
+    }
+    std::fs::create_dir_all(&dest).expect("mkdir");
+
+    let process = |inbox: &Path| {
+        maj(&catalog, &state)
+            .args(["inbox", "process"])
+            .arg(inbox)
+            .args(["--dest"])
+            .arg(&dest)
+            .assert()
+    };
+
+    // First pass over each inbox is a fresh failure (nonzero).
+    process(&inbox_a).failure();
+    process(&inbox_b).failure();
+    // Second pass over each must be a recorded notice (zero) —
+    // independently, regardless of processing order between the two.
+    let out = process(&inbox_a).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("recorded failure"),
+        "inbox A must converge independently of inbox B: {stdout}"
+    );
+    let out = process(&inbox_b).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("recorded failure"),
+        "inbox B must converge independently of inbox A: {stdout}"
     );
 }

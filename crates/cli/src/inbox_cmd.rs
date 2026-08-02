@@ -8,7 +8,7 @@
 //! is the orchestration: the pass loop, hash gate, routing, ingest, and
 //! the failure-marker store.
 use crate::app::FsApp;
-use crate::commands::{self, ExecuteIngest};
+use crate::commands::{self, ExecuteIngest, IngestReport};
 use crate::inbox_manifest::{ContributionManifest, MANIFEST_NAME, check_files, load_manifest};
 use anyhow::{Context, Result};
 use majestical_core::event::{AssetId, Op, ParaKind};
@@ -28,21 +28,48 @@ pub(crate) struct InboxArgs {
 
 /// Catalog root + inbox flags, threaded through every contribution —
 /// bundled so `process_contribution`/`ingest_contribution` stay within the
-/// house 5-positional-parameter limit.
+/// house 5-positional-parameter limit. `inbox_key` is computed once here
+/// (not re-derived per contribution) so every marker lookup and record in
+/// this pass agrees on the same identity.
 struct InboxCtx<'a> {
     catalog: &'a Path,
     args: &'a InboxArgs,
+    inbox_key: String,
+}
+
+/// xxh3-128 of the canonicalized inbox path, hex-encoded — the same
+/// pattern `state_dir.rs` uses to key a catalog's local state dir. Two
+/// different inboxes sharing one catalog (a common shared-drive setup: one
+/// inbox per contributor group) must never collide on this key even when a
+/// folder inside each happens to share a name — see `FailureMarkers`.
+///
+/// # Errors
+/// Returns an error if `inbox` can't be canonicalized (it was just checked
+/// to be a directory by the caller, so this only fails on a genuine,
+/// unusual I/O problem).
+fn inbox_key(inbox: &Path) -> Result<String> {
+    let canonical = inbox
+        .canonicalize()
+        .with_context(|| format!("canonicalizing inbox {}", inbox.display()))?;
+    Ok(format!(
+        "{:032x}",
+        xxh3_128(canonical.as_os_str().as_encoded_bytes())
+    ))
 }
 
 /// Per-machine record of contributions that failed validation, so a later
 /// pass skips them with a notice instead of re-checking forever. Keyed by
-/// folder name; cleared automatically when the fingerprint changes — the
-/// manifest OR any listed file's mtime/size — so both a re-export and
-/// fixing just the corrupt file re-validate.
+/// inbox identity ([`inbox_key`]) and then by folder name within it — a bare
+/// folder-name key would let two different inboxes sharing this catalog
+/// evict each other's markers whenever they happen to have a same-named
+/// contribution folder, oscillating fresh-fail/exit-nonzero forever instead
+/// of each converging independently. Cleared automatically when the
+/// fingerprint changes — the manifest OR any listed file's mtime/size — so
+/// both a re-export and fixing just the corrupt file re-validate.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FailureMarkers {
     #[serde(default)]
-    failures: std::collections::BTreeMap<String, FailureMarker>,
+    inboxes: std::collections::BTreeMap<String, std::collections::BTreeMap<String, FailureMarker>>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -55,21 +82,41 @@ fn markers_path(catalog: &Path) -> Result<PathBuf> {
     Ok(crate::state_dir::state_dir_for(catalog)?.join("inbox-failures.json"))
 }
 
+/// A missing store is empty (nothing has ever failed); an unparsable one
+/// is noted on stderr and treated as empty too. The store is a skip-cache
+/// only — every fact it holds is re-derivable by re-checking the
+/// contribution — so losing it costs one extra hash/check next pass, never
+/// correctness, and it must never turn a corrupt cache file into a hard
+/// failure of the whole pass.
 fn load_markers(catalog: &Path) -> Result<FailureMarkers> {
     let path = markers_path(catalog)?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FailureMarkers::default()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(FailureMarkers::default());
+    };
+    if let Ok(markers) = serde_json::from_slice(&bytes) {
+        return Ok(markers);
     }
+    eprintln!(
+        "note: ignoring unparsable inbox failure store at {} — treating as empty",
+        path.display()
+    );
+    Ok(FailureMarkers::default())
 }
 
+/// Writes via a same-directory temp file + rename so a pass killed
+/// mid-write (or a concurrent reader — `maj inbox process` has no lock
+/// against a second copy of itself) never observes a truncated or
+/// half-written store, matching `sync_cmd.rs`'s `SyncConfig::store`.
 fn store_markers(catalog: &Path, markers: &FailureMarkers) -> Result<()> {
     let path = markers_path(catalog)?;
-    std::fs::write(&path, serde_json::to_string_pretty(markers)?)
-        .with_context(|| format!("writing {}", path.display()))
+    let text = serde_json::to_string_pretty(markers).context("serializing inbox failure store")?;
+    let file_name = path.file_name().map_or_else(
+        || "inbox-failures.json".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("finalizing {}", path.display()))
 }
 
 /// Combined fingerprint over the manifest file's own `(mtime_ms, size)` and,
@@ -84,12 +131,14 @@ fn store_markers(catalog: &Path, markers: &FailureMarkers) -> Result<()> {
 fn contribution_fingerprint(dir: &Path, manifest: Option<&ContributionManifest>) -> String {
     use std::fmt::Write as _;
     let mut encoded = String::new();
-    let (mtime, size) = std::fs::metadata(dir.join(MANIFEST_NAME))
+    // symlink_metadata, not metadata: parity with check_files, which never
+    // follows a listed name through a symlink either.
+    let (mtime, size) = std::fs::symlink_metadata(dir.join(MANIFEST_NAME))
         .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
     let _ = write!(encoded, "m:{mtime}:{size}");
     if let Some(manifest) = manifest {
         for file in &manifest.files {
-            let (mtime, size) = std::fs::metadata(dir.join(&file.name))
+            let (mtime, size) = std::fs::symlink_metadata(dir.join(&file.name))
                 .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
             let _ = write!(encoded, "|{}:{mtime}:{size}", file.name);
         }
@@ -105,27 +154,39 @@ fn contribution_fingerprint(dir: &Path, manifest: Option<&ContributionManifest>)
 /// falls through to a fresh check instead of trusting it.
 fn recorded_failure(
     markers: &mut FailureMarkers,
+    inbox_key: &str,
     name: &str,
     fingerprint: &str,
 ) -> Option<ContribOutcome> {
-    let marker = markers.failures.get(name)?;
+    let bucket = markers.inboxes.get_mut(inbox_key)?;
+    let marker = bucket.get(name)?;
     if marker.fingerprint == fingerprint {
         return Some(ContribOutcome::RecordedFailure {
             reason: marker.reason.clone(),
         });
     }
-    markers.failures.remove(name);
+    bucket.remove(name);
     None
 }
 
-fn record_failure(markers: &mut FailureMarkers, name: &str, reason: &str, fingerprint: &str) {
-    markers.failures.insert(
-        name.to_string(),
-        FailureMarker {
-            reason: reason.to_string(),
-            fingerprint: fingerprint.to_string(),
-        },
-    );
+fn record_failure(
+    markers: &mut FailureMarkers,
+    inbox_key: &str,
+    name: &str,
+    reason: &str,
+    fingerprint: &str,
+) {
+    markers
+        .inboxes
+        .entry(inbox_key.to_string())
+        .or_default()
+        .insert(
+            name.to_string(),
+            FailureMarker {
+                reason: reason.to_string(),
+                fingerprint: fingerprint.to_string(),
+            },
+        );
 }
 
 /// One contribution's outcome for the pass report.
@@ -148,28 +209,32 @@ enum ContribOutcome {
 /// One converging pass over `args.inbox`: every manifested subfolder is
 /// validated, verified-ingested, tagged with provenance, and (unless
 /// `--keep`) moved to `.processed/`. Manifest-less entries (a subfolder
-/// with no `contribution.json`, or a bare file) are collected and silently
-/// ignored this task — a follow-up adds the quiescence-gated triage flow
-/// for them.
+/// with no `contribution.json`, or a bare file) are skipped this release —
+/// no triage flow exists yet.
 ///
 /// # Errors
-/// Returns an error if `inbox` isn't a directory, or if loading or storing
-/// the failure-marker store fails. Reading the inbox directory itself is
-/// the one per-contribution-loop failure that still aborts the pass (an
-/// operator-facing I/O problem, not any one contribution's fault) — markers
-/// recorded by contributions processed earlier in the same pass are always
-/// persisted first, so that failure never discards them. Also returns an
-/// error, after the report prints, if any contribution freshly failed this
-/// run — a previously recorded failure is only a notice, not an error (see
-/// `print_report`).
+/// Returns an error if `inbox` isn't a directory or can't be canonicalized,
+/// or if loading or storing the failure-marker store fails. Reading the
+/// inbox directory itself is the one per-contribution-loop failure that
+/// still aborts the pass (an operator-facing I/O problem, not any one
+/// contribution's fault) — markers recorded by contributions processed
+/// earlier in the same pass are always persisted first, so that failure
+/// never discards them. Also returns an error, after the report prints, if
+/// any contribution freshly failed this run — a previously recorded
+/// failure is only a notice, not an error (see `print_report`).
 pub(crate) fn cmd_inbox_process(app: &mut FsApp, catalog: &Path, args: &InboxArgs) -> Result<()> {
     anyhow::ensure!(
         args.inbox.is_dir(),
-        "inbox must be a directory: {}",
+        "inbox must be a directory: {} — check the path, or create it first",
         args.inbox.display()
     );
+    let inbox_key = inbox_key(&args.inbox)?;
     let mut markers = load_markers(catalog)?;
-    let ctx = InboxCtx { catalog, args };
+    let ctx = InboxCtx {
+        catalog,
+        args,
+        inbox_key,
+    };
     let result = run_pass(app, &ctx, &mut markers);
     store_markers(catalog, &markers)?;
     print_report(&result?, args.json)
@@ -202,12 +267,13 @@ fn run_pass(
             Ok(None) => {} // manifest-less: a follow-up task
             Err(e) => {
                 let fingerprint = contribution_fingerprint(&path, None);
-                let outcome = if let Some(outcome) = recorded_failure(markers, &name, &fingerprint)
+                let outcome = if let Some(outcome) =
+                    recorded_failure(markers, &ctx.inbox_key, &name, &fingerprint)
                 {
                     outcome
                 } else {
                     let reason = format!("{e:#}");
-                    record_failure(markers, &name, &reason, &fingerprint);
+                    record_failure(markers, &ctx.inbox_key, &name, &reason, &fingerprint);
                     ContribOutcome::Failed { reason }
                 };
                 report.push((name, outcome));
@@ -255,7 +321,7 @@ fn process_contribution(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let fingerprint = contribution_fingerprint(dir, Some(manifest));
-    if let Some(outcome) = recorded_failure(markers, &name, &fingerprint) {
+    if let Some(outcome) = recorded_failure(markers, &ctx.inbox_key, &name, &fingerprint) {
         return Ok(outcome);
     }
     let check = check_files(dir, manifest)?;
@@ -269,21 +335,26 @@ fn process_contribution(
     }
     if !check.refused.is_empty() {
         let reason = check.refused.join("; ");
-        record_failure(markers, &name, &reason, &fingerprint);
+        record_failure(markers, &ctx.inbox_key, &name, &reason, &fingerprint);
         return Ok(ContribOutcome::Failed { reason });
     }
     // Route before hashing: resolving the target is a cheap in-memory
     // projection lookup, while the hash gate below reads every listed byte.
     // A contribution parked on a typo'd or archived target must fail here,
-    // not after re-reading a multi-hundred-gigabyte drop on every pass.
-    if let Err(e) = route_contribution(app, manifest) {
-        return Ok(ContribOutcome::Failed {
-            reason: format!("{e:#}"),
-        });
-    }
+    // not after re-reading a multi-hundred-gigabyte drop on every pass. The
+    // resolved node is threaded straight into ingestion below rather than
+    // re-resolved there.
+    let node = match route_contribution(app, manifest) {
+        Ok(node) => node,
+        Err(e) => {
+            return Ok(ContribOutcome::Failed {
+                reason: format!("{e:#}"),
+            });
+        }
+    };
     match hash_mismatch_reason(dir, manifest) {
         Ok(Some(reason)) => {
-            record_failure(markers, &name, &reason, &fingerprint);
+            record_failure(markers, &ctx.inbox_key, &name, &reason, &fingerprint);
             return Ok(ContribOutcome::Failed { reason });
         }
         Ok(None) => {}
@@ -297,12 +368,12 @@ fn process_contribution(
             });
         }
     }
-    // Everything past this point (routing, planning, the verified copy
-    // itself) is likewise contribution-scoped and never recorded: a
-    // nonexistent PARA node or a transient copy failure isn't fixed by
-    // touching the manifest, so recording it against the fingerprint would
-    // leave it stuck even after the operator fixes the real cause.
-    match validate_and_ingest(app, ctx, dir, manifest) {
+    // Everything past this point (planning, the verified copy itself) is
+    // likewise contribution-scoped and never recorded: a transient copy
+    // failure isn't fixed by touching the manifest, so recording it against
+    // the fingerprint would leave it stuck even after the operator fixes
+    // the real cause.
+    match validate_and_ingest(app, ctx, dir, manifest, node) {
         Ok(outcome) => Ok(outcome),
         Err(e) => Ok(ContribOutcome::Failed {
             reason: format!("{e:#}"),
@@ -310,23 +381,21 @@ fn process_contribution(
     }
 }
 
-/// A cheap, no-file-I/O check that this contribution's `para_target`
-/// resolves to somewhere ingestible — no file bytes are read. Called before
+/// A cheap, no-file-I/O check that resolves this contribution's ingest
+/// target, returning it so the caller can thread it straight into
+/// ingestion without a second resolution. Called before
 /// [`hash_mismatch_reason`] purely to fail fast on a routing problem
 /// (missing `para_target`, a typo'd or archived node) before that gate
-/// re-reads every listed byte. [`ingest_contribution`] resolves the target
-/// again once ingestion actually proceeds; a second cheap lookup costs
-/// nothing next to the hash gate it's meant to guard.
-fn route_contribution(app: &mut FsApp, manifest: &ContributionManifest) -> Result<()> {
+/// re-reads every listed byte.
+fn route_contribution(
+    app: &mut FsApp,
+    manifest: &ContributionManifest,
+) -> Result<(String, ParaKind, String)> {
     let Some(para) = manifest.para_target.as_deref() else {
-        anyhow::bail!(
-            "manifest has no para_target — add one to the manifest, or wait for the \
-             manifest-less triage flow"
-        );
+        anyhow::bail!("manifest has no para_target — add a para_target to contribution.json");
     };
     let projection = app.projection()?;
-    resolve_contribution_node(&projection, para)?;
-    Ok(())
+    resolve_contribution_node(&projection, para)
 }
 
 /// End-to-end hash gate: the contributor's client-side xxh64 against a
@@ -351,30 +420,20 @@ fn hash_mismatch_reason(dir: &Path, manifest: &ContributionManifest) -> Result<O
     Ok(None)
 }
 
-/// The routing + verified-ingest + `.processed/` move tail of
-/// [`process_contribution`], split out purely to stay under the house
-/// function-length limit. Every error here is contribution-scoped — the
-/// caller converts it into a `Failed` row rather than propagating it.
+/// The verified-ingest + `.processed/` move tail of [`process_contribution`],
+/// split out purely to stay under the house function-length limit. `node`
+/// is already resolved (by `route_contribution`, earlier in
+/// `process_contribution`) — this function trusts it rather than
+/// re-resolving. Every error here is contribution-scoped — the caller
+/// converts it into a `Failed` row rather than propagating it.
 fn validate_and_ingest(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
     dir: &Path,
     manifest: &ContributionManifest,
+    node: (String, ParaKind, String),
 ) -> Result<ContribOutcome> {
-    // para_target is optional in the wire format — a well-formed manifest
-    // that simply hasn't been routed yet must fail only itself, not halt
-    // every other contribution in the same pass. `route_contribution`
-    // (called before the hash gate, earlier in `process_contribution`) has
-    // already checked this in the common case; re-checked here too since
-    // this function must stand on its own. The report line prepends the
-    // contribution's name, so this message must not repeat it.
-    let Some(para) = manifest.para_target.as_deref() else {
-        anyhow::bail!(
-            "manifest has no para_target — add one to the manifest, or wait for the \
-             manifest-less triage flow"
-        );
-    };
-    let outcome = ingest_contribution(app, ctx, dir, manifest, para)?;
+    let outcome = ingest_contribution(app, ctx, dir, manifest, node)?;
     anyhow::ensure!(
         outcome.failed.is_empty() && outcome.rejected.is_empty() && outcome.diagnostics.is_empty(),
         "{} failed, {} rejected, {} diagnostic(s) placing this contribution's files — see stderr",
@@ -431,16 +490,19 @@ fn resolve_contribution_node(
 /// Plans, verified-ingests, and provenance-tags one contribution's files.
 /// `load_manifest` has already validated `manifest.contributor`/`source`/
 /// `para_target` (no absolute path, no `..`) — this function must not
-/// re-validate them, only consume them.
+/// re-validate them, only consume them. `node` is `route_contribution`'s
+/// already-resolved target; nothing emits events between that resolution
+/// and this call within the same contribution, so re-resolving here would
+/// only cost a second projection scan for no benefit.
 fn ingest_contribution(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
     dir: &Path,
     manifest: &ContributionManifest,
-    para: &str,
+    node: (String, ParaKind, String),
 ) -> Result<engine::Outcome> {
+    let (node_id, kind, name) = node;
     let projection = app.projection()?;
-    let (node_id, kind, name) = resolve_contribution_node(&projection, para)?;
     let known = commands::known_assets_from_projection(&projection);
     let mut ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
         .with_context(|| format!("planning contribution {}", dir.display()))?;
@@ -470,11 +532,12 @@ fn ingest_contribution(
             source_volume: (&vol_id, &vol_label),
             jobs: None,
             resume: None,
-            json: ctx.args.json,
-            // Suppresses this run's own stdout summary: `maj inbox process
-            // --json` must print exactly one JSON document (the final
-            // report), never one blob per ingested contribution.
-            quiet: ctx.args.json,
+            // Silent in both text and JSON mode: the pass-level report
+            // this module prints already carries the outcome, and stderr
+            // carries any failure detail — a per-contribution engine
+            // summary interleaved ahead of it is preamble noise in text
+            // mode, and would break `--json`'s one-document guarantee.
+            report: IngestReport::Silent,
         },
     )?;
     tag_provenance(app, manifest, &ingest_plan, &run.outcome)?;
@@ -508,6 +571,12 @@ fn tag_provenance(
         if let plan::Decision::Duplicate { asset, .. } = &file.decision {
             push_provenance_tag(&mut ops, &mut seen, asset.clone(), manifest);
         }
+    }
+    if ops.is_empty() {
+        // Nothing touched this pass (every listed file was rejected out of
+        // the plan, or the retained plan was empty) — an empty emit would
+        // still fold the whole event log into the HLC for no new events.
+        return Ok(());
     }
     app.emit(ops)?;
     Ok(())
@@ -575,7 +644,7 @@ fn print_report(report: &[(String, ContribOutcome)], json: bool) -> Result<()> {
     }
     anyhow::ensure!(
         !any_failed,
-        "one or more contributions failed — see the report above"
+        "one or more contributions failed — see stdout for the full per-contribution report"
     );
     Ok(())
 }

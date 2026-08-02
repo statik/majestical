@@ -57,6 +57,11 @@ tempfile.workspace = true
 # `catalog-sqlite` depends on — see the root `Cargo.toml` comment on why
 # it's pinned once, not per-crate.
 rusqlite.workspace = true
+# inbox_smoke.rs computes real xxh64 hashes for its manifest fixtures,
+# matching `contribution.json`'s wire format. `[dependencies]` above only
+# pulls in `xxh3` (catalog identity); this is additive, same pattern as
+# `crates/ingest/Cargo.toml`.
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 # Cucumber acceptance harness, pinned to match crates/core's and
 # crates/ingest's versions.
 cucumber = "0.23"

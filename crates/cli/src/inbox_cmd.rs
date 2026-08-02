@@ -35,6 +35,13 @@ pub(crate) struct InboxArgs {
 /// that was never claimed.
 const TRIAGE_TAG: &str = "source/inbox";
 
+/// The report row name every triaged loose file shares — used both as the
+/// `IngestSite::row_name` [`triage_loose_files_ingest`] passes down (so a
+/// bad loose file's stderr line is attributed consistently) and as the row
+/// key [`process_manifest_less`] pushes onto the report, so the two can't
+/// drift apart.
+const LOOSE_FILES_ROW: &str = "(loose files)";
+
 /// Catalog root + inbox flags, threaded through every contribution —
 /// bundled so `process_contribution`/`ingest_contribution` stay within the
 /// house 5-positional-parameter limit. `inbox_key` is computed once here
@@ -672,7 +679,18 @@ fn ingest_contribution(
     if let Some(source) = &manifest.source {
         tags.push(format!("source/{source}"));
     }
-    run_shared_ingest(app, ctx, dir, &ingest_plan, node, &tags)
+    let row_name = display_name(dir);
+    run_shared_ingest(
+        app,
+        ctx,
+        &ingest_plan,
+        node,
+        IngestSite {
+            probe_dir: dir,
+            row_name: &row_name,
+            tags: &tags,
+        },
+    )
 }
 
 /// Plans and verified-ingests one manifest-less folder's files (the whole
@@ -688,7 +706,18 @@ fn triage_folder_ingest(
     let known = commands::known_assets_from_projection(&projection);
     let ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
         .with_context(|| format!("planning manifest-less folder {}", dir.display()))?;
-    run_shared_ingest(app, ctx, dir, &ingest_plan, node, &[TRIAGE_TAG.to_string()])
+    let row_name = display_name(dir);
+    run_shared_ingest(
+        app,
+        ctx,
+        &ingest_plan,
+        node,
+        IngestSite {
+            probe_dir: dir,
+            row_name: &row_name,
+            tags: &[TRIAGE_TAG.to_string()],
+        },
+    )
 }
 
 /// Plans and verified-ingests exactly `files` — quiescent, manifest-less,
@@ -719,29 +748,46 @@ fn triage_loose_files_ingest(
     run_shared_ingest(
         app,
         ctx,
-        &ctx.args.inbox,
         &ingest_plan,
         node,
-        &[TRIAGE_TAG.to_string()],
+        IngestSite {
+            probe_dir: &ctx.args.inbox,
+            row_name: LOOSE_FILES_ROW,
+            tags: &[TRIAGE_TAG.to_string()],
+        },
     )
+}
+
+/// Where an ingest run reads from and how its output is attributed —
+/// bundled so [`run_shared_ingest`] stays within the house
+/// 5-positional-parameter limit. `probe_dir` is what `resolve_volume`
+/// auto-detects the source volume from; `row_name` is the report row this
+/// run belongs to (a contribution/folder name, or [`LOOSE_FILES_ROW`]),
+/// used to prefix each per-file failure line in [`print_failure_detail`] so
+/// two folders that each have a bad `clip.mov` print two attributed lines,
+/// not two identical, unattributed ones.
+#[derive(Clone, Copy)]
+struct IngestSite<'a> {
+    probe_dir: &'a Path,
+    row_name: &'a str,
+    tags: &'a [String],
 }
 
 /// The ingest-orchestration body shared by every call site above: run the
 /// verified copy at `node`'s target, then tag every touched asset with
-/// `tags`. Parameterizing on the tag list — rather than three near-copies
-/// of "plan, resolve subdir, `run_ingest`, tag" — is what keeps a manifested
-/// contribution, a triage folder, and triage loose files from diverging in
-/// how they place files, only in what they tag them with.
+/// `site.tags`. Parameterizing on the tag list — rather than three
+/// near-copies of "plan, resolve subdir, `run_ingest`, tag" — is what keeps
+/// a manifested contribution, a triage folder, and triage loose files from
+/// diverging in how they place files, only in what they tag them with.
 fn run_shared_ingest(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
-    volume_probe_dir: &Path,
     ingest_plan: &plan::IngestPlan,
     node: (String, ParaKind, String),
-    tags: &[String],
+    site: IngestSite<'_>,
 ) -> Result<engine::Outcome> {
     let (node_id, kind, name) = node;
-    let (vol_id, vol_label) = commands::resolve_volume(volume_probe_dir, None);
+    let (vol_id, vol_label) = commands::resolve_volume(site.probe_dir, None);
     // Same default layout `maj ingest` uses — the contributor (or, for
     // triage, nothing) lands as a tag, not a subdirectory, so a manifested
     // drop, a triaged drop, and a manual ingest of the same PARA node share
@@ -767,24 +813,27 @@ fn run_shared_ingest(
             report: IngestReport::Silent,
         },
     )?;
-    print_failure_detail(&run.outcome);
-    tag_assets(app, ingest_plan, &run.outcome, tags)?;
+    print_failure_detail(site.row_name, &run.outcome);
+    tag_assets(app, ingest_plan, &run.outcome, site.tags)?;
     Ok(run.outcome)
 }
 
-/// Per-file failure/rejection/diagnostic detail, printed to stderr from the
-/// one place every ingest call site (manifested, triage folder, triage
-/// loose files) shares. `run_shared_ingest` always runs with
-/// `IngestReport::Silent`, so without this nothing ever prints WHICH file
-/// failed and why — [`require_clean_outcome`]'s error only reports counts,
-/// which would otherwise be a circular "see stderr" pointing at a line that
-/// just repeats the same counts back.
-fn print_failure_detail(outcome: &engine::Outcome) {
+/// Per-file failure/rejection detail, printed to stderr — prefixed with
+/// `row_name` so two rows that each have a bad `clip.mov` don't print two
+/// identical, unattributed lines — from the one place every ingest call
+/// site (manifested, triage folder, triage loose files) shares.
+/// `run_shared_ingest` always runs with `IngestReport::Silent`, so without
+/// this nothing ever prints WHICH file failed and why —
+/// [`require_clean_outcome`]'s error only reports counts, which would
+/// otherwise be a circular "see stderr" pointing at a line that just
+/// repeats the same counts back. Diagnostics are deliberately NOT printed
+/// here: `commands::print_ingest_outcome` (inside `commands::run_ingest`,
+/// called just above) already prints every diagnostic regardless of
+/// `IngestReport` variant — printing them again here would be two
+/// functions claiming the same responsibility.
+fn print_failure_detail(row_name: &str, outcome: &engine::Outcome) {
     for bad in outcome.failed.iter().chain(&outcome.rejected) {
-        eprintln!("{}: {}", bad.rel, bad.reason);
-    }
-    for note in &outcome.diagnostics {
-        eprintln!("diagnostic: {note}");
+        eprintln!("{row_name}: {}: {}", bad.rel, bad.reason);
     }
 }
 
@@ -904,7 +953,7 @@ fn process_manifest_less(
                 reason: format!("{e:#}"),
             }
         });
-        report.push(("(loose files)".to_string(), outcome));
+        report.push((LOOSE_FILES_ROW.to_string(), outcome));
     }
     Ok(())
 }

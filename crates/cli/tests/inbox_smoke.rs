@@ -998,7 +998,9 @@ fn a_redropped_duplicate_loose_file_drains_and_a_converged_pass_emits_nothing() 
 /// unlike a `(loose files)` group, requires a clean outcome — one bad file
 /// fails the whole folder) must still be named, with its rejection reason,
 /// on stderr — not just a count in an error message that has nothing to
-/// point at.
+/// point at. The line is also prefixed with its report row's name
+/// (`bad-folder`), so two different folders each hiding a bad `clip.mov`
+/// print two attributed lines rather than two identical, unattributed ones.
 #[test]
 fn a_zero_byte_file_inside_a_manifest_less_folder_is_named_on_stderr() {
     let s = Setup::new();
@@ -1024,6 +1026,10 @@ fn a_zero_byte_file_inside_a_manifest_less_folder_is_named_on_stderr() {
     assert!(
         stderr.contains("empty.jpg") && stderr.contains("0-byte"),
         "the rejected file's name and reason must reach stderr, not just a count: {stderr}"
+    );
+    assert!(
+        stderr.contains("bad-folder: empty.jpg"),
+        "the line must be attributed to its own report row, not printed bare: {stderr}"
     );
     assert!(
         s.inbox().join("bad-folder").exists(),

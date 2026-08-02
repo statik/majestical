@@ -5,6 +5,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    /// The single source of truth for the "no catalog here" message — every
+    /// guard that checks for `<root>/events` (`FsApp::open`, `sync::status`'s
+    /// catalog check) constructs this variant rather than formatting its own
+    /// copy of the string.
     #[error("no catalog at {root} — run `maj catalog init` first")]
     NoCatalog { root: PathBuf },
     /// Escape hatch while extraction is in flight: wraps the anyhow chains

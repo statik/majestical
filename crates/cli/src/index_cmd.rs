@@ -12,44 +12,28 @@ use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
-use majestical_index::model::{MINILM, SIGLIP};
+use majestical_index::model::MINILM;
 use majestical_index::ocr::{OCR_MODEL_TAG, OcrResult};
 use majestical_index::pdf::{PDF_MODEL_TAG, PdfContent};
 use majestical_index::text_encoder::TextEncoder;
 use majestical_index::transcribe::{Transcriber, Transcript, WHISPER_MODEL_TAG};
 use majestical_index::vector_store::{TextChunkRow, TextVectorStore, VectorRow, VectorStore};
-use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKind, WorkPlan};
+use majestical_index::work::{self, WorkKind};
 use majestical_services::app::FsApp;
-use majestical_services::capability::{
-    DESCRIBER_REMEDY, minilm_model_dir_if_present, transcript_model_remedy,
-    whisper_model_dir_if_present,
-};
+use majestical_services::capability::{minilm_model_dir_if_present, whisper_model_dir_if_present};
 use majestical_services::catalog::open_catalog;
 use majestical_services::describer_config::load_config;
-use majestical_services::volume_identity;
+use majestical_services::index::{
+    VALID_KINDS, build_plan, capabilities, model_dir_if_present, read_failure_report,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const VALID_KINDS: &[&str] = &[
-    "thumbs",
-    "embeddings",
-    "keyframes",
-    "transcripts",
-    "ocr",
-    "pdf",
-    "captions",
-];
-
 /// zstd level for JSON derivation blobs (transcripts, OCR, PDF text) —
 /// matches the level `BlobStore::write_vector` uses for vector blobs.
 const BLOB_ZSTD_LEVEL: i32 = 3;
-
-/// The state-dir file `run_once` overwrites every pass with the pass's
-/// per-item failures, and `index status` reads back — see
-/// [`failure_report_json`].
-const FAILURES_FILE: &str = "index-failures.json";
 
 /// Args for `maj index run`, bundled to keep `cmd_index_run`'s own signature
 /// within the house 5-positional-parameter limit.
@@ -59,37 +43,6 @@ pub(crate) struct IndexRunArgs {
     pub(crate) limit: Option<usize>,
     pub(crate) kinds: Option<Vec<String>>,
     pub(crate) json: bool,
-}
-
-/// What this machine can currently produce: the encoder model if it's been
-/// fetched into the cache (see `maj model fetch`) and present at every
-/// file's exact size, whether `ffmpeg`/`ffprobe` are on `PATH`, and whether
-/// the whisper/`MiniLM` models are installed.
-fn capabilities(catalog_root: &Path) -> Capabilities {
-    let model_tag = model_dir_if_present().map(|_| majestical_index::model::MODEL_TAG.to_string());
-    Capabilities {
-        model_tag,
-        ffmpeg: majestical_index::video::ffmpeg_available(),
-        whisper: whisper_model_dir_if_present().is_some(),
-        text_model: minilm_model_dir_if_present().is_some(),
-        describer_tag: describer_model_tag(catalog_root),
-    }
-}
-
-/// The configured describer's blob derivation tag, or `None` when no
-/// describer is configured. An unreadable/unparsable `describer.toml`
-/// degrades to unconfigured with a stderr note — a broken describer config
-/// must never kill the rest of indexing.
-fn describer_model_tag(catalog_root: &Path) -> Option<String> {
-    match load_config(catalog_root) {
-        Ok(config) => config.map(|c| c.model_tag()),
-        Err(err) => {
-            eprintln!(
-                "note: ignoring broken describer config ({err:#}) — captions degrade to unconfigured"
-            );
-            None
-        }
-    }
 }
 
 /// Validates `--kinds`, defaulting to every kind when omitted.
@@ -105,34 +58,6 @@ fn parse_kinds(kinds: Option<&[String]>) -> Result<BTreeSet<String>> {
         );
     }
     Ok(kinds.iter().cloned().collect())
-}
-
-/// Builds one [`AssetSource`] per catalog asset that has at least one
-/// recorded instance: kind from the first instance's path (all instances of
-/// one asset share content, so any instance's extension classifies it), and
-/// an absolute path to the first instance whose volume is currently mounted
-/// and whose bytes are actually present on disk — mounted-but-stale rows
-/// (see the phase 4 watchlist entry on pre-phase-4 scan-relative paths)
-/// degrade to offline rather than erroring.
-fn gather_sources(projection: &Projection) -> Vec<AssetSource> {
-    let mounted = volume_identity::mounted_volumes();
-    projection
-        .assets()
-        .filter_map(|(asset, state)| {
-            let (_, first_path) = state.instances.keys().next()?;
-            let kind = media_kind(first_path);
-            let abs_path = state.instances.keys().find_map(|(volume, path)| {
-                let mount = mounted.get(volume)?;
-                let candidate = mount.join(path);
-                candidate.is_file().then_some(candidate)
-            });
-            Some(AssetSource {
-                asset: asset.0.clone(),
-                kind,
-                abs_path,
-            })
-        })
-        .collect()
 }
 
 fn default_index_jobs() -> usize {
@@ -223,40 +148,6 @@ fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> 
         written: written.load(Ordering::Relaxed),
         failed,
     }
-}
-
-/// The `--kinds` name each [`WorkKind`] answers to. One CLI kind can cover
-/// two work kinds: `transcripts` spans Transcribe + `TranscriptEmbed`, and
-/// `ocr` spans stills + video keyframes.
-fn workkind_name(kind: WorkKind) -> &'static str {
-    match kind {
-        WorkKind::Thumb => "thumbs",
-        WorkKind::ImageEmbed => "embeddings",
-        WorkKind::Keyframes => "keyframes",
-        WorkKind::Transcribe | WorkKind::TranscriptEmbed => "transcripts",
-        WorkKind::OcrImage | WorkKind::OcrKeyframes => "ocr",
-        WorkKind::PdfText => "pdf",
-        WorkKind::Caption => "captions",
-    }
-}
-
-/// Builds the plan for one pass: gathers sources fresh from the projection
-/// (so `--watch` sees newly scanned assets), diffs against `blobs` under
-/// the caller-computed `caps`, then narrows `items` to `kinds`.
-/// Deliberately does not apply `--limit` here — that happens after
-/// `run_once` splits items by kind, so `--limit` bounds each kind's own
-/// per-pass budget independently rather than one kind starving another.
-fn build_plan(
-    projection: &Projection,
-    blobs: &BlobStore,
-    kinds: &BTreeSet<String>,
-    caps: &Capabilities,
-) -> WorkPlan {
-    let sources = gather_sources(projection);
-    let mut plan = work::plan_work(&sources, blobs, caps);
-    plan.items
-        .retain(|item| kinds.contains(workkind_name(item.kind)));
-    plan
 }
 
 /// Where a pass's per-machine derived state lives: the Lance vector store
@@ -432,14 +323,6 @@ fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> Kind
         split.cap_each(limit);
     }
     split
-}
-
-/// Resolves the encoder model dir only if it's actually present at every
-/// file's exact size — mirrors `capabilities()`'s check, kept separate
-/// since that function returns a `model_tag` string, not a usable path.
-fn model_dir_if_present() -> Option<PathBuf> {
-    let dir = majestical_index::model::model_dir_for(&SIGLIP).ok()?;
-    majestical_index::model::model_present_for(&SIGLIP, &dir).then_some(dir)
 }
 
 /// Opens `dir` and runs a cheap probe scan (`existing_keys`), catching both
@@ -2004,28 +1887,9 @@ fn merge_failure_report(
 fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
-    let path = state_dir.join(FAILURES_FILE);
+    let path = state_dir.join(majestical_services::index::FAILURES_FILE);
     std::fs::write(&path, report.to_string())
         .with_context(|| format!("writing failure report {}", path.display()))
-}
-
-/// Reads the last run's failure marker. A missing file is an empty report
-/// (a fresh catalog has no last run to report on); an unparsable one is
-/// noted on stderr and treated as empty — the next run overwrites it.
-fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
-    let path = state_dir.join(FAILURES_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return serde_json::Map::new();
-    };
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) {
-        map
-    } else {
-        eprintln!(
-            "note: ignoring unparsable failure report at {} — treating as empty",
-            path.display()
-        );
-        serde_json::Map::new()
-    }
 }
 
 /// The blob↔`text_fts` diff, run at the end of EVERY pass (mirroring
@@ -2297,7 +2161,7 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
 
 /// Prints one line per derivation kind: `done`, `pending`, `offline`,
 /// `unsupported`, `needs_ffmpeg` (need ffmpeg), `needs_model` (need model).
-fn print_kind_status(name: &str, status: &KindStatus) {
+fn print_kind_status(name: &str, status: &majestical_services::index::KindStatusRow) {
     println!(
         "{name}: {} done, {} pending, {} offline, {} unsupported, {} need ffmpeg, {} need model",
         status.done,
@@ -2309,7 +2173,7 @@ fn print_kind_status(name: &str, status: &KindStatus) {
     );
 }
 
-fn kind_status_json(status: &KindStatus) -> serde_json::Value {
+fn kind_status_json(status: &majestical_services::index::KindStatusRow) -> serde_json::Value {
     serde_json::json!({
         "done": status.done,
         "pending": status.pending,
@@ -2321,21 +2185,25 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
 }
 
 /// Remedy lines for capability gaps, printed under the per-kind status
-/// lines: each names the exact command that closes the gap.
-fn print_status_remedies(plan: &WorkPlan, caps: &Capabilities) {
-    if plan.transcripts.needs_model > 0
-        && let Some(remedy) = transcript_model_remedy(caps.whisper, caps.text_model)
-    {
+/// lines: each names the exact command that closes the gap. The gating
+/// (whether a kind actually has anything waiting on a missing model) is
+/// compute, already decided in `outcome.{transcripts,captions}_remedy`;
+/// this only prints whichever remedies came back `Some`.
+fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcome) {
+    if let Some(remedy) = &outcome.transcripts_remedy {
         println!("transcripts needs model: {remedy}");
     }
-    if plan.captions.needs_model > 0 {
-        println!("captions needs model: {DESCRIBER_REMEDY}");
+    if let Some(remedy) = outcome.captions_remedy {
+        println!("captions needs model: {remedy}");
     }
 }
 
 /// Per-kind failure lines from the last run's marker, e.g.
 /// `pdf failed last run: 1 (broken.pdf: not a valid pdf)`.
-fn print_last_run_failures(failures: &serde_json::Map<String, serde_json::Value>) {
+fn print_last_run_failures(failures: &serde_json::Value) {
+    let Some(failures) = failures.as_object() else {
+        return;
+    };
     for (kind, list) in failures {
         let Some(entries) = list.as_array() else {
             continue;
@@ -2350,43 +2218,39 @@ fn print_last_run_failures(failures: &serde_json::Map<String, serde_json::Value>
 
 /// Reports the queue's current state per derivation kind without doing any
 /// work — a diff against the blob store, same as `run`, just not executed —
-/// plus the last run's per-item failures from the failure marker.
+/// plus the last run's per-item failures from the failure marker. Compute
+/// lives in `majestical_services::index::status`; this renders its
+/// [`majestical_services::index::IndexStatusOutcome`].
 ///
 /// # Errors
 /// Returns an error if the catalog can't be opened/synced or the state dir
 /// can't be resolved.
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let (_, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = majestical_services::state_dir::state_dir_for(catalog_dir)?;
-    let blobs = BlobStore::new(catalog_dir);
-    let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-    let caps = capabilities(catalog_dir);
-    let plan = build_plan(&projection, &blobs, &kinds, &caps);
-    let failures = read_failure_report(&state_dir);
+    let outcome = majestical_services::index::status(app, catalog_dir)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "thumbs": kind_status_json(&plan.thumbs),
-                "embeddings": kind_status_json(&plan.embeddings),
-                "keyframes": kind_status_json(&plan.keyframes),
-                "transcripts": kind_status_json(&plan.transcripts),
-                "ocr": kind_status_json(&plan.ocr),
-                "pdf": kind_status_json(&plan.pdf),
-                "captions": kind_status_json(&plan.captions),
-                "failed_last_run": serde_json::Value::Object(failures),
+                "thumbs": kind_status_json(&outcome.thumbs),
+                "embeddings": kind_status_json(&outcome.embeddings),
+                "keyframes": kind_status_json(&outcome.keyframes),
+                "transcripts": kind_status_json(&outcome.transcripts),
+                "ocr": kind_status_json(&outcome.ocr),
+                "pdf": kind_status_json(&outcome.pdf),
+                "captions": kind_status_json(&outcome.captions),
+                "failed_last_run": outcome.failed_last_run,
             })
         );
     } else {
-        print_kind_status("thumbs", &plan.thumbs);
-        print_kind_status("embeddings", &plan.embeddings);
-        print_kind_status("keyframes", &plan.keyframes);
-        print_kind_status("transcripts", &plan.transcripts);
-        print_kind_status("ocr", &plan.ocr);
-        print_kind_status("pdf", &plan.pdf);
-        print_kind_status("captions", &plan.captions);
-        print_status_remedies(&plan, &caps);
-        print_last_run_failures(&failures);
+        print_kind_status("thumbs", &outcome.thumbs);
+        print_kind_status("embeddings", &outcome.embeddings);
+        print_kind_status("keyframes", &outcome.keyframes);
+        print_kind_status("transcripts", &outcome.transcripts);
+        print_kind_status("ocr", &outcome.ocr);
+        print_kind_status("pdf", &outcome.pdf);
+        print_kind_status("captions", &outcome.captions);
+        print_status_remedies(&outcome);
+        print_last_run_failures(&outcome.failed_last_run);
     }
     Ok(())
 }

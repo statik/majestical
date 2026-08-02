@@ -28,10 +28,10 @@ struct InboxWorld {
     /// The most recently declared contribution or manifest-less folder's
     /// name — read by steps that don't repeat it in their own Gherkin text
     /// (e.g. "the file finishes uploading", "the contribution folder has
-    /// moved to \".processed\"").
-    last_contribution: String,
+    /// moved to ..."). `None` until a `Given` step declares one.
+    last_contribution: Option<String>,
     /// File names the most recent `Given` step created, so a `Then` step
-    /// like "finds every tracked file" can check search results without
+    /// like "finds every dropped file" can check search results without
     /// re-deriving names from scenario prose.
     tracked_files: Vec<String>,
     /// Set by the "short on disk" `Given` step (path, full bytes);
@@ -49,7 +49,7 @@ impl InboxWorld {
             root: None,
             last_stdout: String::new(),
             last_stderr: String::new(),
-            last_contribution: String::new(),
+            last_contribution: None,
             tracked_files: Vec::new(),
             pending_upload: None,
             hash_pair: None,
@@ -77,6 +77,44 @@ impl InboxWorld {
 
     fn dest(&self) -> Result<PathBuf, String> {
         Ok(self.root_path()?.join("dest"))
+    }
+
+    /// The most recently declared contribution or manifest-less folder's
+    /// name, same `ok_or_else` shape as [`Self::root_path`] and friends —
+    /// a step reading this before any `Given` set it is a scenario bug,
+    /// not a silent empty-string match.
+    fn last_contribution(&self) -> Result<&str, String> {
+        self.last_contribution
+            .as_deref()
+            .ok_or_else(|| "no contribution or manifest-less folder declared yet".to_string())
+    }
+
+    /// Fails the step, naming both the needle and the actual stdout, unless
+    /// `needle` appears in the most recent invocation's stdout.
+    fn expect_stdout(&self, needle: &str) -> Result<(), String> {
+        if !self.last_stdout.contains(needle) {
+            return Err(format!(
+                "expected stdout to contain {needle:?}, got: {}",
+                self.last_stdout
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fails the step unless every needle in `needles` appears somewhere in
+    /// the most recent invocation's stdout and stderr combined — for
+    /// assertions that don't care which stream carried the detail (`maj`
+    /// prints a `Failed` row's reason on both).
+    fn expect_report(&self, needles: &[&str]) -> Result<(), String> {
+        let combined = format!("{}\n{}", self.last_stdout, self.last_stderr);
+        for needle in needles {
+            if !combined.contains(needle) {
+                return Err(format!(
+                    "expected the report to mention {needle:?}, got:\n{combined}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Builds a `maj` invocation with this machine's catalog/state env
@@ -205,7 +243,7 @@ fn contribution_of_n_files(
         files_json.join(",")
     );
     std::fs::write(dir.join("contribution.json"), manifest).map_err(|e| e.to_string())?;
-    world.last_contribution = name;
+    world.last_contribution = Some(name);
     world.tracked_files = names;
     Ok(())
 }
@@ -225,7 +263,7 @@ fn contribution_short_on_disk(world: &mut InboxWorld, name: String) -> Result<()
     std::fs::write(dir.join("contribution.json"), manifest).map_err(|e| e.to_string())?;
     // Only the first few bytes have landed so far — an upload in progress.
     std::fs::write(dir.join("clip.mov"), &payload[..4]).map_err(|e| e.to_string())?;
-    world.last_contribution = name;
+    world.last_contribution = Some(name);
     world.tracked_files = vec!["clip.mov".to_string()];
     world.pending_upload = Some((dir.join("clip.mov"), payload));
     Ok(())
@@ -246,7 +284,7 @@ fn contribution_hash_mismatch(world: &mut InboxWorld, name: String) -> Result<()
     std::fs::write(dir.join("contribution.json"), manifest).map_err(|e| e.to_string())?;
     let computed_hash = xxh64_hex(&payload);
     std::fs::write(dir.join("clip.mov"), &payload).map_err(|e| e.to_string())?;
-    world.last_contribution = name;
+    world.last_contribution = Some(name);
     world.tracked_files = vec!["clip.mov".to_string()];
     world.hash_pair = Some((wrong_hash, computed_hash));
     Ok(())
@@ -270,7 +308,7 @@ fn contribution_with_version(
     );
     std::fs::write(dir.join("contribution.json"), manifest).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("clip.mov"), &payload).map_err(|e| e.to_string())?;
-    world.last_contribution = name;
+    world.last_contribution = Some(name);
     Ok(())
 }
 
@@ -293,7 +331,7 @@ fn quiescent_manifest_less_folder(
             .map_err(|e| e.to_string())?;
         names.push(file_name);
     }
-    world.last_contribution = name;
+    world.last_contribution = Some(name);
     world.tracked_files = names;
     Ok(())
 }
@@ -351,20 +389,13 @@ fn file_finishes_uploading(world: &mut InboxWorld) -> Result<(), String> {
     std::fs::write(&path, &payload).map_err(|e| e.to_string())
 }
 
-#[then(expr = "the report says {string} was ingested with {int} files")]
+#[then(expr = "the report says {string} was ingested with {int} file(s)")]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "cucumber's {string} captures always bind as owned String"
 )]
 fn report_ingested(world: &mut InboxWorld, name: String, count: i64) -> Result<(), String> {
-    let needle = format!("{name}: ingested {count} file(s)");
-    if !world.last_stdout.contains(&needle) {
-        return Err(format!(
-            "expected stdout to contain {needle:?}, got: {}",
-            world.last_stdout
-        ));
-    }
-    Ok(())
+    world.expect_stdout(&format!("{name}: ingested {count} file(s)"))
 }
 
 #[then(expr = "the report says {string} is waiting")]
@@ -373,14 +404,7 @@ fn report_ingested(world: &mut InboxWorld, name: String, count: i64) -> Result<(
     reason = "cucumber's {string} captures always bind as owned String"
 )]
 fn report_waiting(world: &mut InboxWorld, name: String) -> Result<(), String> {
-    let needle = format!("{name}: waiting");
-    if !world.last_stdout.contains(&needle) {
-        return Err(format!(
-            "expected stdout to contain {needle:?}, got: {}",
-            world.last_stdout
-        ));
-    }
-    Ok(())
+    world.expect_stdout(&format!("{name}: waiting"))
 }
 
 #[then(expr = "the report says {string} was skipped with a recorded failure")]
@@ -389,14 +413,7 @@ fn report_waiting(world: &mut InboxWorld, name: String) -> Result<(), String> {
     reason = "cucumber's {string} captures always bind as owned String"
 )]
 fn report_recorded_failure(world: &mut InboxWorld, name: String) -> Result<(), String> {
-    let needle = format!("{name}: skipped (recorded failure)");
-    if !world.last_stdout.contains(&needle) {
-        return Err(format!(
-            "expected stdout to contain {needle:?}, got: {}",
-            world.last_stdout
-        ));
-    }
-    Ok(())
+    world.expect_stdout(&format!("{name}: skipped (recorded failure)"))
 }
 
 #[then("the report names the mismatched file and both hashes")]
@@ -405,40 +422,37 @@ fn report_names_mismatch(world: &mut InboxWorld) -> Result<(), String> {
         .hash_pair
         .clone()
         .ok_or_else(|| "no hash pair recorded by a prior Given step".to_string())?;
-    let combined = format!("{}\n{}", world.last_stdout, world.last_stderr);
-    for needle in ["clip.mov", manifest_hash.as_str(), computed_hash.as_str()] {
-        if !combined.contains(needle) {
-            return Err(format!(
-                "expected the report to name {needle:?}, got:\n{combined}"
-            ));
-        }
-    }
-    Ok(())
+    let file_name = world
+        .tracked_files
+        .first()
+        .cloned()
+        .ok_or_else(|| "no tracked file recorded by a prior Given step".to_string())?;
+    world.expect_report(&[
+        file_name.as_str(),
+        manifest_hash.as_str(),
+        computed_hash.as_str(),
+    ])
 }
 
-#[then("the report names version 99 and the supported version 1")]
-fn report_names_version(world: &mut InboxWorld) -> Result<(), String> {
-    let combined = format!("{}\n{}", world.last_stdout, world.last_stderr);
-    for needle in ["version 99", "supports version 1"] {
-        if !combined.contains(needle) {
-            return Err(format!(
-                "expected the report to mention {needle:?}, got:\n{combined}"
-            ));
-        }
-    }
-    Ok(())
+#[then(expr = "the report names version {int} and the supported version {int}")]
+fn report_names_version(world: &mut InboxWorld, found: i64, supported: i64) -> Result<(), String> {
+    let found_needle = format!("version {found}");
+    let supported_needle = format!("supports version {supported}");
+    world.expect_report(&[found_needle.as_str(), supported_needle.as_str()])
 }
 
-#[then("the contribution folder has moved to \".processed\"")]
-fn contribution_moved(world: &mut InboxWorld) -> Result<(), String> {
-    let processed = world
-        .inbox()?
-        .join(".processed")
-        .join(&world.last_contribution);
+#[then(expr = "the contribution folder has moved to {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn contribution_moved(world: &mut InboxWorld, processed_dir: String) -> Result<(), String> {
+    let name = world.last_contribution()?.to_string();
+    let processed = world.inbox()?.join(&processed_dir).join(&name);
     if !processed.is_dir() {
         return Err(format!("expected {} to exist", processed.display()));
     }
-    let original = world.inbox()?.join(&world.last_contribution);
+    let original = world.inbox()?.join(&name);
     if original.exists() {
         return Err(format!(
             "expected {} to no longer exist",
@@ -448,46 +462,21 @@ fn contribution_moved(world: &mut InboxWorld) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs `maj search <query>` and confirms every file name tracked by the
-/// most recent `Given` step appears in the (text-mode) results — shared by
-/// both "finds every tracked file" and "finds the file", which differ only
-/// in scenario prose, not in what they check.
-fn search_finds_every_tracked_file(world: &mut InboxWorld, query: &str) -> Result<(), String> {
-    world.exec(&["search", query])?;
+#[then(expr = "searching {string} finds every dropped file")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "cucumber's {string} captures always bind as owned String"
+)]
+fn searching_finds_every_dropped_file(world: &mut InboxWorld, query: String) -> Result<(), String> {
+    world.exec(&["search", &query])?;
     let names = world.tracked_files.clone();
     if names.is_empty() {
         return Err("no tracked files to verify against search results".to_string());
     }
     for name in &names {
-        if !world.last_stdout.contains(name.as_str()) {
-            return Err(format!(
-                "expected `search {query}` to find {name:?}, got: {}",
-                world.last_stdout
-            ));
-        }
+        world.expect_stdout(name)?;
     }
     Ok(())
-}
-
-#[then(expr = "searching {string} finds every tracked file")]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "cucumber's {string} captures always bind as owned String"
-)]
-fn searching_finds_every_tracked_file_step(
-    world: &mut InboxWorld,
-    query: String,
-) -> Result<(), String> {
-    search_finds_every_tracked_file(world, &query)
-}
-
-#[then(expr = "searching {string} finds the file")]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "cucumber's {string} captures always bind as owned String"
-)]
-fn searching_finds_the_file(world: &mut InboxWorld, query: String) -> Result<(), String> {
-    search_finds_every_tracked_file(world, &query)
 }
 
 fn main() {

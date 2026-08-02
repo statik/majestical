@@ -6,7 +6,7 @@ Feature: Inbox contributions
     And a contribution "drop-1" of 2 files from contributor "dana" targeting "project/spring"
     When I process the inbox
     Then the report says "drop-1" was ingested with 2 files
-    And searching "tag:contributor/dana" finds every tracked file
+    And searching "tag:contributor/dana" finds every dropped file
     And the contribution folder has moved to ".processed"
 
   Scenario: An incomplete upload waits and converges
@@ -16,7 +16,7 @@ Feature: Inbox contributions
     Then the report says "drop-2" is waiting
     When the file finishes uploading
     And I process the inbox
-    Then the report says "drop-2" was ingested with 1 files
+    Then the report says "drop-2" was ingested with 1 file
 
   Scenario: A hash mismatch is recorded once and skipped after
     Given a catalog with a PARA project "spring"
@@ -36,4 +36,4 @@ Feature: Inbox contributions
     Given a catalog with a PARA resource "inbox-triage"
     And a quiescent manifest-less folder "beach" holding 1 file
     When I process the inbox with triage target "resource/inbox-triage"
-    Then searching "tag:source/inbox" finds the file
+    Then searching "tag:source/inbox" finds every dropped file

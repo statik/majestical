@@ -2584,8 +2584,13 @@ pub(crate) struct InboxArgs {
 
 /// Per-machine record of contributions that failed hash validation, so a
 /// later pass skips them with a notice instead of re-hashing forever.
-/// Keyed by folder name; cleared automatically when the manifest changes
-/// (mtime+size fingerprint) — a re-upload re-validates.
+/// Keyed by (inbox identity, folder name) — inbox identity = xxh3-128 of
+/// the canonicalized inbox path, the state_dir pattern — because two
+/// inboxes sharing one catalog with same-named folders would otherwise
+/// evict each other's markers and oscillate (Task 10 review finding;
+/// as-built supersedes the bare-name sketch below). Cleared automatically
+/// when the manifest OR any listed file's (mtime, size) changes — a
+/// re-upload re-validates.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FailureMarkers {
     #[serde(default)]

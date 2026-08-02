@@ -91,7 +91,7 @@ pub fn capabilities(catalog_root: &Path) -> Capabilities {
 /// path to the first instance whose volume is currently mounted and whose
 /// bytes are actually present on disk.
 #[must_use]
-pub fn gather_sources(projection: &Projection) -> Vec<AssetSource> {
+fn gather_sources(projection: &Projection) -> Vec<AssetSource> {
     let mounted = volume_identity::mounted_volumes();
     projection
         .assets()
@@ -116,7 +116,7 @@ pub fn gather_sources(projection: &Projection) -> Vec<AssetSource> {
 /// two work kinds: `transcripts` spans Transcribe + `TranscriptEmbed`, and
 /// `ocr` spans stills + video keyframes.
 #[must_use]
-pub fn workkind_name(kind: WorkKind) -> &'static str {
+fn workkind_name(kind: WorkKind) -> &'static str {
     match kind {
         WorkKind::Thumb => "thumbs",
         WorkKind::ImageEmbed => "embeddings",

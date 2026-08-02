@@ -10,6 +10,7 @@ use majestical_core::event::AssetId;
 
 /// A single requested `field` (0-or-1 entries — present only if set), or
 /// every field currently set on the asset.
+#[derive(serde::Serialize)]
 pub struct MetaOutcome {
     pub fields: Vec<(String, String)>,
 }

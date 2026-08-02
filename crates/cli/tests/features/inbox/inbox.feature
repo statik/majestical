@@ -6,7 +6,7 @@ Feature: Inbox contributions
     And a contribution "drop-1" of 2 files from contributor "dana" targeting "project/spring"
     When I process the inbox
     Then the report says "drop-1" was ingested with 2 files
-    And searching "tag:contributor/dana" finds both files
+    And searching "tag:contributor/dana" finds every tracked file
     And the contribution folder has moved to ".processed"
 
   Scenario: An incomplete upload waits and converges

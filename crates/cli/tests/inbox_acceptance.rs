@@ -31,7 +31,7 @@ struct InboxWorld {
     /// moved to \".processed\"").
     last_contribution: String,
     /// File names the most recent `Given` step created, so a `Then` step
-    /// like "finds both files" can check search results without
+    /// like "finds every tracked file" can check search results without
     /// re-deriving names from scenario prose.
     tracked_files: Vec<String>,
     /// Set by the "short on disk" `Given` step (path, full bytes);
@@ -450,8 +450,8 @@ fn contribution_moved(world: &mut InboxWorld) -> Result<(), String> {
 
 /// Runs `maj search <query>` and confirms every file name tracked by the
 /// most recent `Given` step appears in the (text-mode) results — shared by
-/// both "finds both files" and "finds the file", which differ only in
-/// scenario prose, not in what they check.
+/// both "finds every tracked file" and "finds the file", which differ only
+/// in scenario prose, not in what they check.
 fn search_finds_every_tracked_file(world: &mut InboxWorld, query: &str) -> Result<(), String> {
     world.exec(&["search", query])?;
     let names = world.tracked_files.clone();
@@ -469,12 +469,15 @@ fn search_finds_every_tracked_file(world: &mut InboxWorld, query: &str) -> Resul
     Ok(())
 }
 
-#[then(expr = "searching {string} finds both files")]
+#[then(expr = "searching {string} finds every tracked file")]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "cucumber's {string} captures always bind as owned String"
 )]
-fn searching_finds_both_files(world: &mut InboxWorld, query: String) -> Result<(), String> {
+fn searching_finds_every_tracked_file_step(
+    world: &mut InboxWorld,
+    query: String,
+) -> Result<(), String> {
     search_finds_every_tracked_file(world, &query)
 }
 
@@ -491,6 +494,6 @@ fn main() {
     futures::executor::block_on(
         InboxWorld::cucumber()
             .fail_on_skipped()
-            .run_and_exit("tests/features/inbox.feature"),
+            .run_and_exit("tests/features/inbox"),
     );
 }

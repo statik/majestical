@@ -1,4 +1,5 @@
-//! CLI application state: adapter wiring, event emission, projection loading.
+//! Application state shared by every head (CLI, MCP, GUI): adapter wiring,
+//! event emission, projection loading.
 use anyhow::{Context, Result};
 use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
 use majestical_core::event::{Event, EventId, Op};

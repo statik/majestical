@@ -1,5 +1,5 @@
-//! ISO-8601 timestamp formatting for CLI display, using civil calendar math
-//! rather than pulling in a datetime dependency for one display need.
+//! ISO-8601 timestamp formatting, using civil calendar math rather than
+//! pulling in a datetime dependency for one display need.
 
 /// Formats milliseconds since the Unix epoch as an ISO-8601 UTC timestamp
 /// (`YYYY-MM-DDTHH:MM:SSZ`).

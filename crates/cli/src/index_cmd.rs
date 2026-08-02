@@ -2,9 +2,7 @@
 //! the catalog projection against the on-disk blob store. main.rs owns the
 //! clap definitions; this module owns behavior, following `search.rs`'s
 //! precedent of keeping non-trivial verbs out of `commands.rs`.
-use crate::app::FsApp;
 use crate::commands::open_catalog;
-use crate::volume_identity;
 use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::event::AssetId;
@@ -22,6 +20,8 @@ use majestical_index::text_encoder::TextEncoder;
 use majestical_index::transcribe::{Transcriber, Transcript, WHISPER_MODEL_TAG};
 use majestical_index::vector_store::{TextChunkRow, TextVectorStore, VectorRow, VectorStore};
 use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKind, WorkPlan};
+use majestical_services::app::FsApp;
+use majestical_services::volume_identity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -325,7 +325,7 @@ struct RunOnceArgs<'a> {
 /// can't be written.
 fn run_once(app: &FsApp, catalog_dir: &Path, args: &RunOnceArgs<'_>) -> Result<()> {
     let (mut db, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = majestical_services::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let caps = capabilities(catalog_dir);
     let plan = build_plan(&projection, &blobs, args.kinds, &caps);
@@ -2393,7 +2393,7 @@ fn print_last_run_failures(failures: &serde_json::Map<String, serde_json::Value>
 /// can't be resolved.
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = majestical_services::state_dir::state_dir_for(catalog_dir)?;
     let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
     let caps = capabilities(catalog_dir);

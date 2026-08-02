@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 
-use crate::state_dir;
+use majestical_services::state_dir;
 
 pub(crate) fn config_path(catalog_root: &Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(state_dir::state_dir_for(catalog_root)?.join("describer.toml"))

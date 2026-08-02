@@ -2,9 +2,7 @@
 //! saved-search management. Parsing lives in `query`; this module resolves
 //! parsed filters against the catalog and renders results.
 use crate::SearchesCmd;
-use crate::app::FsApp;
 use crate::commands::{open_catalog, resolve_para_node};
-use crate::volume_identity;
 use anyhow::{Context, Result, bail};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::event::{AssetId, Op};
@@ -14,6 +12,8 @@ use majestical_core::projection::Projection;
 use majestical_index::model::{MINILM, SIGLIP};
 use majestical_index::text_encoder::TextEncoder;
 use majestical_index::vector_store::{TextChunkHit, TextVectorStore, VectorHit, VectorStore};
+use majestical_services::app::FsApp;
+use majestical_services::volume_identity;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -281,7 +281,7 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
     let (text_fts, mut text_meta) =
         text_fts_search(db, args.terms, text_sources.as_ref(), fts_limit)?;
 
-    let state_dir = crate::state_dir::state_dir_for(args.catalog_dir)?;
+    let state_dir = majestical_services::state_dir::state_dir_for(args.catalog_dir)?;
     let query_text = args.terms.join(" ");
     let (image_ids, keyframe_ts, embedded) = if image_semantic_enabled(args.sources) {
         semantic_candidates(&state_dir, &query_text, semantic_limit)

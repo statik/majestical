@@ -9,13 +9,13 @@
 //! validation gates live in `inbox_manifest.rs`; this module is the
 //! orchestration: the pass loop, hash gate, routing, ingest, quiescence,
 //! and the failure-marker store.
-use crate::app::FsApp;
 use crate::commands::{self, ExecuteIngest, IngestReport};
 use crate::inbox_manifest::{ContributionManifest, MANIFEST_NAME, check_files, load_manifest};
 use anyhow::{Context, Result};
 use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, hashing, plan};
+use majestical_services::app::FsApp;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_128;
@@ -95,7 +95,7 @@ struct FailureMarker {
 }
 
 fn markers_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("inbox-failures.json"))
+    Ok(majestical_services::state_dir::state_dir_for(catalog)?.join("inbox-failures.json"))
 }
 
 /// A missing store is empty (nothing has ever failed); an unparsable one
@@ -313,7 +313,7 @@ fn is_quiescent(path: &Path, window_ms: u64) -> bool {
     let Some(newest) = newest_mtime_ms(path) else {
         return false;
     };
-    crate::app::physical_now_ms().saturating_sub(newest) >= window_ms
+    majestical_services::app::physical_now_ms().saturating_sub(newest) >= window_ms
 }
 
 /// A path's final component as a display string — used everywhere a report

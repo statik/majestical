@@ -3,8 +3,8 @@
 //! (mount points differ per machine) in the state dir's `sync.toml`,
 //! never synced.
 
-use crate::app::FsApp;
 use anyhow::{Context, Result};
+use majestical_services::app::FsApp;
 use majestical_sync::transfer;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +81,7 @@ impl SyncConfig {
 
 /// The per-catalog `sync.toml` path in this machine's state dir.
 pub(crate) fn config_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("sync.toml"))
+    Ok(majestical_services::state_dir::state_dir_for(catalog)?.join("sync.toml"))
 }
 
 /// Registers a new sync location: validates `location` is an accessible,

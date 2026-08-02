@@ -1,8 +1,5 @@
 //! One cmd_* handler per CLI verb. main.rs owns clap definitions and dispatch;
 //! handlers own behavior.
-use crate::app::{FsApp, physical_now_ms, warn_skipped_corrupt_lines};
-use crate::iso8601::iso8601_ms;
-use crate::volume_identity;
 use crate::{MetaCmd, ParaCmd, TagCmd};
 use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
@@ -10,6 +7,9 @@ use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
+use majestical_services::app::{FsApp, physical_now_ms, warn_skipped_corrupt_lines};
+use majestical_services::iso8601::iso8601_ms;
+use majestical_services::volume_identity;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// `volumes list`, and `para list` — so the open+sync pair lives in exactly
 /// one place.
 pub(crate) fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCatalog, Projection)> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    let paths = majestical_services::state_dir::catalog_paths(catalog_dir)?;
     let mut skipped = 0usize;
     let (db, projection, _mode) =
         SqliteCatalog::open_synced(&paths.db_path, app.log(), &mut |_line| skipped += 1)
@@ -874,7 +874,7 @@ fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpe
 }
 
 fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    let paths = majestical_services::state_dir::catalog_paths(catalog_dir)?;
     Ok(paths.runs_dir.join(format!("{run_id}.jsonl")))
 }
 

@@ -1,22 +1,18 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
-mod app;
 mod commands;
 mod describer_cmd;
 mod inbox_cmd;
 mod inbox_manifest;
 mod index_cmd;
-mod iso8601;
 mod query;
 mod search;
-mod state_dir;
 mod sync_cmd;
 mod tags_cmd;
-mod volume_identity;
 
 use anyhow::Result;
-use app::FsApp;
 use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
+use majestical_services::app::FsApp;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]

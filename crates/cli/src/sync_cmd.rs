@@ -492,7 +492,7 @@ pub(crate) fn cmd_pull(
     // Opening the sqlite catalog applies past its saved cursor — the open
     // IS the apply; there is no separate step to call.
     let app = FsApp::open(catalog, machine_id, author)?;
-    crate::commands::open_catalog(&app, catalog)?;
+    majestical_services::catalog::open_catalog(&app, catalog)?;
 
     let summary = summarize_pull(&results);
     print_pull_summary(&results, &summary, args.json)?;

@@ -4,7 +4,6 @@ mod describer_cmd;
 mod inbox_cmd;
 mod inbox_manifest;
 mod index_cmd;
-mod query;
 mod search;
 mod sync_cmd;
 mod tags_cmd;

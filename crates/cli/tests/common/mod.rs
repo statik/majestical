@@ -37,6 +37,45 @@ pub fn first_asset_id(out: &std::process::Output) -> String {
     hits["results"][0]["asset"].as_str().unwrap().to_string()
 }
 
+/// A small deterministic catalog for the services-extraction parity harness
+/// (and any later suite needing a minimal seeded catalog): one volume
+/// (`vol1`), two scanned files, and a `demo` tag on the first. Returns the
+/// catalog root and its isolated state dir, both under `dir`.
+#[cfg(test)]
+pub fn fixture_catalog(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = dir.join("cat");
+    let state = dir.join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir");
+    std::fs::write(src.join("a.txt"), b"alpha").expect("write");
+    std::fs::write(src.join("b.txt"), b"beta").expect("write");
+    maj(&root, &state)
+        .args(["scan", src.to_str().expect("utf8"), "--volume", "vol1"])
+        .assert()
+        .success();
+    let asset = asset_id_of(&root, &state, "a.txt");
+    maj(&root, &state)
+        .args(["tag", "add", &asset, "demo"])
+        .assert()
+        .success();
+    (root, state)
+}
+
+/// Finds an asset id via `search --json` — keeps a fixture independent of
+/// hash literals.
+#[cfg(test)]
+pub fn asset_id_of(root: &std::path::Path, state: &std::path::Path, name: &str) -> String {
+    let out = maj(root, state)
+        .args(["search", name, "--json"])
+        .output()
+        .expect("run");
+    first_asset_id(&out)
+}
+
 #[cfg(test)]
 pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     walkdir::WalkDir::new(root)
@@ -55,12 +94,23 @@ pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBu
 // or `#[expect]` (would itself fail wherever the helper IS otherwise used).
 #[cfg(test)]
 mod tests {
-    use super::{first_asset_id, walkdir_find};
+    use super::{asset_id_of, first_asset_id, fixture_catalog, walkdir_find};
 
     #[test]
     fn walkdir_find_returns_empty_when_name_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(walkdir_find(dir.path(), "no-such-file").is_empty());
+    }
+
+    // Gives every binary compiling this module a real call site for
+    // `fixture_catalog`/`asset_id_of` — only `services_parity.rs` calls
+    // them directly today, same `dead_code` rationale as the tests above.
+    #[test]
+    fn fixture_catalog_seeds_two_tagged_assets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, state) = fixture_catalog(dir.path());
+        let asset = asset_id_of(&root, &state, "a.txt");
+        assert!(asset.starts_with("xxh3:"));
     }
 
     // Gives every binary compiling this module a real call site for

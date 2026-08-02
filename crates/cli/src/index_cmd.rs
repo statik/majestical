@@ -2,7 +2,6 @@
 //! the catalog projection against the on-disk blob store. main.rs owns the
 //! clap definitions; this module owns behavior, following `search.rs`'s
 //! precedent of keeping non-trivial verbs out of `commands.rs`.
-use crate::commands::open_catalog;
 use anyhow::{Context, Result};
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::event::AssetId;
@@ -13,7 +12,7 @@ use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
-use majestical_index::model::{MINILM, SIGLIP, WHISPER};
+use majestical_index::model::{MINILM, SIGLIP};
 use majestical_index::ocr::{OCR_MODEL_TAG, OcrResult};
 use majestical_index::pdf::{PDF_MODEL_TAG, PdfContent};
 use majestical_index::text_encoder::TextEncoder;
@@ -21,6 +20,12 @@ use majestical_index::transcribe::{Transcriber, Transcript, WHISPER_MODEL_TAG};
 use majestical_index::vector_store::{TextChunkRow, TextVectorStore, VectorRow, VectorStore};
 use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKind, WorkPlan};
 use majestical_services::app::FsApp;
+use majestical_services::capability::{
+    DESCRIBER_REMEDY, minilm_model_dir_if_present, transcript_model_remedy,
+    whisper_model_dir_if_present,
+};
+use majestical_services::catalog::open_catalog;
+use majestical_services::describer_config::load_config;
 use majestical_services::volume_identity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -76,7 +81,7 @@ fn capabilities(catalog_root: &Path) -> Capabilities {
 /// degrades to unconfigured with a stderr note — a broken describer config
 /// must never kill the rest of indexing.
 fn describer_model_tag(catalog_root: &Path) -> Option<String> {
-    match crate::describer_cmd::load_config(catalog_root) {
+    match load_config(catalog_root) {
         Ok(config) => config.map(|c| c.model_tag()),
         Err(err) => {
             eprintln!(
@@ -85,24 +90,6 @@ fn describer_model_tag(catalog_root: &Path) -> Option<String> {
             None
         }
     }
-}
-
-/// The whisper cache dir, only if `model_present_for` accepts it (every
-/// registry file present at its exact byte size) — the single "installed"
-/// definition, not a re-hash, so this stays cheap on every invocation.
-/// `pub(crate)`: `search`'s transcript coverage notice reuses this exact
-/// check so its remedy can't disagree with `index status`'s.
-pub(crate) fn whisper_model_dir_if_present() -> Option<PathBuf> {
-    let dir = majestical_index::model::model_dir_for(&WHISPER).ok()?;
-    majestical_index::model::model_present_for(&WHISPER, &dir).then_some(dir)
-}
-
-/// The `MiniLM` cache dir, only if `model_present_for` accepts it.
-/// `pub(crate)`: shared with `search`'s coverage remedy, same rationale as
-/// [`whisper_model_dir_if_present`].
-pub(crate) fn minilm_model_dir_if_present() -> Option<PathBuf> {
-    let dir = majestical_index::model::model_dir_for(&MINILM).ok()?;
-    majestical_index::model::model_present_for(&MINILM, &dir).then_some(dir)
 }
 
 /// Validates `--kinds`, defaulting to every kind when omitted.
@@ -1497,7 +1484,7 @@ fn run_caption_items(
     if items.is_empty() {
         return outcome;
     }
-    let config = match crate::describer_cmd::load_config(env.catalog_root) {
+    let config = match load_config(env.catalog_root) {
         Ok(Some(config)) => config,
         // The planner only queued Caption items because a describer was
         // configured when caps were computed; a config removed/broken since
@@ -2331,29 +2318,6 @@ fn kind_status_json(status: &KindStatus) -> serde_json::Value {
         "needs_ffmpeg": status.needs_ffmpeg,
         "needs_model": status.needs_model,
     })
-}
-
-/// The captions remedy line, shared verbatim by `index status` and
-/// `search`'s coverage notices so the two surfaces cannot drift.
-pub(crate) const DESCRIBER_REMEDY: &str = "run `maj describer set` to configure a backend";
-
-/// The `model fetch` remedy for the transcript pipeline, naming exactly the
-/// missing models — `None` when both are installed. Shared by `index
-/// status` and `search`'s coverage notices so the command they print is
-/// always the same one.
-pub(crate) fn transcript_model_remedy(whisper: bool, text_model: bool) -> Option<String> {
-    let mut fetches = Vec::new();
-    if !whisper {
-        fetches.push(format!("--only {}", WHISPER.tag));
-    }
-    if !text_model {
-        fetches.push(format!("--only {}", MINILM.tag));
-    }
-    if fetches.is_empty() {
-        None
-    } else {
-        Some(format!("run `maj model fetch {}`", fetches.join(" ")))
-    }
 }
 
 /// Remedy lines for capability gaps, printed under the per-kind status

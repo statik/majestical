@@ -623,7 +623,7 @@ fn resolve_contribution_node(
     para: &str,
 ) -> Result<(String, ParaKind, String)> {
     if let Some((kind_str, name)) = para.split_once('/')
-        && let Ok(kind) = commands::parse_kind(kind_str)
+        && let Ok(kind) = majestical_services::para::parse_kind(kind_str)
     {
         let active = projection
             .para_nodes()

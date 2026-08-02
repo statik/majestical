@@ -159,6 +159,11 @@ Cuesheet patterns with the gaps closed (parent spec §7), all in this phase:
 - `cargo-about` license bundle generated in the release job.
 - **Version-sync check** across Cargo.toml / tauri.conf.json / package.json
   as a `just` recipe, in CI from the first Tauri commit.
+- **Cross-platform build feedback from day one**: the GUI workspace builds
+  on macOS, Windows, and Linux in the CI matrix (Linux with the webkit2gtk
+  deps the runner needs) from the first Tauri commit, so platform breakage
+  surfaces per-PR instead of at a future porting phase. Release artifacts
+  remain macOS-only this phase — the matrix is feedback, not distribution.
 - CI hygiene as established: SHA-pinned actions + version comments,
   `persist-credentials: false`, per-job permissions, zizmor + actionlint,
   Dependabot 7-day cooldown groups extended to npm/GUI. The four
@@ -215,7 +220,8 @@ they stay listed with attribution.
   throttle; hover-scrub filmstrip.
 - GUI WebDriver e2e suite.
 - `maj doctor` (natural MCP-era tool; truncated-tail residue check).
-- Windows/Linux GUI builds; localization.
+- Windows/Linux release artifacts, signing, and distribution (CI builds
+  both platforms — see Release pipeline & CI); localization.
 - MCP long-running-tool progress notifications (verify_volume/index_run
   stream progress) — land as a follow-up once rmcp progress support is
   assessed during implementation.

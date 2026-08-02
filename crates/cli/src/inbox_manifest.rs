@@ -632,62 +632,19 @@ mod tests {
     /// A stat failure other than "not found" (permission denied) on a
     /// listed file must surface loudly, not sit in `waiting` forever —
     /// "not yet present" would tell the operator to just wait, which is
-    /// never going to resolve a permissions problem. Denying execute on
-    /// the contribution folder itself (rather than the listed file) makes
-    /// every stat inside it fail with `PermissionDenied`, not `NotFound`,
-    /// which is exactly the distinction under test.
-    #[test]
-    #[cfg(unix)]
-    fn a_permission_denied_listed_file_is_a_hard_error_not_waiting_forever() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("IMG_1.HEIC"), b"abcd").expect("write");
-        let manifest = ContributionManifest {
-            version: 1,
-            contributor: "dana".to_string(),
-            para_target: None,
-            source: None,
-            note: None,
-            files: vec![ManifestFile {
-                name: "IMG_1.HEIC".to_string(),
-                xxh64: "deadbeef00000000".to_string(),
-                size: 4,
-            }],
-        };
-
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o000);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod 000");
-
-        let result = check_files(dir.path(), &manifest);
-
-        // Restoring works even with the folder still locked: stat/chmod on
-        // a path is gated by the PARENT's execute bit, not the path's own.
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
-
-        if result.is_ok() {
-            eprintln!("skipping: this environment does not enforce a mode-000 directory");
-            return;
-        }
-        assert!(
-            result.is_err(),
-            "a permission failure must be a hard error, not silently waiting"
-        );
-    }
-
-    /// Deterministic alternative to the permission-based test above: instead
-    /// of relying on the OS enforcing `chmod 000` (which the test above must
-    /// hedge against, and which — see its own history — can't actually
-    /// isolate this guard alone, since `collect_unlisted`'s separate
-    /// directory walk fails on the same locked directory regardless of this
-    /// guard's mutation state). Listing a file *through* a path component
-    /// that is itself a plain file (`plain-file/IMG_1.HEIC`) makes
-    /// `symlink_metadata` fail with `NotADirectory`/`Other`, never
-    /// `NotFound` — and `collect_unlisted`'s walk never descends into
-    /// `plain-file` (it isn't a directory), so this is the ONLY error
-    /// source in the call, isolating the guard completely.
+    /// never going to resolve a permissions problem. This is deliberately
+    /// NOT tested by denying execute on the contribution folder (chmod
+    /// 000): that approach is structurally unable to fail — `Ok` triggers
+    /// an environment-hedge skip and `Err` satisfies the assertion, so a
+    /// mutant that silently folds every io error into `waiting` also
+    /// returns `Ok` and vacuously skips instead of failing the test.
+    /// Listing a file *through* a path component that is itself a plain
+    /// file (`plain-file/IMG_1.HEIC`) makes `symlink_metadata` fail with
+    /// `NotADirectory`/`Other`, never `NotFound`, deterministically and
+    /// without relying on permission enforcement at all — and
+    /// `collect_unlisted`'s separate walk never descends into `plain-file`
+    /// (it isn't a directory), so this is the ONLY error source in the
+    /// call, isolating the guard completely.
     #[test]
     fn a_listed_path_through_a_non_directory_component_is_a_hard_error() {
         let dir = tempfile::tempdir().expect("tempdir");

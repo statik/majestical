@@ -3,6 +3,11 @@
 //! documented integration point for the share-sheet Shortcut and future
 //! iOS app); manifest-less drops go to a triage PARA node after a
 //! quiescence check. Reuses the verified-ingest pipeline end to end.
+//!
+//! Name comparisons (manifest entries vs. the folder listing) are raw
+//! UTF-8 byte equality with no Unicode NFC/NFD normalization — an iOS
+//! export that writes NFD-normalized file names can misreport a real,
+//! APFS-resolvable file as "unlisted"; watchlisted, not fixed here.
 #![expect(
     dead_code,
     reason = "manifest types and load/check functions are unused until `maj inbox process` \
@@ -36,13 +41,15 @@ pub(crate) struct ManifestFile {
 }
 
 /// `Ok(None)` when the folder has no manifest (the manifest-less path).
-/// Unknown versions and path-traversal names are hard errors — a manifest
-/// we cannot fully honor must never be half-honored.
+/// Unknown versions, degenerate names, duplicate names, and path-traversal
+/// names are hard errors — a manifest we cannot fully honor must never be
+/// half-honored.
 ///
 /// # Errors
 /// Returns an error if the manifest exists but cannot be read or parsed,
-/// declares an unsupported `version`, or lists a file name that escapes
-/// the contribution folder (absolute path or a `..` component).
+/// declares an unsupported `version`, or lists a file name that is empty,
+/// names a directory (trailing `/`), escapes the contribution folder
+/// (absolute path or a `..` component), or repeats a name already listed.
 pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> {
     let path = dir.join(MANIFEST_NAME);
     let text = match std::fs::read_to_string(&path) {
@@ -58,7 +65,17 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> 
         path.display(),
         manifest.version
     );
+    let mut seen_names = std::collections::BTreeSet::new();
     for file in &manifest.files {
+        anyhow::ensure!(
+            !file.name.is_empty(),
+            "manifest lists an entry with an empty name — refusing the whole contribution"
+        );
+        anyhow::ensure!(
+            !file.name.ends_with('/'),
+            "manifest entry '{}' names a directory, not a file — refusing the whole contribution",
+            file.name
+        );
         let name_path = Path::new(&file.name);
         let escapes = name_path.is_absolute()
             || name_path
@@ -69,6 +86,11 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> 
             "manifest entry '{}' escapes the contribution folder — refusing the whole contribution",
             file.name
         );
+        anyhow::ensure!(
+            seen_names.insert(file.name.clone()),
+            "manifest entry '{}' is listed more than once — refusing the whole contribution",
+            file.name
+        );
     }
     Ok(Some(manifest))
 }
@@ -76,6 +98,7 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> 
 /// Presence/size gate ("still uploading" detection) + the unlisted-file
 /// report. Hash checking is deliberately NOT here — it reads every byte,
 /// so it runs once, later, only on contributions that pass this gate.
+#[derive(Debug)]
 pub(crate) struct FileCheck {
     /// Human-readable per-file reasons the contribution isn't ready.
     pub waiting: Vec<String>,
@@ -86,14 +109,26 @@ pub(crate) struct FileCheck {
 
 /// # Errors
 /// Returns an error if the contribution folder (or any subdirectory) can't
-/// be read while walking for unlisted files.
+/// be read while walking for unlisted files, or if a manifest-listed name
+/// resolves to anything other than a regular file — a symlink (which could
+/// point outside the contribution folder), a directory, or other special
+/// file. That case fails the whole contribution, same as a traversal name:
+/// Task 10 hashes and ingests listed files sight-unseen, so "looks like the
+/// right file" is not enough — it must BE the file, in place, unlinked.
 pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result<FileCheck> {
     let mut waiting = Vec::new();
     let mut listed = std::collections::BTreeSet::new();
     for file in &manifest.files {
         listed.insert(file.name.clone());
         let path = dir.join(&file.name);
-        match std::fs::metadata(&path) {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => {
+                anyhow::bail!(
+                    "manifest entry '{}' is {}, not a regular file — refusing the whole contribution",
+                    file.name,
+                    describe_non_file(meta.file_type())
+                );
+            }
             Ok(meta) if meta.len() == file.size => {}
             Ok(meta) => waiting.push(format!(
                 "{}: {} of {} bytes present — still uploading?",
@@ -109,6 +144,23 @@ pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result
     Ok(FileCheck { waiting, unlisted })
 }
 
+fn describe_non_file(file_type: std::fs::FileType) -> &'static str {
+    if file_type.is_symlink() {
+        "a symlink"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else {
+        "a special file"
+    }
+}
+
+/// Walks for files the manifest doesn't list. Symlinks are never followed:
+/// a symlinked directory is reported as a single unlisted leaf and not
+/// descended into (its contents, and whatever they point at, are none of
+/// this contribution's business); a symlinked file is likewise reported by
+/// its own name in the contribution folder, never through the link.
+/// `entry.file_type()` (unlike `Path::is_dir`/`is_file`) reports the entry
+/// itself and does not follow symlinks, which is what makes this safe.
 fn collect_unlisted(
     root: &Path,
     dir: &Path,
@@ -118,7 +170,10 @@ fn collect_unlisted(
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", path.display()))?;
+        if file_type.is_dir() {
             collect_unlisted(root, &path, listed, out)?;
             continue;
         }
@@ -196,6 +251,109 @@ mod tests {
         let manifest = load_manifest(dir.path()).expect("load").expect("present");
         let check = check_files(dir.path(), &manifest).expect("check");
         assert_eq!(check.unlisted, vec!["stray.mov".to_string()]);
+    }
+
+    #[test]
+    fn unlisted_files_are_collected_recursively_and_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("b/sub")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("a")).expect("mkdir");
+        // Written out of lexicographic order on purpose — the result must
+        // still come back fully sorted, not just sorted within one directory.
+        std::fs::write(dir.path().join("z.txt"), b"z").expect("write");
+        std::fs::write(dir.path().join("b/sub/nested.txt"), b"n").expect("write");
+        std::fs::write(dir.path().join("a/one.txt"), b"1").expect("write");
+        std::fs::write(dir.path().join("b/two.txt"), b"2").expect("write");
+        std::fs::write(dir.path().join("contribution.json"), manifest_json("[]")).expect("write");
+        let manifest = load_manifest(dir.path()).expect("load").expect("present");
+        let check = check_files(dir.path(), &manifest).expect("check");
+        assert_eq!(
+            check.unlisted,
+            vec![
+                "a/one.txt".to_string(),
+                "b/sub/nested.txt".to_string(),
+                "b/two.txt".to_string(),
+                "z.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_directory_is_reported_but_not_descended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret.txt"), b"s").expect("write");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).expect("symlink dir");
+        std::fs::write(dir.path().join("contribution.json"), manifest_json("[]")).expect("write");
+        let manifest = load_manifest(dir.path()).expect("load").expect("present");
+        let check = check_files(dir.path(), &manifest).expect("check");
+        assert_eq!(
+            check.unlisted,
+            vec!["linked".to_string()],
+            "the symlink itself is reported, but nothing inside it is walked: {:?}",
+            check.unlisted
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_listed_file_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let real = outside.path().join("real.HEIC");
+        std::fs::write(&real, b"abcd").expect("write real");
+        std::os::unix::fs::symlink(&real, dir.path().join("IMG_1.HEIC")).expect("symlink file");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(r#"[{"name":"IMG_1.HEIC","xxh64":"deadbeef00000000","size":4}]"#),
+        )
+        .expect("write");
+        let manifest = load_manifest(dir.path()).expect("load").expect("present");
+        let err = check_files(dir.path(), &manifest)
+            .expect_err("a symlinked listed file must be refused, matching size or not");
+        assert!(err.to_string().contains("IMG_1.HEIC"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_manifest_entries_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(
+                r#"[{"name":"IMG_1.HEIC","xxh64":"deadbeef00000000","size":4},
+                    {"name":"IMG_1.HEIC","xxh64":"11111111","size":9}]"#,
+            ),
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("duplicate entry must fail");
+        assert!(err.to_string().contains("IMG_1.HEIC"), "{err}");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_manifest_entry_name_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(r#"[{"name":"","xxh64":"00","size":1}]"#),
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("empty name must fail");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_trailing_slash_manifest_entry_name_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("contribution.json"),
+            manifest_json(r#"[{"name":"sub/","xxh64":"00","size":1}]"#),
+        )
+        .expect("write");
+        let err = load_manifest(dir.path()).expect_err("trailing slash must fail");
+        assert!(err.to_string().contains("sub/"), "{err}");
     }
 
     #[test]

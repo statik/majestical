@@ -10,6 +10,32 @@ fn xxh64_hex(bytes: &[u8]) -> String {
     format!("{:016x}", xxhash_rust::xxh64::xxh64(bytes, 0))
 }
 
+/// The exact tag set `search --json` reports for the one asset matching
+/// `query` — used to pin exact tag membership (not merely "contains"), so a
+/// test can prove a manifested asset never picked up `source/inbox` and a
+/// triaged asset never picked up a contributor tag.
+#[cfg(test)]
+fn tags_for(catalog: &Path, state: &Path, query: &str) -> Vec<String> {
+    let out = maj(catalog, state)
+        .args(["search", query, "--json"])
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("search --json output");
+    let results = json["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        1,
+        "query {query:?} must resolve to exactly one asset: {json}"
+    );
+    results[0]["tags"]
+        .as_array()
+        .expect("tags array")
+        .iter()
+        .map(|t| t.as_str().expect("tag is a string").to_string())
+        .collect()
+}
+
 #[cfg(test)]
 struct Setup {
     root: tempfile::TempDir,
@@ -693,5 +719,188 @@ fn missing_triage_target_fails_only_manifest_less_rows_not_a_good_manifested_sib
     assert!(
         s.inbox().join(".processed/drop-good").exists(),
         "the good contribution must still be moved to .processed/"
+    );
+}
+
+/// A `(loose files)` group is not atomic like a contribution: one bad file
+/// (here, a 0-byte file the planner refuses) must not wedge the good file
+/// in the same group forever. The good file is placed, searchable, and
+/// moved to `.processed/`; the bad one is named on stderr, stays in the
+/// inbox, and the pass exits nonzero. A second pass then converges: only
+/// the bad file remains to retry (and fails again, since nothing changed).
+#[test]
+fn a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    std::fs::write(s.inbox().join("good.jpg"), b"good-bytes").expect("write");
+    std::fs::write(s.inbox().join("bad.jpg"), b"").expect("write 0-byte file");
+
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("bad.jpg"),
+        "the bad file's reason must reach stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("ingested 1") && stdout.contains("1 failed"),
+        "the row must report the partial result: {stdout}"
+    );
+    assert!(
+        s.inbox().join(".processed/good.jpg").is_file(),
+        "the good file must still move to .processed/"
+    );
+    assert!(
+        s.inbox().join("bad.jpg").is_file(),
+        "the bad file must stay in the inbox for the operator to fix"
+    );
+    let out = maj(&s.catalog(), &s.state())
+        .args(["search", "good.jpg"])
+        .assert()
+        .success();
+    let found = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        found.contains("good.jpg"),
+        "the good file must be searchable: {found}"
+    );
+
+    // Second pass converges: only the (still-bad) leftover is retried.
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("bad.jpg"),
+        "the leftover bad file must still be named on retry: {stderr}"
+    );
+    assert!(
+        s.inbox().join("bad.jpg").is_file(),
+        "the bad file is still there — the operator hasn't acted yet"
+    );
+}
+
+/// The quiescence check walks a folder's full depth, not just its
+/// top-level entries: a young file two levels deep must block the whole
+/// folder from triaging, the same as a young top-level file would.
+#[test]
+fn a_young_file_nested_two_levels_deep_blocks_folder_quiescence() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let nested = s.inbox().join("archive/a/b");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(s.inbox().join("archive/old.txt"), b"old-bytes").expect("write");
+    // Give the rest of the tree a comfortable head start on the window
+    // before the deeply nested file is written right before the check.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    std::fs::write(nested.join("young.txt"), b"young-bytes").expect("write");
+
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "1000")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("quiesce"),
+        "a young file two levels deep must block the whole folder: {stdout}"
+    );
+    assert!(
+        !s.inbox().join(".processed").exists(),
+        "nothing should have moved while the folder is still quiescing"
+    );
+}
+
+/// Fix 2's `plan_source_filtered` makes the loose-files walk skip every
+/// non-loose entry structurally — it never enters a manifested
+/// contribution's folder at all. This pins that a manifested contribution
+/// processed in the same pass as a manifest-less loose file keeps its own
+/// tag set EXACTLY `contributor/dana` + `source/iphone` (never picking up
+/// `source/inbox`), and that `contribution.json` itself never reaches a
+/// destination.
+#[test]
+fn manifested_and_loose_triage_in_one_pass_never_cross_contaminate() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let payload = b"manifested-clip-bytes";
+    s.write_contribution("drop-1", payload, &xxh64_hex(payload));
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+
+    let mut tags = tags_for(&s.catalog(), &s.state(), "clip.mov");
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec!["contributor/dana".to_string(), "source/iphone".to_string()],
+        "a manifested contribution's tags must never pick up source/inbox"
+    );
+    assert!(
+        walkdir_find(&s.dest(), "contribution.json").is_empty(),
+        "contribution.json must never reach a destination"
+    );
+}
+
+/// A triaged asset's tag list EQUALS `["source/inbox"]`, not merely
+/// contains it — pinning that no contributor identity is ever claimed for
+/// a manifest-less drop.
+#[test]
+fn triaged_loose_files_are_tagged_with_exactly_source_inbox() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+
+    let tags = tags_for(&s.catalog(), &s.state(), "loose.jpg");
+    assert_eq!(
+        tags,
+        vec!["source/inbox".to_string()],
+        "no contributor identity may be claimed for a triaged asset"
     );
 }

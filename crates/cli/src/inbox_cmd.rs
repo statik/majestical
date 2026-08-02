@@ -204,6 +204,17 @@ enum ContribOutcome {
         placed: usize,
         skipped_duplicates: usize,
     },
+    /// The `(loose files)` group only: some files placed, some failed or
+    /// were rejected (e.g. 0 bytes). Unlike a contribution (manifested or a
+    /// manifest-less folder), a loose-files group shares nothing but having
+    /// landed in the inbox root at once — see [`process_triage_loose_files`]
+    /// for why one bad file must never wedge the good ones in the same
+    /// group forever. A fresh failure here still fails the pass (per-file
+    /// reasons already reached stderr by the time this is constructed).
+    PartlyIngested {
+        placed: usize,
+        failed: usize,
+    },
     Waiting {
         reasons: Vec<String>,
     },
@@ -382,13 +393,30 @@ fn list_contribution_dirs(inbox: &Path) -> Result<Vec<PathBuf>> {
 /// Sorted, non-dot, regular-file entries directly under `inbox` — the
 /// manifest-less "bare file" shape: a contributor drops files straight
 /// into the inbox root instead of a `contribution.json` folder.
+///
+/// Candidacy is decided by `entry.file_type()`, which — like
+/// `symlink_metadata` — does not follow symlinks: a symlinked file is never
+/// a loose-file candidate at all. This matters because a symlink pointing
+/// at a real file used to pass a `Path::is_file()` check (which follows
+/// symlinks) here while `plan_source`'s walk (which also never follows
+/// symlinks) silently excluded it from the actual ingest plan — the net
+/// effect was a symlinked loose file getting swept into `.processed/`
+/// without ever having been cataloged. Excluding it from candidacy up
+/// front means it simply sits inert in the inbox instead.
 fn list_loose_files(inbox: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(inbox).with_context(|| format!("reading {}", inbox.display()))? {
         let entry = entry.with_context(|| format!("reading {}", inbox.display()))?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !path.is_file() {
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_regular_file = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", path.display()))?
+            .is_file();
+        if !is_regular_file {
             continue;
         }
         entries.push(path);
@@ -646,11 +674,16 @@ fn triage_folder_ingest(
 
 /// Plans and verified-ingests exactly `files` — quiescent, manifest-less,
 /// top-level loose files — tagged only [`TRIAGE_TAG`]. `plan_source` has no
-/// single-file entry point, so this plans the whole inbox root (which walks
-/// every manifested and manifest-less folder too) and retains only the
-/// wanted top-level names; `IngestPlan` is a plain struct, so filtering it
-/// down after the fact is exactly as safe as planning `files` directly
-/// would have been, just one extra walk.
+/// single-file entry point, so this plans the inbox root but with a filter
+/// (`plan_source_filtered`) accepting only these exact paths: the walk
+/// never enters `.processed/`, a manifested contribution's folder, another
+/// manifest-less folder, or any dot-entry — it doesn't merely discard their
+/// results afterward, it never reads, stats, or hashes anything under them
+/// at all. This matters in practice: without it, every pass re-walks and
+/// re-hashes the inbox's ever-growing `.processed/` archive, which measured
+/// a 5x slowdown at 300 MB and only gets worse as the archive grows. No
+/// post-hoc `retain` is needed on top — the filter's exact-path membership
+/// check is already the complete, precise criterion.
 fn triage_loose_files_ingest(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
@@ -659,13 +692,11 @@ fn triage_loose_files_ingest(
 ) -> Result<engine::Outcome> {
     let projection = app.projection()?;
     let known = commands::known_assets_from_projection(&projection);
-    let mut ingest_plan = plan::plan_source(&ctx.args.inbox, &known, plan::DedupeMode::Skip)
-        .with_context(|| format!("planning inbox {}", ctx.args.inbox.display()))?;
-    let wanted: BTreeSet<String> = files
-        .iter()
-        .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .collect();
-    ingest_plan.files.retain(|f| wanted.contains(&f.rel));
+    let wanted: BTreeSet<PathBuf> = files.iter().cloned().collect();
+    let filter = move |path: &Path| wanted.contains(path);
+    let ingest_plan =
+        plan::plan_source_filtered(&ctx.args.inbox, &known, plan::DedupeMode::Skip, &filter)
+            .with_context(|| format!("planning inbox {}", ctx.args.inbox.display()))?;
     run_shared_ingest(
         app,
         ctx,
@@ -870,7 +901,19 @@ fn process_triage_dir(
     Ok(contrib)
 }
 
-/// The quiescent loose files' ingest + individual `.processed/` moves.
+/// The quiescent loose files' ingest. Unlike a contribution (manifested or
+/// a manifest-less folder — see [`require_clean_outcome`]), a
+/// `(loose files)` row groups files that share nothing but having landed in
+/// the inbox root at the same time, so this deliberately does NOT require a
+/// clean outcome: one bad file (a 0-byte file, a permission problem) must
+/// never wedge every good file in the same group forever. Every file the
+/// engine actually placed is moved to `.processed/` and counts toward
+/// `placed`; every file it failed or rejected is left in the inbox for the
+/// operator to fix or remove, named on stderr (`run_shared_ingest` uses
+/// `IngestReport::Silent`, so nothing else prints them), and picked back up
+/// as a loose file on the next pass. A fresh failure/rejection still fails
+/// the whole run's exit code — the same polarity as any other operator
+/// fault — but never blocks the files that succeeded.
 fn process_triage_loose_files(
     app: &mut FsApp,
     ctx: &InboxCtx<'_>,
@@ -878,13 +921,32 @@ fn process_triage_loose_files(
     node: &(String, ParaKind, String),
 ) -> Result<ContribOutcome> {
     let outcome = triage_loose_files_ingest(app, ctx, files, node.clone())?;
-    let contrib = require_clean_outcome(&outcome)?;
+    for bad in outcome.failed.iter().chain(&outcome.rejected) {
+        eprintln!("(loose files): {}: {}", bad.rel, bad.reason);
+    }
     if !ctx.args.keep {
+        let placed: BTreeSet<&str> = outcome.placed.iter().map(|p| p.rel.as_str()).collect();
         for file in files {
-            move_file_to_processed(&ctx.args.inbox, file)?;
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if placed.contains(name.as_str()) {
+                move_file_to_processed(&ctx.args.inbox, file)?;
+            }
         }
     }
-    Ok(contrib)
+    let failed = outcome.failed.len() + outcome.rejected.len();
+    if failed > 0 {
+        return Ok(ContribOutcome::PartlyIngested {
+            placed: outcome.placed.len(),
+            failed,
+        });
+    }
+    Ok(ContribOutcome::Ingested {
+        placed: outcome.placed.len(),
+        skipped_duplicates: outcome.skipped_duplicates.len(),
+    })
 }
 
 /// The `.processed/<name>` target for a move, with a numeric suffix on
@@ -944,9 +1006,18 @@ fn print_report(report: &[(String, ContribOutcome)], json: bool) -> Result<()> {
     }
     let mut any_failed = false;
     for (name, outcome) in report {
-        if let ContribOutcome::Failed { reason } = outcome {
-            eprintln!("{name}: {reason}");
-            any_failed = true;
+        match outcome {
+            ContribOutcome::Failed { reason } => {
+                eprintln!("{name}: {reason}");
+                any_failed = true;
+            }
+            // Per-file reasons already reached stderr when this was
+            // constructed (see `process_triage_loose_files`) — nothing more
+            // to print here, but it must still fail the pass.
+            ContribOutcome::PartlyIngested { .. } => any_failed = true,
+            ContribOutcome::Ingested { .. }
+            | ContribOutcome::Waiting { .. }
+            | ContribOutcome::RecordedFailure { .. } => {}
         }
     }
     anyhow::ensure!(
@@ -972,6 +1043,9 @@ fn print_report_json(report: &[(String, ContribOutcome)]) -> Result<()> {
                 }
                 row
             }
+            ContribOutcome::PartlyIngested { placed, failed } => serde_json::json!({
+                "contribution": name, "status": "partly_ingested", "placed": placed, "failed": failed
+            }),
             ContribOutcome::Waiting { reasons } => {
                 serde_json::json!({"contribution": name, "status": "waiting", "reasons": reasons})
             }
@@ -1000,6 +1074,9 @@ fn print_report_text(report: &[(String, ContribOutcome)]) {
             }
             ContribOutcome::Ingested { placed, .. } => {
                 println!("{name}: ingested {placed} file(s)");
+            }
+            ContribOutcome::PartlyIngested { placed, failed } => {
+                println!("{name}: ingested {placed} file(s), {failed} failed — see stderr");
             }
             ContribOutcome::Waiting { reasons } => {
                 println!("{name}: waiting — {}", reasons.join("; "));

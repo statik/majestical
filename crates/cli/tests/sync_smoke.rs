@@ -231,6 +231,69 @@ fn push_replicates_segments_and_blobs_to_a_location() {
 }
 
 #[test]
+fn location_list_and_rm_reflect_the_real_config() {
+    // `cmd_location_list`/`cmd_location_rm` are thin CLI wrappers with no
+    // prior coverage through the real binary (only their inner
+    // `remove_location`/config logic was unit-tested) — this exercises the
+    // actual command surface end to end.
+    let root = tempfile::tempdir().expect("tempdir");
+    let fx = fixture(root.path(), "fx");
+    let nas = root.path().join("nas");
+    let shuttle = root.path().join("shuttle");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    std::fs::create_dir_all(&shuttle).expect("mkdir");
+    fx.add_location("nas", &nas);
+    fx.add_location("shuttle", &shuttle);
+
+    let out = fx
+        .maj()
+        .args(["sync", "location", "list", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("parse json");
+    let names: Vec<&str> = json["locations"]
+        .as_array()
+        .expect("locations array")
+        .iter()
+        .map(|l| l["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["nas", "shuttle"],
+        "list must report both configured locations: {stdout}"
+    );
+
+    fx.maj()
+        .args(["sync", "location", "rm", "shuttle"])
+        .assert()
+        .success();
+
+    let out = fx
+        .maj()
+        .args(["sync", "location", "list", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("parse json");
+    let names: Vec<&str> = json["locations"]
+        .as_array()
+        .expect("locations array")
+        .iter()
+        .map(|l| l["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["nas"],
+        "rm must remove exactly the named location, leaving the other: {stdout}"
+    );
+    assert!(
+        shuttle.is_dir(),
+        "rm must never touch the location's own files"
+    );
+}
+
+#[test]
 fn readonly_refuses_push_naming_the_config_file() {
     let root = tempfile::tempdir().expect("tempdir");
     let fx = fixture(root.path(), "fx");

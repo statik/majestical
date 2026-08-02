@@ -133,6 +133,11 @@ fn a_valid_contribution_ingests_with_provenance_and_moves_to_processed() {
         "report names the contribution: {stdout}"
     );
     assert!(
+        !stdout.contains("already known"),
+        "nothing was a duplicate this pass — must not print a 0-count \
+         \"already known\" clause: {stdout}"
+    );
+    assert!(
         s.inbox().join(".processed/drop-1/clip.mov").is_file(),
         "success moves the contribution to .processed/"
     );
@@ -372,6 +377,40 @@ fn json_output_is_a_single_parseable_document() {
     assert_eq!(arr[0]["contribution"], "drop-json");
     assert_eq!(arr[0]["status"], "ingested");
     assert_eq!(arr[0]["placed"], 1);
+    assert!(
+        arr[0].get("skipped_duplicates").is_none(),
+        "nothing was a duplicate this pass — the key must be absent, not 0: {arr:?}"
+    );
+}
+
+/// `--json`'s `skipped_duplicates` key is present (and correct) exactly
+/// when a duplicate was actually skipped — the JSON-mode counterpart of
+/// `json_output_is_a_single_parseable_document`'s absence check above.
+#[test]
+fn json_output_includes_skipped_duplicates_only_when_nonzero() {
+    let s = Setup::new();
+    let payload = b"json-dup-bytes";
+    s.write_contribution("drop-first", payload, &xxh64_hex(payload));
+    s.process().success();
+
+    s.write_contribution("drop-second", payload, &xxh64_hex(payload));
+    let out = maj(&s.catalog(), &s.state())
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--json"])
+        .assert()
+        .success();
+    let stdout = out.get_output().stdout.clone();
+    let rows: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout must be exactly one JSON document");
+    let arr = rows.as_array().expect("report is a JSON array");
+    assert_eq!(arr[0]["contribution"], "drop-second");
+    assert_eq!(
+        arr[0]["skipped_duplicates"], 1,
+        "the duplicate must be counted: {arr:?}"
+    );
 }
 
 /// The marker fingerprint must fold in the listed file's own mtime/size,
@@ -473,6 +512,44 @@ fn an_archived_para_target_names_unarchive_not_add() {
     assert!(
         !stdout.contains("maj para add"),
         "an archived target must not suggest creating a duplicate node: {stdout}"
+    );
+}
+
+/// An archived node of a DIFFERENT kind but the SAME name as the target must
+/// not be mistaken for a match: `resolve_contribution_node` checks archived
+/// AND kind AND name together, not any one alone. A test that only ever
+/// archives the exact target node (like the one above) can't tell `&&` apart
+/// from `||` here, since every sub-condition is true for that one node
+/// either way.
+#[test]
+fn an_archived_node_of_a_different_kind_is_not_mistaken_for_the_target() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "area", "newthing"])
+        .assert()
+        .success();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "archive", "area/newthing"])
+        .assert()
+        .success();
+    s.write_manifest(
+        "drop-wrong-kind",
+        "dana",
+        Some("resource/newthing"),
+        &[("clip.mov", "0000000000000000", 4)],
+    );
+    std::fs::write(s.inbox().join("drop-wrong-kind/clip.mov"), b"abcd").expect("write");
+
+    let out = s.process().failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("does not exist yet") && stdout.contains("maj para add resource newthing"),
+        "an archived node of a different kind must not satisfy the target — \
+         this must fall through to \"does not exist yet\": {stdout}"
+    );
+    assert!(
+        !stdout.contains("exists but is archived"),
+        "must not report the wrong-kind archived node as a match: {stdout}"
     );
 }
 
@@ -758,6 +835,11 @@ fn a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group() {
         "the row must report the partial result with a greppable marker: {stdout}"
     );
     assert!(
+        !stdout.contains("already known"),
+        "no duplicates were skipped this pass — must not print a 0-count \
+         \"already known\" clause: {stdout}"
+    );
+    assert!(
         s.inbox().join(".processed/good.jpg").is_file(),
         "the good file must still move to .processed/"
     );
@@ -793,6 +875,145 @@ fn a_bad_loose_file_does_not_wedge_a_good_loose_file_in_the_same_group() {
     assert!(
         s.inbox().join("bad.jpg").is_file(),
         "the bad file is still there — the operator hasn't acted yet"
+    );
+}
+
+/// A PARTIAL row (some files failed) that ALSO skipped a duplicate must
+/// report both counts together — the same zero-boundary distinction as the
+/// all-succeeded case above, but for `ContribOutcome::PartlyIngested`'s own
+/// (separate) `skipped_duplicates` branch.
+#[test]
+fn a_partial_batch_with_a_duplicate_reports_both_counts() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let dup_payload = b"already-known-bytes";
+    std::fs::write(s.inbox().join("orig.jpg"), dup_payload).expect("write");
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+
+    // Second pass: a re-dropped duplicate, a genuinely new file, and a
+    // 0-byte reject — all in the same triage batch.
+    std::fs::write(s.inbox().join("dup.jpg"), dup_payload).expect("write duplicate");
+    std::fs::write(s.inbox().join("new.jpg"), b"brand-new-bytes").expect("write");
+    std::fs::write(s.inbox().join("bad.jpg"), b"").expect("write 0-byte file");
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("PARTIAL")
+            && stdout.contains("ingested 1")
+            && stdout.contains("1 already known")
+            && stdout.contains("1 FAILED"),
+        "a partial batch with a duplicate must report placed, duplicate, \
+         and failed counts together: {stdout}"
+    );
+    assert!(
+        s.inbox().join(".processed/dup.jpg").is_file(),
+        "the duplicate must still drain to .processed/"
+    );
+    assert!(
+        s.inbox().join(".processed/new.jpg").is_file(),
+        "the new file must still drain to .processed/"
+    );
+    assert!(
+        s.inbox().join("bad.jpg").is_file(),
+        "the bad file must stay in the inbox for the operator to fix"
+    );
+}
+
+/// `--json`'s `skipped_duplicates` key on a `partly_ingested` row — the
+/// JSON-mode counterpart of [`a_partial_batch_with_a_duplicate_reports_both_counts`],
+/// closing `print_report_json`'s separate `PartlyIngested` arm (the boundary
+/// check at that arm is a distinct source location from the `Ingested`
+/// arm's, so nothing above already covers it).
+#[test]
+fn json_output_includes_skipped_duplicates_on_a_partial_row() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    let dup_payload = b"json-partial-dup-bytes";
+    std::fs::write(s.inbox().join("orig.jpg"), dup_payload).expect("write");
+    maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+
+    std::fs::write(s.inbox().join("dup.jpg"), dup_payload).expect("write duplicate");
+    std::fs::write(s.inbox().join("bad.jpg"), b"").expect("write 0-byte file");
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .args(["--json"])
+        .assert()
+        .failure();
+    let stdout = out.get_output().stdout.clone();
+    let rows: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout must be exactly one JSON document");
+    let arr = rows.as_array().expect("report is a JSON array");
+    assert_eq!(arr[0]["status"], "partly_ingested");
+    assert_eq!(
+        arr[0]["skipped_duplicates"], 1,
+        "the duplicate must be counted on the partial row: {arr:?}"
+    );
+}
+
+/// The zero-boundary counterpart of the test above: a `partly_ingested` row
+/// with no duplicates must omit the key entirely, not report 0.
+#[test]
+fn json_output_omits_skipped_duplicates_on_a_partial_row_with_none() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    std::fs::write(s.inbox().join("good.jpg"), b"good-bytes").expect("write");
+    std::fs::write(s.inbox().join("bad.jpg"), b"").expect("write 0-byte file");
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .args(["--json"])
+        .assert()
+        .failure();
+    let stdout = out.get_output().stdout.clone();
+    let rows: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout must be exactly one JSON document");
+    let arr = rows.as_array().expect("report is a JSON array");
+    assert_eq!(arr[0]["status"], "partly_ingested");
+    assert!(
+        arr[0].get("skipped_duplicates").is_none(),
+        "nothing was a duplicate this pass — the key must be absent, not 0: {arr:?}"
     );
 }
 

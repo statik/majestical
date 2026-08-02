@@ -509,6 +509,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_temp_ms_is_one_hour() {
+        // Every test that exercises the sweep only ever backdates well past
+        // an hour or leaves a file fresh — none pins the constant's own
+        // definition, so an arithmetic slip in `60 * 60 * 1000` would be
+        // self-consistent with all of them.
+        assert_eq!(STALE_TEMP_MS, 3_600_000);
+    }
+
+    #[test]
+    fn blob_class_as_str_names_every_variant() {
+        assert_eq!(BlobClass::Thumbs.as_str(), "thumbs");
+        assert_eq!(BlobClass::Metadata.as_str(), "metadata");
+        assert_eq!(BlobClass::Vectors.as_str(), "vectors");
+        assert_eq!(BlobClass::Transcripts.as_str(), "transcripts");
+    }
+
+    #[test]
     fn classify_covers_every_blob_shape() {
         assert_eq!(classify_blob("thumb-320.webp"), BlobClass::Thumbs);
         assert_eq!(classify_blob("transcript.json.zst"), BlobClass::Transcripts);
@@ -827,6 +844,83 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn permission_denied_source_events_directory_propagates_as_error() {
+        // Same guard as the blobs test above, but for `plan_segments`' own
+        // `events/` read — a distinct match arm the blobs test can't reach.
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        FileEventLog::init(src.path(), &MachineId("m1".into())).expect("init");
+        let events_dir = src.path().join("events");
+        let original_perms = std::fs::metadata(&events_dir).expect("meta").permissions();
+        std::fs::set_permissions(&events_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let result = plan_transfer(src.path(), dst.path());
+
+        std::fs::set_permissions(&events_dir, original_perms).expect("restore perms");
+
+        assert!(
+            matches!(result, Err(TransferError::Io { .. })),
+            "a permission-denied events/ dir must propagate as an error, not \
+             be silently treated as an absent (empty) peer: {result:?}"
+        );
+    }
+
+    #[test]
+    fn missing_source_events_directory_is_a_valid_empty_peer() {
+        // The inverse of the permission-denied case above: a `src` that has
+        // never had `maj sync location add` initialize it (no `events/` dir
+        // at all, e.g. blobs-only) must plan as empty, not error.
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(src.path().join("blobs")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("events")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("blobs")).expect("skeleton");
+
+        let plan =
+            plan_transfer(src.path(), dst.path()).expect("a missing events/ dir must not error");
+        assert!(
+            plan.segments.is_empty(),
+            "no events/ dir means nothing to plan: {:?}",
+            plan.segments
+        );
+    }
+
+    #[test]
+    fn a_segment_copy_with_zero_landed_events_is_excluded_from_events_added() {
+        // A copied delta can carry real new bytes but zero complete lines
+        // (a torn tail) — `execute` must not add a zero-count entry for
+        // that machine to `events_added`.
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        let mut log = FileEventLog::init(src.path(), &MachineId("m1".into())).expect("init");
+        log.append(&[ev(1)]).expect("append");
+        let seg = src.path().join("events/m1/0001.jsonl");
+        let bytes = std::fs::read(&seg).expect("read seg");
+        // Drop the trailing newline and part of the JSON so no complete
+        // line survives — a torn tail, not consumed by any reader.
+        std::fs::write(&seg, &bytes[..bytes.len() - 2]).expect("truncate mid-line");
+        std::fs::create_dir_all(dst.path().join("blobs")).expect("skeleton");
+
+        let plan = plan_transfer(src.path(), dst.path()).expect("plan");
+        assert_eq!(
+            plan.segments.len(),
+            1,
+            "a torn-but-grown segment is still planned"
+        );
+        let outcome = execute(src.path(), dst.path(), &plan).expect("execute");
+        assert_eq!(outcome.segments_copied, 1, "the torn segment still copies");
+        assert!(
+            outcome.events_added.is_empty(),
+            "a segment whose copied delta carries zero complete events must \
+             not appear in events_added: {:?}",
+            outcome.events_added
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn symlinked_blob_file_syncs_but_symlinked_directory_is_not_descended() {
         let src = tempfile::tempdir().expect("tempdir");
         let dst = tempfile::tempdir().expect("tempdir");
@@ -863,6 +957,12 @@ mod tests {
             !rels.iter().any(|r| r.contains("hidden.json")),
             "a symlinked blob DIRECTORY must not be descended: {rels:?}"
         );
+        assert_eq!(
+            rels.len(),
+            1,
+            "the symlinked directory itself must not be planned as a blob \
+             (only the real symlinked file may appear): {rels:?}"
+        );
 
         execute(src.path(), dst.path(), &plan).expect("execute");
         let copied =
@@ -870,6 +970,32 @@ mod tests {
         assert_eq!(
             copied, b"real bytes",
             "the symlinked file's content must be copied through the link"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn broken_symlink_is_silently_excluded_not_errored() {
+        // `is_effectively_file`'s doc says a broken symlink is treated as
+        // "not a file" silently. Without this, a whole-function or `&&`->
+        // `||` mutation of that gate would make `plan_blobs` try to stat
+        // the symlink's (missing) target for `size` and propagate an error
+        // instead of quietly excluding it.
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(src.path().join("events")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("events")).expect("skeleton");
+        std::fs::create_dir_all(dst.path().join("blobs")).expect("skeleton");
+        let ghost = src.path().join("blobs/aa/aahex/ghost.json.zst");
+        std::fs::create_dir_all(ghost.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(src.path().join("never-existed"), &ghost)
+            .expect("symlink broken target");
+
+        let plan = plan_transfer(src.path(), dst.path()).expect("plan must not error");
+        assert!(
+            plan.blobs.is_empty(),
+            "a broken symlink must be silently excluded, not planned: {:?}",
+            plan.blobs
         );
     }
 
@@ -899,6 +1025,11 @@ mod tests {
         assert!(
             dst.path().join("blobs/bb/bbhex/thumb-320.webp").is_file(),
             "the surviving blob must be copied"
+        );
+        assert_eq!(
+            outcome.blob_bytes,
+            "thumb2".len() as u64,
+            "blob_bytes must count the surviving blob's real size"
         );
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(

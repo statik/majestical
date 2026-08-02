@@ -596,6 +596,39 @@ mod tests {
         assert!(load_manifest(dir.path()).expect("load").is_none());
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn a_permission_denied_manifest_is_a_hard_error_not_treated_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        std::fs::write(&manifest_path, manifest_json("[]")).expect("write");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // Same reasoning as `check_files`'s permission test: verify the OS
+        // actually enforces the block independently of `load_manifest`'s
+        // own result, so a mutant that folds every io error into "absent"
+        // can't hide behind an environment that doesn't enforce mode 000.
+        let os_enforces_the_block = std::fs::read_to_string(&manifest_path)
+            .err()
+            .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+
+        let result = load_manifest(dir.path());
+
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms");
+
+        if !os_enforces_the_block {
+            eprintln!("skipping: this environment does not enforce a mode-000 file");
+            return;
+        }
+        assert!(
+            result.is_err(),
+            "a permission-denied manifest must be a hard error, not Ok(None): {result:?}"
+        );
+    }
+
     /// A stat failure other than "not found" (permission denied) on a
     /// listed file must surface loudly, not sit in `waiting` forever —
     /// "not yet present" would tell the operator to just wait, which is
@@ -641,6 +674,41 @@ mod tests {
         assert!(
             result.is_err(),
             "a permission failure must be a hard error, not silently waiting"
+        );
+    }
+
+    /// Deterministic alternative to the permission-based test above: instead
+    /// of relying on the OS enforcing `chmod 000` (which the test above must
+    /// hedge against, and which — see its own history — can't actually
+    /// isolate this guard alone, since `collect_unlisted`'s separate
+    /// directory walk fails on the same locked directory regardless of this
+    /// guard's mutation state). Listing a file *through* a path component
+    /// that is itself a plain file (`plain-file/IMG_1.HEIC`) makes
+    /// `symlink_metadata` fail with `NotADirectory`/`Other`, never
+    /// `NotFound` — and `collect_unlisted`'s walk never descends into
+    /// `plain-file` (it isn't a directory), so this is the ONLY error
+    /// source in the call, isolating the guard completely.
+    #[test]
+    fn a_listed_path_through_a_non_directory_component_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain-file"), b"not a directory").expect("write");
+        let manifest = ContributionManifest {
+            version: 1,
+            contributor: "dana".to_string(),
+            para_target: None,
+            source: None,
+            note: None,
+            files: vec![ManifestFile {
+                name: "plain-file/IMG_1.HEIC".to_string(),
+                xxh64: "deadbeef00000000".to_string(),
+                size: 4,
+            }],
+        };
+        let result = check_files(dir.path(), &manifest);
+        assert!(
+            result.is_err(),
+            "a path through a non-directory component must be a hard error, \
+             not silently waiting: {result:?}"
         );
     }
 }

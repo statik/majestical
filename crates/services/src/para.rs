@@ -1,8 +1,12 @@
 //! PARA node reference resolution, shared by `maj para` and `search`'s
 //! `para:` filter. Moved verbatim from `crates/cli/src/commands.rs`.
-use anyhow::Result;
+use crate::app::FsApp;
+use crate::catalog::open_catalog;
+use crate::error::ServiceError;
+use anyhow::{Context, Result};
 use majestical_core::event::ParaKind;
 use majestical_core::projection::Projection;
+use std::path::Path;
 
 /// # Errors
 /// Returns an error if `kind` isn't one of `project`, `area`, `resource`, or
@@ -52,5 +56,70 @@ pub fn resolve_para_node(projection: &Projection, reference: &str) -> Result<Str
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+/// One PARA node row, as returned by the sqlite catalog's `para_nodes`
+/// query.
+#[derive(serde::Serialize)]
+pub struct ParaNodeRow {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub archived: bool,
+}
+
+/// Everything `maj para list` renders.
+#[derive(serde::Serialize)]
+pub struct ParaOutcome {
+    pub nodes: Vec<ParaNodeRow>,
+}
+
+/// `maj para list`: every PARA node the catalog has ever created.
+///
+/// # Errors
+/// Returns an error if the sqlite catalog can't be opened/synced or the
+/// para-nodes query fails.
+pub fn para_list(app: &FsApp, catalog_dir: &Path) -> Result<ParaOutcome, ServiceError> {
+    para_list_impl(app, catalog_dir).map_err(ServiceError::from)
+}
+
+fn para_list_impl(app: &FsApp, catalog_dir: &Path) -> Result<ParaOutcome> {
+    let (db, _projection) = open_catalog(app, catalog_dir)?;
+    let nodes = db.para_nodes().context("querying para nodes")?;
+    let nodes = nodes
+        .into_iter()
+        .map(|(id, kind, name, archived)| ParaNodeRow {
+            id,
+            kind,
+            name,
+            archived,
+        })
+        .collect();
+    Ok(ParaOutcome { nodes })
+}
+
+#[cfg(test)]
+mod para_list_tests {
+    use super::*;
+    use majestical_core::event::{Op, ParaKind};
+
+    #[test]
+    fn para_list_reports_every_created_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        app.emit(vec![Op::ParaNodeCreate {
+            node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            kind: ParaKind::Project,
+            name: "client-x".into(),
+        }])
+        .expect("emit");
+        let outcome = para_list(&app, &root).expect("para_list");
+        assert_eq!(outcome.nodes.len(), 1);
+        let row = &outcome.nodes[0];
+        assert_eq!(row.name, "client-x");
+        assert_eq!(row.kind, "project");
+        assert!(!row.archived);
     }
 }

@@ -4584,9 +4584,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "toml",
  "ulid",
  "walkdir",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

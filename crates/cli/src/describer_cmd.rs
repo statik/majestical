@@ -5,7 +5,9 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 
-use majestical_services::describer_config::{config_path, load_config};
+use majestical_services::describer_config::{
+    DescriberConfigView, config_path, load_config, to_view,
+};
 
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var("MAJ_OPENROUTER_KEY")
@@ -34,13 +36,13 @@ pub(crate) fn cmd_set(catalog_root: &Path, args: &SetArgs) -> anyhow::Result<()>
     config
         .store(&path)
         .with_context(|| format!("write {}", path.display()))?;
-    print_config(&config);
+    print_view(&to_view(&config));
     Ok(())
 }
 
 pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
-    match load_config(catalog_root)? {
-        Some(config) => print_config(&config),
+    match majestical_services::describer_config::show(catalog_root)? {
+        Some(view) => print_view(&view),
         None => println!(
             "no describer configured — run `maj describer set --backend <ollama|lm-studio|open-router> --model <model>`"
         ),
@@ -80,11 +82,11 @@ pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_config(config: &DescriberConfig) {
-    println!("backend:  {}", config.backend.as_str());
-    println!("base-url: {}", config.base_url);
-    println!("model:    {}", config.model);
-    match &config.api_key {
+fn print_view(view: &DescriberConfigView) {
+    println!("backend:  {}", view.backend);
+    println!("base-url: {}", view.base_url);
+    println!("model:    {}", view.model);
+    match &view.api_key {
         Some(_) => println!("api-key:  (redacted)"),
         None => println!("api-key:  (none)"),
     }

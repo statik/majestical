@@ -1,5 +1,6 @@
 //! Application state shared by every head (CLI, MCP, GUI): adapter wiring,
 //! event emission, projection loading.
+use crate::error::ServiceError;
 use anyhow::{Context, Result};
 use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
 use majestical_core::event::{Event, EventId, Op};
@@ -74,11 +75,12 @@ impl FsApp {
     /// Returns an error if `root` has no `events` directory (no catalog
     /// there yet), or if the underlying event log fails to open.
     pub fn open(root: &Path, machine: &str, author: &str) -> Result<Self> {
-        anyhow::ensure!(
-            root.join("events").is_dir(),
-            "no catalog at {} — run `maj catalog init` first",
-            root.display()
-        );
+        if !root.join("events").is_dir() {
+            return Err(ServiceError::NoCatalog {
+                root: root.to_path_buf(),
+            }
+            .into());
+        }
         let machine = MachineId(machine.to_string());
         let log = FileEventLog::open(root, &machine)
             .with_context(|| format!("opening catalog at {}", root.display()))?;

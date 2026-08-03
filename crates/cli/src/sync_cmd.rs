@@ -1,88 +1,20 @@
 //! `maj sync`: location config plus push/pull/status orchestration over
 //! `crates/sync`'s transfer engine. Locations are per-machine config
 //! (mount points differ per machine) in the state dir's `sync.toml`,
-//! never synced.
+//! never synced. `SyncConfig`/`Location`/`config_path`/`resolve_targets`/
+//! `NO_LOCATIONS_HINT` live in `majestical_services::sync`, shared with
+//! `status`/`location list`'s compute there; this module keeps push/pull
+//! (which transfer files and apply landed events) plus location add/rm and
+//! rendering.
 
 use anyhow::{Context, Result};
 use majestical_services::app::FsApp;
+use majestical_services::sync::{
+    Location, NO_LOCATIONS_HINT, SyncConfig, config_path, resolve_targets,
+};
 use majestical_sync::transfer;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-pub(crate) const NO_LOCATIONS_HINT: &str =
-    "no sync locations configured — add one with `maj sync location add <name> <path>`";
-
-#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SyncConfig {
-    /// The read-only-member switch: a machine with `readonly = true` never
-    /// pushes (events already carry author identity, so this is the whole
-    /// feature — a policy on the push side, not a data concept).
-    #[serde(default)]
-    pub readonly: bool,
-    #[serde(default, rename = "location")]
-    pub locations: Vec<Location>,
-    /// Fields a newer `maj` wrote that this build doesn't know about.
-    /// Flattened so `location add|rm` round-trip them unchanged instead of
-    /// silently dropping them.
-    #[serde(flatten)]
-    pub extra: toml::Table,
-}
-
-#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Location {
-    pub name: String,
-    pub path: PathBuf,
-    /// See [`SyncConfig::extra`].
-    #[serde(flatten)]
-    pub extra: toml::Table,
-}
-
-impl SyncConfig {
-    /// Load config from `path`; a missing file returns `Self::default()` (a
-    /// catalog that has never configured sync), never an error.
-    ///
-    /// # Errors
-    /// Returns an error when `path` exists but can't be read, or its
-    /// contents don't parse as TOML.
-    pub(crate) fn load(path: &Path) -> Result<Self> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("reading {}", path.display()));
-            }
-        };
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-    }
-
-    /// Serialize and write `path`, replacing it via a same-directory
-    /// temp-file-then-rename so a concurrent reader never observes a
-    /// partial write. The file is always rewritten wholesale from this
-    /// struct: a hand-edited known field (e.g. `readonly`) survives a
-    /// later `location add|rm`, but TOML comments do not — they have no
-    /// representation in the struct, so they're dropped on the next store.
-    ///
-    /// # Errors
-    /// Returns an error when serialization fails, or the write/rename
-    /// fails.
-    pub(crate) fn store(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string_pretty(self).context("serializing sync config")?;
-        let file_name = path.file_name().map_or_else(
-            || "sync.toml".to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let tmp = path.with_file_name(format!("{file_name}.tmp"));
-        std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("finalizing {}", path.display()))
-    }
-}
-
-/// The per-catalog `sync.toml` path in this machine's state dir.
-pub(crate) fn config_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(majestical_services::state_dir::state_dir_for(catalog)?.join("sync.toml"))
-}
+use std::path::Path;
 
 /// Registers a new sync location: validates `location` is an accessible,
 /// UTF-8-representable directory, canonicalizes it (locations are mount
@@ -196,29 +128,6 @@ fn filter_plan(plan: transfer::TransferPlan, only: Option<OnlyArg>) -> transfer:
     }
 }
 
-/// Locations to operate on: every configured location, or exactly the named
-/// one.
-///
-/// # Errors
-/// Returns an error when no locations are configured at all, or `name` is
-/// given but doesn't match any configured location.
-fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Vec<&'a Location>> {
-    anyhow::ensure!(!cfg.locations.is_empty(), "{NO_LOCATIONS_HINT}");
-    let Some(name) = name else {
-        return Ok(cfg.locations.iter().collect());
-    };
-    cfg.locations.iter().find(|l| l.name == name).map_or_else(
-        || {
-            let known: Vec<&str> = cfg.locations.iter().map(|l| l.name.as_str()).collect();
-            Err(anyhow::anyhow!(
-                "no sync location named '{name}' — configured: {}",
-                known.join(", ")
-            ))
-        },
-        |l| Ok(vec![l]),
-    )
-}
-
 /// Which side of a location pair is the transfer source. Push sends the
 /// catalog's own state out to the location; pull fetches the location's
 /// state into the catalog — otherwise identical plumbing (same plan/execute
@@ -277,12 +186,14 @@ impl LocationResult {
 /// Returns an error naming `maj catalog init` as the remedy when `catalog`
 /// has no `events/` directory.
 fn ensure_catalog(catalog: &Path) -> Result<()> {
-    anyhow::ensure!(
-        catalog.join("events").is_dir(),
-        "no catalog at {} — run `maj catalog init` first",
-        catalog.display()
-    );
-    Ok(())
+    if catalog.join("events").is_dir() {
+        Ok(())
+    } else {
+        Err(majestical_services::error::ServiceError::NoCatalog {
+            root: catalog.to_path_buf(),
+        }
+        .into())
+    }
 }
 
 /// `maj sync push`: replicate everything this catalog has (segments +
@@ -639,180 +550,44 @@ fn json_rows(results: &[LocationResult]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// One machine's ahead/behind segment tally within a direction: files
-/// pending and the bytes the destination is missing. `saturating_sub`
-/// mirrors `crates/sync/src/transfer.rs`'s own `copy_one_segment` (`bytes:
-/// seg.src_len.saturating_sub(seg.dst_len)`) — both read the same
-/// [`transfer::SegmentCopy`] fields, and a plain `-` would panic on
-/// underflow in a debug build if the two ever disagreed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-struct SegmentCounts {
-    files: usize,
-    bytes: u64,
-}
-
-/// Blob counts by [`transfer::BlobClass`], always present — even at zero —
-/// so the JSON contract's key set never varies with what's actually
-/// pending. A struct rather than a `BTreeMap<&str, usize>`: field access
-/// can't panic the way indexing a map by a hand-typed string literal could
-/// (e.g. a typo'd key, or a class added to the enum but not the map).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-struct BlobCounts {
-    thumbs: usize,
-    metadata: usize,
-    vectors: usize,
-    transcripts: usize,
-}
-
-impl BlobCounts {
-    fn from_blobs(blobs: &[transfer::BlobCopy]) -> Self {
-        let mut counts = Self::default();
-        for b in blobs {
-            match b.class {
-                transfer::BlobClass::Thumbs => counts.thumbs += 1,
-                transfer::BlobClass::Metadata => counts.metadata += 1,
-                transfer::BlobClass::Vectors => counts.vectors += 1,
-                transfer::BlobClass::Transcripts => counts.transcripts += 1,
-            }
-        }
-        counts
-    }
-}
-
-/// One location's status: reachable (both directions' full plans, so text
-/// and JSON rendering read the exact same walk and can never disagree),
-/// unreachable (the mount isn't there), or failed (`plan_transfer` itself
-/// errored — e.g. a permission problem on a location that IS mounted).
-/// The latter two are both reported rows per the spec, never errors that
-/// abort the rest of the report — one bad location must never hide every
-/// other location's status.
-enum StatusRow {
-    Reachable {
-        name: String,
-        ahead: transfer::TransferPlan,
-        behind: transfer::TransferPlan,
-    },
-    Unreachable {
-        name: String,
-        path: PathBuf,
-    },
-    Failed {
-        name: String,
-        error: String,
-    },
-}
-
 /// `maj sync status`: for every configured location, plans BOTH
 /// directions — what a push would send (`ahead`) and what a pull would
-/// fetch (`behind`) — without executing either
-/// ([`transfer::plan_transfer`] only reads; it never creates a `tmp/`
-/// staging dir or touches anything, unlike [`transfer::execute`]). Every
-/// count comes from a fresh diff of real files at this moment; nothing is
-/// cached, so a file that changes underneath a location between two
-/// `status` calls changes the next call's counts (see the
-/// `status_counts_are_walked_not_cached` sabotage test). An unreachable
-/// location, or one whose plan itself fails, is a reported row, never an
-/// error that aborts the report — `status` exits 0 as long as at least one
-/// location is configured; it reports, it doesn't enforce (push/pull carry
-/// the exit policy — see [`check_exit_policy`]).
+/// fetch (`behind`) — without executing either. Compute (the walk itself,
+/// unreachable/failed detection, per-machine/per-class counting) lives in
+/// `majestical_services::sync::status`; this renders its
+/// [`majestical_services::sync::StatusRow`]s.
 ///
 /// # Errors
 /// Returns an error when there's no catalog at `catalog`, or no sync
 /// locations are configured.
 pub(crate) fn cmd_status(catalog: &Path, json: bool) -> Result<()> {
-    ensure_catalog(catalog)?;
-    let cfg = SyncConfig::load(&config_path(catalog)?)?;
-    let targets = resolve_targets(&cfg, None)?;
-    let rows: Vec<StatusRow> = targets
-        .into_iter()
-        .map(|loc| status_row(catalog, loc))
-        .collect();
+    let outcome = majestical_services::sync::status(catalog)?;
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&status_json_rows(&rows))
+            serde_json::to_string_pretty(&status_json_rows(&outcome.rows))
                 .context("serializing sync status report")?
         );
         return Ok(());
     }
-    print_status_rows(&rows);
-    if cfg.readonly {
+    print_status_rows(&outcome.rows);
+    if outcome.readonly {
         println!("readonly = true — this machine never pushes");
     }
     Ok(())
 }
 
-/// Plans both directions for one location. Read-only, by construction: it
-/// only ever calls [`transfer::plan_transfer`], never
-/// [`transfer::execute`]. A `plan_transfer` error becomes a
-/// [`StatusRow::Failed`] rather than propagating out of this function.
-fn status_row(catalog: &Path, loc: &Location) -> StatusRow {
-    if !loc.path.is_dir() {
-        return StatusRow::Unreachable {
-            name: loc.name.clone(),
-            path: loc.path.clone(),
-        };
-    }
-    match plan_both_directions(catalog, &loc.path) {
-        Ok((ahead, behind)) => StatusRow::Reachable {
-            name: loc.name.clone(),
-            ahead,
-            behind,
-        },
-        Err(error) => StatusRow::Failed {
-            name: loc.name.clone(),
-            error: error.to_string(),
-        },
-    }
-}
-
-/// Plans `ahead` (catalog -> location) then `behind` (location -> catalog),
-/// short-circuiting on the first failure. Split out of [`status_row`] so
-/// the two-directions-in-one-attempt shape can use `?` instead of a manual
-/// match over a tuple of two [`Result`]s.
-///
-/// # Errors
-/// Returns [`transfer::TransferError`] if either direction's plan fails.
-fn plan_both_directions(
-    catalog: &Path,
-    location: &Path,
-) -> Result<(transfer::TransferPlan, transfer::TransferPlan), transfer::TransferError> {
-    let ahead = transfer::plan_transfer(catalog, location)?;
-    let behind = transfer::plan_transfer(location, catalog)?;
-    Ok((ahead, behind))
-}
-
-/// Segment counts grouped per machine — the spec's granularity, unlike
-/// push/pull's report, which totals every machine's bytes into one figure.
-/// A plan never emits a zero-length [`transfer::SegmentCopy`], so every
-/// entry here is already nonzero: both JSON and text rendering can iterate
-/// this directly with no separate filter.
-fn segments_by_machine(segments: &[transfer::SegmentCopy]) -> BTreeMap<String, SegmentCounts> {
-    let mut by_machine: BTreeMap<String, SegmentCounts> = BTreeMap::new();
-    for s in segments {
-        let counts = by_machine.entry(s.machine.clone()).or_default();
-        counts.files += 1;
-        counts.bytes += s.src_len.saturating_sub(s.dst_len);
-    }
-    by_machine
-}
-
-/// True when a plan has nothing pending in either segments or blobs — the
-/// collapse condition for text mode's `<name>: in sync` line.
-fn plan_is_empty(plan: &transfer::TransferPlan) -> bool {
-    plan.segments.is_empty() && plan.blobs.is_empty()
-}
-
 /// One direction's (`ahead` or `behind`) JSON shape:
 /// `{"segments": {"<machine>": {"files", "bytes"}, ...}, "blobs": {"thumbs", "metadata", "vectors", "transcripts"}}`.
-fn direction_json(plan: &transfer::TransferPlan) -> serde_json::Value {
+fn direction_json(counts: &majestical_services::sync::DirectionCounts) -> serde_json::Value {
     serde_json::json!({
-        "segments": segments_by_machine(&plan.segments),
-        "blobs": BlobCounts::from_blobs(&plan.blobs),
+        "segments": counts.segments,
+        "blobs": counts.blobs,
     })
 }
 
-fn status_json_rows(rows: &[StatusRow]) -> Vec<serde_json::Value> {
+fn status_json_rows(rows: &[majestical_services::sync::StatusRow]) -> Vec<serde_json::Value> {
+    use majestical_services::sync::StatusRow;
     rows.iter()
         .map(|r| match r {
             StatusRow::Reachable {
@@ -838,7 +613,8 @@ fn status_json_rows(rows: &[StatusRow]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn print_status_rows(rows: &[StatusRow]) {
+fn print_status_rows(rows: &[majestical_services::sync::StatusRow]) {
+    use majestical_services::sync::StatusRow;
     for row in rows {
         match row {
             StatusRow::Reachable {
@@ -863,13 +639,15 @@ fn print_status_rows(rows: &[StatusRow]) {
 /// line when both directions have nothing pending, otherwise a `<name>:`
 /// header followed by one indented line per direction — never the old
 /// per-line `{name}: {label}:` prefix repeated across every segment and
-/// blob line.
+/// blob line. The "in sync" collapse is a render-time decision over
+/// already-computed counts — [`majestical_services::sync::DirectionCounts::is_empty`]
+/// does the actual emptiness check.
 fn print_reachable_row(
     name: &str,
-    ahead: &transfer::TransferPlan,
-    behind: &transfer::TransferPlan,
+    ahead: &majestical_services::sync::DirectionCounts,
+    behind: &majestical_services::sync::DirectionCounts,
 ) {
-    if plan_is_empty(ahead) && plan_is_empty(behind) {
+    if ahead.is_empty() && behind.is_empty() {
         println!("{name}: in sync");
         return;
     }
@@ -883,23 +661,18 @@ fn print_reachable_row(
 /// `0 segment(s)` when none), then the blob-class counts — always shown,
 /// even at zero, so a converged direction still reads as explicitly
 /// checked rather than silently omitted.
-fn print_direction(label: &str, plan: &transfer::TransferPlan) {
-    let segments = segments_by_machine(&plan.segments);
-    let segment_summary = if segments.is_empty() {
+fn print_direction(label: &str, counts: &majestical_services::sync::DirectionCounts) {
+    let segment_summary = if counts.segments.is_empty() {
         "0 segment(s)".to_string()
     } else {
-        segments
+        counts
+            .segments
             .iter()
-            .map(|(machine, counts)| {
-                format!(
-                    "{machine}: {} segment(s) ({} bytes)",
-                    counts.files, counts.bytes
-                )
-            })
+            .map(|(machine, c)| format!("{machine}: {} segment(s) ({} bytes)", c.files, c.bytes))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let blobs = BlobCounts::from_blobs(&plan.blobs);
+    let blobs = &counts.blobs;
     println!(
         "  {label}: {segment_summary}, blobs: thumbs {} / metadata {} / vectors {} / transcripts {}",
         blobs.thumbs, blobs.metadata, blobs.vectors, blobs.transcripts
@@ -907,25 +680,25 @@ fn print_direction(label: &str, plan: &transfer::TransferPlan) {
 }
 
 pub(crate) fn cmd_location_list(catalog: &Path, json: bool) -> Result<()> {
-    let cfg = SyncConfig::load(&config_path(catalog)?)?;
+    let outcome = majestical_services::sync::locations_list(catalog)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "readonly": cfg.readonly,
-                "locations": &cfg.locations,
+                "readonly": outcome.readonly,
+                "locations": &outcome.locations,
             }))?
         );
         return Ok(());
     }
-    if cfg.locations.is_empty() {
+    if outcome.locations.is_empty() {
         println!("{NO_LOCATIONS_HINT}");
         return Ok(());
     }
-    for l in &cfg.locations {
+    for l in &outcome.locations {
         println!("{}\t{}", l.name, l.path.display());
     }
-    if cfg.readonly {
+    if outcome.readonly {
         println!("readonly = true — this machine never pushes");
     }
     Ok(())
@@ -1092,41 +865,5 @@ mod tests {
         assert_eq!(summary.applied, 8, "events must sum across locations");
         assert_eq!(summary.blobs_fetched, 7, "blobs must sum across locations");
         assert_eq!(summary.machines, vec!["m1".to_string(), "m2".to_string()]);
-    }
-
-    #[test]
-    fn blob_counts_from_blobs_counts_each_class_independently() {
-        let blobs = vec![
-            transfer::BlobCopy {
-                rel: "a".into(),
-                class: transfer::BlobClass::Metadata,
-                size: 1,
-            },
-            transfer::BlobCopy {
-                rel: "b".into(),
-                class: transfer::BlobClass::Metadata,
-                size: 1,
-            },
-            transfer::BlobCopy {
-                rel: "c".into(),
-                class: transfer::BlobClass::Vectors,
-                size: 1,
-            },
-            transfer::BlobCopy {
-                rel: "d".into(),
-                class: transfer::BlobClass::Transcripts,
-                size: 1,
-            },
-        ];
-        let counts = BlobCounts::from_blobs(&blobs);
-        assert_eq!(
-            counts,
-            BlobCounts {
-                thumbs: 0,
-                metadata: 2,
-                vectors: 1,
-                transcripts: 1,
-            }
-        );
     }
 }

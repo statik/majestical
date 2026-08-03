@@ -2,16 +2,15 @@
 //! handlers own behavior.
 use crate::{MetaCmd, ParaCmd, TagCmd};
 use anyhow::{Context, Result};
-use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
 use majestical_services::app::{FsApp, physical_now_ms};
-use majestical_services::catalog::open_catalog;
 use majestical_services::iso8601::iso8601_ms;
 use majestical_services::para::{parse_kind, resolve_para_node};
 use majestical_services::volume_identity;
-use std::collections::{BTreeSet, HashMap};
+use majestical_services::volumes::VolumeRow;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -186,9 +185,8 @@ pub(crate) fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
             println!("ok");
         }
         MetaCmd::Get { asset, field, json } => {
-            let p = app.projection()?;
-            let asset = AssetId(asset);
-            print_meta_get(&p, &asset, field.as_deref(), json);
+            let outcome = majestical_services::meta::meta_get(app, &asset, field.as_deref())?;
+            print_meta_get(&outcome, field.as_deref(), json);
         }
     }
     Ok(())
@@ -199,13 +197,12 @@ pub(crate) fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
 /// in JSON) rather than erroring — mirroring `search`'s "zero hits" style
 /// rather than treating "not set yet" as a failure.
 pub(crate) fn print_meta_get(
-    projection: &Projection,
-    asset: &AssetId,
+    outcome: &majestical_services::meta::MetaOutcome,
     field: Option<&str>,
     json: bool,
 ) {
     if let Some(field) = field {
-        let value = projection.field(asset, field);
+        let value = outcome.fields.first().map(|(_, v)| v.as_str());
         if json {
             println!("{}", serde_json::json!({ field: value }));
         } else if let Some(value) = value {
@@ -215,74 +212,40 @@ pub(crate) fn print_meta_get(
         }
         return;
     }
-    let fields: Vec<(&str, &str)> = projection.fields(asset).collect();
     if json {
-        let obj: serde_json::Map<String, serde_json::Value> = fields
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+        let obj: serde_json::Map<String, serde_json::Value> = outcome
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
         println!("{}", serde_json::Value::Object(obj));
     } else {
-        for (k, v) in fields {
+        for (k, v) in &outcome.fields {
             println!("{k}\t{v}");
         }
     }
 }
 
-/// Cheap phase-2 "is this volume mounted right now" heuristic, not true
-/// device enumeration. `label:`-id volumes are considered online if
-/// `/Volumes/<label>` exists (or the label is the root volume's, which is
-/// always present). `uuid:`-id volumes are considered online only if a
-/// mount at `/Volumes/<label>` exists *and* resolving its identity still
-/// yields the same id — so a same-named but different card reads offline.
-/// False negative: a volume mounted somewhere other than `/Volumes` reads
-/// offline even when present.
-pub(crate) fn volume_is_online(id: &str, label: &str) -> bool {
-    if label == volume_identity::ROOT_LABEL {
-        return true;
-    }
-    let candidate = PathBuf::from("/Volumes").join(label);
-    if !candidate.exists() {
-        return false;
-    }
-    if id.starts_with("uuid:") {
-        return volume_identity::resolve(&candidate).id == id;
-    }
-    true
-}
-
 pub(crate) fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let (db, _projection) = open_catalog(app, catalog_dir)?;
-    let volumes = db.volumes().context("querying volumes")?;
-    let counts: HashMap<String, u64> = db
-        .volume_asset_counts()
-        .context("querying volume asset counts")?
-        .into_iter()
-        .collect();
-    // A stored last-seen wall time past this ceiling could only have come
-    // from a clock more than MAX_DRIFT_MS ahead of physical now — the HLC
-    // clamp bounds the *local* clock's adoption of such a timestamp, but
-    // doesn't touch what's already durable in the event log, so a poisoned
-    // VolumeSeen can still win the LWW max and display forever unflagged.
-    let suspect_ceiling = physical_now_ms().saturating_add(MAX_DRIFT_MS);
-
+    let outcome = majestical_services::volumes::volumes_list(app, catalog_dir)?;
     if json {
-        let rows: Vec<_> = volumes
+        let rows: Vec<_> = outcome
+            .volumes
             .iter()
-            .map(|(id, label, last_seen_ms)| {
+            .map(|row| {
                 serde_json::json!({
-                    "id": id,
-                    "label": label,
-                    "last_seen": iso8601_ms(*last_seen_ms),
-                    "online": volume_is_online(id, label),
-                    "asset_count": counts.get(id).copied().unwrap_or(0),
-                    "clock_suspect": *last_seen_ms > suspect_ceiling,
+                    "id": row.id,
+                    "label": row.label,
+                    "last_seen": iso8601_ms(row.last_seen_ms),
+                    "online": row.online,
+                    "asset_count": row.asset_count,
+                    "clock_suspect": row.clock_suspect,
                 })
             })
             .collect();
         println!("{}", serde_json::json!({ "volumes": rows }));
     } else {
-        print_volumes_table(&volumes, &counts, suspect_ceiling);
+        print_volumes_table(&outcome.volumes);
     }
     Ok(())
 }
@@ -291,25 +254,22 @@ pub(crate) fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> R
 /// the widest cell in each column (header included) — a fixed width breaks
 /// alignment once an auto-detected `uuid:` id (41 chars) or a
 /// "(clock suspect)"-annotated last-seen cell appears.
-pub(crate) fn print_volumes_table(
-    volumes: &[(String, String, u64)],
-    counts: &HashMap<String, u64>,
-    suspect_ceiling: u64,
-) {
+pub(crate) fn print_volumes_table(volumes: &[VolumeRow]) {
     let rows: Vec<(String, String, String, &'static str, u64)> = volumes
         .iter()
-        .map(|(id, label, last_seen_ms)| {
-            let mut last_seen = iso8601_ms(*last_seen_ms);
-            if *last_seen_ms > suspect_ceiling {
+        .map(|row| {
+            let mut last_seen = iso8601_ms(row.last_seen_ms);
+            if row.clock_suspect {
                 last_seen.push_str(" (clock suspect)");
             }
-            let online = if volume_is_online(id, label) {
-                "online"
-            } else {
-                "offline"
-            };
-            let count = counts.get(id).copied().unwrap_or(0);
-            (id.clone(), label.clone(), last_seen, online, count)
+            let online = if row.online { "online" } else { "offline" };
+            (
+                row.id.clone(),
+                row.label.clone(),
+                last_seen,
+                online,
+                row.asset_count,
+            )
         })
         .collect();
     let id_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(2);
@@ -363,35 +323,36 @@ fn cmd_para_add(app: &mut FsApp, kind_str: &str, name: &str) -> Result<()> {
 }
 
 fn cmd_para_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
-    let (db, _projection) = open_catalog(app, catalog_dir)?;
-    let nodes = db.para_nodes().context("querying para nodes")?;
+    let outcome = majestical_services::para::para_list(app, catalog_dir)?;
     if json {
-        let rows: Vec<_> = nodes
+        let rows: Vec<_> = outcome
+            .nodes
             .iter()
-            .map(|(id, kind, name, archived)| {
+            .map(|row| {
                 serde_json::json!({
-                    "id": id, "kind": kind, "name": name, "archived": archived
+                    "id": row.id, "kind": row.kind, "name": row.name, "archived": row.archived
                 })
             })
             .collect();
         println!("{}", serde_json::json!({ "nodes": rows }));
     } else {
-        print_para_table(&nodes);
+        print_para_table(&outcome.nodes);
     }
     Ok(())
 }
 
 /// Renders the human-readable para-nodes table, following
 /// `print_volumes_table`'s width-sizing pattern.
-fn print_para_table(nodes: &[(String, String, String, bool)]) {
-    let id_w = nodes.iter().map(|r| r.0.len()).max().unwrap_or(0).max(2);
-    let kind_w = nodes.iter().map(|r| r.1.len()).max().unwrap_or(0).max(4);
-    let name_w = nodes.iter().map(|r| r.2.len()).max().unwrap_or(0).max(4);
+fn print_para_table(nodes: &[majestical_services::para::ParaNodeRow]) {
+    let id_w = nodes.iter().map(|r| r.id.len()).max().unwrap_or(0).max(2);
+    let kind_w = nodes.iter().map(|r| r.kind.len()).max().unwrap_or(0).max(4);
+    let name_w = nodes.iter().map(|r| r.name.len()).max().unwrap_or(0).max(4);
     println!(
         "{:<id_w$} {:<kind_w$} {:<name_w$} ARCHIVED",
         "ID", "KIND", "NAME"
     );
-    for (id, kind, name, archived) in nodes {
+    for row in nodes {
+        let (id, kind, name, archived) = (&row.id, &row.kind, &row.name, row.archived);
         println!("{id:<id_w$} {kind:<kind_w$} {name:<name_w$} {archived}");
     }
 }

@@ -6,6 +6,8 @@ pub mod capability;
 pub mod catalog;
 pub mod describer_config;
 pub mod error;
+pub mod inbox;
+pub mod inbox_manifest;
 pub mod index;
 pub mod ingest;
 pub mod iso8601;

@@ -384,16 +384,7 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         },
         &mut |line: &str| eprintln!("{line}"),
     )?;
-    print_ingest_outcome(
-        &run.run_id,
-        &run.outcome,
-        &run.generations,
-        if args.json {
-            IngestReport::Json
-        } else {
-            IngestReport::Text
-        },
-    );
+    print_ingest_outcome(&run.run_id, &run.outcome, &run.generations, args.json);
     anyhow::ensure!(
         run.outcome.failed.is_empty()
             && run.outcome.rejected.is_empty()
@@ -405,20 +396,6 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         run.outcome.diagnostics.len()
     );
     Ok(())
-}
-
-/// This run's stdout summary. `Silent` is for a caller that runs
-/// `majestical_services::ingest::run_ingest` more than once per process and
-/// prints its own combined summary at the end (`maj inbox process`, once
-/// per contribution) — with `--json`, stdout must stay exactly one
-/// document, and even in text mode a per-run engine summary is preamble
-/// noise once the caller's own report already carries the outcome.
-/// Diagnostics reach stderr regardless of which variant is chosen.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum IngestReport {
-    Text,
-    Json,
-    Silent,
 }
 
 fn decision_label(decision: &plan::Decision) -> &'static str {
@@ -449,22 +426,27 @@ fn print_ingest_plan(ingest_plan: &plan::IngestPlan, subdir: &str, dests: &[Path
     }
 }
 
-/// `Silent` suppresses only the stdout summary — diagnostics still go to
-/// stderr regardless, since suppressing them too would silently drop detail
-/// a caller building its own `Failed` row needs to have surfaced somewhere.
-/// Called explicitly by every `run_ingest` call site right after it
+/// Prints `maj ingest`'s outcome: text or JSON depending on `json`, then
+/// every diagnostic — unconditionally, since suppressing them would
+/// silently drop detail a caller building its own `Failed` row needs to
+/// have surfaced somewhere. Called explicitly right after `run_ingest`
 /// returns — unlike before the extraction, this no longer happens inside
-/// `run_ingest` itself, since `majestical_services` never prints.
-pub(crate) fn print_ingest_outcome(
+/// `run_ingest` itself, since `majestical_services` never prints. `maj
+/// inbox process`'s own per-contribution ingest runs print their
+/// diagnostics the same way, but from inside
+/// `majestical_services::inbox::report_failure_detail` — that path never
+/// prints a stdout summary at all (its own pass-level report already
+/// carries the outcome), so it has no `Text`/`Json` choice to make here.
+fn print_ingest_outcome(
     run_id: &str,
     outcome: &engine::Outcome,
     generations: &[(PathBuf, mhl::WrittenGeneration)],
-    report: IngestReport,
+    json: bool,
 ) {
-    match report {
-        IngestReport::Text => print_ingest_outcome_text(run_id, outcome, generations),
-        IngestReport::Json => print_ingest_outcome_json(run_id, outcome, generations),
-        IngestReport::Silent => {}
+    if json {
+        print_ingest_outcome_json(run_id, outcome, generations);
+    } else {
+        print_ingest_outcome_text(run_id, outcome, generations);
     }
     for note in &outcome.diagnostics {
         eprintln!("diagnostic: {note}");

@@ -3,7 +3,9 @@
 //! [`load_manifest`] (parse + structural/trust-boundary validation) and
 //! [`check_files`] (presence/size/regular-file checks, plus the
 //! unlisted-file report). Orchestration — what to do with a validated
-//! manifest — lives in `inbox_cmd.rs`.
+//! manifest — lives in `crate::inbox`. Moved here (from
+//! `crates/cli/src/inbox_manifest.rs`) alongside that orchestration since
+//! services can't depend back on the CLI crate.
 //!
 //! Name comparisons (manifest entries vs. the folder listing) are raw
 //! UTF-8 byte equality with no Unicode NFC/NFD normalization — an iOS
@@ -16,7 +18,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub(crate) const MANIFEST_NAME: &str = "contribution.json";
+pub const MANIFEST_NAME: &str = "contribution.json";
 const SUPPORTED_VERSION: u32 = 1;
 
 /// Shared tail on every hard-refusal message below: `contribution.json` is
@@ -33,25 +35,24 @@ const REMEDY: &str = " — contribution.json is machine-generated; re-export the
 /// contribution folder; `files[].xxh64` is the xxHash64 of the file's
 /// bytes (seed 0) as 16 lowercase hex digits; `files[].size` is in bytes.
 #[derive(Debug, serde::Deserialize)]
-pub(crate) struct ContributionManifest {
+pub struct ContributionManifest {
     pub version: u32,
     pub contributor: String,
     #[serde(default)]
     pub para_target: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
-    /// Free-form capture context; carried for future surfacing.
+    /// Free-form capture context; carried for future surfacing. `pub` (not
+    /// `pub(crate)`, as it was pre-extraction) means rustc no longer treats
+    /// it as dead code even though nothing in this crate reads it yet — an
+    /// external head (MCP, GUI) is free to.
     #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "surfaced in a future inbox report; not yet read anywhere"
-    )]
     pub note: Option<String>,
     pub files: Vec<ManifestFile>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(crate) struct ManifestFile {
+pub struct ManifestFile {
     /// `/`-separated path relative to the contribution folder.
     pub name: String,
     /// xxHash64 of the file's bytes, seed 0, as 16 lowercase hex digits.
@@ -78,7 +79,7 @@ pub(crate) struct ManifestFile {
 /// `files[]` entry has a name that is empty, names a directory (trailing
 /// `/`), escapes the contribution folder, repeats a name already listed, or
 /// has an `xxh64` that isn't exactly 16 lowercase hex characters.
-pub(crate) fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> {
+pub fn load_manifest(dir: &Path) -> Result<Option<ContributionManifest>> {
     let path = dir.join(MANIFEST_NAME);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -175,7 +176,7 @@ fn is_lower_hex16(hash: &str) -> bool {
 /// here — it reads every byte, so it runs once, later, only on
 /// contributions that pass this gate.
 #[derive(Debug)]
-pub(crate) struct FileCheck {
+pub struct FileCheck {
     /// Human-readable per-file reasons the contribution isn't ready yet
     /// (missing or short files). Transient — the next pass may find them
     /// resolved.
@@ -205,7 +206,7 @@ pub(crate) struct FileCheck {
 /// suggest is just an in-progress upload. A listed entry that isn't a
 /// regular file is reported in [`FileCheck::refused`], not returned as an
 /// `Err`.
-pub(crate) fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result<FileCheck> {
+pub fn check_files(dir: &Path, manifest: &ContributionManifest) -> Result<FileCheck> {
     let mut waiting = Vec::new();
     let mut refused = Vec::new();
     let mut listed = BTreeSet::new();
@@ -620,7 +621,13 @@ mod tests {
             .expect("restore perms");
 
         if !os_enforces_the_block {
-            eprintln!("skipping: this environment does not enforce a mode-000 file");
+            #[expect(
+                clippy::print_stderr,
+                reason = "test-only environment hedge notice, verbatim from cli"
+            )]
+            {
+                eprintln!("skipping: this environment does not enforce a mode-000 file");
+            }
             return;
         }
         assert!(

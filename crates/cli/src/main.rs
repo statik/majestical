@@ -2,7 +2,6 @@
 mod commands;
 mod describer_cmd;
 mod inbox_cmd;
-mod inbox_manifest;
 mod index_cmd;
 mod search;
 mod sync_cmd;

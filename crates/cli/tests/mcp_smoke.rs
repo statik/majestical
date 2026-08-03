@@ -1105,6 +1105,573 @@ fn rm_saved_search_dry_run_then_confirm_removes_it() {
     );
 }
 
+/// Closes the cargo-mutants gap on `add_sync_location_result`'s
+/// `Ok(Default::default())`/`delete !`/`==`->`!=` survivors and the
+/// `MajServer::add_sync_location` wrapper survivor: this tool had no
+/// functional test before, only the roster/schema checks.
+#[test]
+fn add_sync_location_dry_run_then_confirm_is_visible_via_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas2");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "add_sync_location",
+        &serde_json::json!({"name": "nas2", "path": nas.to_str().expect("utf8")}),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["already_configured"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["path_accessible"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let before = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert!(
+        before["result"]["structuredContent"]["locations"]
+            .as_array()
+            .expect("locations array")
+            .is_empty(),
+        "a dry run must not add it: {before}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "add_sync_location",
+        &serde_json::json!({
+            "name": "nas2", "path": nas.to_str().expect("utf8"), "confirm": true
+        }),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+
+    let after = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    let locations = after["result"]["structuredContent"]["locations"]
+        .as_array()
+        .expect("locations array");
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(
+        locations[0]["name"],
+        serde_json::json!("nas2"),
+        "{locations:?}"
+    );
+}
+
+/// Closes the cargo-mutants gap on `rm_sync_location_result`'s
+/// `Ok(Default::default())`/`delete !`/`==`->`!=` survivors and the
+/// `MajServer::rm_sync_location` wrapper survivor.
+#[test]
+fn rm_sync_location_dry_run_then_confirm_is_gone_via_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas3");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "nas3"])
+        .arg(&nas)
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool("rm_sync_location", &serde_json::json!({"name": "nas3"}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["configured"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let before = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert_eq!(
+        before["result"]["structuredContent"]["locations"]
+            .as_array()
+            .expect("locations array")
+            .len(),
+        1,
+        "a dry run must not remove it: {before}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "rm_sync_location",
+        &serde_json::json!({"name": "nas3", "confirm": true}),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+
+    let after = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert!(
+        after["result"]["structuredContent"]["locations"]
+            .as_array()
+            .expect("locations array")
+            .is_empty(),
+        "{after}"
+    );
+}
+
+/// Closes the cargo-mutants gap on `scan_volume_result`'s
+/// `Ok(Default::default())`/`delete !` survivors and the
+/// `MajServer::scan_volume` wrapper survivor.
+#[test]
+fn scan_volume_dry_run_then_confirm_makes_the_file_searchable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let scan_dir = dir.path().join("to-scan");
+    std::fs::create_dir_all(&scan_dir).expect("mkdir");
+    std::fs::write(scan_dir.join("scanme.bin"), b"scan-bytes").expect("write");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "scan_volume",
+        &serde_json::json!({"dir": scan_dir.to_str().expect("utf8"), "volume": "scanvol"}),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["would_scan_files"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["resolved_volume_id"],
+        serde_json::json!("scanvol"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "scan_volume",
+        &serde_json::json!({
+            "dir": scan_dir.to_str().expect("utf8"), "volume": "scanvol", "confirm": true
+        }),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    let structured = &confirmed["result"]["structuredContent"];
+    assert_eq!(structured["assets"], serde_json::json!(1), "{structured}");
+    assert_eq!(
+        structured["volume_id"],
+        serde_json::json!("scanvol"),
+        "{structured}"
+    );
+
+    let found = mcp.call_tool("search_assets", &serde_json::json!({"query": "scanme.bin"}));
+    assert_ne!(
+        found["result"]["isError"],
+        serde_json::json!(true),
+        "{found}"
+    );
+    let hit = &found["result"]["structuredContent"]["results"][0];
+    assert_eq!(hit["name"], serde_json::json!("scanme.bin"), "{hit}");
+}
+
+/// Closes the cargo-mutants gap on `set_metadata_result`'s
+/// `Ok(Default::default())`/`delete !` survivors and the
+/// `MajServer::set_metadata` wrapper survivor.
+#[test]
+fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "set_metadata",
+        &serde_json::json!({"asset": asset, "field": "rating", "value": "5"}),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["current_value"],
+        serde_json::json!(null),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "set_metadata",
+        &serde_json::json!({
+            "asset": asset, "field": "rating", "value": "5", "confirm": true
+        }),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+
+    let known = mcp.call_tool("get_asset", &serde_json::json!({"asset_id": asset}));
+    let fields = &known["result"]["structuredContent"]["asset"]["fields"];
+    assert_eq!(fields["rating"], serde_json::json!("5"), "{fields}");
+}
+
+/// Closes the cargo-mutants gap on `set_describer_result`'s
+/// `Ok(Default::default())`/`delete !` survivors and the
+/// `MajServer::set_describer` wrapper survivor.
+#[test]
+fn set_describer_dry_run_then_confirm_is_visible_via_get_describer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "llava"}),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["current"],
+        serde_json::json!(null),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "llava", "confirm": true}),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    let structured = &described["result"]["structuredContent"];
+    assert_eq!(
+        structured["configured"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["describer"]["model"],
+        serde_json::json!("llava"),
+        "{structured}"
+    );
+}
+
+/// Closes the cargo-mutants gap on `test_describer_result`'s
+/// `Ok(Default::default())`/`delete !` survivors and the
+/// `MajServer::test_describer` wrapper survivor. Pins the actual confirmed
+/// semantics against an unreachable backend: `describer_config::test`
+/// propagates the probe's connection error through `?`, so `confirm_gate`
+/// renders it exactly like a read tool's error — plain `isError: true` text
+/// naming the URL, never a structured probe payload (matches the CLI's own
+/// `describer_test_against_unreachable_backend_fails_with_context`).
+#[test]
+fn test_describer_dry_run_then_confirm_against_an_unreachable_backend_is_iserror() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "ollama",
+            "--model",
+            "m",
+            "--base-url",
+            "http://127.0.0.1:1",
+        ])
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool("test_describer", &serde_json::json!({}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["configured"]["model"],
+        serde_json::json!("m"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let confirmed = mcp.call_tool("test_describer", &serde_json::json!({"confirm": true}));
+    assert_eq!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "an unreachable backend must report isError, not a silent success: {confirmed}"
+    );
+    let text = confirmed["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(text.contains("127.0.0.1:1"), "{text}");
+}
+
+/// Closes the cargo-mutants gap on `inbox_dry_run`'s `Ok(Default::default())`
+/// survivor and the `MajServer::inbox_process` wrapper's `Ok(Default::
+/// default())`/`delete !` survivors and one of its two match-guard variants
+/// (the successful pass proves `failed` is correctly `false` here; the
+/// `true`->`false` variant needs a failing pass, not covered by this test —
+/// left open, same residual `sync_push_partial_failure_keeps_rows_and_maps_
+/// polarity` already covers for its own sibling guard on the push side).
+/// Fixture shape copied from `inbox_smoke.rs`'s `write_contribution`.
+#[test]
+fn inbox_process_dry_run_then_confirm_places_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("cat");
+    let state = dir.path().join("state");
+    common::maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "spring"])
+        .assert()
+        .success();
+    let inbox = dir.path().join("inbox");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&inbox).expect("mkdir");
+    std::fs::create_dir_all(&dest).expect("mkdir");
+
+    let drop = inbox.join("drop-1");
+    std::fs::create_dir_all(&drop).expect("mkdir");
+    let payload = b"mov-bytes-for-clip";
+    std::fs::write(drop.join("clip.mov"), payload).expect("write");
+    let hash = format!("{:016x}", xxhash_rust::xxh64::xxh64(payload, 0));
+    let manifest = format!(
+        r#"{{"version":1,"contributor":"dana","para_target":"project/spring","source":"iphone","files":[{{"name":"clip.mov","xxh64":"{hash}","size":{}}}]}}"#,
+        payload.len()
+    );
+    std::fs::write(drop.join("contribution.json"), manifest).expect("write manifest");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "inbox_process",
+        &serde_json::json!({
+            "inbox": inbox.to_str().expect("utf8"),
+            "dest": [dest.to_str().expect("utf8")],
+        }),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    let entries = structured["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0]["name"],
+        serde_json::json!("drop-1"),
+        "{entries:?}"
+    );
+    assert!(drop.is_dir(), "a dry run must not process anything");
+
+    let confirmed = mcp.call_tool(
+        "inbox_process",
+        &serde_json::json!({
+            "inbox": inbox.to_str().expect("utf8"),
+            "dest": [dest.to_str().expect("utf8")],
+            "confirm": true,
+        }),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    let structured = &confirmed["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    let rows = structured["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["name"], serde_json::json!("drop-1"), "{rows:?}");
+    assert_eq!(
+        rows[0]["outcome"]["Ingested"]["placed"],
+        serde_json::json!(1),
+        "{rows:?}"
+    );
+
+    assert!(
+        dest.join("ascmhl").is_dir(),
+        "verified ingest must write an ASC MHL history at dest"
+    );
+    assert!(
+        inbox.join(".processed/drop-1/clip.mov").is_file(),
+        "a successful pass moves the contribution to .processed/"
+    );
+    assert!(!drop.exists());
+}
+
+/// Closes the cargo-mutants gap on `sync_transfer_dry_run`'s
+/// `Ok(Default::default())` survivor (plus its `==`->`!=` location filter,
+/// exercised here via an explicit `location` argument) and the
+/// `MajServer::sync_pull` wrapper's `Ok(Default::default())`/`delete !`
+/// survivors and one of its two match-guard variants (same residual as
+/// `inbox_process`'s test above — a failing pull isn't exercised here).
+#[test]
+fn sync_pull_dry_run_then_confirm_lands_a_pulled_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nas = dir.path().join("nas");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+
+    // Machine 1: seeds one asset, pushes it to the shared location.
+    let cat1 = dir.path().join("cat1");
+    let state1 = dir.path().join("state1");
+    common::maj_as(&cat1, &state1, "m1")
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).expect("mkdir");
+    std::fs::write(src.join("pulled.txt"), b"pulled-bytes").expect("write");
+    common::maj_as(&cat1, &state1, "m1")
+        .args(["scan", src.to_str().expect("utf8"), "--volume", "vol1"])
+        .assert()
+        .success();
+    common::maj_as(&cat1, &state1, "m1")
+        .args(["sync", "location", "add", "nas"])
+        .arg(&nas)
+        .assert()
+        .success();
+    common::maj_as(&cat1, &state1, "m1")
+        .args(["sync", "push"])
+        .assert()
+        .success();
+
+    // Machine 2: a separate catalog configured with the same location — the
+    // one the MCP server serves.
+    let cat2 = dir.path().join("cat2");
+    let state2 = dir.path().join("state2");
+    common::maj_as(&cat2, &state2, "m2")
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    common::maj_as(&cat2, &state2, "m2")
+        .args(["sync", "location", "add", "nas"])
+        .arg(&nas)
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&cat2, &state2);
+    let dry = mcp.call_tool("sync_pull", &serde_json::json!({"location": "nas"}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    let planned = structured["planned"].as_array().expect("planned array");
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["name"], serde_json::json!("nas"), "{planned:?}");
+    assert_eq!(
+        planned[0]["reachable"],
+        serde_json::json!(true),
+        "{planned:?}"
+    );
+    assert!(
+        !planned[0]["planned"]["segments"]
+            .as_object()
+            .expect("segments map")
+            .is_empty(),
+        "a dry-run pull must report the real behind segment count: {planned:?}"
+    );
+
+    let confirmed = mcp.call_tool("sync_pull", &serde_json::json!({"confirm": true}));
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    let structured = &confirmed["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert!(
+        structured["applied_events"]
+            .as_u64()
+            .expect("applied_events")
+            >= 1,
+        "{structured}"
+    );
+
+    // Cross-process verification: the pulled asset is searchable through
+    // this same MCP server, re-opening machine 2's catalog fresh.
+    let found = mcp.call_tool("search_assets", &serde_json::json!({"query": "pulled.txt"}));
+    assert_ne!(
+        found["result"]["isError"],
+        serde_json::json!(true),
+        "{found}"
+    );
+    assert_eq!(
+        found["result"]["structuredContent"]["count"],
+        serde_json::json!(1),
+        "{found}"
+    );
+}
+
 /// The regression net for the critical fix in this suite's history: rmcp
 /// 3.1.0's shutdown path calls `tokio::time::timeout` when the transport
 /// closes, so a runtime built with only `.enable_io()` (no timer driver)

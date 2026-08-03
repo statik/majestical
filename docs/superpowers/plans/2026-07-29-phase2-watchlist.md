@@ -1146,31 +1146,58 @@ were found during execution.
   `IngestOutcome`. Renaming is a call-site-touching change across
   `crates/cli`/`crates/services`; not done this phase given the volume of
   extraction work already in flight.
-- **8 of 16 mutating MCP tools have no functional test in `mcp_smoke.rs`
-  beyond the roster/schema checks** (found during the write_tools.rs
-  cargo-mutants triage below): `add_sync_location`, `rm_sync_location`,
-  `scan_volume`, `set_describer`, `set_metadata`, `sync_pull`,
-  `test_describer`, and `inbox_process` are each named only inside the
-  `EXPECTED_TOOLS`/`MUTATING_TOOLS` constant arrays
+- **CLOSED IN-CHUNK: 8 of 16 mutating MCP tools had no functional test in
+  `mcp_smoke.rs` beyond the roster/schema checks** (found during the
+  write_tools.rs cargo-mutants triage below): `add_sync_location`,
+  `rm_sync_location`, `scan_volume`, `set_describer`, `set_metadata`,
+  `sync_pull`, `test_describer`, and `inbox_process` were each named only
+  inside the `EXPECTED_TOOLS`/`MUTATING_TOOLS` constant arrays
   (`crates/cli/tests/mcp_smoke.rs`) — never called via `mcp.call_tool(...)`
   to assert an actual dry-run or executed response. The other 8
   (`tag_assets`, `ingest_source`, `sync_push`, `catalog_init`,
   `verify_volume`, `index_run`, `move_para`'s `archive` op, `rm_saved_
-  search`) each have a dedicated test. This is why each of the 8 untested
-  functions' own `if !args.confirm { ... }` dry-run guard survives a
-  "delete `!`" mutation (e.g. `scan_volume_result`, `:397`) alongside the
-  whole-body `Ok(Default::default())` replacement: `confirm_gate`/
-  `inject_executed` (`crates/cli/src/mcp_cmd/write_tools.rs:47-91`) always
-  injects `"executed": confirm` from the REQUEST value, not from which
-  branch actually ran, so an inverted guard's response still carries a
-  self-consistent but wrong `executed` flag — a symptom worth naming for
-  whoever writes these tests later, distinct from the untested-function
-  root cause itself. Closing all 8 gaps needs a dedicated dry-run-then-
-  confirm test per tool (the `move_para_archive_dry_run_plans_then_
-  confirm_moves`/`rm_saved_search_dry_run_then_confirm_removes_it` shape,
-  ~30-45 lines each) — out of scope for this closing task's mutants-triage
-  budget; watchlisted here with the full list rather than partially
-  patched.
+  search`) already had a dedicated test. This was why each of the 8
+  untested functions' own `if !args.confirm { ... }` dry-run guard
+  survived a "delete `!`" mutation (e.g. `scan_volume_result`, `:397`)
+  alongside the whole-body `Ok(Default::default())` replacement:
+  `confirm_gate`/`inject_executed` (`crates/cli/src/mcp_cmd/
+  write_tools.rs:47-91`) always injects `"executed": confirm` from the
+  REQUEST value, not from which branch actually ran, so an inverted
+  guard's response still carries a self-consistent but wrong `executed`
+  flag — a symptom worth naming for anyone touching this module's tests
+  again, distinct from the untested-function root cause itself.
+
+  Added one dry-run-then-confirm test per tool (the `move_para_archive_
+  dry_run_plans_then_confirm_moves`/`rm_saved_search_dry_run_then_
+  confirm_removes_it` shape), each verifying the confirmed effect through
+  a read tool or the CLI: `add_sync_location`/`rm_sync_location` via
+  `list_sync_locations`; `scan_volume` via `search_assets` finding the
+  scanned file; `set_metadata` via `get_asset`'s `fields`; `set_describer`
+  via `get_describer`; `sync_pull` via a real two-machine push-then-pull
+  (`search_assets` finds the pulled asset); `inbox_process` via a minimal
+  valid contribution (fixture shape copied from `inbox_smoke.rs`'s
+  `write_contribution`) actually landing at `dest` with an ASC MHL
+  history and moving to `.processed/`; `test_describer` against an
+  unreachable backend (`http://127.0.0.1:1`, matching `describer_smoke.
+  rs`'s own CLI-level test) — confirmed the ACTUAL semantics rather than
+  assuming: `describer_config::test`'s probe error propagates through
+  `?`, so `confirm_gate`'s `Err` arm renders it exactly like a read
+  tool's error (plain `isError: true` text naming the URL), never a
+  structured probe payload.
+
+  Two of the eight new tests each close one but not both variants of a
+  match-guard mutant (`MajServer::inbox_process`'s `:999:33` and
+  `MajServer::sync_pull`'s `:1127:33`, both `Ok(json) if failed => ...`):
+  a successful pass proves the guard doesn't spuriously report `isError`
+  when nothing failed (the `true`-replacement variant, confirmed by hand
+  — reverted after confirming), but neither test drives an actual
+  failure, so the `false`-replacement variant (the guard never firing
+  even on a real failure) remains open for both — the same residual
+  `sync_push_partial_failure_keeps_rows_and_maps_polarity` already closes
+  on the push side. Every other listed survivor in the 8 tools' functions
+  was confirmed by hand for at least one representative
+  (`scan_volume_result`'s whole-body replacement; `MajServer::
+  inbox_process`'s match guard) before committing.
 
 ### cargo-mutants triage (phase 7A)
 
@@ -1270,16 +1297,30 @@ unviable, **51 missed**:
   `parse_only` (mutated to unconditional `Ok(None)`, watched the new test
   fail with `left: None, right: Some(Segments)`, reverted); the other two
   mutated similarly by inspection, not independently re-run.
-- **41 are the systemic gap this pass's other new watchlist item names**
-  (above, "8 of 16 mutating MCP tools have no functional test"): every
-  `Ok(Default::default())`/`delete !` survivor in `set_metadata_result`,
-  `move_para_add`, `move_para_rename`, `scan_volume_result`,
-  `add_sync_location_result`, `rm_sync_location_result`,
-  `sync_transfer_dry_run`, `inbox_dry_run`, `set_describer_result`,
-  `test_describer_result`, and each corresponding `MajServer::*` `#[tool]`
-  wrapper falls in this bucket — not re-itemized here, see that bullet for
-  the full list and the closing-budget reasoning for not chasing it this
-  pass.
+- **41 were the systemic gap this pass's other watchlist item names (above,
+  now marked CLOSED IN-CHUNK): 29 closed by the 8 new `mcp_smoke.rs`
+  tests, 12 remain open.** Closed: `set_metadata_result` (2),
+  `scan_volume_result` (2), `add_sync_location_result` (3),
+  `rm_sync_location_result` (3), `sync_transfer_dry_run` (2, including
+  its `==`->`!=` location filter — exercised via `sync_pull`'s new test
+  passing an explicit `location` argument), `inbox_dry_run` (1),
+  `set_describer_result` (2), `test_describer_result` (2), and 8 of the
+  corresponding `MajServer::*` `#[tool]` wrapper survivors
+  (`add_sync_location`, 3 of `inbox_process`'s 4, `rm_sync_location`,
+  `scan_volume`, `set_describer`, `set_metadata`, 3 of `sync_pull`'s 4,
+  `test_describer`). Still open (12): `move_para_add` (7) and
+  `move_para_rename` (2) — `move_para`'s `add`/`rename` ops were never
+  part of this fix (only its already-tested `archive` op was in scope);
+  `MajServer::inbox_process`'s and `MajServer::sync_pull`'s remaining
+  match-guard `false`-variant mutant each (a real failure case isn't
+  exercised by either new test — see the watchlist item's own note); and
+  `MajServer::sync_push`'s one match-guard `true`-variant survivor, which
+  predates this fix and belongs to `sync_push`'s own already-existing
+  test (`sync_push_partial_failure_keeps_rows_and_maps_polarity` only
+  ever drives a FAILING push, so it can't discriminate a guard that fires
+  unconditionally from one that fires correctly — a distinct, narrower
+  gap than the one this pass closed, watchlisted here rather than in a
+  new bullet since it's one mutant on one already-tested tool).
 - **2 are `verify_volume_result`'s own narrower gap, not the systemic
   one**: the tool DOES have a dedicated test
   (`verify_volume_on_a_tampered_dir_is_iserror_with_the_report_attached`),

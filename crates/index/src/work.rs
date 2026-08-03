@@ -140,7 +140,9 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
-/// prefixed are skipped entirely. [`MediaKind::Other`] has no derivation at
+/// prefixed are skipped entirely — as is an `xxh3:`-prefixed id whose
+/// remainder isn't valid lowercase hex of the expected length (`asset_hex`
+/// rejects both shapes the same way). [`MediaKind::Other`] has no derivation at
 /// all; [`MediaKind::Audio`] is skipped by the thumbnail/image-embed/keyframe
 /// passes (no visual thumbnail for audio) and covered by transcribe instead.
 /// [`MediaKind::Pdf`] joins the thumbnail and image-embed passes (page 1

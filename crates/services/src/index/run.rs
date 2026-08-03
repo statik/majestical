@@ -35,6 +35,39 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// matches the level `BlobStore::write_vector` uses for vector blobs.
 const BLOB_ZSTD_LEVEL: i32 = 3;
 
+/// One failed work item, as every `*Outcome.failed` list serializes it:
+/// `{"path": ..., "error": ...}` rather than a positional 2-tuple — the
+/// shape an MCP agent (or any other JSON consumer) expects from a
+/// key-value pair, matching the object shape the CLI's own hand-built
+/// `failed_json` helpers (`crates/cli/src/index_cmd.rs`,
+/// `crates/services/src/index/mod.rs`) already produce by hand. The
+/// underlying field stays `Vec<(PathBuf, String)>` — every executor in this
+/// module pushes plain tuples — so this exists purely as a
+/// `serialize_with` target ([`serialize_failed_items`]), not a type every
+/// call site needs to construct.
+#[derive(serde::Serialize)]
+struct FailedItem<'a> {
+    path: &'a std::path::Path,
+    error: &'a str,
+}
+
+/// `serialize_with` target for every `failed: Vec<(PathBuf, String)>` field
+/// in this module's per-kind outcome structs — see [`FailedItem`].
+fn serialize_failed_items<S: serde::Serializer>(
+    items: &[(PathBuf, String)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(items.len()))?;
+    for (path, error) in items {
+        seq.serialize_element(&FailedItem {
+            path,
+            error: error.as_str(),
+        })?;
+    }
+    seq.end()
+}
+
 /// One pass's request: `--kinds` already validated/defaulted by the CLI (see
 /// `crates/cli/src/index_cmd.rs::parse_kinds`) into a plain set, `--limit`
 /// and `--threads` passed straight through, and the describer API key the
@@ -98,6 +131,7 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
 #[derive(serde::Serialize)]
 pub struct ThumbOutcome {
     pub written: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -156,6 +190,7 @@ struct EmbedPaths {
 pub struct EmbedOutcome {
     pub written: u64,
     pub loaded: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -171,6 +206,7 @@ pub struct KeyframeOutcome {
     pub videos_done: u64,
     pub keyframes_written: u64,
     pub keyframes_failed: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -824,6 +860,7 @@ fn run_keyframe_items(
 #[derive(Default, serde::Serialize)]
 pub struct TranscribeOutcome {
     pub written: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -897,6 +934,7 @@ pub struct TranscriptEmbedOutcome {
     pub chunks_written: u64,
     pub loaded: u64,
     pub empty: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -1139,6 +1177,7 @@ pub struct OcrOutcome {
     pub images_written: u64,
     pub videos_done: u64,
     pub keyframes_written: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -1287,6 +1326,7 @@ fn run_ocr_items(
 #[derive(Default, serde::Serialize)]
 pub struct PdfOutcome {
     pub written: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -1325,6 +1365,7 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
 #[derive(Default, serde::Serialize)]
 pub struct CaptionOutcome {
     pub written: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
     pub failed: Vec<(PathBuf, String)>,
 }
 

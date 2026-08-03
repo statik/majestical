@@ -65,14 +65,13 @@ pub(super) fn templates() -> Vec<ResourceTemplate> {
 ///
 /// # Errors
 /// Returns [`McpError::resource_not_found`] for an unrecognized URI scheme,
-/// an asset id that isn't a well-formed `xxh3:<hex>` id, or a blob that
-/// hasn't been derived yet (naming the `maj index run` remedy). Returns
-/// whatever [`MajServer::ensure_catalog`] itself reports for a missing
-/// catalog.
+/// an asset id that isn't a well-formed `xxh3:<hex>` id, a blob that hasn't
+/// been derived yet (naming the `maj index run` remedy), or a missing
+/// catalog (naming the `maj catalog init` remedy, via
+/// [`majestical_services::catalog::ensure_catalog`]'s own error).
 pub(super) fn read(server: &MajServer, uri: &str) -> Result<ReadResourceResult, McpError> {
-    server
-        .ensure_catalog()
-        .map_err(|result| tool_error_to_mcp_error(&result))?;
+    majestical_services::catalog::ensure_catalog(&server.catalog)
+        .map_err(|err| McpError::resource_not_found(format!("{err:#}"), None))?;
     if let Some(asset_id) = uri.strip_prefix("majestical://thumb/") {
         return read_thumb(server, uri, asset_id);
     }
@@ -83,22 +82,6 @@ pub(super) fn read(server: &MajServer, uri: &str) -> Result<ReadResourceResult, 
         format!("{uri}: not a majestical:// resource this server serves"),
         None,
     ))
-}
-
-/// `ensure_catalog` (and every other `MajServer` guard) returns a tool-level
-/// `CallToolResult`, but resource errors are a different wire shape
-/// (`McpError`/`ErrorData`, surfaced as the JSON-RPC response's top-level
-/// `error`, not a successful result's `isError`) — this pulls the remedy
-/// text (e.g. "run `maj catalog init` first") back out of the tool error's
-/// rendered content so a resource read reports the identical remedy through
-/// its own wire shape instead of inventing a second copy of the message.
-fn tool_error_to_mcp_error(result: &rmcp::model::CallToolResult) -> McpError {
-    let message = result
-        .content
-        .first()
-        .and_then(|block| block.as_text())
-        .map_or_else(|| "no catalog".to_string(), |text| text.text.clone());
-    McpError::resource_not_found(message, None)
 }
 
 fn read_thumb(
@@ -114,13 +97,17 @@ fn read_thumb(
     };
     let store = BlobStore::new(&server.catalog);
     let path = store.path_for(hex, &Derivation::Thumb);
-    let bytes = std::fs::read(&path).map_err(|_| {
-        McpError::resource_not_found(
+    let bytes = std::fs::read(&path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => McpError::resource_not_found(
             format!(
                 "no thumbnail for {asset_id} — run `maj index run --kinds thumbs` to derive it"
             ),
             None,
-        )
+        ),
+        _ => McpError::internal_error(
+            format!("reading thumbnail blob at {}: {err}", path.display()),
+            None,
+        ),
     })?;
     let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(ReadResourceResult::new(vec![
@@ -146,14 +133,21 @@ fn read_keyframes(
             model_tag: MODEL_TAG,
         },
     );
-    let bytes = std::fs::read(&path).map_err(|_| {
-        McpError::resource_not_found(
+    let bytes = std::fs::read(&path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => McpError::resource_not_found(
             format!(
                 "no keyframe manifest for {asset_id} — run `maj index run --kinds keyframes` \
                  to derive it"
             ),
             None,
-        )
+        ),
+        _ => McpError::internal_error(
+            format!(
+                "reading keyframe manifest blob at {}: {err}",
+                path.display()
+            ),
+            None,
+        ),
     })?;
     let text = String::from_utf8(bytes).map_err(|err| {
         McpError::internal_error(

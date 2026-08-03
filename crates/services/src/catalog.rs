@@ -50,6 +50,26 @@ fn init_impl(root: &Path, machine: &str, author: &str) -> Result<()> {
     Ok(())
 }
 
+/// The single source of truth for "is there a catalog at this root" — every
+/// entry point that needs one calls this before touching the event log or
+/// state dir, rather than carrying its own copy of the same `events`-dir
+/// check. Shared by `FsApp::open`, `sync`'s own guard (its push/pull/status
+/// entry points), and `maj mcp`'s tools that read state-dir-relative config
+/// without ever opening an `FsApp` (e.g. `list_sync_locations`,
+/// `get_describer`).
+///
+/// # Errors
+/// Returns [`ServiceError::NoCatalog`] if `root` has no `events` directory.
+pub fn ensure_catalog(root: &Path) -> Result<(), ServiceError> {
+    if root.join("events").is_dir() {
+        Ok(())
+    } else {
+        Err(ServiceError::NoCatalog {
+            root: root.to_path_buf(),
+        })
+    }
+}
+
 /// Both `tag add` and `meta set` write metadata about an asset that must
 /// already have a physical observation on record — otherwise a typo'd id
 /// silently creates a phantom catalog entry that `search` and `scan` can

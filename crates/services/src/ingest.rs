@@ -91,7 +91,7 @@ pub fn render_ingest_subdir(
 /// Everything `ingest::plan` computed: the file-level plan, the rendered
 /// destination subdir, the resolved node id, and the auto-detected source
 /// volume identity (needed downstream by [`run_ingest`]'s `ExecuteIngest`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct IngestPlanOutcome {
     pub plan: plan::IngestPlan,
     pub subdir: String,
@@ -164,7 +164,7 @@ pub struct ExecuteIngest<'a> {
 /// generations it wrote — everything a head needs to render `maj ingest`'s
 /// (or `maj inbox process`'s) outcome. The run id is needed by a caller's
 /// own failure message, which lives outside this function.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct IngestRun {
     pub run_id: String,
     pub outcome: engine::Outcome,

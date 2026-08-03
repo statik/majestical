@@ -27,7 +27,7 @@ use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
 use crate::error::ServiceError;
 use crate::volume_identity;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use majestical_core::media_kind::media_kind;
 use majestical_core::projection::Projection;
 use majestical_index::blob::BlobStore;
@@ -185,6 +185,98 @@ pub fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_js
     }
 }
 
+/// One kind's per-item failures as `{path, error}` rows — shared by
+/// [`failure_report_json`]'s per-kind map and (independently) the CLI's own
+/// `--json` rendering of a run's failures.
+fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
+    failed
+        .iter()
+        .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
+        .collect()
+}
+
+/// This pass's failures as `{kind: [{path, error}, ..]}`, kinds with no
+/// failures omitted. Never written to disk as-is: [`merge_failure_report`]
+/// first folds it over the previous report so a `--kinds`-filtered run only
+/// speaks for the kinds it actually worked.
+fn failure_report_json(o: &IndexRunOutcome) -> serde_json::Value {
+    let kinds: [(&str, Vec<(PathBuf, String)>); 7] = [
+        ("thumbs", o.thumbs.failed.clone()),
+        ("embeddings", o.embed.failed.clone()),
+        ("keyframes", o.keyframes.failed.clone()),
+        ("transcripts", o.transcript_failures()),
+        ("ocr", o.ocr.failed.clone()),
+        ("pdf", o.pdf.failed.clone()),
+        ("captions", o.captions.failed.clone()),
+    ];
+    let mut map = serde_json::Map::new();
+    for (kind, failed) in kinds {
+        if !failed.is_empty() {
+            map.insert(kind.to_string(), failed_json(&failed).into());
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Folds this pass's failures over the previous report: keys for every kind
+/// in this pass's `--kinds` set are replaced (cleared when the kind now has
+/// no failures), while kinds the pass never worked keep their old record —
+/// `index run --kinds thumbs` must not erase a pdf failure whose item was
+/// never retried.
+fn merge_failure_report(
+    previous: serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Value,
+    kinds: &BTreeSet<String>,
+) -> serde_json::Value {
+    let mut merged = previous;
+    for kind in kinds {
+        merged.remove(kind);
+    }
+    if let Some(current) = current.as_object() {
+        for (kind, failures) in current {
+            merged.insert(kind.clone(), failures.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("creating state dir {}", state_dir.display()))?;
+    let path = state_dir.join(FAILURES_FILE);
+    std::fs::write(&path, report.to_string())
+        .with_context(|| format!("writing failure report {}", path.display()))
+}
+
+/// Folds one `index run` pass's failures into the on-disk failure marker
+/// `index status` reads back — state, not rendering, so it lives here
+/// rather than in the CLI's `run_once` (moved from
+/// `crates/cli/src/index_cmd.rs::run_once`'s bookkeeping half). Any head
+/// that calls [`run`] and then this keeps `index status` truthful.
+///
+/// # Errors
+/// Returns an error if the state dir can't be resolved or the marker can't
+/// be written.
+pub fn update_failure_report(
+    catalog_dir: &Path,
+    outcome: &IndexRunOutcome,
+    kinds: &BTreeSet<String>,
+) -> Result<(), ServiceError> {
+    update_failure_report_impl(catalog_dir, outcome, kinds).map_err(ServiceError::from)
+}
+
+fn update_failure_report_impl(
+    catalog_dir: &Path,
+    outcome: &IndexRunOutcome,
+    kinds: &BTreeSet<String>,
+) -> Result<()> {
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let previous = read_failure_report(&state_dir);
+    let current = failure_report_json(outcome);
+    let merged = merge_failure_report(previous, &current, kinds);
+    write_failure_report(&state_dir, &merged)
+}
+
 /// One derivation kind's queue counts, mirroring [`KindStatus`] as a
 /// serializable row.
 #[derive(serde::Serialize)]
@@ -224,7 +316,7 @@ pub struct IndexStatusOutcome {
     pub pdf: KindStatusRow,
     pub captions: KindStatusRow,
     pub transcripts_remedy: Option<String>,
-    pub captions_remedy: Option<&'static str>,
+    pub captions_remedy: Option<String>,
     pub failed_last_run: serde_json::Value,
 }
 
@@ -250,7 +342,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     let transcripts_remedy = (plan.transcripts.needs_model > 0)
         .then(|| transcript_model_remedy(caps.whisper, caps.text_model))
         .flatten();
-    let captions_remedy = (plan.captions.needs_model > 0).then_some(DESCRIBER_REMEDY);
+    let captions_remedy = (plan.captions.needs_model > 0).then(|| DESCRIBER_REMEDY.to_string());
     Ok(IndexStatusOutcome {
         thumbs: (&plan.thumbs).into(),
         embeddings: (&plan.embeddings).into(),
@@ -355,5 +447,103 @@ mod tests {
         assert_eq!(workkind_name(WorkKind::OcrKeyframes), "ocr");
         assert_eq!(workkind_name(WorkKind::PdfText), "pdf");
         assert_eq!(workkind_name(WorkKind::Caption), "captions");
+    }
+
+    #[test]
+    fn failure_report_json_includes_only_kinds_with_failures() {
+        let outcomes = IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 1,
+                failed: Vec::new(),
+            },
+            embed: EmbedOutcome {
+                written: 0,
+                loaded: 0,
+                failed: Vec::new(),
+            },
+            keyframes: KeyframeOutcome::default(),
+            transcribe: TranscribeOutcome::default(),
+            transcript_embed: TranscriptEmbedOutcome::default(),
+            ocr: OcrOutcome::default(),
+            pdf: PdfOutcome {
+                written: 0,
+                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+            },
+            captions: CaptionOutcome::default(),
+        };
+        let report = failure_report_json(&outcomes);
+        let map = report.as_object().expect("object");
+        assert_eq!(map.len(), 1, "only the pdf kind failed: {report}");
+        let entries = map["pdf"].as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["path"], "/media/broken.pdf");
+        assert_eq!(entries[0]["error"], "not a valid pdf");
+    }
+
+    /// A `--kinds`-filtered pass only speaks for its own kinds: it replaces
+    /// (or clears) their keys and preserves every other kind's record.
+    #[test]
+    fn merge_failure_report_preserves_kinds_the_pass_never_worked() {
+        let mut previous = serde_json::Map::new();
+        previous.insert(
+            "pdf".to_string(),
+            serde_json::json!([{ "path": "/m/broken.pdf", "error": "not a valid pdf" }]),
+        );
+        previous.insert(
+            "thumbs".to_string(),
+            serde_json::json!([{ "path": "/m/old.png", "error": "stale" }]),
+        );
+
+        // A thumbs-only pass with no failures: clears thumbs, keeps pdf.
+        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
+        let merged = merge_failure_report(previous.clone(), &serde_json::json!({}), &kinds);
+        let map = merged.as_object().expect("object");
+        assert!(map.contains_key("pdf"), "pdf record must survive: {merged}");
+        assert!(
+            !map.contains_key("thumbs"),
+            "a clean thumbs pass clears its own record: {merged}"
+        );
+
+        // A pdf pass with a fresh failure: replaces pdf, keeps thumbs.
+        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
+        let current = serde_json::json!({
+            "pdf": [{ "path": "/m/broken.pdf", "error": "still broken" }],
+        });
+        let merged = merge_failure_report(previous, &current, &kinds);
+        let map = merged.as_object().expect("object");
+        assert_eq!(map["pdf"][0]["error"], "still broken");
+        assert_eq!(map["thumbs"][0]["error"], "stale");
+    }
+
+    #[test]
+    fn update_failure_report_writes_the_state_dir_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        let outcome = IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 0,
+                failed: Vec::new(),
+            },
+            embed: EmbedOutcome {
+                written: 0,
+                loaded: 0,
+                failed: Vec::new(),
+            },
+            keyframes: KeyframeOutcome::default(),
+            transcribe: TranscribeOutcome::default(),
+            transcript_embed: TranscriptEmbedOutcome::default(),
+            ocr: OcrOutcome::default(),
+            pdf: PdfOutcome {
+                written: 0,
+                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+            },
+            captions: CaptionOutcome::default(),
+        };
+        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
+        update_failure_report(&root, &outcome, &kinds).expect("update");
+        let state_dir = crate::state_dir::state_dir_for(&root).expect("state dir");
+        let report = read_failure_report(&state_dir);
+        assert_eq!(report["pdf"][0]["error"], "not a valid pdf");
     }
 }

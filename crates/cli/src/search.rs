@@ -87,9 +87,9 @@ fn print_search_results_json(outcome: &SearchOutcome) {
         })
         .collect();
     let mut payload = serde_json::json!({ "count": outcome.count, "results": results });
-    if let Some((embedded, eligible)) = outcome.semantic_coverage {
+    if let Some(coverage) = &outcome.semantic_coverage {
         payload["semantic_coverage"] =
-            serde_json::json!({ "embedded": embedded, "eligible": eligible });
+            serde_json::json!({ "embedded": coverage.embedded, "eligible": coverage.eligible });
     }
     if !outcome.text_coverage.is_empty() {
         let notices: Vec<_> = outcome
@@ -142,10 +142,13 @@ fn print_search_results_text(outcome: &SearchOutcome, limit: usize) {
     if outcome.count == limit {
         println!("note: results truncated at {limit}; raise --limit to see more");
     }
-    if let Some((embedded, eligible)) = outcome.semantic_coverage
-        && embedded < eligible
+    if let Some(coverage) = &outcome.semantic_coverage
+        && coverage.embedded < coverage.eligible
     {
-        println!("semantic index: {embedded} of {eligible} eligible assets");
+        println!(
+            "semantic index: {} of {} eligible assets",
+            coverage.embedded, coverage.eligible
+        );
     }
     for notice in &outcome.text_coverage {
         println!(

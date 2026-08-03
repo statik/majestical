@@ -80,6 +80,21 @@ pub struct TextCoverageNotice {
     pub covered: usize,
     pub eligible: usize,
     pub remedy: String,
+    /// The machine-usable `in:` source key this notice is about (e.g.
+    /// `"transcript"`, from [`TEXT_SOURCE_INFO`]) — `label` is the
+    /// human-facing plural noun ("transcripts"); this is the same value a
+    /// caller would pass back as `in:<source>`. CLI rendering ignores it.
+    pub source: String,
+}
+
+/// Distinct asset counts for the image-semantic layer: how many eligible
+/// assets are embedded versus how many are eligible in total. A named
+/// struct (rather than a bare `(u64, u64)` tuple) so the MCP wire contract
+/// carries labeled fields instead of a positional pair.
+#[derive(Serialize)]
+pub struct SemanticCoverage {
+    pub embedded: u64,
+    pub eligible: u64,
 }
 
 /// Everything [`search`] produces: the ranked rows plus degradation notices
@@ -89,10 +104,9 @@ pub struct TextCoverageNotice {
 pub struct SearchOutcome {
     pub count: usize,
     pub results: Vec<SearchHit>,
-    /// `(embedded, eligible)` distinct asset counts when the image-semantic
-    /// layer ran this search.
+    /// Set when the image-semantic layer ran this search.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_coverage: Option<(u64, u64)>,
+    pub semantic_coverage: Option<SemanticCoverage>,
     /// Per-source text coverage notices; empty for filter-only queries.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub text_coverage: Vec<TextCoverageNotice>,
@@ -352,8 +366,8 @@ struct TermSearchOutput {
     /// Each ranked asset's nearest keyframe timestamp (image-semantic
     /// keyframe hits only).
     keyframe_ts: HashMap<AssetId, i64>,
-    /// `Some((embedded, eligible))` when the image-semantic layer ran.
-    semantic_coverage: Option<(u64, u64)>,
+    /// Set when the image-semantic layer ran.
+    semantic_coverage: Option<SemanticCoverage>,
     /// Per-asset text detail (FTS row, else best chunk).
     text_meta: HashMap<AssetId, TextMeta>,
     /// Per-source text coverage notices, in [`TEXT_SOURCE_INFO`] order.
@@ -430,8 +444,10 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
         limit: args.limit,
     });
 
-    let semantic_coverage =
-        embedded.map(|embedded| (embedded, eligible_asset_count(args.projection)));
+    let semantic_coverage = embedded.map(|embedded| SemanticCoverage {
+        embedded,
+        eligible: eligible_asset_count(args.projection),
+    });
     let text_coverage = text_coverage_notices(db, args)?;
     Ok(TermSearchOutput {
         ranked,
@@ -656,6 +672,7 @@ fn text_coverage_notices(
                 covered,
                 eligible: eligible.len(),
                 remedy: source_remedy(info.source, args.catalog_dir),
+                source: info.source.to_string(),
             });
         }
     }

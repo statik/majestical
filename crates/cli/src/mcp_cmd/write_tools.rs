@@ -1207,3 +1207,48 @@ impl MajServer {
         verify_volume_result(&args)
     }
 }
+
+/// Direct unit tests for this module's pure request-parsing helpers —
+/// cheaper and more precise than driving them through a full `maj mcp`
+/// round trip in `mcp_smoke.rs`, and closes cargo-mutants survivors none of
+/// that suite's tool-level tests happen to call these functions with more
+/// than one `only`/`op`/`kinds` value.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_only_maps_every_value_and_rejects_unknown() {
+        assert_eq!(parse_only(None).expect("none"), None);
+        assert_eq!(
+            parse_only(Some("segments")).expect("segments"),
+            Some(majestical_services::sync::Only::Segments)
+        );
+        assert_eq!(
+            parse_only(Some("transcripts")).expect("transcripts"),
+            Some(majestical_services::sync::Only::Transcripts)
+        );
+        assert!(parse_only(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn non_empty_tags_rejects_missing_and_empty_but_not_real_tags() {
+        assert!(non_empty_tags(None).is_err());
+        assert!(non_empty_tags(Some(&vec![])).is_err());
+        let tags = vec!["kf".to_string()];
+        assert_eq!(non_empty_tags(Some(&tags)).expect("non-empty"), &tags[..]);
+    }
+
+    #[test]
+    fn parse_index_kinds_defaults_to_every_kind_and_rejects_unknown() {
+        let all: BTreeSet<String> = majestical_services::index::VALID_KINDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(parse_index_kinds(None).expect("default"), all);
+        let thumbs = ["thumbs".to_string()];
+        let parsed = parse_index_kinds(Some(&thumbs)).expect("thumbs");
+        assert_eq!(parsed, BTreeSet::from(["thumbs".to_string()]));
+        assert!(parse_index_kinds(Some(&["bogus".to_string()])).is_err());
+    }
+}

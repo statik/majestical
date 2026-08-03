@@ -171,8 +171,8 @@ Write a phase 7B spec + plan in the established format before any code.
    spec-compliance reviewer (probes empirically, mutation-tests claims) →
    code-quality reviewer → fix rounds until APPROVED.
 2. **Merge as you go**: chunk PRs (1-2 tasks each), squash-merge after CI
-   green. Never push to main directly. Phase 7A ran six PRs (#64-#69 +
-   this closing PR) on this cadence.
+   green. Never push to main directly. Phase 7A ran six chunk PRs
+   (#65-#69 plus this closing PR; spec/plan in #64) on this cadence.
 3. **NO Claude-Session trailers in commit messages** (user mandate).
 4. **Do NOT use the `submitting-changes` skill** (user mandate — plain git).
 5. Shared checkout: implementers stage ONLY their files, never `git add -A`.

@@ -41,3 +41,7 @@ resources — `majestical://` thumbnails and keyframe manifests — let a
 client fetch imagery for an asset. Every read result carries the asset's
 stable id so an agent can chain calls (look up an asset, then tag it, then
 verify it) without re-resolving paths.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

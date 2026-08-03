@@ -1307,7 +1307,10 @@ fn scan_volume_dry_run_then_confirm_makes_the_file_searchable() {
 
 /// Closes the cargo-mutants gap on `set_metadata_result`'s
 /// `Ok(Default::default())`/`delete !` survivors and the
-/// `MajServer::set_metadata` wrapper survivor.
+/// `MajServer::set_metadata` wrapper survivor. Uses a known asset
+/// throughout — it does NOT prove the dry-run validates the asset exists;
+/// see the watchlist's "dry-run previews over-promise on an unknown asset
+/// id" item, still open.
 #[test]
 fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -4573,6 +4573,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "image",
  "majestical-catalog-sqlite",
  "majestical-core",
  "majestical-describe",

@@ -1,9 +1,23 @@
-//! Derivation-queue planning shared by `maj index run` (mutating; stays in
-//! the CLI) and `maj index status` (read; its compute lives here). Moved
-//! from `crates/cli/src/index_cmd.rs`: `VALID_KINDS`/`capabilities`/
-//! `gather_sources`/`build_plan`/`workkind_name`/the failure-report reader
-//! are shared so `run` and `status` can never plan differently for the same
-//! catalog state.
+//! Derivation-queue planning and execution for `maj index run`/`maj index
+//! status`. Moved from `crates/cli/src/index_cmd.rs`: `VALID_KINDS`/
+//! `capabilities`/`gather_sources`/`build_plan`/`workkind_name`/the
+//! failure-report reader live directly in this module (shared so `run` and
+//! `status` can never plan differently for the same catalog state); the
+//! derivation engine itself — every per-kind runner, the worker pool, and
+//! the `text_fts` heal — lives in the `run`/`heal`/`blob_read` submodules,
+//! split out to keep any one file well under the house line-length
+//! comfort zone. `run`'s public surface ([`run::run`], [`run::IndexRunReq`],
+//! [`run::IndexRunOutcome`], and the per-kind outcome structs) is
+//! re-exported here so callers only ever need `services::index::`.
+mod blob_read;
+mod heal;
+mod run;
+
+pub use run::{
+    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeOutcome, OcrOutcome,
+    PdfOutcome, ThumbOutcome, TranscribeOutcome, TranscriptEmbedOutcome, run,
+};
+
 use crate::app::FsApp;
 use crate::capability::{
     DESCRIBER_REMEDY, minilm_model_dir_if_present, transcript_model_remedy,

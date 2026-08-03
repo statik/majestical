@@ -31,14 +31,12 @@ similar_names = "allow"
 majestical-core = { path = "../core" }
 majestical-services = { path = "../services" }
 majestical-sync = { path = "../sync" }
-majestical-catalog-sqlite = { path = "../catalog-sqlite" }
 majestical-ingest = { path = "../ingest" }
 majestical-index = { path = "../index" }
 majestical-describe = { path = "../describe" }
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
-image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -46,7 +44,6 @@ ulid.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
 plist.workspace = true
-zstd.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
@@ -58,6 +55,15 @@ tempfile.workspace = true
 # `catalog-sqlite` depends on — see the root `Cargo.toml` comment on why
 # it's pinned once, not per-crate.
 rusqlite.workspace = true
+# `index run`'s compute (thumbnail/embedding decode, blob zstd) moved to
+# `majestical-services` (see `crates/services/src/index/run.rs`); only the
+# integration test suites (index_smoke.rs, caption_smoke.rs, etc.) still
+# decode images or zstd blobs directly to build fixtures/assert on blob
+# bytes, and only sync_smoke.rs/caption_smoke.rs/index_smoke.rs read
+# `catalog.db` straight off disk the same way the `rusqlite` pin above does.
+majestical-catalog-sqlite = { path = "../catalog-sqlite" }
+image.workspace = true
+zstd.workspace = true
 # inbox_smoke.rs computes real xxh64 hashes for its manifest fixtures,
 # matching `contribution.json`'s wire format. `[dependencies]` above only
 # pulls in `xxh3` (catalog identity); this is additive, same pattern as

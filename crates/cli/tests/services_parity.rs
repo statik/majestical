@@ -281,6 +281,48 @@ fn index_status_output_is_byte_identical() {
     }
 }
 
+/// `--limit 0` truncates every kind's per-pass queue to zero items
+/// (`split_and_cap_items`), so this is a deterministic empty pass regardless
+/// of `--kinds` defaulting to every kind — proving the engine-extraction's
+/// full open-catalog/build-plan/heal/failure-report path byte-for-byte
+/// against the pre-extraction binary without needing models or ffmpeg.
+#[test]
+fn index_run_empty_pass_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    for args in [
+        ["index", "run", "--limit", "0", "--json"].as_slice(),
+        ["index", "run", "--limit", "0"].as_slice(),
+    ] {
+        diff_against_ref(&root, &state, args);
+    }
+}
+
+/// `--kinds thumbs` against a text-only catalog (`fixture_catalog`'s `.txt`
+/// files are `MediaKind::Other`, never queued for any kind — see
+/// `crates/index/src/work.rs`): another deterministic empty pass, this time
+/// through the `--kinds`-narrowed path rather than `--limit`.
+#[test]
+fn index_run_kinds_thumbs_on_a_text_only_catalog_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    diff_against_ref(
+        &root,
+        &state,
+        &["index", "run", "--kinds", "thumbs", "--limit", "1"],
+    );
+}
+
+/// An unknown `--kinds` value is a pure arg-validation error — `parse_kinds`
+/// rejects it before the engine ever runs, so this proves the error path
+/// (message and exit code) stayed in the CLI and byte-identical.
+#[test]
+fn index_run_invalid_kinds_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    diff_against_ref(&root, &state, &["index", "run", "--kinds", "bogus"]);
+}
+
 #[test]
 fn no_catalog_error_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");

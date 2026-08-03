@@ -55,17 +55,18 @@ catalog, and agent-native access (CLI + MCP with full GUI parity).
     of phase 7A** — the spec's third architecture section (GUI) and its
     whole "Release pipeline & CI" section are unbuilt. This is Plan B/C
     below, not a phase-7A gap.
-  - **Tests**: 36 `mcp_smoke` tests (real `maj mcp` over stdio via an rmcp
+  - **Tests**: 46 `mcp_smoke` tests (real `maj mcp` over stdio via an rmcp
     client — tool-list snapshot, per-tool dry-run/confirm pairs, wire-shape
-    pins) + 39 `services_parity` tests (byte-identical CLI output through
+    pins) + 42 `services_parity` tests (byte-identical CLI output through
     the extraction, diffed against the pre-extraction reference binary).
     `just ci`'s four conformance jobs are unchanged from phase 6.
 
 **Architecture pointers**:
 
 - `crates/services/src/` — one file per verb family: `search.rs`,
-  `catalog.rs` (get_asset, volumes, catalog_init), `scan.rs`, `verify.rs`,
-  `meta.rs`, `tags.rs`, `para.rs`, `ingest.rs`, `sync.rs`, `inbox.rs`,
+  `catalog.rs` (get_asset, catalog_init, ensure_catalog), `volumes.rs`
+  (volumes_list, volume_is_online), `scan.rs`, `verify.rs`, `meta.rs`,
+  `tags.rs`, `para.rs`, `ingest.rs`, `sync.rs`, `inbox.rs`,
   `inbox_manifest.rs`, `index/` (`mod.rs`, `run.rs`, `heal.rs`,
   `blob_read.rs`), `describer_config.rs`, plus shared plumbing (`app.rs`'s
   `FsApp`, `error.rs`'s `ServiceError`, `state_dir.rs`, `capability.rs`,
@@ -111,18 +112,21 @@ errors; the `"ascmhl"` literal repeated ~8 places instead of a shared
 const; 28 MCP-invisible stderr diagnostics in `crates/services` behind
 per-site `#[expect(clippy::print_stderr)]`, reachable from most tools;
 `IngestRun.outcome`'s name colliding in spirit with the service layer's own
-`*Outcome` convention; and — found during this closing task's mutants
-triage — 8 of 16 mutating MCP tools with no functional `mcp_smoke.rs` test
-beyond the roster/schema checks (`add_sync_location`, `rm_sync_location`,
-`scan_volume`, `set_describer`, `set_metadata`, `sync_pull`,
-`test_describer`, `inbox_process`), plus a general lesson: a tool tested
-only on its `confirm: true` path can still hide an inverted dry-run guard,
-since `confirm_gate`/`inject_executed` reports `executed` from the request
-value, not from which branch ran. A "cargo-mutants triage (phase 7A)"
-section records
-the scoped mutants runs against `crates/services/src/search.rs`,
-`crates/services/src/catalog.rs`, and `crates/cli/src/mcp_cmd/
-write_tools.rs` and their survivor dispositions.
+`*Outcome` convention; and (CLOSED IN-CHUNK — see the watchlist for the
+full account) 8 of 16 mutating MCP tools that had no functional
+`mcp_smoke.rs` test beyond the roster/schema checks (`add_sync_location`,
+`rm_sync_location`, `scan_volume`, `set_describer`, `set_metadata`,
+`sync_pull`, `test_describer`, `inbox_process`) — each now has a
+dry-run-then-confirm test. The lesson that finding surfaced stays live: a
+tool tested only on its `confirm: true` path can still hide an inverted
+dry-run guard, since `confirm_gate`/`inject_executed` reports `executed`
+from the request value, not from which branch ran — two residual
+match-guard mutants (`inbox_process`/`sync_pull`, the variant needing a
+real failure to exercise) remain open for exactly this reason. A
+"cargo-mutants triage (phase 7A)" section records the scoped mutants runs
+against `crates/services/src/search.rs`, `crates/services/src/catalog.rs`,
+and `crates/cli/src/mcp_cmd/write_tools.rs` and their survivor
+dispositions.
 
 ## Phase 7B recommendation
 

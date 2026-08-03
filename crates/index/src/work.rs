@@ -140,7 +140,9 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 
 /// Diffs `sources` against `blobs` under `caps`, producing a priority-ordered
 /// work queue plus per-kind status counts. Assets whose id isn't `xxh3:`-
-/// prefixed are skipped entirely. [`MediaKind::Other`] has no derivation at
+/// prefixed are skipped entirely — as is an `xxh3:`-prefixed id whose
+/// remainder isn't valid lowercase hex of the expected length (`asset_hex`
+/// rejects both shapes the same way). [`MediaKind::Other`] has no derivation at
 /// all; [`MediaKind::Audio`] is skipped by the thumbnail/image-embed/keyframe
 /// passes (no visual thumbnail for audio) and covered by transcribe instead.
 /// [`MediaKind::Pdf`] joins the thumbnail and image-embed passes (page 1
@@ -695,22 +697,22 @@ mod tests {
         let caps = base_caps();
         let sources = vec![
             AssetSource {
-                asset: "xxh3:aa11".into(),
+                asset: "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/a.png".into()),
             },
             AssetSource {
-                asset: "xxh3:bb22".into(),
+                asset: "xxh3:bb22bb22bb22bb22bb22bb22bb22bb22".into(),
                 kind: MediaKind::Image,
                 abs_path: None,
             },
             AssetSource {
-                asset: "xxh3:cc33".into(),
+                asset: "xxh3:cc33cc33cc33cc33cc33cc33cc33cc33".into(),
                 kind: MediaKind::Video,
                 abs_path: Some("/tmp/c.mov".into()),
             },
             AssetSource {
-                asset: "xxh3:dd44".into(),
+                asset: "xxh3:dd44dd44dd44dd44dd44dd44dd44dd44".into(),
                 kind: MediaKind::Other,
                 abs_path: Some("/tmp/d.txt".into()),
             },
@@ -738,7 +740,7 @@ mod tests {
     fn existing_blobs_count_done_and_raw_images_are_unsupported() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
-        let hex = "aa11";
+        let hex = "aa11aa11aa11aa11aa11aa11aa11aa11";
         let thumb = store.path_for(hex, &Derivation::Thumb);
         store.write_atomic(&thumb, b"x").expect("seed thumb");
         let caps = Capabilities {
@@ -747,17 +749,17 @@ mod tests {
         };
         let sources = vec![
             AssetSource {
-                asset: "xxh3:aa11".into(),
+                asset: "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/a.png".into()),
             },
             AssetSource {
-                asset: "xxh3:ee55".into(),
+                asset: "xxh3:ee55ee55ee55ee55ee55ee55ee55ee55".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/e.cr3".into()),
             },
             AssetSource {
-                asset: "xxh3:ff66".into(),
+                asset: "xxh3:ff66ff66ff66ff66ff66ff66ff66ff66".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/f.avif".into()),
             },
@@ -810,22 +812,22 @@ mod tests {
         let caps = base_caps();
         let sources = vec![
             AssetSource {
-                asset: "xxh3:pef1".into(),
+                asset: "xxh3:aef1aef1aef1aef1aef1aef1aef1aef1".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/shot.pef".into()),
             },
             AssetSource {
-                asset: "xxh3:iiq1".into(),
+                asset: "xxh3:11a111a111a111a111a111a111a111a1".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/shot.iiq".into()),
             },
             AssetSource {
-                asset: "xxh3:3fr1".into(),
+                asset: "xxh3:3fb13fb13fb13fb13fb13fb13fb13fb1".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/shot.3fr".into()),
             },
             AssetSource {
-                asset: "xxh3:jxl1".into(),
+                asset: "xxh3:cd31cd31cd31cd31cd31cd31cd31cd31".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/shot.jxl".into()),
             },
@@ -863,12 +865,12 @@ mod tests {
         };
         let sources = vec![
             AssetSource {
-                asset: "xxh3:aa11".into(),
+                asset: "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/a.png".into()),
             },
             AssetSource {
-                asset: "xxh3:cc33".into(),
+                asset: "xxh3:cc33cc33cc33cc33cc33cc33cc33cc33".into(),
                 kind: MediaKind::Video,
                 abs_path: Some("/tmp/c.mov".into()),
             },
@@ -882,11 +884,14 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                (WorkKind::Thumb, "xxh3:aa11"),
-                (WorkKind::Thumb, "xxh3:cc33"),
-                (WorkKind::ImageEmbed, "xxh3:aa11"),
-                (WorkKind::Keyframes, "xxh3:cc33"),
-                (WorkKind::OcrImage, "xxh3:aa11"),
+                (WorkKind::Thumb, "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11"),
+                (WorkKind::Thumb, "xxh3:cc33cc33cc33cc33cc33cc33cc33cc33"),
+                (
+                    WorkKind::ImageEmbed,
+                    "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11"
+                ),
+                (WorkKind::Keyframes, "xxh3:cc33cc33cc33cc33cc33cc33cc33cc33"),
+                (WorkKind::OcrImage, "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11"),
             ],
             "both thumbs must precede the embedding, which must precede the keyframes, \
              which must precede aa11's ungated OCR item"
@@ -908,12 +913,12 @@ mod tests {
         let caps = base_caps();
         let sources = vec![
             AssetSource {
-                asset: "xxh3:img1".into(),
+                asset: "xxh3:10a110a110a110a110a110a110a110a1".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/img1.png".into()),
             },
             AssetSource {
-                asset: "xxh3:vid1".into(),
+                asset: "xxh3:70d170d170d170d170d170d170d170d1".into(),
                 kind: MediaKind::Video,
                 abs_path: Some("/tmp/vid1.mov".into()),
             },
@@ -923,14 +928,16 @@ mod tests {
         assert!(
             plan.items
                 .iter()
-                .any(|i| i.asset == "xxh3:img1" && matches!(i.kind, WorkKind::Thumb)),
+                .any(|i| i.asset == "xxh3:10a110a110a110a110a110a110a110a1"
+                    && matches!(i.kind, WorkKind::Thumb)),
             "an image thumb must be queued even with no ffmpeg installed"
         );
         assert!(
             !plan
                 .items
                 .iter()
-                .any(|i| i.asset == "xxh3:vid1" && matches!(i.kind, WorkKind::Thumb)),
+                .any(|i| i.asset == "xxh3:70d170d170d170d170d170d170d170d1"
+                    && matches!(i.kind, WorkKind::Thumb)),
             "a video thumb must not be queued without ffmpeg"
         );
     }
@@ -943,18 +950,21 @@ mod tests {
             model_tag: Some("m1".into()),
             ..base_caps()
         };
-        let done_blob = store.path_for("aa11", &Derivation::ImageEmbedding { model_tag: "m1" });
+        let done_blob = store.path_for(
+            "aa11aa11aa11aa11aa11aa11aa11aa11",
+            &Derivation::ImageEmbedding { model_tag: "m1" },
+        );
         store
             .write_atomic(&done_blob, b"x")
             .expect("seed embedding blob");
         let sources = vec![
             AssetSource {
-                asset: "xxh3:aa11".into(),
+                asset: "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11".into(),
                 kind: MediaKind::Image,
                 abs_path: Some("/tmp/a.png".into()),
             },
             AssetSource {
-                asset: "xxh3:bb22".into(),
+                asset: "xxh3:bb22bb22bb22bb22bb22bb22bb22bb22".into(),
                 kind: MediaKind::Image,
                 abs_path: None,
             },
@@ -984,23 +994,26 @@ mod tests {
             model_tag: Some("m1".into()),
             ..base_caps()
         };
-        let done_blob = store.path_for("aa11", &Derivation::KeyframeManifest { model_tag: "m1" });
+        let done_blob = store.path_for(
+            "aa11aa11aa11aa11aa11aa11aa11aa11",
+            &Derivation::KeyframeManifest { model_tag: "m1" },
+        );
         store
             .write_atomic(&done_blob, b"[]")
             .expect("seed manifest blob");
         let sources = vec![
             AssetSource {
-                asset: "xxh3:aa11".into(),
+                asset: "xxh3:aa11aa11aa11aa11aa11aa11aa11aa11".into(),
                 kind: MediaKind::Video,
                 abs_path: Some("/tmp/a.mov".into()),
             },
             AssetSource {
-                asset: "xxh3:bb22".into(),
+                asset: "xxh3:bb22bb22bb22bb22bb22bb22bb22bb22".into(),
                 kind: MediaKind::Video,
                 abs_path: None,
             },
             AssetSource {
-                asset: "xxh3:cc33".into(),
+                asset: "xxh3:cc33cc33cc33cc33cc33cc33cc33cc33".into(),
                 kind: MediaKind::Video,
                 abs_path: Some("/tmp/c.mov".into()),
             },
@@ -1024,9 +1037,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
         let sources = vec![
-            source("xxh3:v1", MediaKind::Video, Some("/tmp/v.mov")),
-            source("xxh3:a1", MediaKind::Audio, Some("/tmp/a.m4a")),
-            source("xxh3:i1", MediaKind::Image, Some("/tmp/i.jpg")),
+            source(
+                "xxh3:70707070707070707070707070707070",
+                MediaKind::Video,
+                Some("/tmp/v.mov"),
+            ),
+            source(
+                "xxh3:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                MediaKind::Audio,
+                Some("/tmp/a.m4a"),
+            ),
+            source(
+                "xxh3:10101010101010101010101010101010",
+                MediaKind::Image,
+                Some("/tmp/i.jpg"),
+            ),
         ];
         let plan = plan_work(&sources, &store, &full_caps());
 
@@ -1041,8 +1066,16 @@ mod tests {
             "video + audio, never image: {:?}",
             plan.items
         );
-        assert!(transcribe_items.iter().any(|i| i.asset == "xxh3:v1"));
-        assert!(transcribe_items.iter().any(|i| i.asset == "xxh3:a1"));
+        assert!(
+            transcribe_items
+                .iter()
+                .any(|i| i.asset == "xxh3:70707070707070707070707070707070")
+        );
+        assert!(
+            transcribe_items
+                .iter()
+                .any(|i| i.asset == "xxh3:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+        );
     }
 
     #[test]
@@ -1053,7 +1086,11 @@ mod tests {
             ffmpeg: true,
             ..base_caps()
         };
-        let sources = vec![source("xxh3:v1", MediaKind::Video, Some("/tmp/v.mov"))];
+        let sources = vec![source(
+            "xxh3:70707070707070707070707070707070",
+            MediaKind::Video,
+            Some("/tmp/v.mov"),
+        )];
         let plan = plan_work(&sources, &store, &caps);
 
         assert_eq!(plan.transcripts.needs_model, 1);
@@ -1068,7 +1105,11 @@ mod tests {
             whisper: true,
             ..base_caps()
         };
-        let sources = vec![source("xxh3:v1", MediaKind::Video, Some("/tmp/v.mov"))];
+        let sources = vec![source(
+            "xxh3:70707070707070707070707070707070",
+            MediaKind::Video,
+            Some("/tmp/v.mov"),
+        )];
         let plan = plan_work(&sources, &store, &caps);
 
         assert_eq!(plan.transcripts.needs_ffmpeg, 1);
@@ -1116,14 +1157,18 @@ mod tests {
     fn pdf_assets_plan_thumb_image_embed_and_pdf_text() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
-        let sources = vec![source("xxh3:pdf1", MediaKind::Pdf, Some("/tmp/doc.pdf"))];
+        let sources = vec![source(
+            "xxh3:adf1adf1adf1adf1adf1adf1adf1adf1",
+            MediaKind::Pdf,
+            Some("/tmp/doc.pdf"),
+        )];
         let plan = plan_work(&sources, &store, &full_caps());
 
         for kind in [WorkKind::Thumb, WorkKind::ImageEmbed, WorkKind::PdfText] {
             assert!(
                 plan.items
                     .iter()
-                    .any(|i| i.asset == "xxh3:pdf1" && i.kind == kind),
+                    .any(|i| i.asset == "xxh3:adf1adf1adf1adf1adf1adf1adf1adf1" && i.kind == kind),
                 "expected a {kind:?} item for the pdf: {:?}",
                 plan.items
             );
@@ -1293,22 +1338,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = BlobStore::new(dir.path());
         let sources = vec![
-            source("xxh3:img1", MediaKind::Image, Some("/tmp/i.jpg")),
-            source("xxh3:pdf1", MediaKind::Pdf, Some("/tmp/p.pdf")),
+            source(
+                "xxh3:10a110a110a110a110a110a110a110a1",
+                MediaKind::Image,
+                Some("/tmp/i.jpg"),
+            ),
+            source(
+                "xxh3:adf1adf1adf1adf1adf1adf1adf1adf1",
+                MediaKind::Pdf,
+                Some("/tmp/p.pdf"),
+            ),
         ];
         let plan = plan_work(&sources, &store, &base_caps());
 
         assert!(
             plan.items
                 .iter()
-                .any(|i| i.asset == "xxh3:img1" && i.kind == WorkKind::OcrImage),
+                .any(|i| i.asset == "xxh3:10a110a110a110a110a110a110a110a1"
+                    && i.kind == WorkKind::OcrImage),
             "{:?}",
             plan.items
         );
         assert!(
             plan.items
                 .iter()
-                .any(|i| i.asset == "xxh3:pdf1" && i.kind == WorkKind::PdfText),
+                .any(|i| i.asset == "xxh3:adf1adf1adf1adf1adf1adf1adf1adf1"
+                    && i.kind == WorkKind::PdfText),
             "{:?}",
             plan.items
         );
@@ -1321,7 +1376,7 @@ mod tests {
         let caps_full = full_caps();
 
         let no_manifest = vec![source(
-            "xxh3:novid",
+            "xxh3:0bad0bad0bad0bad0bad0bad0bad0bad",
             MediaKind::Video,
             Some("/tmp/nomanifest.mov"),
         )];
@@ -1400,7 +1455,11 @@ mod tests {
             describer_tag: None,
             ..full_caps()
         };
-        let image_sources = vec![source("xxh3:img1", MediaKind::Image, Some("/tmp/i.jpg"))];
+        let image_sources = vec![source(
+            "xxh3:10a110a110a110a110a110a110a110a1",
+            MediaKind::Image,
+            Some("/tmp/i.jpg"),
+        )];
         let plan_no_describer = plan_work(&image_sources, &store, &caps_no_describer);
         assert_eq!(plan_no_describer.captions.needs_model, 1);
         assert!(
@@ -1415,7 +1474,8 @@ mod tests {
             plan_with_describer
                 .items
                 .iter()
-                .any(|i| i.asset == "xxh3:img1" && i.kind == WorkKind::Caption)
+                .any(|i| i.asset == "xxh3:10a110a110a110a110a110a110a110a1"
+                    && i.kind == WorkKind::Caption)
         );
 
         let hex = "ff11ff11ff11ff11ff11ff11ff11ff11";
@@ -1433,7 +1493,11 @@ mod tests {
             plan_video.items
         );
 
-        let video_no_manifest = vec![source("xxh3:novid2", MediaKind::Video, Some("/tmp/v2.mov"))];
+        let video_no_manifest = vec![source(
+            "xxh3:1bad1bad1bad1bad1bad1bad1bad1bad",
+            MediaKind::Video,
+            Some("/tmp/v2.mov"),
+        )];
         let plan_no_manifest = plan_work(&video_no_manifest, &store, &full_caps());
         assert!(
             !plan_no_manifest
@@ -1558,7 +1622,7 @@ mod tests {
         // A video with a pre-existing keyframe manifest, so its OCR/caption
         // passes have something to react to in this same run (they'd
         // otherwise wait for a keyframes pass that hasn't happened yet).
-        let video_with_manifest_hex = "vm11vm11vm11vm11vm11vm11vm11vm11";
+        let video_with_manifest_hex = "70117011701170117011701170117011";
         let manifest = store.path_for(
             video_with_manifest_hex,
             &Derivation::KeyframeManifest { model_tag: "m1" },
@@ -1568,7 +1632,7 @@ mod tests {
 
         // A transcript blob with no chunks yet, so the transcript-embed pass
         // has something to plan in this same run.
-        let transcript_hex = "ts11ts11ts11ts11ts11ts11ts11ts11";
+        let transcript_hex = "75117511751175117511751175117511";
         let transcript_blob = store.path_for(
             transcript_hex,
             &Derivation::Transcript {
@@ -1581,16 +1645,32 @@ mod tests {
         let transcript_asset = format!("xxh3:{transcript_hex}");
 
         let sources = vec![
-            source("xxh3:img1", MediaKind::Image, Some("/tmp/i.jpg")),
-            source("xxh3:vid1", MediaKind::Video, Some("/tmp/v.mov")),
-            source("xxh3:aud1", MediaKind::Audio, Some("/tmp/a.m4a")),
+            source(
+                "xxh3:10a110a110a110a110a110a110a110a1",
+                MediaKind::Image,
+                Some("/tmp/i.jpg"),
+            ),
+            source(
+                "xxh3:70d170d170d170d170d170d170d170d1",
+                MediaKind::Video,
+                Some("/tmp/v.mov"),
+            ),
+            source(
+                "xxh3:a0d1a0d1a0d1a0d1a0d1a0d1a0d1a0d1",
+                MediaKind::Audio,
+                Some("/tmp/a.m4a"),
+            ),
             source(&transcript_asset, MediaKind::Audio, None),
             source(
                 &video_with_manifest_asset,
                 MediaKind::Video,
                 Some("/tmp/vm.mov"),
             ),
-            source("xxh3:pdf1", MediaKind::Pdf, Some("/tmp/p.pdf")),
+            source(
+                "xxh3:adf1adf1adf1adf1adf1adf1adf1adf1",
+                MediaKind::Pdf,
+                Some("/tmp/p.pdf"),
+            ),
         ];
         let plan = plan_work(&sources, &store, &caps);
 

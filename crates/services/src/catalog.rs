@@ -129,6 +129,7 @@ pub struct AssetDetail {
     /// that needs the archived flag queries the node's own state separately
     /// (`maj para list`).
     pub para: Option<String>,
+    #[serde(serialize_with = "crate::meta::serialize_pairs_as_map")]
     pub fields: Vec<(String, String)>,
     pub verifications: Vec<AssetVerification>,
     pub has_thumb: bool,

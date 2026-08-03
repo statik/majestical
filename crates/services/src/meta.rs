@@ -10,6 +10,30 @@ use crate::error::ServiceError;
 use anyhow::Result;
 use majestical_core::event::{AssetId, Op};
 
+/// `serialize_with` target for [`MetaOutcome::fields`] and
+/// `catalog::AssetDetail::fields`: serializes a `Vec<(String, String)>` as a
+/// JSON object rather than an array-of-pairs. Field keys are unique
+/// (last-write-wins per key), so a map loses nothing and is the shape an
+/// MCP agent — or any other JSON consumer — expects. The underlying field
+/// stays a plain `Vec` (insertion order preserved, no map type pulled in for
+/// two call sites); only the wire shape changes.
+///
+/// # Errors
+/// Returns an error only if the underlying `Serializer` itself fails (e.g. a
+/// non-self-describing format that rejects a map) — never for any input this
+/// module produces.
+pub fn serialize_pairs_as_map<S: serde::Serializer>(
+    pairs: &[(String, String)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(pairs.len()))?;
+    for (key, value) in pairs {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
+}
+
 /// `maj meta set`: sets a field's value (last-write-wins) on an
 /// already-known asset.
 ///
@@ -41,6 +65,7 @@ fn meta_set_impl(app: &mut FsApp, asset: &str, field: &str, value: &str) -> Resu
 /// every field currently set on the asset.
 #[derive(serde::Serialize)]
 pub struct MetaOutcome {
+    #[serde(serialize_with = "serialize_pairs_as_map")]
     pub fields: Vec<(String, String)>,
 }
 

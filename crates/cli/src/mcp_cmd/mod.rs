@@ -16,8 +16,9 @@
 //! remedy text (e.g. "run `maj catalog init` first") already lives.
 //!
 //! Split into submodules by concern: `read_tools` (the 10 read-only tools),
-//! `write_tools` (the 16 mutating-tool stubs; Task 8 replaces their
-//! bodies), and `resources` (the `majestical://` MCP resources: thumbnails
+//! `write_tools` (the 16 mutating tools, each gated behind a `confirm`
+//! parameter — see that module's own doc for the dry-run/execute
+//! contract), and `resources` (the `majestical://` MCP resources: thumbnails
 //! and keyframe manifests). This file keeps only what every submodule
 //! shares: the `MajServer` struct itself, the `open_app`/`ensure_catalog`
 //! guards every tool and resource opens the catalog through, the

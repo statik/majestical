@@ -519,26 +519,482 @@ fn suggest_tags_review_matches() {
     );
 }
 
-/// One representative mutating stub — Task 8 replaces the body, but Task
-/// 6's contract (roster stable now, every stub errors uniformly) is pinned
-/// here so a regression in the stub wiring itself is caught before Task 8.
+/// The 16 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —
+/// every one of these takes `confirm: bool`, checked below.
+const MUTATING_TOOLS: &[&str] = &[
+    "add_sync_location",
+    "catalog_init",
+    "index_run",
+    "ingest_source",
+    "inbox_process",
+    "move_para",
+    "rm_saved_search",
+    "rm_sync_location",
+    "scan_volume",
+    "set_describer",
+    "set_metadata",
+    "sync_pull",
+    "sync_push",
+    "tag_assets",
+    "test_describer",
+    "verify_volume",
+];
+
+/// Every mutating tool's `inputSchema` must document the confirm gate the
+/// same way (so an agent can discover the dry-run/execute contract from
+/// `tools/list` alone) and must NOT list `confirm` as required (it
+/// defaults to `false`) — replaces Task 6's stub tripwire now that every
+/// mutating tool has a real body.
 #[test]
-fn mutating_stub_tool_errors_as_not_yet_implemented() {
+fn every_mutating_tool_documents_the_confirm_gate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
     let mut mcp = Mcp::spawn(&root, &state);
-    let resp = mcp.call_tool("tag_assets", &serde_json::json!({}));
+    let resp = mcp.request("tools/list", &serde_json::json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in MUTATING_TOOLS {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == serde_json::json!(*name))
+            .unwrap_or_else(|| panic!("{name}: missing from tools/list: {resp}"));
+        let description = tool["inputSchema"]["properties"]["confirm"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}: inputSchema has no confirm property: {tool}"));
+        assert!(
+            description.contains("dry-run") && description.contains("executes"),
+            "{name}: confirm's description must document the gate: {description}"
+        );
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|v| v == "confirm"));
+        assert!(
+            !required,
+            "{name}: confirm must default to false, not be required: {tool}"
+        );
+    }
+}
+
+#[test]
+fn tag_assets_defaults_to_dry_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({"asset": asset, "op": "add", "tag": "kf"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert!(
+        structured["would"]
+            .as_str()
+            .is_some_and(|s| s.contains("kf")),
+        "{structured}"
+    );
+
+    let search = mcp.call_tool("search_assets", &serde_json::json!({"query": "tag:kf"}));
+    assert_eq!(
+        search["result"]["structuredContent"]["count"],
+        serde_json::json!(0),
+        "a dry run must not touch the catalog: {search}"
+    );
+}
+
+#[test]
+fn tag_assets_confirm_executes_and_is_visible_to_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({"asset": asset, "op": "add", "tag": "kf", "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{resp}"
+    );
+
+    // A different machine id, same catalog: the tag must be visible through
+    // a wholly separate `maj` process, not just this MCP session's own
+    // in-memory state.
+    let out = common::maj_as(&root, &state, "cli-checker")
+        .args(["search", "tag:kf", "--json"])
+        .output()
+        .expect("run");
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(hits["count"], serde_json::json!(1), "{hits}");
+}
+
+#[test]
+fn ingest_source_dry_run_returns_plan_and_copies_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(source.join("clip.mov"), b"hello").expect("write");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&dest).expect("mkdir");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "ingest_source",
+        &serde_json::json!({
+            "source": source.to_str().expect("utf8"),
+            "dest": [dest.to_str().expect("utf8")],
+            "para": "project/client-x",
+        }),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    let files = structured["plan"]["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "{structured}");
+    assert_eq!(
+        files[0]["rel"],
+        serde_json::json!("clip.mov"),
+        "{structured}"
+    );
+
+    assert!(
+        std::fs::read_dir(&dest)
+            .expect("read dest")
+            .next()
+            .is_none(),
+        "a dry run must not copy anything into dest"
+    );
+}
+
+/// Two locations sharing one catalog's blobs: an unreadable blob fails the
+/// SAME copy for both, so both locations end up `Ran` with a non-empty
+/// `failures` list — the shared "one bad blob" scenario, no need for two
+/// separately-broken blobs. Mirrors `sync_smoke.rs`'s own permission-guard
+/// pattern (including its skip-under-root escape hatch: some environments,
+/// notably running as root, don't enforce a mode-000 file).
+#[test]
+#[cfg(unix)]
+fn sync_push_partial_failure_keeps_rows_and_maps_polarity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+
+    let blob_path = root.join("blobs/ab/abcd/thumb-320.webp");
+    std::fs::create_dir_all(blob_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&blob_path, b"thumb-bytes").expect("write blob");
+    std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+    if std::fs::read(&blob_path).is_ok() {
+        std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms");
+        eprintln!("skipping: this environment does not enforce a mode-000 file (likely root)");
+        return;
+    }
+
+    let loc_a = dir.path().join("loc-a");
+    let loc_b = dir.path().join("loc-b");
+    std::fs::create_dir_all(&loc_a).expect("mkdir");
+    std::fs::create_dir_all(&loc_b).expect("mkdir");
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "loc-a"])
+        .arg(&loc_a)
+        .assert()
+        .success();
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "loc-b"])
+        .arg(&loc_b)
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("sync_push", &serde_json::json!({"confirm": true}));
+
+    // Restore permissions so the tempdir can be cleaned up regardless of
+    // what the assertions below find.
+    std::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore perms");
+
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    let rows = structured["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "rows for BOTH locations must be present: {structured}"
+    );
+    for row in rows {
+        let ran = &row["Ran"];
+        assert!(
+            ran.is_object(),
+            "every location must have attempted to run: {row}"
+        );
+        let failures = ran["failures"].as_array().expect("failures array");
+        assert!(
+            !failures.is_empty(),
+            "the shared unreadable blob must fail for every location: {row}"
+        );
+    }
+}
+
+#[test]
+fn catalog_init_refuses_when_a_catalog_already_exists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+
+    let dry = mcp.call_tool("catalog_init", &serde_json::json!({}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    assert_eq!(
+        dry["result"]["structuredContent"]["already_initialized"],
+        serde_json::json!(true),
+        "{dry}"
+    );
+
+    let confirmed = mcp.call_tool("catalog_init", &serde_json::json!({"confirm": true}));
+    assert_eq!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "re-initializing an existing catalog must refuse: {confirmed}"
+    );
+    let text = confirmed["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(text.contains("already exists"), "{text}");
+}
+
+#[test]
+fn verify_volume_on_a_tampered_dir_is_iserror_with_the_report_attached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let target = dir.path().join("verify-me");
+    std::fs::create_dir_all(&target).expect("mkdir");
+    std::fs::write(target.join("a.mov"), b"hello").expect("write");
+    // Establishes the initial ASC MHL generation this test then tampers
+    // against — `maj verify` (unlike `verify_dir_op`'s own unit tests)
+    // re-verifies against EXISTING history rather than creating it, so the
+    // first generation is written directly here, same as
+    // `crates/services/src/verify.rs`'s own tests do.
+    let hash_list =
+        majestical_ingest::mhl::hash_dir(&target, "2026-01-01T00:00:00Z").expect("hash_dir");
+    majestical_ingest::mhl::write_generation(&target, &hash_list).expect("write_generation");
+    std::fs::write(target.join("a.mov"), b"TAMPERED").expect("tamper");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "verify_volume",
+        &serde_json::json!({"dir": target.to_str().expect("utf8"), "confirm": true}),
+    );
     assert_eq!(
         resp["result"]["isError"],
         serde_json::json!(true),
-        "a stub mutating tool must report a tool error: {resp}"
+        "an altered file must report isError, not a silent success: {resp}"
     );
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("error text");
+    let structured = &resp["result"]["structuredContent"];
     assert_eq!(
-        text, "tag_assets: not yet implemented over MCP — use the maj CLI",
-        "stub text must be exact: {text}"
+        structured["altered"],
+        serde_json::json!(["a.mov"]),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+}
+
+#[test]
+fn index_run_single_pass_on_a_text_only_fixture() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+
+    let dry = mcp.call_tool("index_run", &serde_json::json!({"kinds": ["thumbs"]}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    assert_eq!(
+        dry["result"]["structuredContent"]["executed"],
+        serde_json::json!(false),
+        "{dry}"
+    );
+
+    let resp = mcp.call_tool(
+        "index_run",
+        &serde_json::json!({"kinds": ["thumbs"], "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    // a.txt/b.txt are plain text — `MediaKind::Other` has no derivation, so
+    // a real pass over a text-only fixture writes nothing and fails
+    // nothing.
+    assert_eq!(
+        structured["thumbs"]["written"],
+        serde_json::json!(0),
+        "{structured}"
+    );
+    assert!(
+        structured["thumbs"]["failed"]
+            .as_array()
+            .expect("failed array")
+            .is_empty(),
+        "{structured}"
+    );
+}
+
+#[test]
+fn move_para_archive_dry_run_plans_then_confirm_moves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let materialized = dir.path().join("materialized");
+    let node_dir = materialized.join("Projects").join("client-x");
+    std::fs::create_dir_all(&node_dir).expect("mkdir");
+    std::fs::write(node_dir.join("a.txt"), b"hello").expect("write");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool(
+        "move_para",
+        &serde_json::json!({
+            "op": "archive",
+            "node": "project/client-x",
+            "roots": [materialized.to_str().expect("utf8")],
+        }),
+    );
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["moves"][0]["status"],
+        serde_json::json!("planned"),
+        "{structured}"
+    );
+    assert!(node_dir.is_dir(), "a dry run must not move anything");
+
+    let confirmed = mcp.call_tool(
+        "move_para",
+        &serde_json::json!({
+            "op": "archive",
+            "node": "project/client-x",
+            "roots": [materialized.to_str().expect("utf8")],
+            "confirm": true,
+        }),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    let structured = &confirmed["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["moves"][0]["status"],
+        serde_json::json!("moved"),
+        "{structured}"
+    );
+    assert!(
+        !node_dir.exists(),
+        "confirm must actually move the directory"
+    );
+    assert!(
+        materialized
+            .join("Archives")
+            .join("client-x")
+            .join("a.txt")
+            .is_file()
+    );
+}
+
+#[test]
+fn rm_saved_search_dry_run_then_confirm_removes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["search", "a.txt", "--save", "picks"])
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let dry = mcp.call_tool("rm_saved_search", &serde_json::json!({"name": "picks"}));
+    assert_ne!(dry["result"]["isError"], serde_json::json!(true), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(
+        structured["exists"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+
+    let saved_before = mcp.call_tool("list_saved_searches", &serde_json::json!({}));
+    assert_eq!(
+        saved_before["result"]["structuredContent"]["saved"]
+            .as_array()
+            .expect("saved array")
+            .len(),
+        1,
+        "a dry run must not remove it: {saved_before}"
+    );
+
+    let confirmed = mcp.call_tool(
+        "rm_saved_search",
+        &serde_json::json!({"name": "picks", "confirm": true}),
+    );
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+
+    let saved_after = mcp.call_tool("list_saved_searches", &serde_json::json!({}));
+    assert!(
+        saved_after["result"]["structuredContent"]["saved"]
+            .as_array()
+            .expect("saved array")
+            .is_empty(),
+        "{saved_after}"
     );
 }
 

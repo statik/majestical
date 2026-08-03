@@ -1031,6 +1031,270 @@ task's own TDD tests (`a_filtered_out_directorys_contents_are_absent_from_
 the_plan`, `a_filtered_out_directory_is_never_entered_even_when_unreadable`)
 already discriminated everything; no gaps found, no action needed.
 
+## Phase 7A deferrals
+
+Recorded during the phase 7A PR chain (#64-#69) and this closing task. Items
+marked "(phase 7 spec)" come from that spec's own Deferred list; the rest
+were found during execution.
+
+- **Keyframe-image extraction is deferred** — keyframe *images* are never
+  stored as blobs, only the detected-timestamp manifest is
+  (`majestical_index::blob::Derivation::KeyframeManifest`). The
+  `majestical://keyframes/{asset_id}` MCP resource
+  (`crates/cli/src/mcp_cmd/resources.rs`) serves that manifest, not an
+  image; on-demand frame extraction from the source video whenever an
+  agent wants to actually SEE a keyframe is unbuilt (Task 7, restated at
+  closing; also recorded in the spec's as-built section).
+- **`maj sync location list` and its MCP tool disagree on a missing
+  catalog.** `services::sync::locations_list`
+  (`crates/services/src/sync.rs:383-393`) reads `sync.toml` from the state
+  dir and needs no catalog at all — `locations_list_of_an_unconfigured_
+  catalog_is_empty` (`:838-843`) proves it returns an empty list against a
+  bare, never-`catalog init`'d directory. The CLI (`cmd_location_list`,
+  `crates/cli/src/sync_cmd.rs:450-451`) calls it directly and succeeds. The
+  MCP tool (`list_sync_locations`, `crates/cli/src/mcp_cmd/read_tools.rs:
+  196-206`) calls `self.ensure_catalog()` first and returns the `maj
+  catalog init` remedy error instead — same verb, same underlying service
+  call, different behavior against the same input. Named `ensure_catalog`'s
+  own doc comment (`crates/cli/src/mcp_cmd/mod.rs:108-119`), added during
+  Task 6's implementation; the plan document itself doesn't flag it in
+  prose. Unresolved at closing.
+- **Enum-shaped string parameters have no schemars enum, losing
+  schema-level validation/documentation.** Four `write_tools.rs` fields
+  are each a closed set of string literals, documented only in a doc
+  comment and hand-parsed at call time with a `match`/`bail!` that errors
+  on anything else: `TagAssetsArgs::op` (`:145`, one of
+  `add`/`rm`/`confirm_suggestion`/`reject_suggestion`, parsed by
+  `parse_tag_op`, `:173-187`), `MoveParaArgs::op` (`:284`, one of
+  `add`/`rename`/`archive`), `IngestSourceArgs::dedupe` (`:486`, one of
+  `skip`/`copy`, default via `default_dedupe`, `:466-468`), and
+  `SetDescriberArgs::backend` (`:822`, one of
+  `ollama`/`lm-studio`/`open-router`, parsed by `parse_backend`,
+  `:124-135`). A real `schemars`-derived enum on each would surface the
+  allowed values in the tool's JSON schema itself, catching a typo'd value
+  at the client before the call round-trips instead of after.
+- **Dry-run previews over-promise on an unknown asset id.** `set_metadata`'s
+  dry-run branch (`crates/cli/src/mcp_cmd/write_tools.rs:254-273`) calls
+  `meta::meta_get`, which does not validate the asset exists
+  (`crates/services/src/meta.rs:85-100` has no `ensure_asset_known` call —
+  unlike `meta_set_impl`, `:52-62`, which does) — an unknown asset id
+  silently reports `current_value: null` and a "would set..." message as
+  if the write will succeed. `tag_assets`'s dry-run branch
+  (`crates/cli/src/mcp_cmd/write_tools.rs:198-220`) has the identical gap:
+  it reads `projection.tags(...)` directly (empty for an unknown id, no
+  existence check), while the real `tag_add` (`crates/services/src/
+  tags.rs:31-39`) calls `ensure_asset_known` and `tag_rm` (`:52-64`)
+  requires a non-empty `tag_add_ids` lookup — an unknown asset has none,
+  so it's rejected too, just via a different guard. Both tools' dry runs
+  describe an action as
+  achievable when `confirm: true` on the same unknown id would actually
+  fail.
+- **`scan_volume`'s dry-run count silently drops walk errors.** The preview
+  branch (`crates/cli/src/mcp_cmd/write_tools.rs:400-404`) counts files via
+  `walkdir::WalkDir::new(&args.dir).into_iter().filter_map(Result::ok)` —
+  every entry that errors (permission denied, a broken symlink, ...) is
+  dropped from `would_scan_files` with no indication any occurred, so the
+  previewed count can undercount what a real `confirm: true` scan would
+  actually attempt.
+- **The `"ascmhl"` directory name is a literal repeated in ~8 places, not a
+  shared const.** `majestical_ingest::mhl` defines `const ASCMHL_DIR: &str
+  = "ascmhl"` (`crates/ingest/src/mhl.rs:139`) but keeps it private, so
+  `verify_volume`'s dry-run history check
+  (`crates/cli/src/mcp_cmd/write_tools.rs:436`,
+  `args.dir.join("ascmhl").is_dir()`) and several test fixtures
+  (`crates/ingest/tests/conformance.rs:33`, `crates/cli/tests/
+  cli_smoke.rs:1086,1162,1250`, `crates/cli/tests/inbox_smoke.rs:146,209`)
+  each hand-write the same string. Exporting the const (or a small public
+  helper) would remove the risk of the literal drifting from the real
+  directory name in exactly one of these call sites.
+- **MCP clients never see stderr diagnostics.** `crates/services` inherits
+  the workspace's `print_stderr = "deny"` (unlike `crates/cli`, which
+  allows it crate-wide since CLI diagnostics are the product), so every
+  stderr notice moved verbatim from the pre-extraction CLI carries its own
+  local `#[expect(clippy::print_stderr, reason = "...not yet a rendered
+  outcome")]` (first at `crates/services/src/app.rs:35-54`'s
+  `warn_skipped_corrupt_lines`, which itself names this as later work). 28
+  such sites exist across
+  `crates/services/src/{app,state_dir,tags,search,inbox,index/run,
+  index/heal,index/mod}.rs` (app.rs 2, state_dir.rs 2, tags.rs 1,
+  search.rs 6, inbox.rs 4, index/run.rs 5, index/heal.rs 6, index/mod.rs
+  2), and most are reachable from an MCP
+  tool: `warn_skipped_corrupt_lines`/the HLC clock-clamp warning
+  (`app.rs`) from nearly every tool that opens the catalog; legacy-catalog
+  migration notices (`state_dir.rs`) from the same path; the
+  unreadable-suggestions notice (`tags.rs`) from `suggest_tags_review`; six
+  semantic-miss notices (`search.rs`) from `search_assets`/
+  `run_saved_search`; vector-store/caption/video-caption notices
+  (`index/run.rs`) and unreadable-blob notices (`index/heal.rs`) from
+  `index_run`; the describer-model-tag and failure-report notices
+  (`index/mod.rs`) from `index_status`/`index_run`; and marker/quiescence/
+  per-row failure notices (`inbox.rs`) from `inbox_process`. `maj mcp`'s
+  tools route every outcome through `structured_ok`/`tool_error`, never
+  reading stderr, so an agent driving any of these paths never sees these
+  notices at all today. Migrating each to a field on its outcome struct
+  (rather than a bare `eprintln!`) before the GUI head lands — which faces
+  the identical stderr-is-invisible problem — is the fix.
+- **`IngestRun.outcome`'s name collides in spirit with the service layer's
+  own `*Outcome` convention.** Every other service verb returns a struct
+  named `<Verb>Outcome` (`SearchOutcome`, `MetaOutcome`, `LocationsOutcome`,
+  `ScanOutcome`, ...) — `run_ingest` breaks the pattern by returning
+  `IngestRun` (`crates/services/src/ingest.rs:168-172`), whose own
+  `outcome` field holds `majestical_ingest::engine::Outcome`, a completely
+  different, lower-level, per-file-copy type from a different crate. A
+  reader skimming for "the ingest outcome struct" finds two different
+  things named `Outcome` in two different crates, neither of them called
+  `IngestOutcome`. Renaming is a call-site-touching change across
+  `crates/cli`/`crates/services`; not done this phase given the volume of
+  extraction work already in flight.
+- **8 of 16 mutating MCP tools have no functional test in `mcp_smoke.rs`
+  beyond the roster/schema checks** (found during the write_tools.rs
+  cargo-mutants triage below): `add_sync_location`, `rm_sync_location`,
+  `scan_volume`, `set_describer`, `set_metadata`, `sync_pull`,
+  `test_describer`, and `inbox_process` are each named only inside the
+  `EXPECTED_TOOLS`/`MUTATING_TOOLS` constant arrays
+  (`crates/cli/tests/mcp_smoke.rs`) — never called via `mcp.call_tool(...)`
+  to assert an actual dry-run or executed response. The other 8
+  (`tag_assets`, `ingest_source`, `sync_push`, `catalog_init`,
+  `verify_volume`, `index_run`, `move_para`'s `archive` op, `rm_saved_
+  search`) each have a dedicated test. This is why each of the 8 untested
+  functions' own `if !args.confirm { ... }` dry-run guard survives a
+  "delete `!`" mutation (e.g. `scan_volume_result`, `:397`) alongside the
+  whole-body `Ok(Default::default())` replacement: `confirm_gate`/
+  `inject_executed` (`crates/cli/src/mcp_cmd/write_tools.rs:47-91`) always
+  injects `"executed": confirm` from the REQUEST value, not from which
+  branch actually ran, so an inverted guard's response still carries a
+  self-consistent but wrong `executed` flag — a symptom worth naming for
+  whoever writes these tests later, distinct from the untested-function
+  root cause itself. Closing all 8 gaps needs a dedicated dry-run-then-
+  confirm test per tool (the `move_para_archive_dry_run_plans_then_
+  confirm_moves`/`rm_saved_search_dry_run_then_confirm_removes_it` shape,
+  ~30-45 lines each) — out of scope for this closing task's mutants-triage
+  budget; watchlisted here with the full list rather than partially
+  patched.
+
+### cargo-mutants triage (phase 7A)
+
+Three scoped runs (`cargo mutants --package <pkg> --file <path> --timeout
+300`; this repo's version, 27.1.0). The two `crates/services` runs used the
+plan's sketch verbatim, default full-package test command; the
+`crates/cli` run needed narrowing to `-- --test mcp_smoke` (see that run's
+own note below — the crate's full default suite measured roughly 100s per
+mutant against 88 mutants, over two hours projected). Every count below is
+the run's own final tally; several representative survivors were confirmed
+by hand (mutate the real source, run the specific test that should catch
+it, confirm failure, revert) rather than assumed.
+
+```bash
+cargo mutants --package majestical-services --timeout 300 \
+  --file crates/services/src/search.rs
+cargo mutants --package majestical-services --timeout 300 \
+  --file crates/services/src/catalog.rs
+cargo mutants --package majestical-cli --timeout 300 \
+  --file crates/cli/src/mcp_cmd/write_tools.rs -- --test mcp_smoke
+```
+
+**`crates/services/src/search.rs`**: 128 mutants tested in 21m, 24 caught,
+52 unviable, **52 missed — all triaged, none needing a new test in this
+crate**:
+
+- **39 of the 52 are covered by `crates/cli`'s own suite, not this crate's.**
+  `search.rs` was extracted from `crates/cli/src/search.rs` this same
+  phase (PR1, #65); `cargo mutants -p majestical-services` only runs this
+  crate's OWN `#[cfg(test)]` module, never `crates/cli`'s integration
+  suites that already drive every one of these code paths through the real
+  `maj` binary — the same "covered by a sibling crate's own suite"
+  category phase 4 (`model.rs::fetch`) and phase 6 (`EventLog`
+  trait-forwarding) both documented. Confirmed by hand for one
+  representative: `searches_rm_impl` reduced to a bare `Ok(())` no-op
+  still passes every test in this crate, but fails two `crates/cli/tests/
+  cli_smoke.rs` tests (`running_and_managing_saved_searches`,
+  `saved_searches_sync_between_machines`) — reverted after confirming.
+  The remaining 38 are the same category by direct inspection, not
+  independently hand-verified this pass: `searches_list` (1, exercised by
+  the same `cli_smoke.rs` tests), `resolve_filters`/`resolve_filter` (3,
+  exercised by `cli_smoke.rs`'s `key:value` filter tests),
+  `text_coverage_notices`/`source_remedy` (9, `search_text_smoke.rs`'s
+  `coverage_notice_names_uncovered_transcripts` and neighbors assert the
+  exact stdout remedy text these functions produce),
+  `SemanticMiss::note`/`TextSemanticMiss::note`/`open_semantic_index`/
+  `open_text_semantic_index`/`embed_query`/`embed_text_query`/
+  `semantic_candidates`/`text_semantic_candidates` (20, `crates/cli/tests/
+  index_smoke.rs`'s `MAJ_MODEL_DIR`-gated tests assert the exact
+  "semantic index is empty"/"semantic index unreadable" stderr text these
+  functions produce), and `selected_text_sources`/`eligible_assets`/
+  `text_fts_search` (5, exercised end-to-end by `search_text_smoke.rs`'s
+  `maj search <term> --json` calls).
+- **13 remain open — pure ranking arithmetic with no confirmed coverage
+  even at the `crates/cli` level, in the spirit of phase 4's
+  "aggregate-covered arithmetic" bucket**: `run_search`'s `!=`->`==` guard
+  (1, `:198`), `TermSearchOutput`'s `ranked` field deletion (1, `:223`),
+  `term_search`'s `>>`->`<<` (1, `:406`), `fuse_ranked_n`'s two `!`
+  deletions and one `&&`->`||` (3, `:556,558,567`), and `rrf_merge`'s
+  scoring arithmetic (7, `:732-733` — the `+=`->`*=` mutant in particular
+  would zero every fresh score, collapsing fusion ranking to alphabetical
+  tie-break order). No test asserts exact multi-source result ORDER (only
+  membership/coverage), so a subtly wrong fusion score could survive
+  end-to-end too. Not chased this pass; a future task adding an
+  order-sensitive fusion test would need to cover both crates' suites,
+  since `crates/services` itself has no test of its own for this
+  arithmetic either.
+
+**`crates/services/src/catalog.rs`**: 27 mutants tested in 9m, 20 caught, 5
+unviable, **2 missed — both the same single line, both closed by the same
+existing `crates/cli` test**: `open_catalog`'s `skipped += 1` corrupt-line
+counter (`:30`, `+=`->`-=` and `+=`->`*=`) has no test in this crate
+(`warn_skipped_corrupt_lines` is a display-only diagnostic here), but
+`crates/cli/tests/cli_smoke.rs`'s `corrupt_log_line_is_skipped_and_
+reported_on_stderr` asserts the literal stderr text `"warning: skipped 1
+corrupt event log line(s)"` — confirmed by hand: mutating `+=` to `*=`
+(count stays 0 regardless of skips) fails that exact test with the real
+stderr showing no corrupt-line warning at all; reverted after confirming.
+Same sibling-crate-coverage category as `search.rs` above, and for the
+same reason — `catalog.rs` is also "moved verbatim from `crates/cli/src/
+commands.rs`" per its own module doc.
+
+**`crates/cli/src/mcp_cmd/write_tools.rs`**: 88 mutants tested in 42m
+(rescoped mid-run from the default full-crate test command, which measured
+~100s/mutant against 88 mutants — over two hours projected — to `-- --test
+mcp_smoke`, the one suite that actually exercises these tools; the killed
+first attempt's one real result, `parse_only`'s `Ok(None)` mutant missed at
+96s, is not counted below, only the clean rescoped run is), 33 caught, 4
+unviable, **51 missed**:
+
+- **7 closed with new unit tests added this pass** (`parse_only` 1,
+  `non_empty_tags` 3, `parse_index_kinds` 3): these three are pure
+  request-parsing helpers with no test anywhere touching more than one
+  input value each. A new `#[cfg(test)] mod tests` at the end of
+  `write_tools.rs` tests each directly (cheaper and more precise than a
+  full `maj mcp` stdio round trip for pure logic) — confirmed by hand for
+  `parse_only` (mutated to unconditional `Ok(None)`, watched the new test
+  fail with `left: None, right: Some(Segments)`, reverted); the other two
+  mutated similarly by inspection, not independently re-run.
+- **41 are the systemic gap this pass's other new watchlist item names**
+  (above, "8 of 16 mutating MCP tools have no functional test"): every
+  `Ok(Default::default())`/`delete !` survivor in `set_metadata_result`,
+  `move_para_add`, `move_para_rename`, `scan_volume_result`,
+  `add_sync_location_result`, `rm_sync_location_result`,
+  `sync_transfer_dry_run`, `inbox_dry_run`, `set_describer_result`,
+  `test_describer_result`, and each corresponding `MajServer::*` `#[tool]`
+  wrapper falls in this bucket — not re-itemized here, see that bullet for
+  the full list and the closing-budget reasoning for not chasing it this
+  pass.
+- **2 are `verify_volume_result`'s own narrower gap, not the systemic
+  one**: the tool DOES have a dedicated test
+  (`verify_volume_on_a_tampered_dir_is_iserror_with_the_report_attached`),
+  and its dry-run guard (`:435`) is correctly caught — but the "failed"
+  determination (`crates/cli/src/mcp_cmd/write_tools.rs:451`, `let failed
+  = !report.altered.is_empty() || !report.missing.is_empty()`) only ever
+  gets exercised with an ALTERED file, never a MISSING one, so the second
+  `!` (`:451:56`) and its neighboring match-guard mutant (`:453`) survive.
+  Not chased this pass; a second fixture (delete a listed file rather than
+  tamper with it) would close both.
+- **1 display-only, not chased**: `default_ingest_template`'s literal
+  default string (`:463`, mutated to `"xyzzy"`) — no test asserts the
+  exact default template text, only that omitting `template` doesn't
+  error; cosmetic, matching the phase-4 "display/diagnostic-only" category.
+
 ## Done in phase 6
 
 - **Segment rotation** (was Open, phase 2): landed with zero-padded `NNNN`

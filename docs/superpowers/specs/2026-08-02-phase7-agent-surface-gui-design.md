@@ -214,6 +214,60 @@ Watchlist items adjacent to this phase (`PortError` opacity, repeated
 projection scans in search) are addressed if they block MCP work, otherwise
 they stay listed with attribution.
 
+## As-built (phase 7A)
+
+Phase 7A shipped the service layer + `maj mcp` (Architecture's two service-
+layer/MCP-server sections above); the GUI slice and release pipeline are
+Plan B/C, not this phase (see `HANDOFF-phase7B.md`). Where execution
+diverged from or added detail beyond the text above:
+
+- **The keyframe resource serves the manifest, not images.** Keyframe
+  *images* are never stored as blobs — only the detected-timestamp manifest
+  is (`majestical_index::blob::Derivation::KeyframeManifest`). So
+  `majestical://keyframes/{asset_id}` (`crates/cli/src/mcp_cmd/resources.rs`)
+  serves that JSON manifest; on-demand frame extraction from the source
+  video is watchlisted, not built.
+- **The scoped-thread rule: any tool whose service call can reach
+  `VectorStore`/`TextVectorStore` must run off the server's own tokio
+  runtime.** `run_off_tokio_runtime` (`crates/cli/src/mcp_cmd/mod.rs:92-99`)
+  spawns a plain `std::thread::scope` thread because Lance's vector-store
+  open builds and enters its OWN tokio runtime internally, and entering a
+  runtime from inside a thread that already has one active panics
+  ("Cannot start a runtime from within a runtime") — regardless of whether
+  it's the same `Runtime` value. Two call paths need it today:
+  `read_tools::search_assets`/`run_saved_search` (the image-semantic layer
+  opens the vector store whenever a query has terms and a model is
+  installed) and `write_tools::index_run`'s real (non-dry-run) pass. Any
+  future tool whose service path can reach either vector store must route
+  through this same helper.
+- **`tokio::runtime::Builder::enable_time()` is required, not optional, for
+  a clean shutdown.** `serve` (`crates/cli/src/mcp_cmd/mod.rs:176-186`)
+  builds the runtime with `.enable_io().enable_time()`; without
+  `enable_time()`, rmcp's shutdown path (which calls
+  `tokio::time::timeout` when the client closes stdin at the end of a
+  normal session) panics the worker thread instead of exiting cleanly,
+  turning every well-behaved client disconnect into a nonzero exit.
+  Verified live by `read_tool_then_clean_stdin_close_exits_success`
+  (`crates/cli/tests/mcp_smoke.rs`), which fails without it.
+- **`verify_volume` has no true dry-run.** The real run always mutates — a
+  new ASC MHL generation is appended even on a fully clean pass
+  (`majestical_services::verify::verify_dir_op`) — so there is no
+  side-effect-free way to preview `altered`/`missing` ahead of running it.
+  The dry-run branch (`crates/cli/src/mcp_cmd/write_tools.rs:434-448`)
+  reports only whether ASC MHL history exists yet at the target directory,
+  not a forecast of what a real run would find.
+- **Wire shapes**: struct fields carrying key/value pairs serialize as JSON
+  objects, not positional tuples or arrays-of-pairs — `AssetDetail::fields`
+  (`Vec<(String, String)>` internally,
+  `#[serde(serialize_with = "crate::meta::serialize_pairs_as_map")]`,
+  `crates/services/src/catalog.rs:132-133`) and every `failed:
+  Vec<(PathBuf, String)>` field across `crates/services/src/index/run.rs`
+  (serializes as `{"path", "error"}` objects, pinned by
+  `failed_items_serialize_as_named_objects_not_tuples`). `SemanticCoverage`
+  (`crates/services/src/search.rs:95-98`) is a named `{embedded, eligible}`
+  struct rather than a bare `(u64, u64)` tuple for the same reason: the MCP
+  wire contract needs labeled fields, not positional ones.
+
 ## Deferred (watchlist items with this spec's attribution)
 
 - Browse / Ingest / Organize surfaces; menu-bar indicator with indexing

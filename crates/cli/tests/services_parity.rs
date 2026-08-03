@@ -755,3 +755,549 @@ fn verify_new_file_output_is_byte_identical() {
         "stdout/stderr/exit diverged for verify new file"
     );
 }
+
+/// `sync location add`'s state dir sync.toml lives at a hashed-key path
+/// under `state/catalogs/<key>/` — one key per test catalog root, so the
+/// first (and only) entry under `catalogs/` is always it.
+#[cfg(test)]
+fn find_sync_toml(state: &Path) -> std::path::PathBuf {
+    let catalogs = state.join("catalogs");
+    let entry = std::fs::read_dir(&catalogs)
+        .expect("state dir")
+        .next()
+        .expect("one catalog key")
+        .expect("entry");
+    entry.path().join("sync.toml")
+}
+
+#[test]
+fn tags_confirm_reject_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    // Confirming a tag never already on the asset is a plain TagAdd —
+    // idempotent on a shared root (a re-add is a harmless OR-Set re-add,
+    // same reasoning as `tag_add_output_is_byte_identical`).
+    diff_against_ref(&root, &state, &["tags", "confirm", &asset, "landscape"]);
+    // Reject never validates against a current suggestion, so it's a
+    // harmless append-only write regardless of prior state — safe to run
+    // against the shared machine-scoped rejection log twice.
+    diff_against_ref(&root, &state, &["tags", "reject", &asset, "blurry"]);
+}
+
+#[test]
+fn describer_set_and_test_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    // Setting the same backend/model twice (once per binary) is a plain
+    // overwrite of describer.toml — idempotent, safe on a shared root.
+    diff_against_ref(
+        &root,
+        &state,
+        &[
+            "describer",
+            "set",
+            "--backend",
+            "ollama",
+            "--model",
+            "llava",
+            "--base-url",
+            "http://127.0.0.1:1",
+        ],
+    );
+    // Nothing listens on port 1: both binaries hit the identical
+    // connection-refused path — the parity case that matters here, since
+    // neither this fixture nor CI has a real describer backend running.
+    diff_against_ref(&root, &state, &["describer", "test"]);
+}
+
+#[test]
+fn sync_location_add_rm_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let location_dir = dir.path().join("shuttle");
+    std::fs::create_dir_all(&location_dir).expect("mkdir");
+    let loc_str = location_dir.to_str().expect("utf8").to_string();
+    let add_args = ["sync", "location", "add", "shuttle", &loc_str];
+
+    // First application only (a second `add` of the same name refuses) —
+    // `between` removes the entry `new` just added via the `ref`-independent
+    // rm verb, so `ref`'s identical add call is also a genuine first
+    // application against the same shared root/location path.
+    diff_against_ref_with_between(&root, &state, &add_args, || {
+        common::maj(&root, &state)
+            .args(["sync", "location", "rm", "shuttle"])
+            .assert()
+            .success();
+    });
+
+    // Duplicate add: the `between` above already left "shuttle" configured
+    // again (the `ref` binary's own add, run last inside
+    // `diff_against_ref_with_between`), so both binaries now hit the
+    // identical "already configured" refusal against the shared config.
+    diff_against_ref(&root, &state, &add_args);
+
+    // rm of an unknown name is a safe, non-mutating refusal on a shared root.
+    diff_against_ref(&root, &state, &["sync", "location", "rm", "ghost"]);
+
+    // rm success: `between` re-adds "shuttle" so `ref`'s identical rm call
+    // is also a genuine first removal.
+    diff_against_ref_with_between(
+        &root,
+        &state,
+        &["sync", "location", "rm", "shuttle"],
+        || {
+            common::maj(&root, &state).args(add_args).assert().success();
+        },
+    );
+}
+
+#[test]
+fn sync_push_output_is_byte_identical() {
+    // A real push actually copies segments/blobs, so a second push against
+    // the same location reports zero — independent catalogs, one per
+    // binary, each doing its own first push.
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let (root_new, state_new) = common::fixture_catalog(dir_new.path());
+    let location_new = dir_new.path().join("shuttle");
+    std::fs::create_dir_all(&location_new).expect("mkdir");
+    common::maj(&root_new, &state_new)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "shuttle",
+            location_new.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let (root_ref, state_ref) = common::fixture_catalog(dir_ref.path());
+    let location_ref = dir_ref.path().join("shuttle");
+    std::fs::create_dir_all(&location_ref).expect("mkdir");
+    common::maj(&root_ref, &state_ref)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "shuttle",
+            location_ref.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+
+    for args in [
+        ["sync", "push", "--json"].as_slice(),
+        ["sync", "push"].as_slice(),
+    ] {
+        diff_against_ref_independent(&root_new, &state_new, &root_ref, &state_ref, args);
+        // Reset both sides to "nothing pushed yet" before the next mode's
+        // pass — push is otherwise a one-shot event in this test.
+        std::fs::remove_dir_all(location_new.join("events")).expect("reset new location");
+        std::fs::remove_dir_all(location_ref.join("events")).expect("reset ref location");
+        std::fs::create_dir_all(location_new.join("events")).expect("recreate");
+        std::fs::create_dir_all(location_ref.join("events")).expect("recreate");
+    }
+}
+
+#[test]
+fn sync_push_readonly_refusal_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let location_dir = dir.path().join("nas");
+    std::fs::create_dir_all(&location_dir).expect("mkdir");
+    common::maj(&root, &state)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "nas",
+            location_dir.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    let config = find_sync_toml(&state);
+    let text = std::fs::read_to_string(&config).expect("read");
+    let flipped = text.replace("readonly = false", "readonly = true");
+    assert_ne!(
+        flipped, text,
+        "sync.toml must contain readonly = false: {text}"
+    );
+    std::fs::write(&config, flipped).expect("write");
+
+    // Refuses before touching any location, so this never mutates and is
+    // safe to run for both binaries against the shared config file — whose
+    // absolute path is embedded in the refusal message and is identical
+    // either way, since it's the same path on disk.
+    diff_against_ref(&root, &state, &["sync", "push"]);
+}
+
+#[test]
+fn sync_push_partial_failure_output_is_byte_identical() {
+    // One reachable location plus one whose directory was removed after
+    // `location add` (so `push` reports it Skipped, unreachable) —
+    // independent catalogs since the reachable location's push is a
+    // real, first-application transfer.
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let (root_new, state_new) = common::fixture_catalog(dir_new.path());
+    let good_new = dir_new.path().join("good");
+    std::fs::create_dir_all(&good_new).expect("mkdir");
+    let gone_new = dir_new.path().join("gone");
+    std::fs::create_dir_all(&gone_new).expect("mkdir");
+    common::maj(&root_new, &state_new)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "good",
+            good_new.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    common::maj(&root_new, &state_new)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "gone",
+            gone_new.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(&gone_new).expect("remove");
+
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let (root_ref, state_ref) = common::fixture_catalog(dir_ref.path());
+    let good_ref = dir_ref.path().join("good");
+    std::fs::create_dir_all(&good_ref).expect("mkdir");
+    let gone_ref = dir_ref.path().join("gone");
+    std::fs::create_dir_all(&gone_ref).expect("mkdir");
+    common::maj(&root_ref, &state_ref)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "good",
+            good_ref.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    common::maj(&root_ref, &state_ref)
+        .args([
+            "sync",
+            "location",
+            "add",
+            "gone",
+            gone_ref.to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(&gone_ref).expect("remove");
+
+    let reference = Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(sync push partial failure): /tmp/maj-ref missing — build it first");
+        return;
+    }
+    let new = common::maj(&root_new, &state_new)
+        .args(["sync", "push", "--json"])
+        .output()
+        .expect("run new");
+    let mut c = Command::new(reference);
+    c.env("MAJ_CATALOG", &root_ref)
+        .env("MAJ_MACHINE_ID", "test-machine")
+        .env("MAJ_STATE_DIR", &state_ref)
+        .args(["sync", "push", "--json"]);
+    let old = c.output().expect("run ref");
+
+    assert_eq!(new.status.code(), old.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&new.stderr),
+        String::from_utf8_lossy(&old.stderr)
+    );
+    // The "gone" row's `skipped` reason embeds each side's own independent
+    // tempdir path — structurally identical (same location name, same
+    // "unreachable ... — skipped" wording) but never textually equal, so
+    // that one field is normalized before comparing the rest of the JSON.
+    let mut new_json: serde_json::Value =
+        serde_json::from_slice(&new.stdout).expect("new stdout is JSON");
+    let mut old_json: serde_json::Value =
+        serde_json::from_slice(&old.stdout).expect("ref stdout is JSON");
+    for doc in [&mut new_json, &mut old_json] {
+        if let Some(rows) = doc.as_array_mut() {
+            for row in rows {
+                if row.get("location") == Some(&serde_json::json!("gone")) {
+                    row["skipped"] = serde_json::json!("<SKIPPED>");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        new_json, old_json,
+        "sync push JSON must match once the unreachable location's path is normalized"
+    );
+}
+
+#[test]
+fn sync_pull_output_is_byte_identical() {
+    // Independent (source catalog, location, dest catalog) triples: a pull
+    // both fetches and applies, so a second pull against the same location
+    // reports nothing new.
+    fn seed_and_pull(base: &std::path::Path) -> std::process::Output {
+        let (source_root, source_state) = common::fixture_catalog(base);
+        let location = base.join("shuttle");
+        std::fs::create_dir_all(&location).expect("mkdir");
+        common::maj(&source_root, &source_state)
+            .args([
+                "sync",
+                "location",
+                "add",
+                "shuttle",
+                location.to_str().expect("utf8"),
+            ])
+            .assert()
+            .success();
+        common::maj(&source_root, &source_state)
+            .args(["sync", "push"])
+            .assert()
+            .success();
+
+        let dest_root = base.join("dest");
+        let dest_state = base.join("dest-state");
+        common::maj(&dest_root, &dest_state)
+            .args(["catalog", "init"])
+            .assert()
+            .success();
+        common::maj(&dest_root, &dest_state)
+            .args([
+                "sync",
+                "location",
+                "add",
+                "shuttle",
+                location.to_str().expect("utf8"),
+            ])
+            .assert()
+            .success();
+        common::maj(&dest_root, &dest_state)
+            .args(["sync", "pull", "--json"])
+            .output()
+            .expect("run pull")
+    }
+
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let new = seed_and_pull(dir_new.path());
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let ref_out = seed_and_pull(dir_ref.path());
+
+    assert_eq!(new.status.code(), ref_out.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&new.stdout),
+        String::from_utf8_lossy(&ref_out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&new.stderr),
+        String::from_utf8_lossy(&ref_out.stderr)
+    );
+}
+
+#[test]
+fn inbox_process_output_is_byte_identical() {
+    // A clean pass moves the contribution to `.processed/`, so a second
+    // pass over the same inbox finds nothing left — independent catalogs,
+    // one per binary, each with its own fresh inbox.
+    fn seed_and_process(base: &std::path::Path) -> std::process::Output {
+        let (root, state) = common::fixture_catalog(base);
+        common::maj(&root, &state)
+            .args(["para", "add", "project", "spring"])
+            .assert()
+            .success();
+        let inbox = base.join("inbox");
+        let drop = inbox.join("drop-1");
+        std::fs::create_dir_all(&drop).expect("mkdir");
+        std::fs::write(drop.join("clip.mov"), b"hello-world").expect("write");
+        let xxh64 = format!("{:016x}", xxhash_rust::xxh64::xxh64(b"hello-world", 0));
+        std::fs::write(
+            drop.join("contribution.json"),
+            serde_json::json!({
+                "version": 1,
+                "contributor": "dana",
+                "para_target": "project/spring",
+                "files": [{"name": "clip.mov", "xxh64": xxh64, "size": 11}]
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir");
+        common::maj(&root, &state)
+            .args([
+                "inbox",
+                "process",
+                inbox.to_str().expect("utf8"),
+                "--dest",
+                dest.to_str().expect("utf8"),
+                "--json",
+            ])
+            .output()
+            .expect("run inbox process")
+    }
+
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let new = seed_and_process(dir_new.path());
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let ref_out = seed_and_process(dir_ref.path());
+
+    assert_eq!(new.status.code(), ref_out.status.code());
+    assert_eq!(
+        String::from_utf8_lossy(&new.stdout),
+        String::from_utf8_lossy(&ref_out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&new.stderr),
+        String::from_utf8_lossy(&ref_out.stderr)
+    );
+}
+
+/// `maj ingest --dry-run` never writes a journal or prints a run id, so a
+/// shared root/source/dest is safe to diff byte for byte — unlike the real
+/// run below.
+#[test]
+fn ingest_dry_run_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "p1"])
+        .assert()
+        .success();
+    let source = dir.path().join("src");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(source.join("a.mov"), b"hello").expect("write");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&dest).expect("mkdir");
+    let source_str = source.to_str().expect("utf8").to_string();
+    let dest_str = dest.to_str().expect("utf8").to_string();
+    for args in [
+        vec![
+            "ingest",
+            &source_str,
+            "--dest",
+            &dest_str,
+            "--para",
+            "project/p1",
+            "--dry-run",
+            "--json",
+        ],
+        vec![
+            "ingest",
+            &source_str,
+            "--dest",
+            &dest_str,
+            "--para",
+            "project/p1",
+            "--dry-run",
+        ],
+    ] {
+        diff_against_ref(&root, &state, &args);
+    }
+}
+
+/// A real ingest run: independent catalogs/sources/dests, one per binary.
+#[cfg(test)]
+fn run_real_ingest(base: &std::path::Path) -> std::process::Output {
+    let (root, state) = common::fixture_catalog(base);
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "p1"])
+        .assert()
+        .success();
+    let source = base.join("src");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(source.join("a.mov"), b"hello").expect("write");
+    let dest = base.join("dest");
+    std::fs::create_dir_all(&dest).expect("mkdir");
+    common::maj(&root, &state)
+        .args([
+            "ingest",
+            source.to_str().expect("utf8"),
+            "--dest",
+            dest.to_str().expect("utf8"),
+            "--para",
+            "project/p1",
+            "--json",
+        ])
+        .output()
+        .expect("run ingest")
+}
+
+/// `maj ingest` prints a fresh run-id ULID (in `--json`'s `"run"` field, and
+/// on stderr's `run {id} — resume with: --resume {id}` line) — like `para
+/// add`, this can never byte-match across two independent invocations, so
+/// this checks structure instead: each binary's own ULID shape, the rest of
+/// the JSON body (`"run"` blanked out) structurally equal, and stderr equal
+/// after substituting each side's own run id for a shared placeholder.
+#[test]
+fn ingest_real_run_output_is_byte_identical() {
+    let reference = Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(ingest real run): /tmp/maj-ref missing — build it first");
+        return;
+    }
+
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let new = run_real_ingest(dir_new.path());
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let old = run_real_ingest(dir_ref.path());
+
+    assert_eq!(new.status.code(), old.status.code());
+    let is_ulid_char = |c: char| c.is_ascii_alphanumeric();
+    let extract_run_id = |stderr: &str| -> String {
+        stderr
+            .strip_prefix("run ")
+            .and_then(|s| s.split(' ').next())
+            .filter(|token| token.len() == 26 && token.chars().all(is_ulid_char))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let new_stderr = String::from_utf8_lossy(&new.stderr).into_owned();
+    let old_stderr = String::from_utf8_lossy(&old.stderr).into_owned();
+    let new_run_id = extract_run_id(&new_stderr);
+    let old_run_id = extract_run_id(&old_stderr);
+    assert_eq!(
+        new_run_id.len(),
+        26,
+        "expected a ULID in stderr: {new_stderr:?}"
+    );
+    assert_eq!(
+        old_run_id.len(),
+        26,
+        "expected a ULID in stderr: {old_stderr:?}"
+    );
+    assert_eq!(
+        new_stderr.replacen(&new_run_id, "<ULID>", 2),
+        old_stderr.replacen(&old_run_id, "<ULID>", 2),
+        "stderr must match once each side's own run id is normalized"
+    );
+
+    let mut new_json: serde_json::Value =
+        serde_json::from_slice(&new.stdout).expect("new stdout is JSON");
+    let mut old_json: serde_json::Value =
+        serde_json::from_slice(&old.stdout).expect("ref stdout is JSON");
+    assert_eq!(new_json["run"].as_str(), Some(new_run_id.as_str()));
+    assert_eq!(old_json["run"].as_str(), Some(old_run_id.as_str()));
+    new_json["run"] = serde_json::json!("<ULID>");
+    old_json["run"] = serde_json::json!("<ULID>");
+    // `generations[].root` is an absolute path under each side's own
+    // independent tempdir — structurally equal in shape (one entry, same
+    // generation number) but never textually equal, so it's normalized too.
+    for doc in [&mut new_json, &mut old_json] {
+        if let Some(generations) = doc["generations"].as_array_mut() {
+            for g in generations {
+                g["root"] = serde_json::json!("<DEST_ROOT>");
+            }
+        }
+    }
+    assert_eq!(
+        new_json, old_json,
+        "ingest JSON must match once run id and dest roots are normalized"
+    );
+}

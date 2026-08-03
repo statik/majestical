@@ -586,11 +586,14 @@ mod tests {
     /// and the touched-entity mapping are pinned against the same list.
     /// This list is the project's op-variant absence assertion: phase 5
     /// (describers) added no new `Op` variants (a describer-generated tag
-    /// suggestion emits a plain `TagAdd`), and phase 6 (sync + inbox) adds
+    /// suggestion emits a plain `TagAdd`), phase 6 (sync + inbox) adds
     /// none either — sync moves existing segment/blob files without
     /// minting events, and `maj inbox process` re-emits the same
-    /// pre-existing ops the verified-ingest pipeline already produces. If a
-    /// future phase adds a variant, it must be added here too.
+    /// pre-existing ops the verified-ingest pipeline already produces — and
+    /// phase 7A (services extraction + `maj mcp`) adds none either: the
+    /// services crate and the MCP server call the same verbs the CLI
+    /// already called, and expose no new mutation. If a future phase adds
+    /// a variant, it must be added here too.
     ///
     /// Split across two functions purely to stay under the crate's
     /// max-function-length lint; the two lists together are one logical

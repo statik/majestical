@@ -1,13 +1,10 @@
 //! `maj describer set|show|test` — per-machine backend configuration.
+//! Compute for all three lives in `majestical_services::describer_config`;
+//! this module only reads the API-key env var and renders.
 
 use std::path::Path;
 
-use anyhow::{Context as _, bail};
-use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
-
-use majestical_services::describer_config::{
-    DescriberConfigView, config_path, load_config, to_view,
-};
+use majestical_services::describer_config::{self, DescriberConfigView, SetArgs};
 
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var("MAJ_OPENROUTER_KEY")
@@ -15,33 +12,14 @@ pub(crate) fn env_api_key() -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-pub(crate) struct SetArgs {
-    pub backend: BackendKind,
-    pub model: String,
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
-}
-
 pub(crate) fn cmd_set(catalog_root: &Path, args: &SetArgs) -> anyhow::Result<()> {
-    let config = DescriberConfig {
-        backend: args.backend,
-        base_url: args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| args.backend.default_base_url().to_string()),
-        model: args.model.clone(),
-        api_key: args.api_key.clone(),
-    };
-    let path = config_path(catalog_root)?;
-    config
-        .store(&path)
-        .with_context(|| format!("write {}", path.display()))?;
-    print_view(&to_view(&config));
+    let view = describer_config::set(catalog_root, args)?;
+    print_view(&view);
     Ok(())
 }
 
 pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
-    match majestical_services::describer_config::show(catalog_root)? {
+    match describer_config::show(catalog_root)? {
         Some(view) => print_view(&view),
         None => println!(
             "no describer configured — run `maj describer set --backend <ollama|lm-studio|open-router> --model <model>`"
@@ -51,32 +29,25 @@ pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
-    let Some(config) = load_config(catalog_root)? else {
-        bail!("no describer configured — run `maj describer set`");
-    };
-    let base_url = config.base_url.clone();
-    let model = config.model.clone();
-    let describer = HttpDescriber::new(config, env_api_key());
-    let report = describer
-        .probe()
-        .with_context(|| format!("describer test against {base_url}"))?;
+    let probe = describer_config::test(catalog_root, env_api_key())?;
     println!("backend reachable: yes");
     println!(
-        "model {model} listed: {}",
-        if report.model_listed {
+        "model {} listed: {}",
+        probe.model,
+        if probe.model_listed {
             "yes"
         } else {
             "NO — check the model name"
         }
     );
-    match report.vision {
+    match probe.vision {
         Some(true) => println!("vision capability: yes"),
         Some(false) => {
             println!("vision capability: NO — caption work will not run with this model");
         }
         None => println!("vision capability: unknown (reported by LM Studio only)"),
     }
-    if report.model_listed && report.vision != Some(false) {
+    if probe.model_listed && probe.vision != Some(false) {
         println!("caption and tag-suggestion work will run on the next `maj index run`");
     }
     Ok(())

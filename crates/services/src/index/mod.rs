@@ -1,9 +1,23 @@
-//! Derivation-queue planning shared by `maj index run` (mutating; stays in
-//! the CLI) and `maj index status` (read; its compute lives here). Moved
-//! from `crates/cli/src/index_cmd.rs`: `VALID_KINDS`/`capabilities`/
-//! `gather_sources`/`build_plan`/`workkind_name`/the failure-report reader
-//! are shared so `run` and `status` can never plan differently for the same
-//! catalog state.
+//! Derivation-queue planning and execution for `maj index run`/`maj index
+//! status`. Moved from `crates/cli/src/index_cmd.rs`: `VALID_KINDS`/
+//! `capabilities`/`gather_sources`/`build_plan`/`workkind_name`/the
+//! failure-report reader live directly in this module (shared so `run` and
+//! `status` can never plan differently for the same catalog state); the
+//! derivation engine itself — every per-kind runner, the worker pool, and
+//! the `text_fts` heal — lives in the `run`/`heal`/`blob_read` submodules,
+//! split out to keep any one file well under the house line-length
+//! comfort zone. `run`'s public surface ([`run::run`], [`run::IndexRunReq`],
+//! [`run::IndexRunOutcome`], and the per-kind outcome structs) is
+//! re-exported here so callers only ever need `services::index::`.
+mod blob_read;
+mod heal;
+mod run;
+
+pub use run::{
+    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeOutcome, OcrOutcome,
+    PdfOutcome, ThumbOutcome, TranscribeOutcome, TranscriptEmbedOutcome, run,
+};
+
 use crate::app::FsApp;
 use crate::capability::{
     DESCRIBER_REMEDY, minilm_model_dir_if_present, transcript_model_remedy,
@@ -251,9 +265,68 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     })
 }
 
+/// `maj model fetch`: downloads every registered model (or, with `only`,
+/// exactly the named tags) into its cache dir, verifying every file's
+/// sha256 before it's installed. `progress` is called for every line this
+/// used to print unconditionally to stdout: the cache-dir announcement,
+/// each file's own download/verify status (from
+/// `majestical_index::model::fetch_spec`), and the per-model "ready" line —
+/// mirroring `crate::ingest::run_ingest`'s `notice` callback, since this is
+/// the same "streams to stdout while it runs" shape rather than a single
+/// end-of-run outcome. Moved from
+/// `crates/cli/src/index_cmd.rs::cmd_model_fetch`.
+///
+/// # Errors
+/// Returns an error if `only` names an unknown tag, the cache directory
+/// can't be resolved, or any file fails to download or verify.
+pub fn model_fetch(
+    verify: bool,
+    only: &[String],
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), ServiceError> {
+    model_fetch_impl(verify, only, progress).map_err(ServiceError::from)
+}
+
+fn model_fetch_impl(verify: bool, only: &[String], progress: &mut dyn FnMut(&str)) -> Result<()> {
+    use majestical_index::model;
+
+    let known: Vec<&str> = model::ALL_MODELS.iter().map(|m| m.tag).collect();
+    for tag in only {
+        anyhow::ensure!(
+            known.contains(&tag.as_str()),
+            "unknown model tag {tag}; known: {}",
+            known.join(", ")
+        );
+    }
+    for spec in model::ALL_MODELS {
+        if !only.is_empty() && !only.iter().any(|t| t == spec.tag) {
+            continue;
+        }
+        let dir = model::model_dir_for(spec)?;
+        progress(&format!("model cache: {}", dir.display()));
+        model::fetch_spec(spec, verify, progress)?;
+        progress(&format!("model '{}' ready", spec.tag));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_fetch_rejects_an_unknown_only_tag() {
+        let mut lines = Vec::new();
+        let err = model_fetch(false, &["not-a-real-model".to_string()], &mut |line| {
+            lines.push(line.to_string());
+        })
+        .expect_err("must fail");
+        assert!(err.to_string().contains("unknown model tag"));
+        assert!(
+            lines.is_empty(),
+            "an unknown tag must fail before any progress prints"
+        );
+    }
 
     #[test]
     fn status_of_an_empty_catalog_has_every_kind_at_zero() {

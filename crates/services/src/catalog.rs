@@ -33,6 +33,40 @@ pub fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCatalog, P
     Ok((db, projection))
 }
 
+/// `maj catalog init`: creates a fresh catalog at `root`. Idempotent — an
+/// already-initialized root's `events/<machine>` directory is created with
+/// `create_dir_all`, so re-running against an existing catalog succeeds
+/// again rather than erroring.
+///
+/// # Errors
+/// Returns an error if the underlying event log's directories can't be
+/// created (e.g. a permissions problem).
+pub fn init(root: &Path, machine: &str, author: &str) -> Result<(), ServiceError> {
+    init_impl(root, machine, author).map_err(ServiceError::from)
+}
+
+fn init_impl(root: &Path, machine: &str, author: &str) -> Result<()> {
+    FsApp::init(root, machine, author)?;
+    Ok(())
+}
+
+/// Both `tag add` and `meta set` write metadata about an asset that must
+/// already have a physical observation on record — otherwise a typo'd id
+/// silently creates a phantom catalog entry that `search` and `scan` can
+/// never produce, and would look scanned when it never was. Moved from
+/// `crates/cli/src/commands.rs`.
+///
+/// # Errors
+/// Returns an error if `asset` has no recorded instance in `projection`.
+pub fn ensure_asset_known(projection: &Projection, asset: &AssetId) -> Result<()> {
+    anyhow::ensure!(
+        projection.has_instances(asset),
+        "unknown asset {} — scan its volume first, or check `maj search`",
+        asset.0
+    );
+    Ok(())
+}
+
 /// One volume holding an instance of the asset: its recorded identity, label,
 /// online status, and the instance's own recorded attributes.
 #[derive(serde::Serialize)]
@@ -412,5 +446,176 @@ mod get_asset_tests {
         assert_eq!(v.value, "0011223344556677");
         assert_eq!(v.outcome, VerifyOutcome::Verified);
         assert_eq!(v.hashdate_ms, 42);
+    }
+
+    /// Two `VerificationRecorded` events for the same (asset, volume, path)
+    /// are both kept — the ASC MHL action model records a plain fact per
+    /// check, not "latest per volume", so a re-verify's `Verified` record
+    /// must not clobber the original `Original` one.
+    #[test]
+    fn get_asset_keeps_every_verification_in_history_no_dedup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        let asset = asset_id();
+        app.emit(vec![
+            Op::AssetSeen {
+                asset: asset.clone(),
+                volume: "vol1".into(),
+                path: "clips/a.mov".into(),
+                size: 5,
+                mtime_ms: 1000,
+            },
+            Op::VerificationRecorded {
+                asset: asset.clone(),
+                volume: "vol1".into(),
+                path: "clips/a.mov".into(),
+                algo: "xxh64".into(),
+                value: "aaaa".into(),
+                outcome: VerifyOutcome::Original,
+                hashdate_ms: 10,
+            },
+            Op::VerificationRecorded {
+                asset: asset.clone(),
+                volume: "vol1".into(),
+                path: "clips/a.mov".into(),
+                algo: "xxh64".into(),
+                value: "aaaa".into(),
+                outcome: VerifyOutcome::Verified,
+                hashdate_ms: 20,
+            },
+        ])
+        .expect("emit");
+        let out = get_asset(&app, &root, &asset.0)
+            .expect("get_asset")
+            .expect("known asset");
+        assert_eq!(
+            out.verifications.len(),
+            2,
+            "both verification records must survive, not just the latest"
+        );
+        assert_eq!(out.verifications[0].outcome, VerifyOutcome::Original);
+        assert_eq!(out.verifications[1].outcome, VerifyOutcome::Verified);
+    }
+
+    /// `resolve_para`'s fallback to the bare node id: an `AssetParaSet`
+    /// naming a node the projection never saw a `ParaNodeCreate` for (a
+    /// partial event log) must still render something, not panic or vanish.
+    #[test]
+    fn resolve_para_falls_back_to_the_bare_node_id_for_an_unknown_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        let asset = asset_id();
+        app.emit(vec![
+            Op::AssetSeen {
+                asset: asset.clone(),
+                volume: "vol1".into(),
+                path: "clips/a.mov".into(),
+                size: 5,
+                mtime_ms: 1000,
+            },
+            Op::AssetParaSet {
+                asset: asset.clone(),
+                node: "unknown-node-id".into(),
+            },
+        ])
+        .expect("emit");
+        let out = get_asset(&app, &root, &asset.0)
+            .expect("get_asset")
+            .expect("known asset");
+        assert_eq!(out.para.as_deref(), Some("unknown-node-id"));
+    }
+
+    /// `resolve_para`'s fallback when the node exists but is missing its
+    /// kind/name (its `ParaNodeCreate` event may be missing from a partial
+    /// log) — falls back to the bare node id rather than panicking on the
+    /// `(Some, Some)` match arm.
+    #[test]
+    fn resolve_para_falls_back_to_the_bare_node_id_when_kind_or_name_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        let asset = asset_id();
+        let node = ulid::Ulid::generate().to_string();
+        app.emit(vec![
+            Op::AssetSeen {
+                asset: asset.clone(),
+                volume: "vol1".into(),
+                path: "clips/a.mov".into(),
+                size: 5,
+                mtime_ms: 1000,
+            },
+            // A rename with no prior create leaves the node present in the
+            // projection (via the rename fold) but with no recorded kind —
+            // `resolve_para`'s `(Some(kind), Some(name))` arm can't match.
+            Op::ParaNodeRename {
+                node: node.clone(),
+                name: "orphan-rename".into(),
+            },
+            Op::AssetParaSet {
+                asset: asset.clone(),
+                node: node.clone(),
+            },
+        ])
+        .expect("emit");
+        let out = get_asset(&app, &root, &asset.0)
+            .expect("get_asset")
+            .expect("known asset");
+        assert_eq!(out.para.as_deref(), Some(node.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn init_creates_a_catalog_that_can_be_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        init(&root, "m1", "m1").expect("init");
+        crate::app::FsApp::open(&root, "m1", "m1").expect("open the freshly initialized catalog");
+    }
+
+    #[test]
+    fn init_of_an_already_initialized_catalog_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        init(&root, "m1", "m1").expect("first init");
+        init(&root, "m1", "m1").expect("re-init must succeed");
+        crate::app::FsApp::open(&root, "m1", "m1").expect("still opens after re-init");
+    }
+}
+
+#[cfg(test)]
+mod ensure_asset_known_tests {
+    use super::*;
+    use majestical_core::event::Op;
+
+    #[test]
+    fn ensure_asset_known_accepts_a_scanned_asset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let asset = AssetId("xxh3:aa".into());
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        app.emit(vec![Op::AssetSeen {
+            asset: asset.clone(),
+            volume: "vol1".into(),
+            path: "a.txt".into(),
+            size: 1,
+            mtime_ms: 0,
+        }])
+        .expect("emit");
+        let projection = app.projection().expect("projection");
+        ensure_asset_known(&projection, &asset).expect("known asset must pass");
+    }
+
+    #[test]
+    fn ensure_asset_known_rejects_an_unscanned_asset() {
+        let projection = Projection::default();
+        let asset = AssetId("xxh3:never-scanned".into());
+        let err = ensure_asset_known(&projection, &asset).expect_err("must fail");
+        assert!(err.to_string().contains("unknown asset"));
     }
 }

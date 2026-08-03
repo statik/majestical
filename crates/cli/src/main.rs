@@ -2,7 +2,6 @@
 mod commands;
 mod describer_cmd;
 mod inbox_cmd;
-mod inbox_manifest;
 mod index_cmd;
 mod search;
 mod sync_cmd;
@@ -463,7 +462,7 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
             api_key,
         } => describer_cmd::cmd_set(
             catalog,
-            &describer_cmd::SetArgs {
+            &majestical_services::describer_config::SetArgs {
                 backend: backend.into(),
                 model,
                 base_url,

@@ -1,9 +1,7 @@
-//! Sync location config plus `maj sync status`/`maj sync location list`
-//! compute. Moved from `crates/cli/src/sync_cmd.rs`. `push`/`pull` (which
-//! transfer files and apply landed events — mutating) stay in the CLI for
-//! now, but share [`SyncConfig`]/[`Location`]/[`config_path`]/
-//! [`resolve_targets`]/[`NO_LOCATIONS_HINT`] from here rather than each
-//! holding its own copy.
+//! Sync location config, `maj sync push`/`pull`/`location add`/`location
+//! rm`, and `maj sync status`/`maj sync location list` compute. Moved from
+//! `crates/cli/src/sync_cmd.rs`.
+use crate::app::FsApp;
 use crate::error::ServiceError;
 use anyhow::{Context, Result};
 use majestical_sync::transfer;
@@ -124,6 +122,83 @@ fn ensure_catalog(catalog: &Path) -> Result<(), ServiceError> {
             root: catalog.to_path_buf(),
         })
     }
+}
+
+/// Registers a new sync location: validates `location` is an accessible,
+/// UTF-8-representable directory, canonicalizes it (locations are mount
+/// points and must be absolute at rest — a relative path would resolve
+/// against whatever CWD a later push/pull happens to run from), idempotently
+/// creates the `events/`/`blobs/` skeleton so the first push has somewhere
+/// to land, and appends it to this catalog's `sync.toml`. Moved from
+/// `crates/cli/src/sync_cmd.rs::add_location`/`cmd_location_add`.
+///
+/// # Errors
+/// Returns an error when `name` is empty, `location` is not an accessible
+/// directory, `location` is not valid UTF-8, `name` is already configured,
+/// the skeleton directories can't be created, or the config can't be
+/// stored.
+pub fn location_add(catalog: &Path, name: &str, location: &Path) -> Result<(), ServiceError> {
+    location_add_impl(catalog, name, location).map_err(ServiceError::from)
+}
+
+fn location_add_impl(catalog: &Path, name: &str, location: &Path) -> Result<()> {
+    let config = config_path(catalog)?;
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "sync location name must not be empty");
+    anyhow::ensure!(
+        location.is_dir(),
+        "{} is not an accessible directory — mount it or check the path",
+        location.display()
+    );
+    let canonical = location
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", location.display()))?;
+    anyhow::ensure!(
+        canonical.to_str().is_some(),
+        "{} is not valid UTF-8 — sync locations must have UTF-8 paths so they can be stored in sync.toml",
+        canonical.display()
+    );
+    let mut cfg = SyncConfig::load(&config)?;
+    anyhow::ensure!(
+        !cfg.locations.iter().any(|l| l.name == name),
+        "sync location '{name}' is already configured — remove it first with `maj sync location rm {name}`"
+    );
+    // Git-init style: idempotently create the layout so the first push
+    // has somewhere to land. Never touches existing files.
+    for sub in ["events", "blobs"] {
+        let dir = canonical.join(sub);
+        std::fs::create_dir_all(&dir).with_context(|| format!("initializing {}", dir.display()))?;
+    }
+    cfg.locations.push(Location {
+        name: name.to_string(),
+        path: canonical,
+        extra: toml::Table::new(),
+    });
+    cfg.store(&config)
+}
+
+/// Removes the location named `name` from this catalog's `sync.toml`. Never
+/// touches the location's own files (its `events/`/`blobs/` directories, and
+/// anything a prior sync landed there) — only the config entry is dropped.
+/// Moved from `crates/cli/src/sync_cmd.rs::remove_location`/`cmd_location_rm`.
+///
+/// # Errors
+/// Returns an error when no location named `name` exists, or the config
+/// can't be stored.
+pub fn location_rm(catalog: &Path, name: &str) -> Result<(), ServiceError> {
+    location_rm_impl(catalog, name).map_err(ServiceError::from)
+}
+
+fn location_rm_impl(catalog: &Path, name: &str) -> Result<()> {
+    let config = config_path(catalog)?;
+    let mut cfg = SyncConfig::load(&config)?;
+    let before = cfg.locations.len();
+    cfg.locations.retain(|l| l.name != name);
+    anyhow::ensure!(
+        cfg.locations.len() < before,
+        "no sync location named '{name}' — see `maj sync location list`"
+    );
+    cfg.store(&config)
 }
 
 /// One machine's ahead/behind segment tally within a direction: files
@@ -321,6 +396,385 @@ fn locations_list_impl(catalog_dir: &Path) -> Result<LocationsOutcome> {
     })
 }
 
+/// Narrows a transfer to one class of file — the service-level counterpart
+/// of the CLI's clap-driven `--only` flag (kept in the CLI since it derives
+/// `clap::ValueEnum`, which this crate has no reason to depend on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Only {
+    Segments,
+    Thumbs,
+    Metadata,
+    Vectors,
+    Transcripts,
+}
+
+/// Narrows `plan` to one transfer class. `None` (no `--only`) returns the
+/// plan unchanged. Moved from `crates/cli/src/sync_cmd.rs::filter_plan`.
+fn filter_plan(plan: transfer::TransferPlan, only: Option<Only>) -> transfer::TransferPlan {
+    let Some(only) = only else { return plan };
+    let class = match only {
+        Only::Segments => {
+            return transfer::TransferPlan {
+                segments: plan.segments,
+                blobs: Vec::new(),
+            };
+        }
+        Only::Thumbs => transfer::BlobClass::Thumbs,
+        Only::Metadata => transfer::BlobClass::Metadata,
+        Only::Vectors => transfer::BlobClass::Vectors,
+        Only::Transcripts => transfer::BlobClass::Transcripts,
+    };
+    transfer::TransferPlan {
+        segments: Vec::new(),
+        blobs: plan
+            .blobs
+            .into_iter()
+            .filter(|b| b.class == class)
+            .collect(),
+    }
+}
+
+/// Which side of a location pair is the transfer source. Push sends the
+/// catalog's own state out to the location; pull fetches the location's
+/// state into the catalog — otherwise identical plumbing (same plan/execute
+/// call, same [`LocationRow`] shape), so [`location_row`] takes this instead
+/// of duplicating itself per direction.
+#[derive(Clone, Copy)]
+enum Direction {
+    Push,
+    Pull,
+}
+
+/// One planned-but-failed transfer, as recorded in
+/// [`transfer::TransferOutcome::failures`].
+#[derive(Debug, serde::Serialize)]
+pub struct FileFailure {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// One location's push or pull result: it either ran — with an outcome that
+/// may itself carry per-file failures — or it never ran at all, for one of
+/// two distinct reasons: the location's mount wasn't there (`Skipped`) or the
+/// transfer engine itself failed setting up or running the transfer
+/// (`Failed`, e.g. `plan_transfer`/`execute`'s own error). Moved from
+/// `crates/cli/src/sync_cmd.rs::LocationResult`.
+#[derive(Debug, serde::Serialize)]
+pub enum LocationRow {
+    Ran {
+        name: String,
+        segments_copied: usize,
+        segment_bytes: u64,
+        blobs_copied: usize,
+        blob_bytes: u64,
+        /// `(machine, events)` this location contributed — only meaningful
+        /// for a pull, which sums it into [`PullOutcome::applied_events`]/
+        /// [`PullOutcome::machines`]; a push's rendering ignores it.
+        events_added: Vec<(String, usize)>,
+        failures: Vec<FileFailure>,
+    },
+    Skipped {
+        name: String,
+        reason: String,
+    },
+    Failed {
+        name: String,
+        error: String,
+    },
+}
+
+impl LocationRow {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Ran { name, .. } | Self::Skipped { name, .. } | Self::Failed { name, .. } => name,
+        }
+    }
+}
+
+/// Runs one location's transfer in `direction`, converting an unreachable
+/// location into a `Skipped` row and any `plan_transfer`/`execute` setup
+/// error into a `Failed` row, rather than propagating an error out of this
+/// function — one bad location must never abort every other location's
+/// transfer. Moved from `crates/cli/src/sync_cmd.rs::transfer_one`.
+fn location_row(
+    catalog: &Path,
+    loc: &Location,
+    only: Option<Only>,
+    direction: Direction,
+) -> LocationRow {
+    if !loc.path.is_dir() {
+        return LocationRow::Skipped {
+            name: loc.name.clone(),
+            reason: format!("unreachable at {} — skipped", loc.path.display()),
+        };
+    }
+    let (src, dst) = match direction {
+        Direction::Push => (catalog, loc.path.as_path()),
+        Direction::Pull => (loc.path.as_path(), catalog),
+    };
+    let run = transfer::plan_transfer(src, dst)
+        .map(|plan| filter_plan(plan, only))
+        .and_then(|plan| transfer::execute(src, dst, &plan));
+    match run {
+        Ok(outcome) => LocationRow::Ran {
+            name: loc.name.clone(),
+            segments_copied: outcome.segments_copied,
+            segment_bytes: outcome.segment_bytes,
+            blobs_copied: outcome.blobs_copied,
+            blob_bytes: outcome.blob_bytes,
+            events_added: outcome.events_added,
+            failures: outcome
+                .failures
+                .into_iter()
+                .map(|(path, error)| FileFailure { path, error })
+                .collect(),
+        },
+        Err(e) => LocationRow::Failed {
+            name: loc.name.clone(),
+            error: e.to_string(),
+        },
+    }
+}
+
+/// The exit-policy boolean shared by [`PushOutcome::overall_failed`] and
+/// [`PullOutcome::overall_failed`]: nonzero when EVERY requested location
+/// was skipped, failed outright, or otherwise never ran, and ALSO when a
+/// location that DID run had per-file failures within its own transfer —
+/// that location's other files still copied (the engine records and
+/// continues past per-file errors), but a sync that could not move
+/// everything must not exit 0 under cron. Moved verbatim (as a boolean,
+/// rather than the original `Result<()>` with its location-naming error
+/// message — heads that need the exact failing-location text still have
+/// `rows` to derive it from) from
+/// `crates/cli/src/sync_cmd.rs::check_exit_policy`.
+fn overall_failed(rows: &[LocationRow]) -> bool {
+    let any_ran = rows.iter().any(|r| matches!(r, LocationRow::Ran { .. }));
+    if !any_ran {
+        return true;
+    }
+    rows.iter().any(|r| match r {
+        LocationRow::Ran { failures, .. } => !failures.is_empty(),
+        LocationRow::Skipped { .. } | LocationRow::Failed { .. } => false,
+    })
+}
+
+/// Everything `maj sync push` renders: one row per targeted location.
+#[derive(Debug, serde::Serialize)]
+pub struct PushOutcome {
+    pub rows: Vec<LocationRow>,
+}
+
+impl PushOutcome {
+    /// See [`overall_failed`].
+    #[must_use]
+    pub fn overall_failed(&self) -> bool {
+        overall_failed(&self.rows)
+    }
+}
+
+/// `maj sync push` request: which location(s) to target and which transfer
+/// class to narrow to (`None` for both flags means every location, every
+/// class).
+pub struct PushRequest<'a> {
+    pub location: Option<&'a str>,
+    pub only: Option<Only>,
+}
+
+/// `maj sync push`: replicate everything this catalog has (segments +
+/// blobs) to configured locations. Refuses outright when this machine is a
+/// read-only sync member; otherwise every reachable location gets its own
+/// independent transfer attempt, and per-file failures within a transfer
+/// are recorded in that location's row rather than aborting it — see
+/// [`transfer::TransferOutcome`]. Moved from
+/// `crates/cli/src/sync_cmd.rs::cmd_push`.
+///
+/// # Errors
+/// Returns an error when there's no catalog at `catalog`, this machine is
+/// readonly, or no sync locations are configured (or none match
+/// `req.location`). Per-location failures are reported inside the returned
+/// outcome, never as an `Err` — see [`PushOutcome::overall_failed`].
+pub fn push(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome, ServiceError> {
+    push_impl(catalog, req).map_err(ServiceError::from)
+}
+
+fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
+    ensure_catalog(catalog)?;
+    let config = config_path(catalog)?;
+    let cfg = SyncConfig::load(&config)?;
+    anyhow::ensure!(
+        !cfg.readonly,
+        "readonly = true in {} — this machine is a read-only sync member and never pushes — set `readonly = false` there to push from this machine",
+        config.display()
+    );
+    let targets = resolve_targets(&cfg, req.location)?;
+    let rows = targets
+        .into_iter()
+        .map(|loc| location_row(catalog, loc, req.only, Direction::Push))
+        .collect();
+    Ok(PushOutcome { rows })
+}
+
+/// Everything `maj sync pull` renders: one row per targeted location, plus
+/// the tally `cmd_pull`'s summary reports — events newly landed and which
+/// machines they came from (aggregated across locations; see
+/// `summarize_pull`'s original doc for why a landed event can never be
+/// double-counted across two locations), and how many blobs landed.
+#[derive(Debug, serde::Serialize)]
+pub struct PullOutcome {
+    pub rows: Vec<LocationRow>,
+    pub applied_events: usize,
+    pub machines: Vec<String>,
+    pub blobs_fetched: usize,
+}
+
+impl PullOutcome {
+    /// See [`overall_failed`].
+    #[must_use]
+    pub fn overall_failed(&self) -> bool {
+        overall_failed(&self.rows)
+    }
+}
+
+/// `maj sync pull` request: mirrors [`PushRequest`] (no readonly gate —
+/// unlike push, a read-only member still needs to pull).
+pub struct PullRequest<'a> {
+    pub location: Option<&'a str>,
+    pub only: Option<Only>,
+}
+
+/// Aggregates `rows` into `(applied_events, machines, blobs_fetched)`. A
+/// pulled event can never be double-counted across two locations holding
+/// the same segment tail: `events_added` is already aggregated per machine
+/// within one location's own outcome (the transfer engine's own accounting,
+/// counted from the destination after each copy lands), and the second
+/// location's own plan is measured against that already-caught-up
+/// destination — its range has shrunk to nothing by the time it's diffed,
+/// so it contributes nothing further. This only sums across locations.
+fn summarize_pull(rows: &[LocationRow]) -> (usize, Vec<String>, usize) {
+    let mut per_machine: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut blobs_fetched = 0usize;
+    for r in rows {
+        if let LocationRow::Ran {
+            blobs_copied,
+            events_added,
+            ..
+        } = r
+        {
+            blobs_fetched += blobs_copied;
+            for (machine, n) in events_added {
+                *per_machine.entry(machine.as_str()).or_default() += n;
+            }
+        }
+    }
+    let applied = per_machine.values().sum();
+    let machines = per_machine.into_keys().map(str::to_string).collect();
+    (applied, machines, blobs_fetched)
+}
+
+/// Internal carrier for [`pull_impl`]'s early return when the local-catalog
+/// apply fails after every location's transfer already completed: downcast
+/// back out of the `anyhow` chain by [`pull`] and turned into
+/// [`ServiceError::SyncPullApplyFailed`] so the completed transfer rows
+/// survive to the caller instead of being silently dropped by the early
+/// `Err`. Not part of the public API — [`pull`]'s callers only ever see the
+/// typed [`ServiceError`] variant. Mirrors `para::PartialArchiveFailure`.
+#[derive(Debug)]
+struct PullApplyFailure {
+    rows: Vec<LocationRow>,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for PullApplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for PullApplyFailure {}
+
+/// `maj sync pull`: fetch everything configured locations have that this
+/// catalog doesn't (segments + blobs), then apply the newly landed events to
+/// the local sqlite catalog. Like [`push`], refuses outright when there's no
+/// catalog at `catalog`; unlike [`push`], there is no readonly refusal.
+///
+/// Order matters: transfer every location, THEN apply. A per-file blob
+/// failure at one location must never block already-landed segments from
+/// being applied — opening the sqlite catalog applies past its saved
+/// cursor, so the open below IS the apply; there is no separate step to
+/// call. If THAT apply step itself fails, the transfer rows already
+/// completed must still reach the caller — see
+/// [`ServiceError::SyncPullApplyFailed`]. Moved from
+/// `crates/cli/src/sync_cmd.rs::cmd_pull`.
+///
+/// # Errors
+/// Returns an error when there's no catalog at `catalog`, no sync locations
+/// are configured (or none match `req.location`), or the local sqlite
+/// catalog can't be opened/synced — the latter as
+/// [`ServiceError::SyncPullApplyFailed`], carrying the transfer rows that
+/// already completed. Per-location transfer failures are reported inside
+/// the returned outcome, never as an `Err` — see
+/// [`PullOutcome::overall_failed`].
+pub fn pull(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    req: &PullRequest<'_>,
+) -> Result<PullOutcome, ServiceError> {
+    pull_impl(catalog, machine_id, author, req).map_err(|err| {
+        match err.downcast::<PullApplyFailure>() {
+            Ok(partial) => ServiceError::SyncPullApplyFailed {
+                rows: partial.rows,
+                source: partial.source,
+            },
+            Err(err) => ServiceError::from(err),
+        }
+    })
+}
+
+fn pull_impl(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    req: &PullRequest<'_>,
+) -> Result<PullOutcome> {
+    ensure_catalog(catalog)?;
+    let cfg = SyncConfig::load(&config_path(catalog)?)?;
+    let targets = resolve_targets(&cfg, req.location)?;
+    let rows: Vec<LocationRow> = targets
+        .into_iter()
+        .map(|loc| location_row(catalog, loc, req.only, Direction::Pull))
+        .collect();
+
+    // Apply pulled events to the local catalog BEFORE tallying the summary
+    // below: a per-file blob failure elsewhere must still let already-
+    // landed segments become searchable rather than leaving them stranded
+    // on disk unapplied. A failure here must not lose `rows` — every
+    // location's transfer already genuinely completed by this point.
+    if let Err(source) = apply_pulled_events(catalog, machine_id, author) {
+        return Err(anyhow::Error::new(PullApplyFailure { rows, source }));
+    }
+
+    let (applied_events, machines, blobs_fetched) = summarize_pull(&rows);
+    Ok(PullOutcome {
+        rows,
+        applied_events,
+        machines,
+        blobs_fetched,
+    })
+}
+
+/// Opens the local sqlite catalog, applying past its saved cursor — the
+/// open IS the apply; there is no separate step to call. Split out of
+/// [`pull_impl`] purely so that function can attach `rows` to this specific
+/// failure via [`PullApplyFailure`] without the `?` operator discarding
+/// them.
+fn apply_pulled_events(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
+    let app = FsApp::open(catalog, machine_id, author)?;
+    crate::catalog::open_catalog(&app, catalog)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +879,347 @@ mod tests {
             }
         );
         assert!(!counts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod location_add_rm_tests {
+    use super::*;
+
+    fn catalog_dir(base: &Path) -> PathBuf {
+        let root = base.join("cat");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        root
+    }
+
+    #[test]
+    fn add_rejects_duplicate_names_and_rm_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let loc = dir.path().join("remote");
+        std::fs::create_dir(&loc).expect("mkdir");
+        location_add(&catalog, "nas", &loc).expect("first add");
+        assert!(
+            loc.join("events").is_dir() && loc.join("blobs").is_dir(),
+            "add initializes the events/ + blobs/ skeleton"
+        );
+        let err = location_add(&catalog, "nas", &loc).expect_err("dup must fail");
+        assert!(err.to_string().contains("already configured"));
+        let err = location_rm(&catalog, "ghost").expect_err("unknown rm");
+        assert!(err.to_string().contains("no sync location named"));
+    }
+
+    #[test]
+    fn add_rejects_an_unreachable_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let err = location_add(&catalog, "nas", &dir.path().join("missing"))
+            .expect_err("unreachable path must fail");
+        assert!(err.to_string().contains("not an accessible directory"));
+    }
+
+    #[test]
+    fn add_rejects_an_empty_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let err = location_add(&catalog, "  ", dir.path()).expect_err("empty name must fail");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn add_stores_a_canonicalized_absolute_trimmed_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let loc = dir.path().join("remote");
+        std::fs::create_dir(&loc).expect("mkdir");
+        location_add(&catalog, "  nas  ", &loc).expect("add");
+        let cfg = SyncConfig::load(&config_path(&catalog).expect("config_path")).expect("load");
+        assert_eq!(cfg.locations[0].name, "nas");
+        assert!(cfg.locations[0].path.is_absolute());
+        assert_eq!(
+            cfg.locations[0].path,
+            loc.canonicalize().expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn rm_removes_a_configured_location_without_touching_its_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let loc = dir.path().join("remote");
+        std::fs::create_dir(&loc).expect("mkdir");
+        location_add(&catalog, "nas", &loc).expect("add");
+        location_rm(&catalog, "nas").expect("rm");
+        let cfg = SyncConfig::load(&config_path(&catalog).expect("config_path")).expect("load");
+        assert!(cfg.locations.is_empty());
+        assert!(loc.join("events").is_dir(), "rm must not touch the files");
+    }
+}
+
+#[cfg(test)]
+mod push_pull_tests {
+    use super::*;
+    use crate::app::FsApp;
+    use majestical_core::event::{Op, ParaKind};
+
+    fn init_catalog(base: &Path, name: &str, machine: &str) -> (FsApp, PathBuf) {
+        let root = base.join(name);
+        let app = FsApp::init(&root, machine, machine).expect("init");
+        (app, root)
+    }
+
+    #[test]
+    fn overall_failed_is_true_when_every_location_is_skipped_or_failed() {
+        let rows = vec![
+            LocationRow::Skipped {
+                name: "a".into(),
+                reason: "unreachable".into(),
+            },
+            LocationRow::Failed {
+                name: "b".into(),
+                error: "boom".into(),
+            },
+        ];
+        assert!(overall_failed(&rows));
+    }
+
+    #[test]
+    fn overall_failed_is_false_when_a_location_ran_cleanly() {
+        let rows = vec![LocationRow::Ran {
+            name: "a".into(),
+            segments_copied: 1,
+            segment_bytes: 10,
+            blobs_copied: 0,
+            blob_bytes: 0,
+            events_added: vec![],
+            failures: vec![],
+        }];
+        assert!(!overall_failed(&rows));
+    }
+
+    #[test]
+    fn overall_failed_is_true_when_a_ran_location_has_per_file_failures() {
+        let rows = vec![LocationRow::Ran {
+            name: "a".into(),
+            segments_copied: 1,
+            segment_bytes: 10,
+            blobs_copied: 0,
+            blob_bytes: 0,
+            events_added: vec![],
+            failures: vec![FileFailure {
+                path: "x".into(),
+                error: "boom".into(),
+            }],
+        }];
+        assert!(overall_failed(&rows));
+    }
+
+    #[test]
+    fn summarize_pull_sums_events_and_blobs_across_locations() {
+        let rows = vec![
+            LocationRow::Ran {
+                name: "a".into(),
+                segments_copied: 0,
+                segment_bytes: 0,
+                blobs_copied: 2,
+                blob_bytes: 0,
+                events_added: vec![("m1".into(), 3)],
+                failures: vec![],
+            },
+            LocationRow::Ran {
+                name: "b".into(),
+                segments_copied: 0,
+                segment_bytes: 0,
+                blobs_copied: 5,
+                blob_bytes: 0,
+                events_added: vec![("m1".into(), 4), ("m2".into(), 1)],
+                failures: vec![],
+            },
+        ];
+        let (applied, machines, blobs) = summarize_pull(&rows);
+        assert_eq!(applied, 8, "events must sum across locations");
+        assert_eq!(blobs, 7, "blobs must sum across locations");
+        assert_eq!(machines, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[test]
+    fn push_of_an_unconfigured_catalog_errors_naming_the_remedy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_app, root) = init_catalog(dir.path(), "cat", "m1");
+        let err = push(
+            &root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect_err("no locations must error");
+        assert!(err.to_string().contains("no sync locations configured"));
+    }
+
+    #[test]
+    fn push_refuses_when_this_machine_is_readonly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_app, root) = init_catalog(dir.path(), "cat", "m1");
+        // Directly write a readonly=true config with one location — the
+        // refusal must happen before any location is even looked at.
+        let mut cfg = SyncConfig::load(&config_path(&root).expect("config_path")).expect("load");
+        cfg.readonly = true;
+        cfg.locations.push(Location {
+            name: "nas".into(),
+            path: dir.path().to_path_buf(),
+            extra: toml::Table::new(),
+        });
+        cfg.store(&config_path(&root).expect("config_path"))
+            .expect("store");
+        let err = push(
+            &root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect_err("readonly must refuse");
+        assert!(err.to_string().contains("read-only sync member"));
+    }
+
+    #[test]
+    fn push_reports_a_skipped_row_for_an_unreachable_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_app, root) = init_catalog(dir.path(), "cat", "m1");
+        let mut cfg = SyncConfig::load(&config_path(&root).expect("config_path")).expect("load");
+        cfg.locations.push(Location {
+            name: "gone".into(),
+            path: dir.path().join("does-not-exist"),
+            extra: toml::Table::new(),
+        });
+        cfg.store(&config_path(&root).expect("config_path"))
+            .expect("store");
+        let outcome = push(
+            &root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+        assert_eq!(outcome.rows.len(), 1);
+        assert!(matches!(outcome.rows[0], LocationRow::Skipped { .. }));
+        assert!(outcome.overall_failed(), "an all-skipped push must fail");
+    }
+
+    #[test]
+    fn push_then_pull_round_trips_an_event_through_a_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+
+        let loc = dir.path().join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&source_root, "shuttle", &loc).expect("add");
+        let push_outcome = push(
+            &source_root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+        assert!(!push_outcome.overall_failed());
+        assert!(matches!(push_outcome.rows[0], LocationRow::Ran { .. }));
+
+        let dest_root = dir.path().join("dest");
+        std::fs::create_dir_all(&dest_root).expect("mkdir");
+        let dest_app = FsApp::init(&dest_root, "m2", "m2").expect("init dest");
+        location_add(&dest_root, "shuttle", &loc).expect("add on dest");
+        let pull_outcome = pull(
+            &dest_root,
+            "m2",
+            "m2",
+            &PullRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("pull");
+        assert!(!pull_outcome.overall_failed());
+        assert_eq!(pull_outcome.applied_events, 1);
+        assert_eq!(pull_outcome.machines, vec!["m1".to_string()]);
+
+        let projection = dest_app.projection().expect("projection");
+        assert!(
+            projection.para_node("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_some(),
+            "the pulled event must be visible in the destination's own projection"
+        );
+    }
+
+    /// Pins `ServiceError::SyncPullApplyFailed`'s shape: when the local
+    /// sqlite apply fails AFTER every location's transfer already
+    /// completed, the completed transfer rows must still reach the caller
+    /// rather than being silently dropped by the early `Err`. Forces the
+    /// apply to fail deterministically by pre-creating a directory at the
+    /// exact path `open_synced` will try to open as a sqlite file —
+    /// `Connection::open` on a directory fails every time, on every
+    /// platform, with no reliance on corrupting real bytes.
+    #[test]
+    fn pull_carries_completed_rows_when_the_local_apply_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+
+        let loc = dir.path().join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&source_root, "shuttle", &loc).expect("add");
+        push(
+            &source_root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+
+        let dest_root = dir.path().join("dest");
+        std::fs::create_dir_all(&dest_root).expect("mkdir");
+        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
+        location_add(&dest_root, "shuttle", &loc).expect("add on dest");
+
+        // Block the apply: put a directory where `open_synced` expects to
+        // open a sqlite file.
+        let paths = crate::state_dir::catalog_paths(&dest_root).expect("catalog_paths");
+        std::fs::create_dir_all(&paths.db_path).expect("mkdir catalog.db");
+
+        let err = pull(
+            &dest_root,
+            "m2",
+            "m2",
+            &PullRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect_err("apply must fail against a directory in place of catalog.db");
+        let ServiceError::SyncPullApplyFailed { rows, source } = err else {
+            panic!("expected SyncPullApplyFailed, got a different ServiceError variant");
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "the completed transfer row must survive the apply failure"
+        );
+        assert!(matches!(rows[0], LocationRow::Ran { .. }));
+        assert!(!source.to_string().is_empty());
     }
 }

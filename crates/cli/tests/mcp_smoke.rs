@@ -3,6 +3,7 @@
 //! client dependency — this suite IS the wire-contract test.
 mod common; // fixture_catalog + asset_id_of
 
+use base64::Engine as _;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
@@ -556,5 +557,166 @@ fn read_tool_then_clean_stdin_close_exits_success() {
     assert!(
         status.success(),
         "a clean stdin close must exit 0, not panic: {status:?}"
+    );
+}
+
+/// Plants a thumb blob at the real `BlobStore` path (`majestical-index` is
+/// already a `[dependencies]` entry of this crate, not just a dev-dependency,
+/// so the test can compute the exact same path the resource reader does
+/// rather than hand-deriving `blobs/<hex[..2]>/<hex[2..]>/thumb-320.webp` and
+/// risking drift from `BlobStore::path_for`'s real layout).
+#[test]
+fn thumb_resource_serves_webp_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let hex = majestical_index::blob::asset_hex(&asset).expect("xxh3 asset id");
+    let store = majestical_index::blob::BlobStore::new(&root);
+    let thumb_path = store.path_for(hex, &majestical_index::blob::Derivation::Thumb);
+    std::fs::create_dir_all(thumb_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&thumb_path, b"RIFFfakewebp").expect("plant thumb blob");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://thumb/{asset}")}),
+    );
+    let contents = &resp["result"]["contents"][0];
+    assert_eq!(
+        contents["mimeType"],
+        serde_json::json!("image/webp"),
+        "{resp}"
+    );
+    let blob = contents["blob"].as_str().expect("base64 blob field");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .expect("valid base64");
+    assert_eq!(decoded, b"RIFFfakewebp");
+}
+
+/// A resource error is a protocol-level JSON-RPC `error`, NOT a tool-style
+/// `result.isError` — `read_resource` returns `Result<_, ErrorData>`, and
+/// rmcp surfaces an `Err` there as the response's top-level `error` field
+/// (see rmcp's own `test_resource_not_found_version.rs`), unlike every tool
+/// call in this suite above, which nests its error inside a successful
+/// `result`.
+#[test]
+fn missing_thumb_is_a_clean_resource_error_naming_the_remedy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://thumb/{asset}")}),
+    );
+    assert!(resp["result"].is_null(), "must not be a success: {resp}");
+    let message = resp["error"]["message"]
+        .as_str()
+        .expect("a protocol-level error");
+    assert!(
+        message.contains("maj index run --kinds thumbs"),
+        "error must name the remedy: {message}"
+    );
+}
+
+/// The keyframe manifest blob is plain JSON, NOT zstd-compressed — unlike
+/// every other JSON derivation blob (transcripts, OCR, captions), which
+/// `crates/services/src/index/run.rs` zstd-compresses before
+/// `BlobStore::write_atomic`. `run_keyframe_items` writes
+/// `keyframes_manifest_json`'s bytes straight through instead (see
+/// `Derivation::KeyframeManifest`'s doc: "JSON list of keyframe
+/// timestamps"), so this plants raw JSON, matching the real writer.
+#[test]
+fn keyframes_resource_serves_manifest_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let hex = majestical_index::blob::asset_hex(&asset).expect("xxh3 asset id");
+    let store = majestical_index::blob::BlobStore::new(&root);
+    let manifest_path = store.path_for(
+        hex,
+        &majestical_index::blob::Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    std::fs::create_dir_all(manifest_path.parent().expect("parent")).expect("mkdir");
+    let manifest_json = br#"{"model_tag":"siglip2-b16-v1","detected":2,"timestamps":[1500,4500]}"#;
+    std::fs::write(&manifest_path, manifest_json).expect("plant keyframe manifest");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://keyframes/{asset}")}),
+    );
+    let contents = &resp["result"]["contents"][0];
+    assert_eq!(
+        contents["mimeType"],
+        serde_json::json!("application/json"),
+        "{resp}"
+    );
+    let text = contents["text"].as_str().expect("text contents");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("valid json");
+    assert_eq!(
+        parsed["timestamps"],
+        serde_json::json!([1500, 4500]),
+        "{text}"
+    );
+}
+
+#[test]
+fn resource_templates_are_listed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request("resources/templates/list", &serde_json::json!({}));
+    let templates = resp["result"]["resourceTemplates"]
+        .as_array()
+        .expect("resourceTemplates array");
+    let mut uris: Vec<&str> = templates
+        .iter()
+        .map(|t| t["uriTemplate"].as_str().expect("uriTemplate"))
+        .collect();
+    uris.sort_unstable();
+    assert_eq!(
+        uris,
+        vec![
+            "majestical://keyframes/{asset_id}",
+            "majestical://thumb/{asset_id}",
+        ],
+        "{templates:?}"
+    );
+    for template in templates {
+        assert!(
+            template["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "every template must describe what agents get: {template}"
+        );
+    }
+}
+
+/// Without `ensure_catalog`, resolving a blob path under a nonexistent
+/// catalog root would still succeed as a plain path join (unlike the state
+/// dir resolution `list_sync_locations`/`get_describer` guard against) —
+/// but it would then read as a plain "no such file" `resource_not_found`,
+/// not the `maj catalog init` remedy every other missing-catalog case in
+/// this suite gives. This pins that the resource reader guards explicitly.
+#[test]
+fn resource_on_missing_catalog_names_remedy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("no-such-catalog");
+    let state = dir.path().join("state");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": "majestical://thumb/xxh3:deadbeefdeadbeefdeadbeefdeadbeef"}),
+    );
+    let message = resp["error"]["message"]
+        .as_str()
+        .expect("a protocol-level error");
+    assert!(
+        message.contains("maj catalog init"),
+        "error must name the remedy: {message}"
     );
 }

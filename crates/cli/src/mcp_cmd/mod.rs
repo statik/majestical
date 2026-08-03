@@ -15,20 +15,28 @@
 //! error's full Display chain (`{:#}`), which is where a `ServiceError`'s
 //! remedy text (e.g. "run `maj catalog init` first") already lives.
 //!
-//! Split into submodules by concern: `read_tools` (the 10 read-only tools)
-//! and `write_tools` (the 16 mutating-tool stubs; Task 8 replaces their
-//! bodies). This file keeps only what both submodules share: the
-//! `MajServer` struct itself, the `open_app`/`ensure_catalog` guards every
-//! tool opens the catalog through, the `tool_error`/`structured_ok` result
-//! builders, the `ServerHandler` impl that sums both tool routers, and
-//! `serve`.
+//! Split into submodules by concern: `read_tools` (the 10 read-only tools),
+//! `write_tools` (the 16 mutating-tool stubs; Task 8 replaces their
+//! bodies), and `resources` (the `majestical://` MCP resources: thumbnails
+//! and keyframe manifests). This file keeps only what every submodule
+//! shares: the `MajServer` struct itself, the `open_app`/`ensure_catalog`
+//! guards every tool and resource opens the catalog through, the
+//! `tool_error`/`structured_ok` result builders, the `ServerHandler` impl
+//! (tool routers summed, resources capability enabled, both resource
+//! methods delegating to `resources`), and `serve`.
 mod read_tools;
+mod resources;
 mod write_tools;
 
 use majestical_services::app::FsApp;
 use rmcp::ServerHandler;
-use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::{ServiceExt, tool_handler};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServiceExt, tool_handler};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -88,7 +96,45 @@ impl MajServer {
 }
 
 #[tool_handler(router = (Self::read_tool_router() + Self::write_tool_router()))]
-impl ServerHandler for MajServer {}
+impl ServerHandler for MajServer {
+    /// Overrides the `#[tool_handler]`-generated default (which only ever
+    /// enables the tools capability) so the resources capability is
+    /// advertised too — `#[tool_handler]` only fills in `get_info` when the
+    /// impl block doesn't already define one, so this is the only place
+    /// that needs to know both capabilities exist.
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+    }
+
+    /// Advertises the `majestical://thumb/{asset_id}` and
+    /// `majestical://keyframes/{asset_id}` URI templates — see
+    /// `resources::templates` for what each hands back.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resources::templates(),
+        ))
+    }
+
+    /// Reads one `majestical://` resource — see `resources::read` for the
+    /// URI dispatch, catalog guard, and blob lookup.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
+        resources::read(self, &request.uri).map(Into::into)
+    }
+}
 
 /// Serves the catalog at `catalog` to an MCP client over stdio
 /// (newline-delimited JSON-RPC 2.0), blocking until the client disconnects.

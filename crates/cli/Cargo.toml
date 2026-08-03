@@ -48,6 +48,11 @@ plist.workspace = true
 # (built manually in `mcp_cmd::serve`, not `#[tokio::main]` — every other
 # subcommand stays synchronous) and only for this one subcommand.
 rmcp.workspace = true
+# `mcp_cmd::resources` base64-encodes thumbnail blob bytes for the
+# `BlobResourceContents.blob` wire field (MCP resources have no raw-bytes
+# transport). Same workspace pin `crates/describe` already uses for its
+# data-URL image payloads.
+base64.workspace = true
 schemars.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std"] }
 

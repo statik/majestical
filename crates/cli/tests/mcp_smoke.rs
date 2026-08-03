@@ -33,15 +33,31 @@ struct Mcp {
 impl Mcp {
     #[cfg(test)]
     fn spawn(catalog: &std::path::Path, state: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_maj"))
+        Self::spawn_with_extra_env(catalog, state, &[])
+    }
+
+    /// Like [`Self::spawn`], plus extra environment variables on the child
+    /// — used by the fake-model regression test below to point
+    /// `MAJ_MODEL_DIR` at a planted, byte-exact-size model without touching
+    /// every other test's env.
+    #[cfg(test)]
+    fn spawn_with_extra_env(
+        catalog: &std::path::Path,
+        state: &std::path::Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_maj"));
+        command
             .env("MAJ_CATALOG", catalog)
             .env("MAJ_MACHINE_ID", "m1")
             .env("MAJ_STATE_DIR", state)
             .arg("mcp")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn maj mcp");
+            .stdout(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn maj mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let mut s = Self {
@@ -188,6 +204,83 @@ fn search_assets_rows_match_service_outcome() {
     assert!(hit["name"].is_string(), "{hit}");
     assert_eq!(hit["known"], serde_json::json!(true), "{hit}");
     assert_eq!(hit["name"], serde_json::json!("a.txt"), "{hit}");
+}
+
+/// Regression test for the nested-tokio-runtime panic `search_assets`/
+/// `run_saved_search` could hit on a real machine: once a user has `maj
+/// model fetch`ed a real model and `maj index run` built an index, every
+/// term search opens the local Lance vector store
+/// (`open_semantic_index`/`open_text_semantic_index` in
+/// `crates/services/src/search.rs`), which builds and enters its OWN tokio
+/// runtime (`VectorStore`/`TextVectorStore::open_existing` in
+/// `crates/index/src/vector_store.rs`) — panicking if the calling thread is
+/// already inside one, as every MCP `#[tool]` handler's thread is. CI never
+/// hits this because no real model is ever installed in these tests.
+///
+/// This reaches the exact vulnerable line WITHOUT downloading a real model:
+/// `model_present_for` (`crates/index/src/model.rs`) checks only that each
+/// file exists at its exact declared byte length, never content or hash, so
+/// a zero-filled file the right size passes; `VectorStore`/
+/// `TextVectorStore::open_existing` gate on nothing but `dir.is_dir()`
+/// before building their runtime (`crates/index/src/vector_store.rs`), so a
+/// plain empty `lance` directory is enough. Verified as a real mutation
+/// test: with `read_tools::search_assets`/`run_saved_search` NOT routed
+/// through `run_off_tokio_runtime` (i.e. reverting that part of this fix),
+/// this test either panics the server (observed as the MCP child closing
+/// stdout, which fails `Mcp::request`'s "server closed stdout before
+/// responding" assertion) or hangs — confirmed via `timeout 30 cargo test
+/// -p majestical-cli --test mcp_smoke -- --exact
+/// search_with_a_planted_fake_model_does_not_panic_the_server`, which
+/// killed the run at the 30s wall clock with no response ever received.
+#[test]
+#[cfg(unix)]
+fn search_with_a_planted_fake_model_does_not_panic_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+
+    // Materializes the per-catalog state dir (and `catalog.db`) as a side
+    // effect, so its path — and the `lance` dir this test plants beside it
+    // — can be found below. Neither `scan` nor `tag add` (both already run
+    // by `fixture_catalog`) ever opens the sqlite view themselves.
+    common::maj(&root, &state)
+        .args(["volumes", "list"])
+        .assert()
+        .success();
+    let catalog_dbs = common::walkdir_find(&state, "catalog.db");
+    assert_eq!(catalog_dbs.len(), 1, "{catalog_dbs:?}");
+    let catalog_state_dir = catalog_dbs[0].parent().expect("parent").to_path_buf();
+    std::fs::create_dir_all(catalog_state_dir.join("lance")).expect("mkdir lance");
+
+    // Fakes a MiniLM install at the exact byte sizes `model_present_for`
+    // checks, no real weights downloaded.
+    let model_dir = dir
+        .path()
+        .join("models")
+        .join(majestical_index::model::MINILM.tag);
+    std::fs::create_dir_all(&model_dir).expect("mkdir model dir");
+    for file in majestical_index::model::MINILM.files {
+        let f = std::fs::File::create(model_dir.join(file.name)).expect("create model file");
+        f.set_len(file.bytes).expect("set_len");
+    }
+
+    let model_dir_root = dir.path().join("models");
+    let mut mcp = Mcp::spawn_with_extra_env(
+        &root,
+        &state,
+        &[(
+            "MAJ_MODEL_DIR",
+            model_dir_root.to_str().expect("utf8 model dir"),
+        )],
+    );
+    let resp = mcp.call_tool("search_assets", &serde_json::json!({"query": "a.txt"}));
+    assert_ne!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "a search that reaches the vector store must not error, and must not have panicked or \
+         hung the server: {resp}"
+    );
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["count"], serde_json::json!(1), "{structured}");
 }
 
 #[test]

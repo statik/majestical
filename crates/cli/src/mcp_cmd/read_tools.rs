@@ -60,6 +60,27 @@ struct SavedSearchesResult {
     saved: Vec<majestical_services::search::SavedSearch>,
 }
 
+/// Runs `req` on a plain OS thread, off this server's own tokio runtime —
+/// `search::search`'s semantic layer opens a Lance vector store whenever a
+/// query has terms and a model is installed, and that store builds and
+/// enters its own tokio runtime internally (see `super::run_off_tokio_runtime`'s
+/// doc for why that panics from inside this server's `#[tool]` handler
+/// threads otherwise). Opens its own `FsApp` inside the spawned thread
+/// (never crossing the thread boundary as a reference), same reason
+/// `write_tools::index_run_exec` does: `App`'s HLC clock holds a
+/// `Box<dyn Clock>`, so `&FsApp` isn't `Send`.
+fn run_search_off_runtime(
+    catalog: &std::path::Path,
+    machine_id: &str,
+    author: &str,
+    req: &majestical_services::search::SearchRequest,
+) -> anyhow::Result<majestical_services::search::SearchOutcome> {
+    super::run_off_tokio_runtime(|| {
+        let mut app = majestical_services::app::FsApp::open(catalog, machine_id, author)?;
+        Ok(majestical_services::search::search(&mut app, catalog, req)?)
+    })
+}
+
 #[tool_router(router = read_tool_router, vis = "pub(super)")]
 impl MajServer {
     /// Search the catalog: bare terms match names; `key:value` tokens are
@@ -67,17 +88,13 @@ impl MajServer {
     /// safe to pass into `get_asset` or a later mutating-tool call.
     #[tool]
     fn search_assets(&self, Parameters(args): Parameters<SearchAssetsArgs>) -> CallToolResult {
-        let mut app = match self.open_app() {
-            Ok(app) => app,
-            Err(result) => return result,
-        };
         let req = majestical_services::search::SearchRequest {
             query: args.query,
             limit: args.limit,
             saved: args.saved,
             save: None,
         };
-        match majestical_services::search::search(&mut app, &self.catalog, &req) {
+        match run_search_off_runtime(&self.catalog, &self.machine_id, &self.author, &req) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
@@ -138,17 +155,13 @@ impl MajServer {
     /// Same result shape as `search_assets`.
     #[tool]
     fn run_saved_search(&self, Parameters(args): Parameters<RunSavedSearchArgs>) -> CallToolResult {
-        let mut app = match self.open_app() {
-            Ok(app) => app,
-            Err(result) => return result,
-        };
         let req = majestical_services::search::SearchRequest {
             query: None,
             limit: args.limit,
             saved: Some(args.name),
             save: None,
         };
-        match majestical_services::search::search(&mut app, &self.catalog, &req) {
+        match run_search_off_runtime(&self.catalog, &self.machine_id, &self.author, &req) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }

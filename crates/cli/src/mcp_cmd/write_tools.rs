@@ -67,9 +67,12 @@ fn confirm_gate<T: Serialize>(confirm: bool, result: anyhow::Result<T>) -> CallT
 
 /// Serializes `value` and folds `"executed": executed` into the resulting
 /// JSON object — every mutating tool's response built in this module is an
-/// object by construction, so this always finds one to add to.
-/// Serialization failure (never expected for these plain-data outcomes)
-/// becomes a tool error instead of a panic, mirroring `super::structured_ok`.
+/// object by construction, so this always finds one to add to. A non-object
+/// serialization is a tool error too, same as an outright serialization
+/// failure: silently shipping a response with no `executed` flag is the one
+/// ambiguity this module must never allow (a caller diffing a dry-run
+/// response against the executed one has nowhere else to look), so there is
+/// no "pass the value through anyway" fallback.
 fn inject_executed(
     value: &impl Serialize,
     executed: bool,
@@ -79,7 +82,10 @@ fn inject_executed(
             map.insert("executed".to_string(), serde_json::Value::Bool(executed));
             Ok(serde_json::Value::Object(map))
         }
-        Ok(other) => Ok(other),
+        Ok(other) => Err(super::tool_error(anyhow::anyhow!(
+            "internal error: mutating tool response serialized as {other}, not a JSON object — \
+             cannot attach the executed flag"
+        ))),
         Err(err) => Err(super::tool_error(err)),
     }
 }
@@ -781,33 +787,13 @@ fn index_run_dry(
     }))
 }
 
-/// Runs `f` on a plain, tokio-unaffiliated OS thread — every `#[tool]`
-/// handler's own thread is already inside this server's tokio runtime (see
-/// `mcp_cmd::serve`), but `index::run`'s embed/keyframe/transcript-embed
-/// executors open a Lance vector store
-/// (`majestical_index::vector_store::VectorStore::open`) that builds and
-/// enters ANOTHER tokio runtime internally — and entering any runtime while
-/// the current thread already has one active panics ("Cannot start a
-/// runtime from within a runtime"), regardless of whether it's the same
-/// `Runtime` value. A genuinely separate `std::thread` (never
-/// `spawn_blocking`, whose task still runs inside this runtime's own worker
-/// context) has no such context to collide with.
-fn run_off_tokio_runtime<T: Send>(
-    f: impl FnOnce() -> anyhow::Result<T> + Send,
-) -> anyhow::Result<T> {
-    std::thread::scope(|scope| match scope.spawn(f).join() {
-        Ok(result) => result,
-        Err(panic) => std::panic::resume_unwind(panic),
-    })
-}
-
-/// Unlike [`index_run_dry`], this opens its OWN `FsApp` — inside the
-/// spawned thread, never crossing the thread boundary as a reference — for
-/// [`run_off_tokio_runtime`]'s isolation to work: `App`'s HLC clock holds a
-/// `Box<dyn Clock>`, so `&FsApp` itself isn't `Send`, and reusing the
-/// caller's already-open `FsApp` across the thread boundary would fail to
-/// compile for exactly that reason (correctly — nothing about `FsApp`
-/// promises safe concurrent access from two threads at once).
+/// Unlike [`index_run_dry`], this opens its OWN `FsApp` — inside
+/// [`super::run_off_tokio_runtime`]'s spawned thread, never crossing the
+/// thread boundary as a reference — for that isolation to work: `App`'s HLC
+/// clock holds a `Box<dyn Clock>`, so `&FsApp` itself isn't `Send`, and
+/// reusing the caller's already-open `FsApp` across the thread boundary
+/// would fail to compile for exactly that reason (correctly — nothing about
+/// `FsApp` promises safe concurrent access from two threads at once).
 fn index_run_exec(
     catalog: &Path,
     machine_id: &str,
@@ -821,7 +807,7 @@ fn index_run_exec(
         threads: args.threads,
         api_key: crate::describer_cmd::env_api_key(),
     };
-    let outcome = run_off_tokio_runtime(|| {
+    let outcome = super::run_off_tokio_runtime(|| {
         let app = FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;

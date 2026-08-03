@@ -72,6 +72,32 @@ fn structured_ok<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+/// Runs `f` on a plain, tokio-unaffiliated OS thread. Every `#[tool]`
+/// handler's own thread is already inside this server's tokio runtime (see
+/// `serve` below), but some `majestical_services`/`majestical_index` calls
+/// open a Lance vector store (`VectorStore`/`TextVectorStore::open`/
+/// `open_existing`) that builds and enters ANOTHER tokio runtime
+/// internally — and entering any runtime while the current thread already
+/// has one active panics ("Cannot start a runtime from within a runtime"),
+/// regardless of whether it's the same `Runtime` value. Two call paths hit
+/// this today: `write_tools::index_run`'s real pass (embed/keyframe/
+/// transcript-embed executors), and `read_tools::search_assets`/
+/// `run_saved_search`'s semantic layer (`search::search` opens the store to
+/// nearest-neighbor-search it whenever a query has terms and a describer/
+/// encoder model is installed) — a real user with a model fetched and an
+/// index built would panic on their first MCP search without this. A
+/// genuinely separate `std::thread` (never `spawn_blocking`, whose task
+/// still runs inside this runtime's own worker context) has no such
+/// context to collide with.
+fn run_off_tokio_runtime<T: Send>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send,
+) -> anyhow::Result<T> {
+    std::thread::scope(|scope| match scope.spawn(f).join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
 impl MajServer {
     /// Opens this call's `FsApp` fresh — never cached across calls (see the
     /// module doc). On failure (most commonly no catalog at this path —

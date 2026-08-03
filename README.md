@@ -9,7 +9,9 @@ All output is JSON-first so both humans and agents can drive it.
 
 ```bash
 maj --catalog /path/to/catalog --machine-id studio-1 catalog init
-maj --catalog /path/to/catalog --machine-id studio-1 ingest --source /path/to/media
+maj --catalog /path/to/catalog --machine-id studio-1 para add project my-shoot
+maj --catalog /path/to/catalog --machine-id studio-1 \
+  ingest /path/to/media --dest /path/to/dest --para project/my-shoot
 maj --catalog /path/to/catalog --machine-id studio-1 search "sunset beach"
 ```
 
@@ -30,8 +32,9 @@ with:
 ```
 
 The server exposes 26 tools mirroring the CLI's verbs: 10 read-only tools
-(search, get_asset, list tags/saved-searches/volumes/sync-locations, etc.)
-plus 16 mutating tools covering tagging, PARA moves, metadata, scanning,
+(search, get_asset, list volumes/saved-searches/sync-locations, sync/index
+status, review pending AI tag suggestions, etc.) plus 16 mutating tools
+covering tagging, PARA moves, metadata, scanning,
 verification, ingest, sync, and describer configuration. Mutating tools
 default to a dry-run preview; pass `confirm: true` to execute. Two
 resources — `majestical://` thumbnails and keyframe manifests — let a

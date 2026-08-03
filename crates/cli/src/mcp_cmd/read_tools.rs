@@ -1,0 +1,228 @@
+//! The 10 read-only MCP tools: each opens (or, for the two that never touch
+//! the event log, guards) a fresh catalog handle and serializes the matching
+//! `majestical_services` outcome straight through — see `super`'s module doc
+//! for the shared wire contract.
+use super::MajServer;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// `search_assets`'s `--limit` default, mirroring `maj search`'s own.
+fn default_search_limit() -> usize {
+    50
+}
+
+/// Params for `search_assets`, mirroring
+/// `majestical_services::search::SearchRequest` minus `save` — this read
+/// tool never writes a saved search.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchAssetsArgs {
+    /// Bare terms match names; `key:value` tokens are hard filters (tag,
+    /// vol or volume, para, kind, online, before, after, in). Omit when
+    /// passing `saved`.
+    #[serde(default)]
+    query: Option<String>,
+    /// Max results (default 50).
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    /// Run a previously saved search by name instead of `query`.
+    #[serde(default)]
+    saved: Option<String>,
+}
+
+/// Params for `get_asset`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetAssetArgs {
+    /// Asset id, e.g. `xxh3:0123...`. Asset ids (and every timestamp this
+    /// server returns) are stable across catalog operations, so a value
+    /// returned by `search_assets`/`run_saved_search` can be passed straight
+    /// into `get_asset` (or a future mutating tool) without re-resolving.
+    asset_id: String,
+}
+
+/// Params for `run_saved_search`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RunSavedSearchArgs {
+    /// Saved search name (see `list_saved_searches`).
+    name: String,
+    /// Max results (default 50).
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// `list_saved_searches`'s structured result — the service verb returns a
+/// bare `Vec<SavedSearch>`, so this names the wire object's one field.
+#[derive(Serialize)]
+struct SavedSearchesResult {
+    saved: Vec<majestical_services::search::SavedSearch>,
+}
+
+#[tool_router(router = read_tool_router, vis = "pub(super)")]
+impl MajServer {
+    /// Search the catalog: bare terms match names; `key:value` tokens are
+    /// hard filters. Asset ids and timestamps in `results` are stable and
+    /// safe to pass into `get_asset` or a later mutating-tool call.
+    #[tool]
+    fn search_assets(&self, Parameters(args): Parameters<SearchAssetsArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        let req = majestical_services::search::SearchRequest {
+            query: args.query,
+            limit: args.limit,
+            saved: args.saved,
+            save: None,
+        };
+        match majestical_services::search::search(&mut app, &self.catalog, &req) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Fetches everything the catalog knows about one asset: instances,
+    /// tags, PARA assignment, metadata fields, and verification history.
+    /// `verifications` is the FULL recorded history for the asset (every
+    /// check ever recorded), not just the latest per volume. `para`, when
+    /// set, may name an archived node — archived PARA nodes render exactly
+    /// like live ones here. An unknown asset id is a value, not an error:
+    /// returns `{"found": false}`; a known asset returns
+    /// `{"found": true, "asset": {...}}`.
+    #[tool]
+    fn get_asset(&self, Parameters(args): Parameters<GetAssetArgs>) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::catalog::get_asset(&app, &self.catalog, &args.asset_id) {
+            Ok(Some(detail)) => match serde_json::to_value(&detail) {
+                Ok(asset) => CallToolResult::structured(json!({ "found": true, "asset": asset })),
+                Err(err) => super::tool_error(err),
+            },
+            Ok(None) => CallToolResult::structured(json!({ "found": false })),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists every volume the catalog has ever seen, with per-volume asset
+    /// counts and online status.
+    #[tool]
+    fn list_volumes(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::volumes::volumes_list(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists every saved search (name and query text).
+    #[tool]
+    fn list_saved_searches(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::search::searches_list(&app) {
+            Ok(saved) => super::structured_ok(&SavedSearchesResult { saved }),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Runs a previously saved search by name (see `list_saved_searches`).
+    /// Same result shape as `search_assets`.
+    #[tool]
+    fn run_saved_search(&self, Parameters(args): Parameters<RunSavedSearchArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        let req = majestical_services::search::SearchRequest {
+            query: None,
+            limit: args.limit,
+            saved: Some(args.name),
+            save: None,
+        };
+        match majestical_services::search::search(&mut app, &self.catalog, &req) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// For every configured sync location, reports reachability plus what a
+    /// push would send (`ahead`) and a pull would fetch (`behind`) — walked
+    /// fresh from real files; never executes a transfer.
+    #[tool]
+    fn sync_status(&self) -> CallToolResult {
+        match majestical_services::sync::status(&self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Reports the derivation queue's current state per kind (thumbnails,
+    /// embeddings, keyframes, transcripts, OCR, PDF text, captions) without
+    /// doing any work, plus the last `index_run`'s per-item failures.
+    #[tool]
+    fn index_status(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::index::status(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists this machine's configured sync locations.
+    #[tool]
+    fn list_sync_locations(&self) -> CallToolResult {
+        if let Err(result) = self.ensure_catalog() {
+            return result;
+        }
+        match majestical_services::sync::locations_list(&self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// The configured describer backend for this machine, API key redacted.
+    /// Returns `{"configured": false}` when none is set, else
+    /// `{"configured": true, "describer": {...}}`.
+    #[tool]
+    fn get_describer(&self) -> CallToolResult {
+        if let Err(result) = self.ensure_catalog() {
+            return result;
+        }
+        match majestical_services::describer_config::show(&self.catalog) {
+            Ok(Some(view)) => match serde_json::to_value(&view) {
+                Ok(describer) => CallToolResult::structured(
+                    json!({ "configured": true, "describer": describer }),
+                ),
+                Err(err) => super::tool_error(err),
+            },
+            Ok(None) => CallToolResult::structured(json!({ "configured": false })),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists every pending AI tag suggestion not yet confirmed or rejected,
+    /// sorted by asset then tag.
+    #[tool]
+    fn suggest_tags_review(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::tags::suggestions(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+}

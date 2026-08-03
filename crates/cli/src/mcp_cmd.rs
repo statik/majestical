@@ -15,7 +15,6 @@
 //! error's full Display chain (`{:#}`), which is where a `ServiceError`'s
 //! remedy text (e.g. "run `maj catalog init` first") already lives.
 use majestical_services::app::FsApp;
-use majestical_services::error::ServiceError;
 use rmcp::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -106,6 +105,15 @@ fn structured_ok<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+/// A stub tool's uniform response: registers the tool name in the roster
+/// now (so the roster is stable) without implementing its body — that
+/// arrives with Task 8's mutating tools and confirm gate.
+fn not_yet_implemented(tool: &str) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "{tool}: not yet implemented over MCP — use the maj CLI"
+    ))])
+}
+
 #[tool_router]
 impl MajServer {
     /// Opens this call's `FsApp` fresh — never cached across calls (see the
@@ -118,30 +126,16 @@ impl MajServer {
 
     /// Guards a tool that never opens `FsApp` — `list_sync_locations` and
     /// `get_describer` read state-dir-relative config directly, without
-    /// ever touching the event log — against a missing catalog, so it gives
-    /// the same `ServiceError::NoCatalog` remedy every `open_app`-based tool
-    /// already gives on a missing catalog. Without this guard, resolving
-    /// the state dir for a nonexistent catalog root fails first with a raw
+    /// ever touching the event log — against a missing catalog, via the
+    /// same `majestical_services::catalog::ensure_catalog` predicate
+    /// `FsApp::open` and `sync`'s own guard use, so it gives the identical
+    /// `ServiceError::NoCatalog` remedy every `open_app`-based tool already
+    /// gives on a missing catalog. Without this guard, resolving the state
+    /// dir for a nonexistent catalog root fails first with a raw
     /// `canonicalize` OS error instead of the "run `maj catalog init`
     /// first" remedy.
     fn ensure_catalog(&self) -> Result<(), CallToolResult> {
-        if self.catalog.join("events").is_dir() {
-            Ok(())
-        } else {
-            Err(tool_error(ServiceError::NoCatalog {
-                root: self.catalog.clone(),
-            }))
-        }
-    }
-
-    /// A stub tool's uniform response: registers the tool name in the
-    /// roster now (so the roster is stable) without implementing its body —
-    /// that arrives with Task 8's mutating tools and confirm gate.
-    fn not_yet_implemented(&self, tool: &str) -> CallToolResult {
-        CallToolResult::error(vec![ContentBlock::text(format!(
-            "{tool}: not yet implemented — arrives in the next release (catalog: {})",
-            self.catalog.display()
-        ))])
+        majestical_services::catalog::ensure_catalog(&self.catalog).map_err(tool_error)
     }
 
     /// Search the catalog: bare terms match names; `key:value` tokens are
@@ -310,106 +304,170 @@ impl MajServer {
 
     /// Adds a named sync location. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn add_sync_location(&self) -> CallToolResult {
-        self.not_yet_implemented("add_sync_location")
+        not_yet_implemented("add_sync_location")
     }
 
     /// Initializes a new catalog directory. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn catalog_init(&self) -> CallToolResult {
-        self.not_yet_implemented("catalog_init")
+        not_yet_implemented("catalog_init")
     }
 
     /// Works the derivation queue. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn index_run(&self) -> CallToolResult {
-        self.not_yet_implemented("index_run")
+        not_yet_implemented("index_run")
     }
 
     /// Verified copy from a source directory into a PARA-routed
     /// destination. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn ingest_source(&self) -> CallToolResult {
-        self.not_yet_implemented("ingest_source")
+        not_yet_implemented("ingest_source")
     }
 
     /// Processes a shared inbox folder. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn inbox_process(&self) -> CallToolResult {
-        self.not_yet_implemented("inbox_process")
+        not_yet_implemented("inbox_process")
     }
 
     /// Renames or archives a PARA node. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn move_para(&self) -> CallToolResult {
-        self.not_yet_implemented("move_para")
+        not_yet_implemented("move_para")
     }
 
     /// Removes a saved search. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn rm_saved_search(&self) -> CallToolResult {
-        self.not_yet_implemented("rm_saved_search")
+        not_yet_implemented("rm_saved_search")
     }
 
     /// Removes a sync location. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn rm_sync_location(&self) -> CallToolResult {
-        self.not_yet_implemented("rm_sync_location")
+        not_yet_implemented("rm_sync_location")
     }
 
     /// Hashes a directory into the catalog as `AssetSeen` events. Not yet
     /// implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn scan_volume(&self) -> CallToolResult {
-        self.not_yet_implemented("scan_volume")
+        not_yet_implemented("scan_volume")
     }
 
     /// Configures the caption/tag-suggestion describer backend. Not yet
     /// implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn set_describer(&self) -> CallToolResult {
-        self.not_yet_implemented("set_describer")
+        not_yet_implemented("set_describer")
     }
 
     /// Sets an LWW metadata field on an asset. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn set_metadata(&self) -> CallToolResult {
-        self.not_yet_implemented("set_metadata")
+        not_yet_implemented("set_metadata")
     }
 
     /// Confirms or rejects pending AI tag suggestions. Not yet implemented
     /// over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn tag_assets(&self) -> CallToolResult {
-        self.not_yet_implemented("tag_assets")
+        not_yet_implemented("tag_assets")
     }
 
     /// Fetches everything configured locations have that this catalog
     /// doesn't. Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn sync_pull(&self) -> CallToolResult {
-        self.not_yet_implemented("sync_pull")
+        not_yet_implemented("sync_pull")
     }
 
     /// Replicates this catalog to configured locations. Not yet implemented
     /// over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn sync_push(&self) -> CallToolResult {
-        self.not_yet_implemented("sync_push")
+        not_yet_implemented("sync_push")
     }
 
     /// Probes the configured describer backend's connectivity/capability.
     /// Not yet implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn test_describer(&self) -> CallToolResult {
-        self.not_yet_implemented("test_describer")
+        not_yet_implemented("test_describer")
     }
 
     /// Re-verifies a destination against its ASC MHL history. Not yet
     /// implemented over MCP.
     #[tool]
+    #[expect(
+        clippy::unused_self,
+        reason = "the #[tool] router requires &self on every tool method; a stub's message needs none of MajServer's state"
+    )]
     fn verify_volume(&self) -> CallToolResult {
-        self.not_yet_implemented("verify_volume")
+        not_yet_implemented("verify_volume")
     }
 }
 
@@ -426,8 +484,16 @@ impl ServerHandler for MajServer {}
 /// to start (e.g. a malformed `initialize` handshake), or the service loop
 /// itself ends in an error.
 pub fn serve(catalog: &Path, machine_id: &str, author: &str) -> anyhow::Result<()> {
+    // `.enable_time()` is required, not optional: rmcp's shutdown path calls
+    // `tokio::time::timeout` when the transport closes (e.g. a client
+    // closing stdin at the end of a normal session), and without a timer
+    // driver that panics the worker thread instead of shutting down
+    // cleanly — every clean client disconnect would exit nonzero. Verified
+    // live: `read_tool_then_clean_stdin_close_exits_success` in
+    // `mcp_smoke.rs` fails without this.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .build()
         .map_err(|err| anyhow::anyhow!("building tokio runtime for mcp server: {err}"))?;
     runtime.block_on(serve_async(catalog, machine_id, author))

@@ -110,18 +110,14 @@ pub fn resolve_targets<'a>(cfg: &'a SyncConfig, name: Option<&str>) -> Result<Ve
 }
 
 /// Guards every sync entry point against operating on a directory that was
-/// never `maj catalog init`ed. See `FsApp::open`'s doc for why this can't
-/// just reuse that guard: the transfer engine creates `events/<machine>/`
-/// on the destination as a side effect of copying a segment there, so a
-/// pull in particular must check before it transfers anything, not after.
+/// never `maj catalog init`ed, via `crate::catalog::ensure_catalog` (the one
+/// shared predicate — see its doc). This can't just call `FsApp::open`
+/// itself: the transfer engine creates `events/<machine>/` on the
+/// destination as a side effect of copying a segment there, so a pull in
+/// particular must check the predicate before it transfers anything, not
+/// open a whole `FsApp` for it.
 fn ensure_catalog(catalog: &Path) -> Result<(), ServiceError> {
-    if catalog.join("events").is_dir() {
-        Ok(())
-    } else {
-        Err(ServiceError::NoCatalog {
-            root: catalog.to_path_buf(),
-        })
-    }
+    crate::catalog::ensure_catalog(catalog)
 }
 
 /// Registers a new sync location: validates `location` is an accessible,

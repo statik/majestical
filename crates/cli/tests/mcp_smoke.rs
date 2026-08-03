@@ -8,7 +8,12 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 struct Mcp {
     child: Child,
-    stdin: ChildStdin,
+    // `Option` (not a bare `ChildStdin`) so a test can close the write half
+    // deliberately (see `close_stdin`) — the "client disconnects cleanly"
+    // signal a real MCP client sends by ending its process — without
+    // dropping the rest of `Mcp` (still needed to `wait()` on the child and
+    // assert its exit status).
+    stdin: Option<ChildStdin>,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: i64,
 }
@@ -35,7 +40,7 @@ impl Mcp {
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let mut s = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             next_id: 0,
         };
@@ -62,7 +67,8 @@ impl Mcp {
             "jsonrpc": "2.0", "id": self.next_id,
             "method": method, "params": params
         });
-        writeln!(self.stdin, "{msg}").expect("write");
+        let stdin = self.stdin.as_mut().expect("stdin still open");
+        writeln!(stdin, "{msg}").expect("write");
         let mut line = String::new();
         loop {
             line.clear();
@@ -78,7 +84,8 @@ impl Mcp {
     #[cfg(test)]
     fn notify(&mut self, method: &str, params: &serde_json::Value) {
         let msg = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
-        writeln!(self.stdin, "{msg}").expect("write");
+        let stdin = self.stdin.as_mut().expect("stdin still open");
+        writeln!(stdin, "{msg}").expect("write");
     }
 
     #[cfg(test)]
@@ -87,6 +94,15 @@ impl Mcp {
             "tools/call",
             &serde_json::json!({"name": name, "arguments": args}),
         )
+    }
+
+    /// Closes the write half of the child's stdin — the clean-disconnect
+    /// signal a real MCP client sends by ending its process, distinct from
+    /// `Drop`'s hard `kill()`. Lets the server see EOF and run its own
+    /// shutdown path instead of being killed out from under it.
+    #[cfg(test)]
+    fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 }
 
@@ -512,8 +528,33 @@ fn mutating_stub_tool_errors_as_not_yet_implemented() {
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("error text");
+    assert_eq!(
+        text, "tag_assets: not yet implemented over MCP — use the maj CLI",
+        "stub text must be exact: {text}"
+    );
+}
+
+/// The regression net for the critical fix in this suite's history: rmcp
+/// 3.1.0's shutdown path calls `tokio::time::timeout` when the transport
+/// closes, so a runtime built with only `.enable_io()` (no timer driver)
+/// panics the worker thread on every clean client disconnect — a client
+/// closing stdin at the end of a normal session, not a crash. This is
+/// deliberately NOT a `kill()` (that's `Drop`'s job, and a killed process
+/// never runs the shutdown path at all): closing just the write half of
+/// stdin is what a real client does when its own process ends, and is the
+/// only way to exercise the panicking path this test guards against.
+#[test]
+fn read_tool_then_clean_stdin_close_exits_success() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_volumes", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+
+    mcp.close_stdin();
+    let status = mcp.child.wait().expect("wait for the server to exit");
     assert!(
-        text.contains("not yet implemented"),
-        "stub text must say so: {text}"
+        status.success(),
+        "a clean stdin close must exit 0, not panic: {status:?}"
     );
 }

@@ -15,6 +15,7 @@
 //! error's full Display chain (`{:#}`), which is where a `ServiceError`'s
 //! remedy text (e.g. "run `maj catalog init` first") already lives.
 use majestical_services::app::FsApp;
+use majestical_services::error::ServiceError;
 use rmcp::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -113,6 +114,24 @@ impl MajServer {
     /// remedy), returns the tool error the caller should propagate.
     fn open_app(&self) -> Result<FsApp, CallToolResult> {
         FsApp::open(&self.catalog, &self.machine_id, &self.author).map_err(tool_error)
+    }
+
+    /// Guards a tool that never opens `FsApp` — `list_sync_locations` and
+    /// `get_describer` read state-dir-relative config directly, without
+    /// ever touching the event log — against a missing catalog, so it gives
+    /// the same `ServiceError::NoCatalog` remedy every `open_app`-based tool
+    /// already gives on a missing catalog. Without this guard, resolving
+    /// the state dir for a nonexistent catalog root fails first with a raw
+    /// `canonicalize` OS error instead of the "run `maj catalog init`
+    /// first" remedy.
+    fn ensure_catalog(&self) -> Result<(), CallToolResult> {
+        if self.catalog.join("events").is_dir() {
+            Ok(())
+        } else {
+            Err(tool_error(ServiceError::NoCatalog {
+                root: self.catalog.clone(),
+            }))
+        }
     }
 
     /// A stub tool's uniform response: registers the tool name in the
@@ -246,6 +265,9 @@ impl MajServer {
     /// Lists this machine's configured sync locations.
     #[tool]
     fn list_sync_locations(&self) -> CallToolResult {
+        if let Err(result) = self.ensure_catalog() {
+            return result;
+        }
         match majestical_services::sync::locations_list(&self.catalog) {
             Ok(outcome) => structured_ok(&outcome),
             Err(err) => tool_error(err),
@@ -257,6 +279,9 @@ impl MajServer {
     /// `{"configured": true, "describer": {...}}`.
     #[tool]
     fn get_describer(&self) -> CallToolResult {
+        if let Err(result) = self.ensure_catalog() {
+            return result;
+        }
         match majestical_services::describer_config::show(&self.catalog) {
             Ok(Some(view)) => match serde_json::to_value(&view) {
                 Ok(describer) => CallToolResult::structured(

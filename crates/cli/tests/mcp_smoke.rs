@@ -285,3 +285,235 @@ fn read_tool_on_missing_catalog_names_remedy() {
         "error must name the remedy: {text}"
     );
 }
+
+/// Asserts a tool error's text names the `maj catalog init` remedy — shared
+/// by every "no `FsApp`, but still missing-catalog-aware" tool check below.
+#[cfg(test)]
+fn assert_missing_catalog_remedy(resp: &serde_json::Value) {
+    assert_eq!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "a missing catalog must be a tool error: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("maj catalog init"),
+        "error must name the remedy, not a raw path/OS error: {text}"
+    );
+}
+
+/// `list_sync_locations` and `get_describer` never open an `FsApp` — they
+/// read state-dir-relative config directly — so without their own guard
+/// they'd surface a raw `canonicalize`/`os error 2` instead of the same
+/// `maj catalog init` remedy every `FsApp::open`-based tool gives.
+#[test]
+fn list_sync_locations_on_missing_catalog_names_remedy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("no-such-catalog");
+    let state = dir.path().join("state");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert_missing_catalog_remedy(&resp);
+}
+
+#[test]
+fn get_describer_on_missing_catalog_names_remedy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("no-such-catalog");
+    let state = dir.path().join("state");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert_missing_catalog_remedy(&resp);
+}
+
+/// A sabotage check: an error's remedy text must survive as the FULL
+/// Display chain (`{err:#}`), not just the top-level message (`{err}`) —
+/// swapping the format spec in `tool_error` would still pass every other
+/// test in this suite (they only check for a remedy substring), so this
+/// test specifically manufactures a two-link chain (an outer "parsing
+/// <path>" context wrapping a real TOML parse error) and asserts BOTH
+/// links survive in the tool error text.
+#[test]
+fn tool_error_preserves_the_full_context_chain_not_just_the_top_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    // `location add` creates a valid sync.toml first — simplest way to land
+    // one at its real, hash-keyed state-dir path without reimplementing
+    // `state_dir_for`'s own path derivation here.
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "nas"])
+        .arg(&nas)
+        .assert()
+        .success();
+    let sync_tomls = common::walkdir_find(&state, "sync.toml");
+    assert_eq!(sync_tomls.len(), 1, "{sync_tomls:?}");
+    std::fs::write(&sync_tomls[0], "not valid toml {{{\n").expect("corrupt sync.toml");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("parsing") && text.contains("sync.toml"),
+        "outer context must survive: {text}"
+    );
+    assert!(
+        text.contains("TOML parse error"),
+        "root cause must survive, not just the outer context: {text}"
+    );
+}
+
+#[test]
+fn run_saved_search_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["search", "a.txt", "--save", "picks"])
+        .assert()
+        .success();
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("run_saved_search", &serde_json::json!({"name": "picks"}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["count"], serde_json::json!(1), "{structured}");
+    assert_eq!(
+        structured["results"][0]["name"],
+        serde_json::json!("a.txt"),
+        "{structured}"
+    );
+}
+
+#[test]
+fn list_saved_searches_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["search", "a.txt", "--save", "picks"])
+        .assert()
+        .success();
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_saved_searches", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let saved = resp["result"]["structuredContent"]["saved"]
+        .as_array()
+        .expect("saved array");
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["name"], serde_json::json!("picks"));
+    assert_eq!(saved[0]["query"], serde_json::json!("a.txt"));
+}
+
+#[test]
+fn list_sync_locations_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "nas"])
+        .arg(&nas)
+        .assert()
+        .success();
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_sync_locations", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["readonly"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    let locations = structured["locations"].as_array().expect("locations array");
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0]["name"], serde_json::json!("nas"));
+}
+
+#[test]
+fn get_describer_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+
+    let unset = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert_ne!(
+        unset["result"]["isError"],
+        serde_json::json!(true),
+        "{unset}"
+    );
+    assert_eq!(
+        unset["result"]["structuredContent"],
+        serde_json::json!({"configured": false}),
+        "{unset}"
+    );
+
+    common::maj(&root, &state)
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "ollama",
+            "--model",
+            "llava",
+        ])
+        .assert()
+        .success();
+    let configured = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert_ne!(
+        configured["result"]["isError"],
+        serde_json::json!(true),
+        "{configured}"
+    );
+    let structured = &configured["result"]["structuredContent"];
+    assert_eq!(
+        structured["configured"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["describer"]["model"],
+        serde_json::json!("llava"),
+        "{structured}"
+    );
+}
+
+#[test]
+fn suggest_tags_review_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("suggest_tags_review", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["structuredContent"],
+        serde_json::json!({"pending": []}),
+        "a fixture with no caption-runner tag-suggestion blobs has nothing pending: {resp}"
+    );
+}
+
+/// One representative mutating stub — Task 8 replaces the body, but Task
+/// 6's contract (roster stable now, every stub errors uniformly) is pinned
+/// here so a regression in the stub wiring itself is caught before Task 8.
+#[test]
+fn mutating_stub_tool_errors_as_not_yet_implemented() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("tag_assets", &serde_json::json!({}));
+    assert_eq!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "a stub mutating tool must report a tool error: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("not yet implemented"),
+        "stub text must say so: {text}"
+    );
+}

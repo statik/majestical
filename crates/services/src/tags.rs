@@ -1,9 +1,11 @@
 //! `maj tag add`/`maj tag rm` compute, plus `maj tags suggestions`: every AI
-//! tag suggestion not yet confirmed or rejected. `tag add`/`tag rm` moved
-//! from `crates/cli/src/commands.rs::cmd_tag`; `tags confirm`/`tags reject`
-//! (which write the folksonomy or the rejection log) stay in the CLI.
-//! `rejections_path`/[`Rejection`] are shared with `tags reject`'s write
-//! side, so the two can't drift on file location or line shape.
+//! tag suggestion not yet confirmed or rejected, and `maj tags confirm`/`maj
+//! tags reject`. `tag add`/`tag rm` moved from
+//! `crates/cli/src/commands.rs::cmd_tag`; `confirm`/`reject` moved from
+//! `crates/cli/src/tags_cmd.rs::cmd_confirm`/`cmd_reject`. `rejections_path`/
+//! [`Rejection`] are shared between [`reject`]'s write side and
+//! [`suggestions`]'s read side, so the two can't drift on file location or
+//! line shape.
 use crate::app::FsApp;
 use crate::catalog::ensure_asset_known;
 use crate::error::ServiceError;
@@ -14,6 +16,7 @@ use majestical_core::ports::TagSuggestion;
 use majestical_core::projection::Projection;
 use majestical_index::blob::BlobStore;
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// `maj tag add`: adds a folksonomy tag to an already-known asset.
@@ -60,6 +63,67 @@ fn tag_rm_impl(app: &mut FsApp, asset: &str, tag: &str) -> Result<()> {
         tag: tag.to_string(),
         observed,
     }])?;
+    Ok(())
+}
+
+/// `maj tags confirm <asset> <tag>...`: emits a plain `TagAdd` per tag — the
+/// same validation and op shape as `maj tag add`, so a confirmed suggestion
+/// is indistinguishable from a hand-added tag in the event log. Moved from
+/// `crates/cli/src/tags_cmd.rs::cmd_confirm`.
+///
+/// # Errors
+/// Returns an error if the asset has never been scanned (no `AssetSeen` on
+/// record) or the event log can't be read/appended.
+pub fn confirm(app: &mut FsApp, asset: &str, tags: &[String]) -> Result<(), ServiceError> {
+    confirm_impl(app, asset, tags).map_err(ServiceError::from)
+}
+
+fn confirm_impl(app: &mut FsApp, asset: &str, tags: &[String]) -> Result<()> {
+    let projection = app.projection()?;
+    let asset_id = AssetId(asset.to_string());
+    ensure_asset_known(&projection, &asset_id)?;
+    let ops = tags
+        .iter()
+        .map(|tag| Op::TagAdd {
+            asset: asset_id.clone(),
+            tag: tag.clone(),
+        })
+        .collect();
+    app.emit(ops)?;
+    Ok(())
+}
+
+/// `maj tags reject <asset> <tag>...`: appends each pair to this machine's
+/// rejection log. Never touches the event log — a rejection is a
+/// per-machine "stop suggesting this" note, not a fact synced to teammates.
+/// The pair is recorded as given, without checking it against any current
+/// suggestion: a typo'd asset or tag just writes a rejection that never
+/// matches anything, a harmless no-op line, rather than paying for a full
+/// blob scan on every reject to validate it up front. Moved from
+/// `crates/cli/src/tags_cmd.rs::cmd_reject`.
+///
+/// # Errors
+/// Returns an error if the state dir can't be resolved or the rejection log
+/// can't be opened/appended.
+pub fn reject(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<(), ServiceError> {
+    reject_impl(catalog_root, asset, tags).map_err(ServiceError::from)
+}
+
+fn reject_impl(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<()> {
+    let path = rejections_path(catalog_root)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    for tag in tags {
+        let line = serde_json::to_string(&Rejection {
+            asset: asset.to_string(),
+            tag: tag.clone(),
+        })
+        .context("serializing rejection")?;
+        writeln!(file, "{line}").with_context(|| format!("appending to {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -269,8 +333,92 @@ mod tag_add_rm_tests {
     fn tag_rm_of_a_tag_not_set_errors_without_touching_the_log() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, asset) = seeded_app(dir.path());
+        let events_before = app.events().expect("events").len();
         let err = tag_rm(&mut app, &asset.0, "not-set").expect_err("must fail");
         assert!(err.to_string().contains("not set"));
+        let events_after = app.events().expect("events").len();
+        assert_eq!(
+            events_after, events_before,
+            "a rejected removal must not append a TagRemove event"
+        );
+        let projection = app.projection().expect("projection");
+        assert!(!projection.tags(&asset).contains("not-set"));
+    }
+}
+
+#[cfg(test)]
+mod confirm_reject_tests {
+    use super::*;
+    use majestical_core::event::Op;
+
+    fn seeded_app(dir: &std::path::Path) -> (FsApp, AssetId) {
+        let root = dir.join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let asset = AssetId("xxh3:0123456789abcdef0123456789abcdef".into());
+        app.emit(vec![Op::AssetSeen {
+            asset: asset.clone(),
+            volume: "vol1".into(),
+            path: "clip.txt".into(),
+            size: 5,
+            mtime_ms: 1000,
+        }])
+        .expect("emit");
+        (app, asset)
+    }
+
+    #[test]
+    fn confirm_emits_a_tag_add_per_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, asset) = seeded_app(dir.path());
+        confirm(
+            &mut app,
+            &asset.0,
+            &["demo".to_string(), "landscape".to_string()],
+        )
+        .expect("confirm");
+        let projection = app.projection().expect("projection");
+        assert!(projection.tags(&asset).contains("demo"));
+        assert!(projection.tags(&asset).contains("landscape"));
+    }
+
+    #[test]
+    fn confirm_on_an_unknown_asset_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let err =
+            confirm(&mut app, "xxh3:never-scanned", &["demo".to_string()]).expect_err("must fail");
+        assert!(err.to_string().contains("unknown asset"));
+    }
+
+    #[test]
+    fn reject_appends_one_line_per_tag_to_the_rejection_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        reject(
+            &root,
+            "xxh3:abc",
+            &["demo".to_string(), "landscape".to_string()],
+        )
+        .expect("reject");
+        let path = rejections_path(&root).expect("rejections_path");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("landscape"));
+    }
+
+    #[test]
+    fn reject_never_touches_the_event_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, asset) = seeded_app(dir.path());
+        let events_before = app.events().expect("events").len();
+        reject(&dir.path().join("cat"), &asset.0, &["demo".to_string()]).expect("reject");
+        let events_after = app.events().expect("events").len();
+        assert_eq!(
+            events_after, events_before,
+            "reject must never emit an event"
+        );
     }
 }
 

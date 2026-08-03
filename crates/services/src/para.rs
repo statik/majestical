@@ -554,7 +554,10 @@ mod mutation_tests {
         let root = tempfile::tempdir().expect("tempdir");
         let err =
             archive(&mut app, &id, &[root.path().to_path_buf()], false).expect_err("must fail");
-        assert!(err.to_string().contains("does not exist"));
+        let ServiceError::ParaArchivePartial { source, .. } = err else {
+            panic!("expected ParaArchivePartial, got a different ServiceError variant");
+        };
+        assert!(source.to_string().contains("does not exist"));
         let projection = app.projection().expect("projection");
         assert!(
             !projection.para_node(&id).expect("node").archived(),

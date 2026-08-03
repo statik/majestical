@@ -17,6 +17,11 @@ struct Mcp {
     stdin: Option<ChildStdin>,
     stdout: BufReader<std::process::ChildStdout>,
     next_id: i64,
+    // The raw `initialize` response, kept around so a test can inspect the
+    // capabilities the server advertised (see
+    // `initialize_advertises_the_resources_capability`) without every test
+    // having to replay its own handshake.
+    initialize_response: serde_json::Value,
 }
 
 // `#[cfg(test)]` on every method below is not redundant despite this whole
@@ -44,6 +49,7 @@ impl Mcp {
             stdin: Some(stdin),
             stdout,
             next_id: 0,
+            initialize_response: serde_json::Value::Null,
         };
         let init = s.request(
             "initialize",
@@ -57,6 +63,7 @@ impl Mcp {
             init["result"]["serverInfo"]["name"].is_string(),
             "initialize must report a server name: {init}"
         );
+        s.initialize_response = init;
         s.notify("notifications/initialized", &serde_json::json!({}));
         s
     }
@@ -718,5 +725,81 @@ fn resource_on_missing_catalog_names_remedy() {
     assert!(
         message.contains("maj catalog init"),
         "error must name the remedy: {message}"
+    );
+}
+
+/// `asset_hex` (`crates/index/src/blob.rs`) is the only thing standing
+/// between a resource URI and a raw filesystem path join in
+/// `BlobStore::path_for` — sabotage that removes its length/hex-alphabet
+/// validation would let a payload like `../../../etc/passwd` ride through
+/// as if it were a hex string, and neither resource had a test that would
+/// have caught that before this one. Both `thumb` and `keyframes` share the
+/// same `asset_hex` call, so both are pinned here.
+#[test]
+fn traversal_payload_in_asset_id_is_a_clean_error_for_both_resources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    for kind in ["thumb", "keyframes"] {
+        let resp = mcp.request(
+            "resources/read",
+            &serde_json::json!({
+                "uri": format!("majestical://{kind}/xxh3:../../../etc/passwd")
+            }),
+        );
+        assert!(
+            resp["result"].is_null(),
+            "a traversal payload must not be treated as a valid asset id: {resp}"
+        );
+        let message = resp["error"]["message"]
+            .as_str()
+            .expect("a protocol-level error");
+        assert!(
+            message.contains("not a valid asset id"),
+            "{kind}: error must reject the malformed id, not the traversal path itself: {message}"
+        );
+    }
+}
+
+/// An id that isn't `xxh3:<hex>`-shaped at all (no prefix, or a prefix from
+/// a hash algorithm this catalog doesn't use) must be rejected the same
+/// clean way as a traversal payload, for both resources.
+#[test]
+fn malformed_non_xxh3_asset_id_is_a_clean_error_for_both_resources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    for kind in ["thumb", "keyframes"] {
+        let resp = mcp.request(
+            "resources/read",
+            &serde_json::json!({"uri": format!("majestical://{kind}/not-an-asset-id")}),
+        );
+        assert!(
+            resp["result"].is_null(),
+            "a non-xxh3 id must not be treated as valid: {resp}"
+        );
+        let message = resp["error"]["message"]
+            .as_str()
+            .expect("a protocol-level error");
+        assert!(
+            message.contains("not a valid asset id"),
+            "{kind}: error must name the malformed id: {message}"
+        );
+    }
+}
+
+/// Pins the `.enable_resources()` call in `MajServer::get_info`
+/// (`crates/cli/src/mcp_cmd/mod.rs`) — sabotage that drops it is otherwise
+/// invisible to this suite, since every resource test above spawns its own
+/// server and never inspects `initialize`'s advertised capabilities.
+#[test]
+fn initialize_advertises_the_resources_capability() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mcp = Mcp::spawn(&root, &state);
+    assert!(
+        mcp.initialize_response["result"]["capabilities"]["resources"].is_object(),
+        "initialize must advertise the resources capability: {}",
+        mcp.initialize_response
     );
 }

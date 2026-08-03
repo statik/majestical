@@ -85,10 +85,29 @@ pub enum Derivation<'a> {
     },
 }
 
-/// The catalog asset id is `xxh3:<32 hex>`; blob paths use the bare hex.
+/// The exact length of the hex remainder of a well-formed asset id:
+/// `xxh3_128` (see `crates/services/src/scan.rs`) always formats as
+/// `{:032x}`, i.e. 32 lowercase hex digits — never fewer (no zero-trimming)
+/// nor more.
+const ASSET_HEX_LEN: usize = 32;
+
+/// The catalog asset id is `xxh3:<32 lowercase hex digits>`; blob paths use
+/// the bare hex. Validates the remainder is exactly `ASSET_HEX_LEN`
+/// lowercase hex digits — not just that the `xxh3:` prefix is present —
+/// because every caller of this function (`BlobStore::path_for` via
+/// `plan_work`, the MCP `thumb`/`keyframes` resources) joins the result
+/// straight onto a filesystem path with no further checking. Without this,
+/// an id like `xxh3:../../../etc/passwd` would strip the prefix and hand
+/// back a path-traversal payload as if it were a hex string; rejecting
+/// anything that isn't the right length and alphabet closes that whole
+/// class of malformed input, not just the specific `..` case.
 #[must_use]
 pub fn asset_hex(asset_id: &str) -> Option<&str> {
-    asset_id.strip_prefix("xxh3:")
+    let hex = asset_id.strip_prefix("xxh3:")?;
+    let is_lower_hex_digit =
+        |b: u8| b.is_ascii_hexdigit() && (b.is_ascii_digit() || b.is_ascii_lowercase());
+    let is_valid = hex.len() == ASSET_HEX_LEN && hex.bytes().all(is_lower_hex_digit);
+    is_valid.then_some(hex)
 }
 
 pub struct BlobStore {
@@ -726,8 +745,52 @@ mod tests {
 
     #[test]
     fn asset_hex_strips_the_hash_prefix() {
-        assert_eq!(asset_hex("xxh3:abc123"), Some("abc123"));
-        assert_eq!(asset_hex("sha1:abc123"), None);
+        assert_eq!(
+            asset_hex("xxh3:0123456789abcdef0123456789abcdef"),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(asset_hex("sha1:0123456789abcdef0123456789abcdef"), None);
+    }
+
+    /// The remainder must be exactly [`ASSET_HEX_LEN`] lowercase hex digits —
+    /// too short, too long, uppercase, or containing non-hex characters must
+    /// all be rejected, not just an absent `xxh3:` prefix. This is the
+    /// traversal defense: `BlobStore::path_for` joins whatever `asset_hex`
+    /// hands back straight onto a filesystem path with no further checking,
+    /// so a malformed id like `xxh3:../../../etc/passwd` must be rejected
+    /// here rather than silently becoming a path-traversal payload.
+    #[test]
+    fn asset_hex_rejects_malformed_remainders() {
+        assert_eq!(
+            asset_hex("xxh3:../../../etc/passwd"),
+            None,
+            "a traversal payload must not be treated as hex"
+        );
+        assert_eq!(
+            asset_hex("xxh3:0123456789abcdef0123456789abcde"),
+            None,
+            "31 hex digits (one short) must be rejected"
+        );
+        assert_eq!(
+            asset_hex("xxh3:0123456789abcdef0123456789abcdef0"),
+            None,
+            "33 hex digits (one over) must be rejected"
+        );
+        assert_eq!(
+            asset_hex("xxh3:0123456789ABCDEF0123456789ABCDEF"),
+            None,
+            "uppercase hex must be rejected — asset ids are always lowercase"
+        );
+        assert_eq!(
+            asset_hex("xxh3:0123456789abcdefg123456789abcde"),
+            None,
+            "a non-hex character (g) must be rejected"
+        );
+        assert_eq!(
+            asset_hex("xxh3:"),
+            None,
+            "an empty remainder must be rejected"
+        );
     }
 
     #[test]

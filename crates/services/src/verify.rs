@@ -79,6 +79,25 @@ mod tests {
         assert_eq!(report.altered, vec!["a.mov".to_string()]);
     }
 
+    /// Pins `new_files`: a file added since the last generation must be
+    /// reported as new, not silently dropped — a sabotage that hardcodes
+    /// `new_files: Vec::new()` in the extraction would still pass every
+    /// other test in this module.
+    #[test]
+    fn verify_dir_op_reports_a_new_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.mov"), b"hello").expect("write");
+        let hash_list = mhl::hash_dir(dir.path(), "2026-07-30T00:00:00Z").expect("hash_dir");
+        mhl::write_generation(dir.path(), &hash_list).expect("write_generation");
+        std::fs::write(dir.path().join("b.mov"), b"world").expect("write new file");
+
+        let report = verify_dir_op(dir.path()).expect("verify_dir_op");
+        assert_eq!(report.new_files, vec!["b.mov".to_string()]);
+        assert_eq!(report.verified, vec!["a.mov".to_string()]);
+        assert!(report.altered.is_empty());
+        assert!(report.missing.is_empty());
+    }
+
     #[test]
     fn verify_dir_op_with_no_history_errors() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -215,19 +215,50 @@ fn cmd_para_rename(app: &mut FsApp, node: &str, name: &str) -> Result<()> {
 /// disk. `outcome.moves` is empty exactly when no roots were given (every
 /// root produces exactly one [`majestical_services::para::ArchiveMove`]),
 /// which is what distinguishes the two print shapes below.
+///
+/// A multi-root run that fails partway through still reports the roots
+/// already moved (or classified) BEFORE the failing one on stdout — real
+/// filesystem mutations that happened must never go unreported just
+/// because a later root errored — via
+/// [`majestical_services::error::ServiceError::ParaArchivePartial`].
 fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: bool) -> Result<()> {
-    use majestical_services::para::MoveStatus;
+    use majestical_services::error::ServiceError;
 
-    let outcome = majestical_services::para::archive(app, node, roots, dry_run)?;
+    match majestical_services::para::archive(app, node, roots, dry_run) {
+        Ok(outcome) => {
+            print_archive_outcome(&outcome, dry_run);
+            Ok(())
+        }
+        Err(ServiceError::ParaArchivePartial { moves, source }) => {
+            print_archive_moves(&moves);
+            Err(source)
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Renders a completed `para archive` call's outcome: the two whole-run
+/// messages when no `--root`s were given (`outcome.moves` is empty), or
+/// each root's move line otherwise.
+fn print_archive_outcome(outcome: &majestical_services::para::ArchiveOutcome, dry_run: bool) {
     if outcome.moves.is_empty() {
         if dry_run {
             println!("would archive (dry run; no --root given; no directories to move)");
         } else {
             println!("ok (no --root given; no directories moved)");
         }
-        return Ok(());
+        return;
     }
-    for mv in &outcome.moves {
+    print_archive_moves(&outcome.moves);
+}
+
+/// Renders each root's move line — shared by the success path and the
+/// partial-failure path (the roots completed before a later root's failure
+/// still get reported here).
+fn print_archive_moves(moves: &[majestical_services::para::ArchiveMove]) {
+    use majestical_services::para::MoveStatus;
+
+    for mv in moves {
         match mv.status {
             MoveStatus::AlreadyArchived => {
                 println!("already archived at {} — skipping", mv.to.display());
@@ -240,7 +271,6 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
             }
         }
     }
-    Ok(())
 }
 
 /// Re-verifies `dir` against its own ASC MHL history and appends a new

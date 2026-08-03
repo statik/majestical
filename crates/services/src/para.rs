@@ -148,6 +148,26 @@ pub struct ArchiveOutcome {
     pub executed: bool,
 }
 
+/// Internal carrier for [`archive_impl`]'s early return when a multi-root
+/// run fails partway through: downcast back out of the `anyhow` chain by
+/// [`archive`] and turned into [`ServiceError::ParaArchivePartial`] so the
+/// moves already completed survive to the caller instead of being silently
+/// dropped by the early `Err`. Not part of the public API — [`archive`]'s
+/// callers only ever see the typed [`ServiceError`] variant.
+#[derive(Debug)]
+struct PartialArchiveFailure {
+    moves: Vec<ArchiveMove>,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for PartialArchiveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for PartialArchiveFailure {}
+
 /// `maj para archive`: archives a node. With `--root`s, each root's
 /// materialized directory (`<root>/<KindDir>/<name>`) is moved to
 /// `<root>/Archives/<name>` before the archive event is emitted; with no
@@ -174,7 +194,68 @@ pub fn archive(
     roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<ArchiveOutcome, ServiceError> {
-    archive_impl(app, node, roots, dry_run).map_err(ServiceError::from)
+    archive_impl(app, node, roots, dry_run).map_err(|err| {
+        match err.downcast::<PartialArchiveFailure>() {
+            Ok(partial) => ServiceError::ParaArchivePartial {
+                moves: partial.moves,
+                source: partial.source,
+            },
+            Err(err) => ServiceError::from(err),
+        }
+    })
+}
+
+/// Classifies (or performs) one root's move: already archived, planned
+/// (`--dry-run`), or actually moved. Split out of [`archive_impl`] so the
+/// loop there can catch a per-root failure and attach the moves already
+/// completed for the OTHER roots before propagating it — see
+/// [`PartialArchiveFailure`].
+///
+/// # Errors
+/// Returns an error if `dry_run` is false and the source directory is
+/// missing, the archive target already exists, or a filesystem operation
+/// fails.
+fn archive_one_root(root: &Path, kind: ParaKind, name: &str, dry_run: bool) -> Result<ArchiveMove> {
+    let source = root.join(kind.dir_name()).join(name);
+    let archives_dir = root.join("Archives");
+    let target = archives_dir.join(name);
+    // Source gone, target present: an earlier partial run already moved
+    // this root. Skip rather than erroring, so a plain re-run of the same
+    // command converges instead of failing on the root that already
+    // succeeded.
+    if !source.is_dir() && target.is_dir() {
+        return Ok(ArchiveMove {
+            from: source,
+            to: target,
+            status: MoveStatus::AlreadyArchived,
+        });
+    }
+    if dry_run {
+        return Ok(ArchiveMove {
+            from: source,
+            to: target,
+            status: MoveStatus::Planned,
+        });
+    }
+    anyhow::ensure!(
+        source.is_dir(),
+        "source directory {} does not exist — nothing to archive",
+        source.display()
+    );
+    anyhow::ensure!(
+        !target.exists(),
+        "archive target {} already exists",
+        target.display()
+    );
+    std::fs::create_dir_all(&archives_dir)
+        .with_context(|| format!("creating {}", archives_dir.display()))?;
+    std::fs::rename(&source, &target)
+        .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
+    Ok(ArchiveMove {
+        from: source,
+        to: target,
+        status: MoveStatus::Moved,
+    })
 }
 
 fn archive_impl(
@@ -216,52 +297,21 @@ fn archive_impl(
 
     let mut moves = Vec::new();
     for root in roots {
-        let source = root.join(kind.dir_name()).join(&name);
-        let archives_dir = root.join("Archives");
-        let target = archives_dir.join(&name);
-        // Source gone, target present: an earlier partial run already moved
-        // this root. Skip rather than erroring, so a plain re-run of the
-        // same command converges instead of failing on the root that
-        // already succeeded.
-        if !source.is_dir() && target.is_dir() {
-            moves.push(ArchiveMove {
-                from: source,
-                to: target,
-                status: MoveStatus::AlreadyArchived,
-            });
-            continue;
+        match archive_one_root(root, kind, &name, dry_run) {
+            Ok(mv) => moves.push(mv),
+            // A root failing partway through a multi-root run must not
+            // silently drop the OTHER roots' completed moves — those are
+            // real filesystem mutations a head still needs to report.
+            Err(source) => return Err(anyhow::Error::new(PartialArchiveFailure { moves, source })),
         }
-        if dry_run {
-            moves.push(ArchiveMove {
-                from: source,
-                to: target,
-                status: MoveStatus::Planned,
-            });
-            continue;
-        }
-        anyhow::ensure!(
-            source.is_dir(),
-            "source directory {} does not exist — nothing to archive",
-            source.display()
-        );
-        anyhow::ensure!(
-            !target.exists(),
-            "archive target {} already exists",
-            target.display()
-        );
-        std::fs::create_dir_all(&archives_dir)
-            .with_context(|| format!("creating {}", archives_dir.display()))?;
-        std::fs::rename(&source, &target)
-            .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
-        moves.push(ArchiveMove {
-            from: source,
-            to: target,
-            status: MoveStatus::Moved,
-        });
     }
 
     if !dry_run {
-        app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
+        // Every root's directory move already succeeded by this point; an
+        // emit failure here still must not lose those completed moves.
+        if let Err(source) = app.emit(vec![Op::ParaNodeArchive { node: node_id }]) {
+            return Err(anyhow::Error::new(PartialArchiveFailure { moves, source }));
+        }
     }
     Ok(ArchiveOutcome {
         moves,
@@ -509,6 +559,53 @@ mod mutation_tests {
         assert!(
             !projection.para_node(&id).expect("node").archived(),
             "a failed move must not archive the node"
+        );
+    }
+
+    /// A multi-root run failing on the SECOND root must not silently drop
+    /// the first root's already-completed move: the completed moves must
+    /// travel with the error (via `ServiceError::ParaArchivePartial`) so a
+    /// head can still report them — never lie about partial progress.
+    #[test]
+    fn archive_failing_on_a_later_root_carries_the_earlier_roots_completed_moves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = init_app(dir.path());
+        let NodeId(id) = add(&mut app, "project", "client-x").expect("add");
+
+        let root1 = tempfile::tempdir().expect("tempdir");
+        let root1_source = root1.path().join("Projects").join("client-x");
+        std::fs::create_dir_all(&root1_source).expect("mkdir");
+        std::fs::write(root1_source.join("a.txt"), b"hello").expect("write");
+
+        // root2 has no materialized directory at all, so its move fails.
+        let root2 = tempfile::tempdir().expect("tempdir");
+
+        let err = archive(
+            &mut app,
+            &id,
+            &[root1.path().to_path_buf(), root2.path().to_path_buf()],
+            false,
+        )
+        .expect_err("must fail on root2");
+        let ServiceError::ParaArchivePartial { moves, source } = err else {
+            panic!("expected ParaArchivePartial, got a different ServiceError variant");
+        };
+        assert_eq!(
+            moves.len(),
+            1,
+            "root1's completed move must survive the error"
+        );
+        assert_eq!(moves[0].status, MoveStatus::Moved);
+        assert_eq!(moves[0].to, root1.path().join("Archives").join("client-x"));
+        assert!(source.to_string().contains("does not exist"));
+        assert!(
+            root1.path().join("Archives").join("client-x").is_dir(),
+            "root1's move actually happened on disk"
+        );
+        let projection = app.projection().expect("projection");
+        assert!(
+            !projection.para_node(&id).expect("node").archived(),
+            "the archive event must not be emitted when a later root fails"
         );
     }
 }

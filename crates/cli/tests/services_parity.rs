@@ -515,6 +515,60 @@ fn para_archive_executed_output_is_byte_identical() {
     );
 }
 
+/// Pins the partial-failure shape: a multi-root run failing on the SECOND
+/// root must still report the FIRST root's completed move on stdout before
+/// the error reaches stderr — the old (pre-extraction) binary interleaved
+/// its `moved X -> Y` println with the loop, so root1's real filesystem
+/// mutation was already visible before root2's failure. The buffered
+/// services extraction must reproduce this exactly (see
+/// `ServiceError::ParaArchivePartial`), not silently drop it.
+#[test]
+fn para_archive_partial_failure_output_is_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "p1"])
+        .assert()
+        .success();
+    let root1 = tempfile::tempdir().expect("tempdir");
+    let root1_source = root1.path().join("Projects").join("p1");
+    let root1_archived = root1.path().join("Archives").join("p1");
+    std::fs::create_dir_all(&root1_source).expect("mkdir");
+    std::fs::write(root1_source.join("a.txt"), b"hello").expect("write");
+    // root2 has no materialized directory at all, so its move fails. The
+    // run never reaches the archive-event emit, so the node stays active
+    // in the catalog after each binary's call — both calls can address it
+    // by `<kind>/<name>` without needing the raw-node-id workaround the
+    // executed (successful) archive test above needs.
+    let root2 = tempfile::tempdir().expect("tempdir");
+    let root1_arg = root1.path().to_str().expect("utf8");
+    let root2_arg = root2.path().to_str().expect("utf8");
+
+    // Restoring root1's directory between the two binaries' calls (rather
+    // than seeding two separate root1 dirs) keeps both calls a genuine
+    // first application of the SAME absolute paths — two separate tempdirs
+    // would print different, non-comparable paths in "moved X -> Y".
+    diff_against_ref_with_between(
+        &root,
+        &state,
+        &[
+            "para",
+            "archive",
+            "project/p1",
+            "--root",
+            root1_arg,
+            "--root",
+            root2_arg,
+        ],
+        || {
+            if root1_archived.is_dir() && !root1_source.is_dir() {
+                std::fs::rename(&root1_archived, &root1_source)
+                    .expect("restore root1 for second binary's run");
+            }
+        },
+    );
+}
+
 /// Builds a directory with one file and a fresh ASC MHL generation-1
 /// baseline — `verify`'s starting point before its own run (which writes
 /// generation 2). No `--catalog`/`--state` is needed: `maj verify` neither
@@ -648,5 +702,56 @@ fn verify_tampered_output_is_byte_identical() {
             old.status.code()
         ),
         "stdout/stderr/exit diverged for verify tampered"
+    );
+}
+
+/// Pins `new_files` end to end through the CLI: a `NEW <name>` line plus
+/// the "1 new" count in the summary must survive extraction — a sabotage
+/// hardcoding `new_files: Vec::new()` in the service would pass every
+/// other verify parity row (none of them add a file after the baseline)
+/// but fail this one.
+#[test]
+fn verify_new_file_output_is_byte_identical() {
+    let media_new = seed_verify_baseline();
+    std::fs::write(media_new.path().join("b.mov"), b"world").expect("write new file");
+    let media_ref = seed_verify_baseline();
+    std::fs::write(media_ref.path().join("b.mov"), b"world").expect("write new file");
+
+    let reference = Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(verify new file): /tmp/maj-ref missing — build it first");
+        return;
+    }
+    let unused = tempfile::tempdir().expect("tempdir");
+    let new = common::maj(
+        &unused.path().join("cat-new"),
+        &unused.path().join("state-new"),
+    )
+    .args(["verify", media_new.path().to_str().expect("utf8")])
+    .output()
+    .expect("run new");
+    let mut c = Command::new(reference);
+    c.env("MAJ_CATALOG", unused.path().join("cat-ref"))
+        .env("MAJ_MACHINE_ID", "test-machine")
+        .env("MAJ_STATE_DIR", unused.path().join("state-ref"))
+        .args(["verify", media_ref.path().to_str().expect("utf8")]);
+    let old = c.output().expect("run ref");
+    let new_stdout = String::from_utf8_lossy(&new.stdout);
+    assert!(
+        new_stdout.contains("NEW b.mov") && new_stdout.contains("1 new"),
+        "expected a NEW b.mov line and a '1 new' count, got: {new_stdout}"
+    );
+    assert_eq!(
+        (
+            &new_stdout,
+            String::from_utf8_lossy(&new.stderr),
+            new.status.code()
+        ),
+        (
+            &String::from_utf8_lossy(&old.stdout),
+            String::from_utf8_lossy(&old.stderr),
+            old.status.code()
+        ),
+        "stdout/stderr/exit diverged for verify new file"
     );
 }

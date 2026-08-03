@@ -7,161 +7,29 @@ use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
 use majestical_services::app::{FsApp, physical_now_ms};
 use majestical_services::iso8601::iso8601_ms;
-use majestical_services::para::{parse_kind, resolve_para_node};
+use majestical_services::para::resolve_para_node;
+use majestical_services::scan::{mtime_ms_of, resolve_volume};
 use majestical_services::volume_identity;
 use majestical_services::volumes::VolumeRow;
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn cmd_catalog_init(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
-    FsApp::init(catalog, machine_id, author)?;
+    majestical_services::catalog::init(catalog, machine_id, author)?;
     println!("initialized catalog at {}", catalog.display());
     Ok(())
 }
 
-/// Resolves the (id, label) pair a scan should tag its events with. An
-/// explicit `--volume` is used as both id and label — an override that
-/// keeps e2e tests deterministic. Omitted, the volume's physical identity
-/// is auto-detected (see `volume_identity`).
-pub(crate) fn resolve_volume(dir: &Path, volume: Option<String>) -> (String, String) {
-    if let Some(v) = volume {
-        return (v.clone(), v);
-    }
-    let identity = volume_identity::resolve(dir);
-    (identity.id, identity.label)
-}
-
-/// A file's real modification time, in milliseconds since the Unix epoch —
-/// `0` (meaning "unknown") if the platform can't report it or it predates
-/// the epoch, rather than failing the whole scan/ingest over one file's
-/// clock oddity.
-pub(crate) fn mtime_ms_of(metadata: &std::fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
-}
-
 pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
-    let auto_detect = volume.is_none();
-    let (volume_id, volume_label) = resolve_volume(dir, volume);
-    let mut ops = Vec::new();
-    for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
-        let entry = entry.context("walking scan directory")?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
-        let size = metadata.len();
-        let file = std::fs::File::open(entry.path())
-            .with_context(|| format!("reading {}", entry.path().display()))?;
-        // Stream the hash rather than loading the whole file: media
-        // assets can be multi-gigabyte, so a `Vec<u8>` per file would
-        // blow up memory on a scan of a card full of video.
-        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-        let mut reader = std::io::BufReader::new(file);
-        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-        loop {
-            let n = reader
-                .read(&mut buf)
-                .with_context(|| format!("reading {}", entry.path().display()))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        let hash = hasher.digest128();
-        // Phase 1: lossy UTF-8 conversion of the relative path. JSON
-        // events force UTF-8 anyway, so a non-UTF-8 path can't round
-        // trip through the log yet; revisit once ingest needs to
-        // preserve exact bytes.
-        let scan_rel = entry
-            .path()
-            .strip_prefix(dir)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        // An explicit `--volume` override has no real mount to re-base
-        // against (it's a synthetic id kept for e2e-test determinism), so
-        // its instances stay scan-dir-relative, as before. An auto-detected
-        // volume gets a path relative to the volume's actual root, so a
-        // later indexer run can re-find the bytes regardless of which
-        // subdirectory was scanned.
-        let rel = if auto_detect {
-            let abs = entry
-                .path()
-                .canonicalize()
-                .unwrap_or_else(|_| entry.path().to_path_buf());
-            let mount = volume_identity::mount_point_of(&abs);
-            abs.strip_prefix(&mount).map_or_else(
-                |_| scan_rel.clone(),
-                |p| p.to_string_lossy().replace('\\', "/"),
-            )
-        } else {
-            scan_rel
-        };
-        ops.push(Op::AssetSeen {
-            asset: AssetId(format!("xxh3:{hash:032x}")),
-            volume: volume_id.clone(),
-            path: rel,
-            size,
-            mtime_ms: mtime_ms_of(&metadata),
-        });
-    }
-    let n = ops.len();
-    ops.insert(
-        0,
-        Op::VolumeSeen {
-            volume: volume_id,
-            label: volume_label,
-        },
-    );
-    app.emit(ops)?;
-    println!("scanned: {n} assets");
-    Ok(())
-}
-
-/// Both `tag add` and `meta set` write metadata about an asset that must
-/// already have a physical observation on record — otherwise a typo'd id
-/// silently creates a phantom catalog entry that `search` and `scan` can
-/// never produce, and would look scanned when it never was.
-pub(crate) fn ensure_asset_known(projection: &Projection, asset: &AssetId) -> Result<()> {
-    anyhow::ensure!(
-        projection.has_instances(asset),
-        "unknown asset {} — scan its volume first, or check `maj search`",
-        asset.0
-    );
+    let outcome = majestical_services::scan::scan(app, dir, volume)?;
+    println!("scanned: {} assets", outcome.assets);
     Ok(())
 }
 
 pub(crate) fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
     match cmd {
-        TagCmd::Add { asset, tag } => {
-            let p = app.projection()?;
-            let asset = AssetId(asset);
-            ensure_asset_known(&p, &asset)?;
-            app.emit(vec![Op::TagAdd { asset, tag }])?;
-        }
-        TagCmd::Rm { asset, tag } => {
-            let p = app.projection()?;
-            let asset = AssetId(asset);
-            let observed = p.tag_add_ids(&asset, &tag);
-            anyhow::ensure!(
-                !observed.is_empty(),
-                "tag '{tag}' is not set on {} — nothing to remove",
-                asset.0
-            );
-            app.emit(vec![Op::TagRemove {
-                asset,
-                tag,
-                observed,
-            }])?;
-        }
+        TagCmd::Add { asset, tag } => majestical_services::tags::tag_add(app, &asset, &tag)?,
+        TagCmd::Rm { asset, tag } => majestical_services::tags::tag_rm(app, &asset, &tag)?,
     }
     println!("ok");
     Ok(())
@@ -174,14 +42,7 @@ pub(crate) fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
             field,
             value,
         } => {
-            let p = app.projection()?;
-            let asset = AssetId(asset);
-            ensure_asset_known(&p, &asset)?;
-            app.emit(vec![Op::FieldSet {
-                asset,
-                field,
-                value,
-            }])?;
+            majestical_services::meta::meta_set(app, &asset, &field, &value)?;
             println!("ok");
         }
         MetaCmd::Get { asset, field, json } => {
@@ -299,25 +160,9 @@ pub(crate) fn cmd_para(app: &mut FsApp, catalog_dir: &Path, cmd: ParaCmd) -> Res
     Ok(())
 }
 
-/// Creates a node, rejecting a duplicate non-archived `(kind, name)` — two
-/// active nodes with the same reference would be indistinguishable to
-/// `resolve_para_node`.
 fn cmd_para_add(app: &mut FsApp, kind_str: &str, name: &str) -> Result<()> {
-    let kind = parse_kind(kind_str)?;
-    let projection = app.projection()?;
-    let duplicate = projection
-        .para_nodes()
-        .any(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
-    anyhow::ensure!(
-        !duplicate,
-        "a PARA node '{kind_str}/{name}' already exists — see `maj para list`"
-    );
-    let node_id = ulid::Ulid::generate().to_string();
-    app.emit(vec![Op::ParaNodeCreate {
-        node: node_id.clone(),
-        kind,
-        name: name.to_string(),
-    }])?;
+    let majestical_services::para::NodeId(node_id) =
+        majestical_services::para::add(app, kind_str, name)?;
     println!("{node_id}");
     Ok(())
 }
@@ -358,12 +203,7 @@ fn print_para_table(nodes: &[majestical_services::para::ParaNodeRow]) {
 }
 
 fn cmd_para_rename(app: &mut FsApp, node: &str, name: &str) -> Result<()> {
-    let projection = app.projection()?;
-    let node_id = resolve_para_node(&projection, node)?;
-    app.emit(vec![Op::ParaNodeRename {
-        node: node_id,
-        name: name.to_string(),
-    }])?;
+    majestical_services::para::rename(app, node, name)?;
     println!("ok");
     Ok(())
 }
@@ -372,80 +212,33 @@ fn cmd_para_rename(app: &mut FsApp, node: &str, name: &str) -> Result<()> {
 /// (`<root>/<KindDir>/<name>`) is moved to `<root>/Archives/<name>` before
 /// the archive event is emitted; with no roots, only the event is emitted
 /// (skipped in `--dry-run`) and a note is printed that nothing was moved on
-/// disk.
-///
-/// If a move fails partway through a multi-root run, the roots already
-/// moved stay moved and the archive event is NOT emitted. A root whose
-/// source is gone and target already exists is treated as already archived
-/// and skipped rather than re-erroring — so re-running the exact same
-/// command converges instead of failing forever on the root that succeeded
-/// last time.
+/// disk. `outcome.moves` is empty exactly when no roots were given (every
+/// root produces exactly one [`majestical_services::para::ArchiveMove`]),
+/// which is what distinguishes the two print shapes below.
 fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: bool) -> Result<()> {
-    let projection = app.projection()?;
-    let node_id = resolve_para_node(&projection, node)?;
-    let state = projection
-        .para_node(&node_id)
-        .context("resolved node vanished from the projection")?;
-    let Some(kind) = state.kind() else {
-        anyhow::bail!("PARA node {node_id} has no kind recorded — its create event may be missing");
-    };
-    let Some(name) = state.name() else {
-        anyhow::bail!("PARA node {node_id} has no name recorded — its create event may be missing");
-    };
+    use majestical_services::para::MoveStatus;
 
-    if roots.is_empty() {
+    let outcome = majestical_services::para::archive(app, node, roots, dry_run)?;
+    if outcome.moves.is_empty() {
         if dry_run {
             println!("would archive (dry run; no --root given; no directories to move)");
         } else {
-            app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
             println!("ok (no --root given; no directories moved)");
         }
         return Ok(());
     }
-    // A node of kind `archive` already materializes under `Archives/` (its
-    // own `dir_name()`), so source and target would be the same path for
-    // every root — reject up front rather than reporting a no-op "move" in
-    // dry-run and a target-already-exists error in the real run.
-    anyhow::ensure!(
-        kind != ParaKind::Archive,
-        "node of kind archive is already under Archives/ — nothing to move"
-    );
-
-    for root in roots {
-        let source = root.join(kind.dir_name()).join(name);
-        let archives_dir = root.join("Archives");
-        let target = archives_dir.join(name);
-        // Source gone, target present: an earlier partial run already moved
-        // this root. Skip rather than erroring, so a plain re-run of the
-        // same command converges instead of failing on the root that
-        // already succeeded.
-        if !source.is_dir() && target.is_dir() {
-            println!("already archived at {} — skipping", target.display());
-            continue;
+    for mv in &outcome.moves {
+        match mv.status {
+            MoveStatus::AlreadyArchived => {
+                println!("already archived at {} — skipping", mv.to.display());
+            }
+            MoveStatus::Planned => {
+                println!("would move {} -> {}", mv.from.display(), mv.to.display());
+            }
+            MoveStatus::Moved => {
+                println!("moved {} -> {}", mv.from.display(), mv.to.display());
+            }
         }
-        if dry_run {
-            println!("would move {} -> {}", source.display(), target.display());
-            continue;
-        }
-        anyhow::ensure!(
-            source.is_dir(),
-            "source directory {} does not exist — nothing to archive",
-            source.display()
-        );
-        anyhow::ensure!(
-            !target.exists(),
-            "archive target {} already exists",
-            target.display()
-        );
-        std::fs::create_dir_all(&archives_dir)
-            .with_context(|| format!("creating {}", archives_dir.display()))?;
-        std::fs::rename(&source, &target)
-            .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
-        println!("moved {} -> {}", source.display(), target.display());
-    }
-
-    if !dry_run {
-        app.emit(vec![Op::ParaNodeArchive { node: node_id }])?;
     }
     Ok(())
 }
@@ -454,9 +247,7 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
 /// generation recording the result. Needs no catalog — the history lives
 /// entirely under `dir/ascmhl`.
 pub(crate) fn cmd_verify(dir: &Path, json: bool) -> Result<()> {
-    let hashdate = iso8601_ms(physical_now_ms());
-    let report =
-        mhl::verify_dir(dir, &hashdate).with_context(|| format!("verifying {}", dir.display()))?;
+    let report = majestical_services::verify::verify_dir_op(dir)?;
 
     if json {
         println!(
@@ -466,7 +257,7 @@ pub(crate) fn cmd_verify(dir: &Path, json: bool) -> Result<()> {
                 "altered": report.altered,
                 "missing": report.missing,
                 "new": report.new_files,
-                "generation": report.written.generation,
+                "generation": report.generation,
             })
         );
     } else {
@@ -485,7 +276,7 @@ pub(crate) fn cmd_verify(dir: &Path, json: bool) -> Result<()> {
             report.altered.len(),
             report.missing.len(),
             report.new_files.len(),
-            report.written.generation
+            report.generation
         );
     }
 

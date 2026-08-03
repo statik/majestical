@@ -149,13 +149,16 @@ fn contribution_fingerprint(dir: &Path, manifest: Option<&ContributionManifest>)
     let mut encoded = String::new();
     // symlink_metadata, not metadata: parity with check_files, which never
     // follows a listed name through a symlink either.
-    let (mtime, size) = std::fs::symlink_metadata(dir.join(MANIFEST_NAME))
-        .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
+    let (mtime, size) = std::fs::symlink_metadata(dir.join(MANIFEST_NAME)).map_or((0, 0), |m| {
+        (majestical_services::scan::mtime_ms_of(&m), m.len())
+    });
     let _ = write!(encoded, "m:{mtime}:{size}");
     if let Some(manifest) = manifest {
         for file in &manifest.files {
             let (mtime, size) = std::fs::symlink_metadata(dir.join(&file.name))
-                .map_or((0, 0), |m| (commands::mtime_ms_of(&m), m.len()));
+                .map_or((0, 0), |m| {
+                    (majestical_services::scan::mtime_ms_of(&m), m.len())
+                });
             let _ = write!(encoded, "|{}:{mtime}:{size}", file.name);
         }
     }
@@ -286,9 +289,9 @@ fn format_window(window_ms: u64) -> String {
 fn newest_mtime_ms(path: &Path) -> Option<u64> {
     let top = std::fs::symlink_metadata(path).ok()?;
     if !top.is_dir() {
-        return Some(commands::mtime_ms_of(&top));
+        return Some(majestical_services::scan::mtime_ms_of(&top));
     }
-    let mut newest = commands::mtime_ms_of(&top);
+    let mut newest = majestical_services::scan::mtime_ms_of(&top);
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).ok()?;
@@ -297,7 +300,7 @@ fn newest_mtime_ms(path: &Path) -> Option<u64> {
             // `DirEntry::metadata` does not follow symlinks, matching
             // `symlink_metadata` above.
             let meta = entry.metadata().ok()?;
-            newest = newest.max(commands::mtime_ms_of(&meta));
+            newest = newest.max(majestical_services::scan::mtime_ms_of(&meta));
             if meta.is_dir() {
                 stack.push(entry.path());
             }
@@ -787,7 +790,7 @@ fn run_shared_ingest(
     site: IngestSite<'_>,
 ) -> Result<engine::Outcome> {
     let (node_id, kind, name) = node;
-    let (vol_id, vol_label) = commands::resolve_volume(site.probe_dir, None);
+    let (vol_id, vol_label) = majestical_services::scan::resolve_volume(site.probe_dir, None);
     // Same default layout `maj ingest` uses — the contributor (or, for
     // triage, nothing) lands as a tag, not a subdirectory, so a manifested
     // drop, a triaged drop, and a manual ingest of the same PARA node share

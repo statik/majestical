@@ -2,10 +2,10 @@
 //! into a per-machine jsonl (never synced, survives projection rebuilds).
 //! Listing's compute lives in `majestical_services::tags`; this module
 //! renders it and owns the two writing verbs (`confirm`/`reject`).
-use crate::commands::ensure_asset_known;
 use anyhow::{Context, Result};
 use majestical_core::event::{AssetId, Op};
 use majestical_services::app::FsApp;
+use majestical_services::catalog::ensure_asset_known;
 use majestical_services::tags::{Rejection, rejections_path};
 use std::io::Write as _;
 use std::path::Path;

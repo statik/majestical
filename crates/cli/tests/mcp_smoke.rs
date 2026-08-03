@@ -212,6 +212,10 @@ fn get_asset_unknown_is_a_value_not_an_error() {
     );
 
     let asset_id = common::asset_id_of(&root, &state, "a.txt");
+    common::maj(&root, &state)
+        .args(["meta", "set", &asset_id, "shot", "sunset"])
+        .assert()
+        .success();
     let known = mcp.call_tool("get_asset", &serde_json::json!({"asset_id": asset_id}));
     assert_ne!(
         known["result"]["isError"],
@@ -229,6 +233,16 @@ fn get_asset_unknown_is_a_value_not_an_error() {
             .any(|t| t == "demo"),
         "{structured}"
     );
+    // Pins the wire shape: `AssetDetail::fields` (a `Vec<(String, String)>`
+    // internally) must serialize as a JSON OBJECT, not an array-of-pairs —
+    // a regression back to the tuple shape would still pass every assertion
+    // above, so this checks the shape explicitly, not just the value.
+    let fields = &structured["asset"]["fields"];
+    assert!(
+        fields.is_object(),
+        "fields must serialize as a JSON object, not an array-of-pairs: {structured}"
+    );
+    assert_eq!(fields["shot"], serde_json::json!("sunset"), "{structured}");
 }
 
 #[test]

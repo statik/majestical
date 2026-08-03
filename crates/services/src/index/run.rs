@@ -1776,6 +1776,29 @@ mod tests {
         }
     }
 
+    /// Pins the wire shape every `failed: Vec<(PathBuf, String)>` field in
+    /// this module serializes through: a JSON array of `{"path", "error"}`
+    /// objects, not a positional 2-tuple — a regression back to
+    /// `["path", "error"]` pairs would silently break every consumer that
+    /// serializes an outcome directly (e.g. `maj mcp`'s `index_run` tool,
+    /// which serializes `IndexRunOutcome` as-is).
+    #[test]
+    fn failed_items_serialize_as_named_objects_not_tuples() {
+        let outcome = ThumbOutcome {
+            written: 0,
+            failed: vec![(
+                PathBuf::from("/media/broken.mov"),
+                "decode failed".to_string(),
+            )],
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize");
+        assert_eq!(
+            json["failed"],
+            serde_json::json!([{"path": "/media/broken.mov", "error": "decode failed"}]),
+            "failed items must serialize as named {{path, error}} objects: {json}"
+        );
+    }
+
     #[test]
     fn keyframes_manifest_round_trips_through_the_reader() {
         let bytes = keyframes_manifest_json("m1", 5, &[1500, 4500, 7500]);

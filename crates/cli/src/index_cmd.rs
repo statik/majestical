@@ -5,7 +5,7 @@
 //! worker pool, the `text_fts` heal) lives in
 //! `majestical_services::index::run`, following `search.rs`'s precedent of
 //! keeping non-trivial verbs out of `commands.rs`.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use majestical_services::app::FsApp;
 use majestical_services::index::{IndexRunOutcome, IndexRunReq, VALID_KINDS};
 use std::collections::BTreeSet;
@@ -146,59 +146,6 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
     }
 }
 
-/// This pass's failures as `{kind: [{path, error}, ..]}`, kinds with no
-/// failures omitted. Never written to disk as-is: [`merge_failure_report`]
-/// first folds it over the previous report so a `--kinds`-filtered run only
-/// speaks for the kinds it actually worked.
-fn failure_report_json(o: &IndexRunOutcome) -> serde_json::Value {
-    let kinds: [(&str, Vec<(PathBuf, String)>); 7] = [
-        ("thumbs", o.thumbs.failed.clone()),
-        ("embeddings", o.embed.failed.clone()),
-        ("keyframes", o.keyframes.failed.clone()),
-        ("transcripts", o.transcript_failures()),
-        ("ocr", o.ocr.failed.clone()),
-        ("pdf", o.pdf.failed.clone()),
-        ("captions", o.captions.failed.clone()),
-    ];
-    let mut map = serde_json::Map::new();
-    for (kind, failed) in kinds {
-        if !failed.is_empty() {
-            map.insert(kind.to_string(), failed_json(&failed).into());
-        }
-    }
-    serde_json::Value::Object(map)
-}
-
-/// Folds this pass's failures over the previous report: keys for every kind
-/// in this pass's `--kinds` set are replaced (cleared when the kind now has
-/// no failures), while kinds the pass never worked keep their old record —
-/// `index run --kinds thumbs` must not erase a pdf failure whose item was
-/// never retried.
-fn merge_failure_report(
-    previous: serde_json::Map<String, serde_json::Value>,
-    current: &serde_json::Value,
-    kinds: &BTreeSet<String>,
-) -> serde_json::Value {
-    let mut merged = previous;
-    for kind in kinds {
-        merged.remove(kind);
-    }
-    if let Some(current) = current.as_object() {
-        for (kind, failures) in current {
-            merged.insert(kind.clone(), failures.clone());
-        }
-    }
-    serde_json::Value::Object(merged)
-}
-
-fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating state dir {}", state_dir.display()))?;
-    let path = state_dir.join(majestical_services::index::FAILURES_FILE);
-    std::fs::write(&path, report.to_string())
-        .with_context(|| format!("writing failure report {}", path.display()))
-}
-
 /// True when `--kinds` was passed explicitly and names `keyframes` — the one
 /// case where a missing ffmpeg is a hard error rather than a degrade: an
 /// unqualified `index run` silently reports `needs_ffmpeg` in its kind
@@ -209,21 +156,17 @@ fn explicitly_requested_keyframes(kinds: Option<&[String]>) -> bool {
 }
 
 /// One `index run` pass: calls the services engine, updates the on-disk
-/// failure marker `index status` reads back, and renders the result.
+/// failure marker `index status` reads back (state, folded into the
+/// services layer — see `majestical_services::index::update_failure_report`
+/// — so any head calling `index::run` keeps `index status` truthful, not
+/// just this CLI), and renders the result.
 ///
 /// # Errors
 /// Returns an error if the engine fails, or the failure marker can't be
 /// read/written.
 fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> Result<()> {
     let outcome = majestical_services::index::run(app, catalog_dir, req)?;
-
-    let state_dir = majestical_services::state_dir::state_dir_for(catalog_dir)?;
-    let report = merge_failure_report(
-        majestical_services::index::read_failure_report(&state_dir),
-        &failure_report_json(&outcome),
-        &req.kinds,
-    );
-    write_failure_report(&state_dir, &report)?;
+    majestical_services::index::update_failure_report(catalog_dir, &outcome, &req.kinds)?;
     print_run_result(&outcome, json);
     Ok(())
 }
@@ -296,7 +239,7 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
     if let Some(remedy) = &outcome.transcripts_remedy {
         println!("transcripts needs model: {remedy}");
     }
-    if let Some(remedy) = outcome.captions_remedy {
+    if let Some(remedy) = &outcome.captions_remedy {
         println!("captions needs model: {remedy}");
     }
 }
@@ -374,10 +317,6 @@ pub(crate) fn cmd_model_fetch(verify: bool, only: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majestical_services::index::{
-        CaptionOutcome, EmbedOutcome, KeyframeOutcome, OcrOutcome, PdfOutcome, ThumbOutcome,
-        TranscribeOutcome, TranscriptEmbedOutcome,
-    };
 
     #[test]
     fn parse_kinds_defaults_to_every_kind() {
@@ -394,71 +333,5 @@ mod tests {
             .expect_err("must reject unknown kind");
         assert!(err.to_string().contains("bogus"));
         assert!(err.to_string().contains("thumbs"));
-    }
-
-    #[test]
-    fn failure_report_json_includes_only_kinds_with_failures() {
-        let outcomes = IndexRunOutcome {
-            thumbs: ThumbOutcome {
-                written: 1,
-                failed: Vec::new(),
-            },
-            embed: EmbedOutcome {
-                written: 0,
-                loaded: 0,
-                failed: Vec::new(),
-            },
-            keyframes: KeyframeOutcome::default(),
-            transcribe: TranscribeOutcome::default(),
-            transcript_embed: TranscriptEmbedOutcome::default(),
-            ocr: OcrOutcome::default(),
-            pdf: PdfOutcome {
-                written: 0,
-                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
-            },
-            captions: CaptionOutcome::default(),
-        };
-        let report = failure_report_json(&outcomes);
-        let map = report.as_object().expect("object");
-        assert_eq!(map.len(), 1, "only the pdf kind failed: {report}");
-        let entries = map["pdf"].as_array().expect("array");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["path"], "/media/broken.pdf");
-        assert_eq!(entries[0]["error"], "not a valid pdf");
-    }
-
-    /// A `--kinds`-filtered pass only speaks for its own kinds: it replaces
-    /// (or clears) their keys and preserves every other kind's record.
-    #[test]
-    fn merge_failure_report_preserves_kinds_the_pass_never_worked() {
-        let mut previous = serde_json::Map::new();
-        previous.insert(
-            "pdf".to_string(),
-            serde_json::json!([{ "path": "/m/broken.pdf", "error": "not a valid pdf" }]),
-        );
-        previous.insert(
-            "thumbs".to_string(),
-            serde_json::json!([{ "path": "/m/old.png", "error": "stale" }]),
-        );
-
-        // A thumbs-only pass with no failures: clears thumbs, keeps pdf.
-        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
-        let merged = merge_failure_report(previous.clone(), &serde_json::json!({}), &kinds);
-        let map = merged.as_object().expect("object");
-        assert!(map.contains_key("pdf"), "pdf record must survive: {merged}");
-        assert!(
-            !map.contains_key("thumbs"),
-            "a clean thumbs pass clears its own record: {merged}"
-        );
-
-        // A pdf pass with a fresh failure: replaces pdf, keeps thumbs.
-        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
-        let current = serde_json::json!({
-            "pdf": [{ "path": "/m/broken.pdf", "error": "still broken" }],
-        });
-        let merged = merge_failure_report(previous, &current, &kinds);
-        let map = merged.as_object().expect("object");
-        assert_eq!(map["pdf"][0]["error"], "still broken");
-        assert_eq!(map["thumbs"][0]["error"], "stale");
     }
 }

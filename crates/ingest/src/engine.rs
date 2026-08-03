@@ -76,7 +76,7 @@ impl SinkFactory for RealSinks {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PlacedFile {
     pub rel: String,
     pub size: u64,
@@ -86,13 +86,16 @@ pub struct PlacedFile {
     pub dest_rel: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FailedFile {
     pub rel: String,
     pub reason: String,
 }
 
-#[derive(Debug, Default)]
+/// Additive `serde::Serialize` derive: `majestical_services::ingest::IngestRun`
+/// (used by `maj mcp`'s wire contract) carries this outcome straight through
+/// as structured content — see Task 6's Part A serialize-alignment note.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Outcome {
     pub placed: Vec<PlacedFile>,
     pub failed: Vec<FailedFile>,

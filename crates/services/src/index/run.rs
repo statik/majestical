@@ -95,6 +95,7 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
 /// `failed` (path, reason) — mirrors [`EmbedOutcome`]/[`KeyframeOutcome`]'s
 /// shape so every kind's executor returns one outcome value instead of a
 /// bare tuple.
+#[derive(serde::Serialize)]
 pub struct ThumbOutcome {
     pub written: u64,
     pub failed: Vec<(PathBuf, String)>,
@@ -151,6 +152,7 @@ struct EmbedPaths {
 /// `loaded` vectors pulled in from blobs the local Lance store didn't have
 /// yet (the blob↔Lance diff — a teammate's synced vectors, or a lance dir
 /// just rebuilt after corruption), and per-item `failed` (path, reason).
+#[derive(serde::Serialize)]
 pub struct EmbedOutcome {
     pub written: u64,
     pub loaded: u64,
@@ -164,7 +166,7 @@ pub struct EmbedOutcome {
 /// (whether or not their video ended up over the half-failed threshold — see
 /// [`over_half_failed`]), and per-video `failed` (path, reason — for a video
 /// over that threshold, the reason includes the first per-timestamp failure).
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct KeyframeOutcome {
     pub videos_done: u64,
     pub keyframes_written: u64,
@@ -819,7 +821,7 @@ fn run_keyframe_items(
 
 /// One pass's transcribe-kind result: `written` new transcript blobs and
 /// per-item `failed` (path, reason).
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct TranscribeOutcome {
     pub written: u64,
     pub failed: Vec<(PathBuf, String)>,
@@ -890,7 +892,7 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
 /// chunked to nothing (their `ChunksEmpty` marker written), and per-item
 /// `failed` (transcript blob path, reason — the item's own `abs_path` can
 /// be the empty sentinel, see `work::WorkItem::abs_path`).
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct TranscriptEmbedOutcome {
     pub chunks_written: u64,
     pub loaded: u64,
@@ -1132,7 +1134,7 @@ fn load_transcript_chunks(
 }
 
 /// One pass's OCR-kind result across stills and video keyframes.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct OcrOutcome {
     pub images_written: u64,
     pub videos_done: u64,
@@ -1282,7 +1284,7 @@ fn run_ocr_items(
 }
 
 /// One pass's PDF-text result.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct PdfOutcome {
     pub written: u64,
     pub failed: Vec<(PathBuf, String)>,
@@ -1320,7 +1322,7 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
 /// One pass's caption-kind result: `written` caption-item completions (a
 /// still's caption blob, or a video's captions blob — each with its tags
 /// blob) and per-item `failed` (path, reason).
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct CaptionOutcome {
     pub written: u64,
     pub failed: Vec<(PathBuf, String)>,
@@ -1694,6 +1696,7 @@ fn open_and_probe_text(dir: &Path) -> Result<TextVectorStore, String> {
 
 /// Every kind's outcome for one pass, bundled so the CLI's printers and
 /// failure-report bookkeeping take one value instead of eight.
+#[derive(serde::Serialize)]
 pub struct IndexRunOutcome {
     pub thumbs: ThumbOutcome,
     pub embed: EmbedOutcome,

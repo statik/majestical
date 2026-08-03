@@ -59,35 +59,32 @@ fn print_failure_lines(rows: &[LocationRow]) {
     }
 }
 
-/// Enforces the exit policy over already-reported `rows`: nonzero when
-/// EVERY requested location was skipped, failed outright, or otherwise
-/// never ran, and ALSO when a location that DID run had per-file failures
-/// within its own transfer — see
+/// Enforces the exit policy over an outcome's already-reported rows: nonzero
+/// when EVERY requested location was skipped, failed outright, or otherwise
+/// never ran (`no_location_ran`), and ALSO when a location that DID run had
+/// per-file failures within its own transfer (`failing`) — see
 /// `majestical_services::sync::PushOutcome::overall_failed`'s doc for why.
-/// This reconstructs the same two conditions (rather than just branching on
-/// `overall_failed()`) so the two distinct cases keep their own precise
-/// message naming which locations were at fault.
+/// Takes the two conditions as already-computed queries (see
+/// `PushOutcome::no_location_ran`/`failing_locations`, mirrored on
+/// `PullOutcome`) rather than re-deriving them from `rows` itself — `rows`
+/// is only still needed here for the all-failed message's location list.
 ///
 /// # Errors
 /// See above.
-fn check_exit_policy(rows: &[LocationRow], verb: &str) -> Result<()> {
+fn check_exit_policy(
+    rows: &[LocationRow],
+    no_location_ran: bool,
+    failing: &[&str],
+    verb: &str,
+) -> Result<()> {
     anyhow::ensure!(
-        rows.iter().any(|r| matches!(r, LocationRow::Ran { .. })),
+        !no_location_ran,
         "sync {verb} failed for every requested location ({}) — check they're mounted and reachable",
         rows.iter()
             .map(LocationRow::name)
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let failing: Vec<&str> = rows
-        .iter()
-        .filter_map(|r| match r {
-            LocationRow::Ran { name, failures, .. } if !failures.is_empty() => Some(name.as_str()),
-            LocationRow::Ran { .. } | LocationRow::Skipped { .. } | LocationRow::Failed { .. } => {
-                None
-            }
-        })
-        .collect();
     anyhow::ensure!(
         failing.is_empty(),
         "sync {verb} had per-file failures at {} — progress was kept; the next run retries",
@@ -134,7 +131,12 @@ pub(crate) fn cmd_push(
                 .context("serializing sync report")?
         );
     }
-    check_exit_policy(&outcome.rows, "push")
+    check_exit_policy(
+        &outcome.rows,
+        outcome.no_location_ran(),
+        &outcome.failing_locations(),
+        "push",
+    )
 }
 
 /// Bundles `maj sync pull`'s flags within the house 5-positional-parameter
@@ -198,7 +200,12 @@ pub(crate) fn cmd_pull(
     }
     print_failure_lines(&outcome.rows);
     print_pull_summary(&outcome, args.json)?;
-    check_exit_policy(&outcome.rows, "pull")
+    check_exit_policy(
+        &outcome.rows,
+        outcome.no_location_ran(),
+        &outcome.failing_locations(),
+        "pull",
+    )
 }
 
 /// Prints `cmd_pull`'s final summary: one JSON object (`{locations,
@@ -481,7 +488,7 @@ mod tests {
                 error: "boom".into(),
             },
         ];
-        let err = check_exit_policy(&rows, "push").expect_err("all failed must error");
+        let err = check_exit_policy(&rows, true, &[], "push").expect_err("all failed must error");
         let msg = err.to_string();
         assert!(
             msg.contains("shuttle-drive") && msg.contains("attic-nas"),

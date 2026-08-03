@@ -115,7 +115,7 @@ fn set_impl(catalog_root: &Path, args: &SetArgs) -> Result<DescriberConfigView> 
 /// returns an error instead when the backend can't be reached at all,
 /// so by the time a [`DescriberProbe`] exists reachability is already a
 /// given.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct DescriberProbe {
     pub model: String,
     pub model_listed: bool,

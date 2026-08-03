@@ -112,8 +112,9 @@ pub struct HashList {
     pub entries: Vec<MhlEntry>,
 }
 
-/// What `write_generation` produced.
-#[derive(Debug, Clone)]
+/// What `write_generation` produced. Additive `serde::Serialize` derive: see
+/// the note on `engine::Outcome`.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WrittenGeneration {
     pub path: PathBuf,
     pub generation: u32,

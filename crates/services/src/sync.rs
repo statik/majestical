@@ -537,26 +537,42 @@ fn location_row(
     }
 }
 
+/// True when not one requested location ever ran (every one was skipped or
+/// failed outright before/during its own transfer setup) — the first of the
+/// two conditions [`overall_failed`] checks. Named so a head (the CLI's
+/// `check_exit_policy`, an MCP tool later) can report exactly which of the
+/// two distinct exit-policy conditions fired, rather than re-deriving the
+/// boolean from `rows` itself.
+fn no_location_ran(rows: &[LocationRow]) -> bool {
+    !rows.iter().any(|r| matches!(r, LocationRow::Ran { .. }))
+}
+
+/// The names of every location that DID run but had per-file failures
+/// within its own transfer — the second of the two conditions
+/// [`overall_failed`] checks. That location's other files still copied (the
+/// engine records and continues past per-file errors), but a sync that
+/// could not move everything must not exit 0 under cron.
+fn failing_locations(rows: &[LocationRow]) -> Vec<&str> {
+    rows.iter()
+        .filter_map(|r| match r {
+            LocationRow::Ran { name, failures, .. } if !failures.is_empty() => Some(name.as_str()),
+            LocationRow::Ran { .. } | LocationRow::Skipped { .. } | LocationRow::Failed { .. } => {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The exit-policy boolean shared by [`PushOutcome::overall_failed`] and
 /// [`PullOutcome::overall_failed`]: nonzero when EVERY requested location
-/// was skipped, failed outright, or otherwise never ran, and ALSO when a
-/// location that DID run had per-file failures within its own transfer —
-/// that location's other files still copied (the engine records and
-/// continues past per-file errors), but a sync that could not move
-/// everything must not exit 0 under cron. Moved verbatim (as a boolean,
-/// rather than the original `Result<()>` with its location-naming error
-/// message — heads that need the exact failing-location text still have
-/// `rows` to derive it from) from
-/// `crates/cli/src/sync_cmd.rs::check_exit_policy`.
+/// was skipped, failed outright, or otherwise never ran ([`no_location_ran`]),
+/// or when a location that DID run had per-file failures within its own
+/// transfer ([`failing_locations`]). Moved verbatim (as a boolean, rather
+/// than the original `Result<()>` with its location-naming error message —
+/// heads that need the exact failing-location text use [`failing_locations`]
+/// directly) from `crates/cli/src/sync_cmd.rs::check_exit_policy`.
 fn overall_failed(rows: &[LocationRow]) -> bool {
-    let any_ran = rows.iter().any(|r| matches!(r, LocationRow::Ran { .. }));
-    if !any_ran {
-        return true;
-    }
-    rows.iter().any(|r| match r {
-        LocationRow::Ran { failures, .. } => !failures.is_empty(),
-        LocationRow::Skipped { .. } | LocationRow::Failed { .. } => false,
-    })
+    no_location_ran(rows) || !failing_locations(rows).is_empty()
 }
 
 /// Everything `maj sync push` renders: one row per targeted location.
@@ -566,6 +582,19 @@ pub struct PushOutcome {
 }
 
 impl PushOutcome {
+    /// True when not one requested location ever ran. See [`no_location_ran`].
+    #[must_use]
+    pub fn no_location_ran(&self) -> bool {
+        no_location_ran(&self.rows)
+    }
+
+    /// The names of every location that ran but had per-file failures. See
+    /// [`failing_locations`].
+    #[must_use]
+    pub fn failing_locations(&self) -> Vec<&str> {
+        failing_locations(&self.rows)
+    }
+
     /// See [`overall_failed`].
     #[must_use]
     pub fn overall_failed(&self) -> bool {
@@ -629,6 +658,19 @@ pub struct PullOutcome {
 }
 
 impl PullOutcome {
+    /// True when not one requested location ever ran. See [`no_location_ran`].
+    #[must_use]
+    pub fn no_location_ran(&self) -> bool {
+        no_location_ran(&self.rows)
+    }
+
+    /// The names of every location that ran but had per-file failures. See
+    /// [`failing_locations`].
+    #[must_use]
+    pub fn failing_locations(&self) -> Vec<&str> {
+        failing_locations(&self.rows)
+    }
+
     /// See [`overall_failed`].
     #[must_use]
     pub fn overall_failed(&self) -> bool {

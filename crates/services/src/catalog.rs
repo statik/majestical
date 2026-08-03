@@ -69,7 +69,11 @@ pub struct AssetDetail {
     pub tags: Vec<String>,
     /// `<kind>/<name>` of the assigned PARA node, if any — falls back to the
     /// bare node id if the node itself is unknown (an assignment can outlive
-    /// or race its node's own create in a partial event log).
+    /// or race its node's own create in a partial event log). Archived nodes
+    /// render identically to live ones: archiving doesn't clear an asset's
+    /// assignment, so this deliberately doesn't distinguish them — a caller
+    /// that needs the archived flag queries the node's own state separately
+    /// (`maj para list`).
     pub para: Option<String>,
     pub fields: Vec<(String, String)>,
     pub verifications: Vec<AssetVerification>,
@@ -165,7 +169,7 @@ fn thumb_exists(catalog_dir: &Path, asset_id: &str) -> bool {
 /// # Errors
 /// Returns an error if the event log cannot be read.
 pub fn get_asset(
-    app: &mut FsApp,
+    app: &FsApp,
     catalog_dir: &Path,
     asset_id: &str,
 ) -> Result<Option<AssetDetail>, ServiceError> {
@@ -240,7 +244,7 @@ mod get_asset_tests {
             },
         ])
         .expect("emit");
-        let out = get_asset(&mut app, &root, &asset.0)
+        let out = get_asset(&app, &root, &asset.0)
             .expect("get_asset")
             .expect("known asset");
         assert_eq!(out.instances.len(), 1);
@@ -251,13 +255,98 @@ mod get_asset_tests {
         assert!(!out.has_thumb);
     }
 
+    /// Pins every `AssetInstance` field, not just `instances.len()` — a prior
+    /// version of this test only checked the count, so a bug scrambling
+    /// `volume_label` or `online` (e.g. swapping which volume's label gets
+    /// attached, or hardcoding `online: false`) passed the suite unnoticed.
+    /// Two volumes with genuinely different online status (the always-online
+    /// root label vs. an unmounted label) forces `online` to actually differ
+    /// per instance rather than incidentally agreeing.
+    #[test]
+    fn get_asset_reports_differing_instances_across_two_volumes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        let asset = asset_id();
+        app.emit(vec![
+            Op::VolumeSeen {
+                volume: "label:root".into(),
+                label: "root".into(),
+            },
+            Op::VolumeSeen {
+                volume: "label:probe-offline-vol-xyz".into(),
+                label: "probe-offline-vol-xyz".into(),
+            },
+            Op::AssetSeen {
+                asset: asset.clone(),
+                volume: "label:root".into(),
+                path: "clips/a.mov".into(),
+                size: 5,
+                mtime_ms: 1000,
+            },
+            Op::AssetSeen {
+                asset: asset.clone(),
+                volume: "label:probe-offline-vol-xyz".into(),
+                path: "backup/a.mov".into(),
+                size: 9,
+                mtime_ms: 2000,
+            },
+        ])
+        .expect("emit");
+        let out = get_asset(&app, &root, &asset.0)
+            .expect("get_asset")
+            .expect("known asset");
+        assert_eq!(out.instances.len(), 2);
+        let root_instance = out
+            .instances
+            .iter()
+            .find(|i| i.volume == "label:root")
+            .expect("root instance");
+        assert_eq!(
+            (
+                root_instance.volume.as_str(),
+                root_instance.volume_label.as_str(),
+                root_instance.online,
+                root_instance.path.as_str(),
+                root_instance.size,
+                root_instance.mtime_ms,
+            ),
+            ("label:root", "root", true, "clips/a.mov", 5, 1000),
+            "root-labeled volume must be online and carry its own attributes"
+        );
+        let offline_instance = out
+            .instances
+            .iter()
+            .find(|i| i.volume == "label:probe-offline-vol-xyz")
+            .expect("offline instance");
+        assert_eq!(
+            (
+                offline_instance.volume.as_str(),
+                offline_instance.volume_label.as_str(),
+                offline_instance.online,
+                offline_instance.path.as_str(),
+                offline_instance.size,
+                offline_instance.mtime_ms,
+            ),
+            (
+                "label:probe-offline-vol-xyz",
+                "probe-offline-vol-xyz",
+                false,
+                "backup/a.mov",
+                9,
+                2000
+            ),
+            "an unmounted label must read offline and keep its own attributes"
+        );
+    }
+
     #[test]
     fn get_asset_of_an_unknown_asset_is_ok_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("cat");
-        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        let app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
         let out =
-            get_asset(&mut app, &root, "xxh3:ffffffffffffffffffffffffffffffff").expect("get_asset");
+            get_asset(&app, &root, "xxh3:ffffffffffffffffffffffffffffffff").expect("get_asset");
         assert!(out.is_none());
     }
 
@@ -281,7 +370,7 @@ mod get_asset_tests {
         blobs
             .write_atomic(&thumb_path, b"fake-thumb")
             .expect("write thumb");
-        let out = get_asset(&mut app, &root, &asset.0)
+        let out = get_asset(&app, &root, &asset.0)
             .expect("get_asset")
             .expect("known asset");
         assert!(out.has_thumb);
@@ -312,7 +401,7 @@ mod get_asset_tests {
             },
         ])
         .expect("emit");
-        let out = get_asset(&mut app, &root, &asset.0)
+        let out = get_asset(&app, &root, &asset.0)
             .expect("get_asset")
             .expect("known asset");
         assert_eq!(out.verifications.len(), 1);

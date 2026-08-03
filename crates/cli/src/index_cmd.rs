@@ -2264,25 +2264,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
 /// Returns an error if `only` names an unknown tag, the cache directory
 /// can't be resolved, or any file fails to download or verify.
 pub(crate) fn cmd_model_fetch(verify: bool, only: &[String]) -> Result<()> {
-    use majestical_index::model;
-
-    let known: Vec<&str> = model::ALL_MODELS.iter().map(|m| m.tag).collect();
-    for tag in only {
-        anyhow::ensure!(
-            known.contains(&tag.as_str()),
-            "unknown model tag {tag}; known: {}",
-            known.join(", ")
-        );
-    }
-    for spec in model::ALL_MODELS {
-        if !only.is_empty() && !only.iter().any(|t| t == spec.tag) {
-            continue;
-        }
-        let dir = model::model_dir_for(spec)?;
-        println!("model cache: {}", dir.display());
-        model::fetch_spec(spec, verify, &mut |line| println!("{line}"))?;
-        println!("model '{}' ready", spec.tag);
-    }
+    majestical_services::index::model_fetch(verify, only, &mut |line| println!("{line}"))?;
     Ok(())
 }
 

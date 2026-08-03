@@ -251,9 +251,68 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     })
 }
 
+/// `maj model fetch`: downloads every registered model (or, with `only`,
+/// exactly the named tags) into its cache dir, verifying every file's
+/// sha256 before it's installed. `progress` is called for every line this
+/// used to print unconditionally to stdout: the cache-dir announcement,
+/// each file's own download/verify status (from
+/// `majestical_index::model::fetch_spec`), and the per-model "ready" line —
+/// mirroring `crate::ingest::run_ingest`'s `notice` callback, since this is
+/// the same "streams to stdout while it runs" shape rather than a single
+/// end-of-run outcome. Moved from
+/// `crates/cli/src/index_cmd.rs::cmd_model_fetch`.
+///
+/// # Errors
+/// Returns an error if `only` names an unknown tag, the cache directory
+/// can't be resolved, or any file fails to download or verify.
+pub fn model_fetch(
+    verify: bool,
+    only: &[String],
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), ServiceError> {
+    model_fetch_impl(verify, only, progress).map_err(ServiceError::from)
+}
+
+fn model_fetch_impl(verify: bool, only: &[String], progress: &mut dyn FnMut(&str)) -> Result<()> {
+    use majestical_index::model;
+
+    let known: Vec<&str> = model::ALL_MODELS.iter().map(|m| m.tag).collect();
+    for tag in only {
+        anyhow::ensure!(
+            known.contains(&tag.as_str()),
+            "unknown model tag {tag}; known: {}",
+            known.join(", ")
+        );
+    }
+    for spec in model::ALL_MODELS {
+        if !only.is_empty() && !only.iter().any(|t| t == spec.tag) {
+            continue;
+        }
+        let dir = model::model_dir_for(spec)?;
+        progress(&format!("model cache: {}", dir.display()));
+        model::fetch_spec(spec, verify, progress)?;
+        progress(&format!("model '{}' ready", spec.tag));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_fetch_rejects_an_unknown_only_tag() {
+        let mut lines = Vec::new();
+        let err = model_fetch(false, &["not-a-real-model".to_string()], &mut |line| {
+            lines.push(line.to_string());
+        })
+        .expect_err("must fail");
+        assert!(err.to_string().contains("unknown model tag"));
+        assert!(
+            lines.is_empty(),
+            "an unknown tag must fail before any progress prints"
+        );
+    }
 
     #[test]
     fn status_of_an_empty_catalog_has_every_kind_at_zero() {

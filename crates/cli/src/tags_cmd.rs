@@ -1,13 +1,13 @@
 //! Suggestion review: list pending, confirm into the folksonomy, reject
 //! into a per-machine jsonl (never synced, survives projection rebuilds).
-use crate::app::FsApp;
 use crate::commands::ensure_asset_known;
-use crate::state_dir;
 use anyhow::{Context, Result};
 use majestical_core::event::{AssetId, Op};
 use majestical_core::ports::TagSuggestion;
 use majestical_core::projection::Projection;
 use majestical_index::blob::BlobStore;
+use majestical_services::app::FsApp;
+use majestical_services::state_dir;
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

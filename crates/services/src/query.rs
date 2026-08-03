@@ -7,14 +7,14 @@
 use anyhow::{Result, bail};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RawFilter {
+pub struct RawFilter {
     pub key: String,
     pub value: String,
     pub negated: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ParsedQuery {
+pub struct ParsedQuery {
     pub terms: Vec<String>,
     pub filters: Vec<RawFilter>,
 }
@@ -26,7 +26,7 @@ pub(crate) struct ParsedQuery {
 /// # Errors
 /// Returns an error for an unbalanced quote, an empty filter value, or a
 /// `-` negation applied to a bare term.
-pub(crate) fn parse_query(input: &str) -> Result<ParsedQuery> {
+pub fn parse_query(input: &str) -> Result<ParsedQuery> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -102,7 +102,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// civil date (bad month, or a day beyond that month's real length,
 /// leap-year aware), predates the Unix epoch, or names a year past 9999 (a
 /// bound that also keeps `days * 86_400_000` below from overflowing `i64`).
-pub(crate) fn parse_date_ms(value: &str) -> Result<u64> {
+pub fn parse_date_ms(value: &str) -> Result<u64> {
     let mut parts = value.split('-');
     let (Some(y), Some(m), Some(d), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())

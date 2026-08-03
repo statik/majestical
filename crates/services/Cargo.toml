@@ -1,0 +1,28 @@
+[package]
+name = "majestical-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+majestical-core = { path = "../core" }
+majestical-catalog-sqlite = { path = "../catalog-sqlite" }
+majestical-sync = { path = "../sync" }
+majestical-ingest = { path = "../ingest" }
+majestical-index = { path = "../index" }
+majestical-describe = { path = "../describe" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+walkdir.workspace = true
+xxhash-rust.workspace = true
+dirs.workspace = true
+plist.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

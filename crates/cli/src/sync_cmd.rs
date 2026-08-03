@@ -3,8 +3,8 @@
 //! (mount points differ per machine) in the state dir's `sync.toml`,
 //! never synced.
 
-use crate::app::FsApp;
 use anyhow::{Context, Result};
+use majestical_services::app::FsApp;
 use majestical_sync::transfer;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +81,7 @@ impl SyncConfig {
 
 /// The per-catalog `sync.toml` path in this machine's state dir.
 pub(crate) fn config_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("sync.toml"))
+    Ok(majestical_services::state_dir::state_dir_for(catalog)?.join("sync.toml"))
 }
 
 /// Registers a new sync location: validates `location` is an accessible,
@@ -492,7 +492,7 @@ pub(crate) fn cmd_pull(
     // Opening the sqlite catalog applies past its saved cursor — the open
     // IS the apply; there is no separate step to call.
     let app = FsApp::open(catalog, machine_id, author)?;
-    crate::commands::open_catalog(&app, catalog)?;
+    majestical_services::catalog::open_catalog(&app, catalog)?;
 
     let summary = summarize_pull(&results);
     print_pull_summary(&results, &summary, args.json)?;

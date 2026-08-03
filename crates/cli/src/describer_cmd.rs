@@ -5,17 +5,7 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 
-use crate::state_dir;
-
-pub(crate) fn config_path(catalog_root: &Path) -> anyhow::Result<std::path::PathBuf> {
-    Ok(state_dir::state_dir_for(catalog_root)?.join("describer.toml"))
-}
-
-/// Load the configured describer, if any. Shared with `index_cmd` (PR 8).
-pub(crate) fn load_config(catalog_root: &Path) -> anyhow::Result<Option<DescriberConfig>> {
-    let path = config_path(catalog_root)?;
-    DescriberConfig::load(&path).with_context(|| format!("load {}", path.display()))
-}
+use majestical_services::describer_config::{config_path, load_config};
 
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var("MAJ_OPENROUTER_KEY")

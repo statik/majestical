@@ -1,4 +1,5 @@
-//! CLI application state: adapter wiring, event emission, projection loading.
+//! Application state shared by every head (CLI, MCP, GUI): adapter wiring,
+//! event emission, projection loading.
 use anyhow::{Context, Result};
 use majestical_core::clock::{Clock, HlcClock, MachineId, ObserveOutcome};
 use majestical_core::event::{Event, EventId, Op};
@@ -9,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Current wall-clock time in milliseconds since the Unix epoch, shared by
 /// `SystemClock` and the clamp-warning's "how far ahead" calculation below.
-pub(crate) fn physical_now_ms() -> u64 {
+#[must_use]
+pub fn physical_now_ms() -> u64 {
     u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -19,7 +21,7 @@ pub(crate) fn physical_now_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-pub(crate) struct SystemClock;
+pub struct SystemClock;
 impl Clock for SystemClock {
     fn wall_ms(&self) -> u64 {
         physical_now_ms()
@@ -30,16 +32,28 @@ impl Clock for SystemClock {
 /// `App::events` (a full read) and `commands::open_catalog` (an incremental
 /// or full sqlite sync) so the message can't drift between the two call
 /// sites that both count skipped lines from the same underlying log.
-pub(crate) fn warn_skipped_corrupt_lines(skipped: usize, catalog_root: &Path) {
+pub fn warn_skipped_corrupt_lines(skipped: usize, catalog_root: &Path) {
     if skipped > 0 {
-        eprintln!(
-            "warning: skipped {skipped} corrupt event log line(s) in {}/events — damaged transport; affected metadata may be missing",
-            catalog_root.display()
-        );
+        // services inherits the workspace's print_stderr = "deny" (unlike
+        // cli's, which allows it crate-wide since CLI diagnostics are the
+        // product) — `#[expect]` documents the exception locally instead of
+        // weakening the lint crate-wide. This is the same user-facing
+        // stderr diagnostic moved verbatim from the pre-extraction cli
+        // crate; extracting it into a rendered outcome is later work.
+        #[expect(
+            clippy::print_stderr,
+            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
+        )]
+        {
+            eprintln!(
+                "warning: skipped {skipped} corrupt event log line(s) in {}/events — damaged transport; affected metadata may be missing",
+                catalog_root.display()
+            );
+        }
     }
 }
 
-pub(crate) struct App<L> {
+pub struct App<L> {
     log: L,
     hlc: HlcClock,
     author: String,
@@ -48,13 +62,18 @@ pub(crate) struct App<L> {
 
 /// The CLI's concrete adapter wiring: a real, filesystem-backed event log.
 /// The `App<L>` split exists so tests and future adapters can swap it out.
-pub(crate) type FsApp = App<FileEventLog>;
+pub type FsApp = App<FileEventLog>;
 
 impl FsApp {
     /// Opens an already-initialized catalog. Errors rather than creating one
     /// implicitly — a missing catalog is almost always a typo'd path, and
     /// silently creating an empty one there would hide that.
-    pub(crate) fn open(root: &Path, machine: &str, author: &str) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `root` has no `events` directory (no catalog
+    /// there yet), or if the underlying event log fails to open.
+    pub fn open(root: &Path, machine: &str, author: &str) -> Result<Self> {
         anyhow::ensure!(
             root.join("events").is_dir(),
             "no catalog at {} — run `maj catalog init` first",
@@ -72,7 +91,11 @@ impl FsApp {
     }
 
     /// Creates a fresh catalog at `root` (`maj catalog init`).
-    pub(crate) fn init(root: &Path, machine: &str, author: &str) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying event log fails to initialize.
+    pub fn init(root: &Path, machine: &str, author: &str) -> Result<Self> {
         let machine = MachineId(machine.to_string());
         let log = FileEventLog::init(root, &machine)
             .with_context(|| format!("initializing catalog at {}", root.display()))?;
@@ -88,7 +111,7 @@ impl FsApp {
 impl<L: EventLog> App<L> {
     /// The underlying event log, for adapters (e.g. the sqlite catalog) that
     /// need to read it directly rather than through `events`/`projection`.
-    pub(crate) fn log(&self) -> &L {
+    pub fn log(&self) -> &L {
         &self.log
     }
 
@@ -98,7 +121,11 @@ impl<L: EventLog> App<L> {
     /// Corrupt lines are skipped rather than failing the read; a warning is
     /// printed to stderr so the user knows metadata may be missing, without
     /// polluting stdout (which carries this process's data output).
-    pub(crate) fn events(&self) -> Result<Vec<Event>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event log cannot be read.
+    pub fn events(&self) -> Result<Vec<Event>> {
         let mut skipped = 0usize;
         let events = self
             .log
@@ -108,7 +135,8 @@ impl<L: EventLog> App<L> {
         Ok(events)
     }
 
-    pub(crate) fn projection_of(events: &[Event]) -> Projection {
+    #[must_use]
+    pub fn projection_of(events: &[Event]) -> Projection {
         let mut p = Projection::default();
         for e in events {
             p.apply(e);
@@ -116,11 +144,19 @@ impl<L: EventLog> App<L> {
         p
     }
 
-    pub(crate) fn projection(&self) -> Result<Projection> {
+    /// # Errors
+    ///
+    /// Returns an error if the event log cannot be read.
+    pub fn projection(&self) -> Result<Projection> {
         Ok(Self::projection_of(&self.events()?))
     }
 
-    pub(crate) fn emit(&mut self, ops: Vec<Op>) -> Result<Vec<Event>> {
+    /// # Errors
+    ///
+    /// Returns an error if the event log cannot be read (to fold existing
+    /// events into the clock before appending) or if appending the new
+    /// events to the log fails.
+    pub fn emit(&mut self, ops: Vec<Op>) -> Result<Vec<Event>> {
         // Fold existing log into the clock so new events order after it.
         // A peer's clock may be wrong; count how many events got clamped
         // rather than adopted, and track the worst offender, so the
@@ -136,9 +172,16 @@ impl<L: EventLog> App<L> {
         if clamped > 0 {
             let days_ahead =
                 worst_remote_wall_ms.saturating_sub(physical_now_ms()) / (24 * 60 * 60 * 1000);
-            eprintln!(
-                "warning: {clamped} event(s) carry timestamps more than 24h in the future (worst: ~{days_ahead}d ahead) — a peer's clock may be wrong; ordering was clamped locally"
-            );
+            // See the `#[expect]` note in `warn_skipped_corrupt_lines` above.
+            #[expect(
+                clippy::print_stderr,
+                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
+            )]
+            {
+                eprintln!(
+                    "warning: {clamped} event(s) carry timestamps more than 24h in the future (worst: ~{days_ahead}d ahead) — a peer's clock may be wrong; ordering was clamped locally"
+                );
+            }
         }
         // ulid 3.x generates through a monotonic Generator; on same-millisecond
         // random-part overflow (astronomically rare), fall back to a fresh

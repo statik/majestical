@@ -29,6 +29,7 @@ similar_names = "allow"
 
 [dependencies]
 majestical-core = { path = "../core" }
+majestical-services = { path = "../services" }
 majestical-sync = { path = "../sync" }
 majestical-catalog-sqlite = { path = "../catalog-sqlite" }
 majestical-ingest = { path = "../ingest" }

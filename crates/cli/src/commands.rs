@@ -1,34 +1,19 @@
 //! One cmd_* handler per CLI verb. main.rs owns clap definitions and dispatch;
 //! handlers own behavior.
-use crate::app::{FsApp, physical_now_ms, warn_skipped_corrupt_lines};
-use crate::iso8601::iso8601_ms;
-use crate::volume_identity;
 use crate::{MetaCmd, ParaCmd, TagCmd};
 use anyhow::{Context, Result};
-use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::clock::MAX_DRIFT_MS;
 use majestical_core::event::{AssetId, Op, ParaKind, VerifyOutcome};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, journal, mhl, plan, template};
+use majestical_services::app::{FsApp, physical_now_ms};
+use majestical_services::catalog::open_catalog;
+use majestical_services::iso8601::iso8601_ms;
+use majestical_services::para::{parse_kind, resolve_para_node};
+use majestical_services::volume_identity;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
-/// Opens the sqlite catalog from the per-machine local state dir (see
-/// `state_dir`), applying only the events past its last-saved cursor (or
-/// rebuilding from scratch if there's no usable saved state). Shared by
-/// every read path that needs an ad hoc sqlite view — `search`,
-/// `volumes list`, and `para list` — so the open+sync pair lives in exactly
-/// one place.
-pub(crate) fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCatalog, Projection)> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
-    let mut skipped = 0usize;
-    let (db, projection, _mode) =
-        SqliteCatalog::open_synced(&paths.db_path, app.log(), &mut |_line| skipped += 1)
-            .context("opening sqlite catalog")?;
-    warn_skipped_corrupt_lines(skipped, catalog_dir);
-    Ok((db, projection))
-}
 
 pub(crate) fn cmd_catalog_init(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
     FsApp::init(catalog, machine_id, author)?;
@@ -337,50 +322,6 @@ pub(crate) fn print_volumes_table(
     );
     for (id, label, last_seen, online, count) in &rows {
         println!("{id:<id_w$} {label:<label_w$} {last_seen:<seen_w$} {online:<online_w$} {count}");
-    }
-}
-
-pub(crate) fn parse_kind(kind: &str) -> Result<ParaKind> {
-    match kind {
-        "project" => Ok(ParaKind::Project),
-        "area" => Ok(ParaKind::Area),
-        "resource" => Ok(ParaKind::Resource),
-        "archive" => Ok(ParaKind::Archive),
-        other => {
-            anyhow::bail!("unknown PARA kind '{other}' — one of: project, area, resource, archive")
-        }
-    }
-}
-
-/// Resolves `<kind>/<name>` or a raw node ULID against non-archived nodes.
-/// The non-archived restriction applies only to the `<kind>/<name>` form; a
-/// raw node id resolves an archived node too (intentional — once a node is
-/// archived, its id is the only way left to address it).
-pub(crate) fn resolve_para_node(projection: &Projection, reference: &str) -> Result<String> {
-    if projection.para_node(reference).is_some() {
-        return Ok(reference.to_string());
-    }
-    let Some((kind_str, name)) = reference.split_once('/') else {
-        anyhow::bail!(
-            "unknown PARA node '{reference}' — use <kind>/<name> or a node id from `maj para list`"
-        );
-    };
-    let kind = parse_kind(kind_str)?;
-    let matches: Vec<&String> = projection
-        .para_nodes()
-        .filter(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name))
-        .map(|(id, _)| id)
-        .collect();
-    match matches.as_slice() {
-        [] => anyhow::bail!("no active PARA node '{reference}' — see `maj para list`"),
-        [id] => Ok((*id).clone()),
-        many => anyhow::bail!(
-            "'{reference}' is ambiguous (concurrent creates); use a node id: {}",
-            many.iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     }
 }
 
@@ -874,7 +815,7 @@ fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpe
 }
 
 fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    let paths = majestical_services::state_dir::catalog_paths(catalog_dir)?;
     Ok(paths.runs_dir.join(format!("{run_id}.jsonl")))
 }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use xxhash_rust::xxh3::xxh3_128;
 
-pub(crate) struct CatalogPaths {
+pub struct CatalogPaths {
     pub db_path: PathBuf,
     pub runs_dir: PathBuf,
 }
@@ -37,7 +37,12 @@ fn state_dir_with_base(base: &Path, catalog_root: &Path) -> Result<PathBuf> {
 /// derived files out of the sync root: a pre-phase-4 `catalog.db` is deleted
 /// (disposable by invariant; it is rebuilt locally), and `runs/*.jsonl`
 /// journals are moved so `--resume` keeps working.
-pub(crate) fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
+/// # Errors
+///
+/// Returns an error if `catalog_root` cannot be canonicalized, if the state
+/// dir cannot be created, or if migrating legacy derived files out of the
+/// sync root fails.
+pub fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
     let state_dir = state_dir_with_base(&state_base()?, catalog_root)?;
     let runs_dir = state_dir.join("runs");
     std::fs::create_dir_all(&runs_dir)
@@ -54,7 +59,10 @@ pub(crate) fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
 /// (the index queue's Lance store and `CoreML` cache, the search command's
 /// semantic layer) that need the directory itself rather than a path inside
 /// it.
-pub(crate) fn state_dir_for(catalog_root: &Path) -> Result<PathBuf> {
+/// # Errors
+///
+/// Returns an error under the same conditions as [`catalog_paths`].
+pub fn state_dir_for(catalog_root: &Path) -> Result<PathBuf> {
     let paths = catalog_paths(catalog_root)?;
     Ok(paths
         .db_path
@@ -67,7 +75,16 @@ fn migrate_legacy(catalog_root: &Path, state_runs: &Path) -> Result<()> {
     if legacy_db.is_file() {
         std::fs::remove_file(&legacy_db)
             .with_context(|| format!("removing legacy catalog.db at {}", legacy_db.display()))?;
-        eprintln!("note: removed legacy catalog.db from the sync root (rebuilt locally)");
+        // See the `#[expect]` note on `warn_skipped_corrupt_lines` in app.rs:
+        // services inherits print_stderr = "deny"; this is a verbatim
+        // stderr diagnostic moved from cli, not yet a rendered outcome.
+        #[expect(
+            clippy::print_stderr,
+            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
+        )]
+        {
+            eprintln!("note: removed legacy catalog.db from the sync root (rebuilt locally)");
+        }
     }
     let legacy_runs = catalog_root.join("runs");
     if legacy_runs.is_dir() {
@@ -119,7 +136,14 @@ fn migrate_legacy_journals(legacy_runs: &Path, state_runs: &Path) -> Result<()> 
         moved_any = true;
     }
     if moved_any {
-        eprintln!("note: moved legacy run journals into the local state dir");
+        // See the `#[expect]` note above in `migrate_legacy`.
+        #[expect(
+            clippy::print_stderr,
+            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
+        )]
+        {
+            eprintln!("note: moved legacy run journals into the local state dir");
+        }
     }
     Ok(())
 }

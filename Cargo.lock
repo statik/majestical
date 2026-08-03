@@ -4473,6 +4473,7 @@ dependencies = [
  "majestical-describe",
  "majestical-index",
  "majestical-ingest",
+ "majestical-services",
  "majestical-sync",
  "plist",
  "predicates",
@@ -4559,6 +4560,28 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "thiserror",
+ "ulid",
+ "walkdir",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "majestical-services"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "majestical-catalog-sqlite",
+ "majestical-core",
+ "majestical-describe",
+ "majestical-index",
+ "majestical-ingest",
+ "majestical-sync",
+ "plist",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "ulid",

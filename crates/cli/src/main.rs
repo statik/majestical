@@ -3,6 +3,7 @@ mod commands;
 mod describer_cmd;
 mod inbox_cmd;
 mod index_cmd;
+mod mcp_cmd;
 mod search;
 mod sync_cmd;
 mod tags_cmd;
@@ -157,6 +158,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Serve the catalog to MCP clients over stdio.
+    Mcp,
 }
 
 /// `maj ingest --dedupe` surface: only `skip` and `copy` are exposed this
@@ -654,6 +657,10 @@ fn main() -> Result<()> {
             };
             commands::cmd_ingest(&mut app, &cli.catalog, &args)?;
         }
+        // Deliberately does not open a catalog here: `mcp_cmd::serve` opens
+        // (and re-opens) it per tool call, not at startup — see its own
+        // module doc for why, mirroring `Verify`/`Model` above.
+        Cmd::Mcp => mcp_cmd::serve(&cli.catalog, &cli.machine_id, &author)?,
     }
     Ok(())
 }

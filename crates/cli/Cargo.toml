@@ -44,6 +44,12 @@ ulid.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
 plist.workspace = true
+# `maj mcp`: stdio JSON-RPC server. Only this crate opens a tokio runtime
+# (built manually in `mcp_cmd::serve`, not `#[tokio::main]` — every other
+# subcommand stays synchronous) and only for this one subcommand.
+rmcp.workspace = true
+schemars.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std"] }
 
 [dev-dependencies]
 assert_cmd.workspace = true

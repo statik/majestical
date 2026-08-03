@@ -38,8 +38,15 @@ arrow-schema = "=58.3.0"
 # Only "rt": the sync VectorStore wrapper drives everything through one
 # current-thread runtime's block_on, never spawning or using channels/
 # Mutex/Notify, so "sync" (and its Send+Sync-bound API surface) adds nothing.
-tokio = { version = "1", features = ["rt"] }
+# `crates/cli` adds "rt-multi-thread"/"macros"/"io-std" on top (see its own
+# Cargo.toml) for `maj mcp`'s stdio server.
+tokio = { version = "=1.53.1", features = ["rt"] }
 futures = "0.3"
+# `maj mcp`: stdio JSON-RPC server over the services layer. Default features
+# (base64, macros, server) pull in the `#[tool_router]`/`#[tool]` proc
+# macros, `ServerHandler`, and the stdio-capable transport.
+rmcp = "=3.1.0"
+schemars = "=1.2.2"
 ureq = { version = "3.3.0", features = ["json"] }
 base64 = "0.23.0"
 toml = "1.1.4"

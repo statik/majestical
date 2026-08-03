@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod describer_config;
 pub mod error;
 pub mod index;
+pub mod ingest;
 pub mod iso8601;
 pub mod meta;
 pub mod para;

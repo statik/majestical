@@ -9,13 +9,14 @@
 //! validation gates live in `inbox_manifest.rs`; this module is the
 //! orchestration: the pass loop, hash gate, routing, ingest, quiescence,
 //! and the failure-marker store.
-use crate::commands::{self, ExecuteIngest, IngestReport};
+use crate::commands::{self, IngestReport};
 use crate::inbox_manifest::{ContributionManifest, MANIFEST_NAME, check_files, load_manifest};
 use anyhow::{Context, Result};
 use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
 use majestical_ingest::{engine, hashing, plan};
 use majestical_services::app::FsApp;
+use majestical_services::ingest::ExecuteIngest;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_128;
@@ -615,7 +616,7 @@ fn require_clean_outcome(outcome: &engine::Outcome) -> Result<ContribOutcome> {
 /// Resolves `para` (validated by `load_manifest` to at most one interior
 /// `/`) to an active ingest target. When it's in `<kind>/<name>` form and
 /// doesn't resolve to an active node, this names the exact fix instead of
-/// [`commands::resolve_ingest_node`]'s generic "see `maj para list`" (which
+/// [`majestical_services::ingest::resolve_ingest_node`]'s generic "see `maj para list`" (which
 /// doesn't tell the operator what to do next) — distinguishing the two ways
 /// "not active" happens matters: a target that was never created needs
 /// `maj para add`, but a target that exists and is merely archived would
@@ -646,7 +647,7 @@ fn resolve_contribution_node(
             );
         }
     }
-    commands::resolve_ingest_node(projection, para)
+    majestical_services::ingest::resolve_ingest_node(projection, para)
 }
 
 /// Plans and verified-ingests one contribution's files, then tags every
@@ -665,7 +666,7 @@ fn ingest_contribution(
     node: (String, ParaKind, String),
 ) -> Result<engine::Outcome> {
     let projection = app.projection()?;
-    let known = commands::known_assets_from_projection(&projection);
+    let known = majestical_services::ingest::known_assets_from_projection(&projection);
     let mut ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
         .with_context(|| format!("planning contribution {}", dir.display()))?;
     // Only files the manifest actually lists may ever be placed, verified,
@@ -706,7 +707,7 @@ fn triage_folder_ingest(
     node: (String, ParaKind, String),
 ) -> Result<engine::Outcome> {
     let projection = app.projection()?;
-    let known = commands::known_assets_from_projection(&projection);
+    let known = majestical_services::ingest::known_assets_from_projection(&projection);
     let ingest_plan = plan::plan_source(dir, &known, plan::DedupeMode::Skip)
         .with_context(|| format!("planning manifest-less folder {}", dir.display()))?;
     let row_name = display_name(dir);
@@ -742,7 +743,7 @@ fn triage_loose_files_ingest(
     node: (String, ParaKind, String),
 ) -> Result<engine::Outcome> {
     let projection = app.projection()?;
-    let known = commands::known_assets_from_projection(&projection);
+    let known = majestical_services::ingest::known_assets_from_projection(&projection);
     let wanted: BTreeSet<PathBuf> = files.iter().cloned().collect();
     let filter = move |path: &Path| wanted.contains(path);
     let ingest_plan =
@@ -795,8 +796,13 @@ fn run_shared_ingest(
     // triage, nothing) lands as a tag, not a subdirectory, so a manifested
     // drop, a triaged drop, and a manual ingest of the same PARA node share
     // one layout.
-    let subdir = commands::render_ingest_subdir(kind, &name, "{date}/{source-label}", &vol_label)?;
-    let run = commands::run_ingest(
+    let subdir = majestical_services::ingest::render_ingest_subdir(
+        kind,
+        &name,
+        "{date}/{source-label}",
+        &vol_label,
+    )?;
+    let run = majestical_services::ingest::run_ingest(
         app,
         ctx.catalog,
         &ExecuteIngest {
@@ -807,15 +813,25 @@ fn run_shared_ingest(
             source_volume: (&vol_id, &vol_label),
             jobs: None,
             resume: None,
-            // Silent in both text and JSON mode: the pass-level report
-            // this module prints already carries the outcome, and stderr
-            // carries any failure detail (via `print_failure_detail`
-            // below) — a per-contribution engine summary interleaved ahead
-            // of it is preamble noise in text mode, and would break
-            // `--json`'s one-document guarantee.
-            report: IngestReport::Silent,
         },
+        // No-op: `maj inbox process` runs this once per contribution, so
+        // the `--resume` advice line would print once per contribution
+        // too — and `--resume` isn't a flag this command even accepts.
+        &mut |_line: &str| {},
     )?;
+    // Silent in both text and JSON mode: the pass-level report this module
+    // prints already carries the outcome, and stderr carries any failure
+    // detail (via `print_failure_detail` below) — a per-contribution engine
+    // summary interleaved ahead of it is preamble noise in text mode, and
+    // would break `--json`'s one-document guarantee. Diagnostics still
+    // print regardless of the `Silent` variant — see
+    // `commands::print_ingest_outcome`'s doc.
+    commands::print_ingest_outcome(
+        &run.run_id,
+        &run.outcome,
+        &run.generations,
+        IngestReport::Silent,
+    );
     print_failure_detail(site.row_name, &run.outcome);
     tag_assets(app, ingest_plan, &run.outcome, site.tags)?;
     Ok(run.outcome)
@@ -830,10 +846,10 @@ fn run_shared_ingest(
 /// [`require_clean_outcome`]'s error only reports counts, which would
 /// otherwise be a circular "see stderr" pointing at a line that just
 /// repeats the same counts back. Diagnostics are deliberately NOT printed
-/// here: `commands::print_ingest_outcome` (inside `commands::run_ingest`,
-/// called just above) already prints every diagnostic regardless of
-/// `IngestReport` variant — printing them again here would be two
-/// functions claiming the same responsibility.
+/// here: `commands::print_ingest_outcome` (called just above, right after
+/// `majestical_services::ingest::run_ingest` returns) already prints every
+/// diagnostic regardless of `IngestReport` variant — printing them again
+/// here would be two functions claiming the same responsibility.
 fn print_failure_detail(row_name: &str, outcome: &engine::Outcome) {
     for bad in outcome.failed.iter().chain(&outcome.rejected) {
         eprintln!("{row_name}: {}: {}", bad.rel, bad.reason);

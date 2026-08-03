@@ -671,6 +671,67 @@ mod tests {
         ));
     }
 
+    /// `--dedupe skip` vs `--dedupe copy` must plan a known-duplicate file
+    /// differently — `plan::Decision::Duplicate`'s `action` field carries
+    /// whichever mode was requested, so `engine::run` (untested by this
+    /// crate) knows whether to skip the copy or place it anyway. Pins the
+    /// planning half of that contract; `CopyAnyway`'s actual copy behavior
+    /// is `majestical_ingest`'s own responsibility, exercised end to end by
+    /// `crates/cli/tests/cli_smoke.rs` and the parity harness.
+    #[test]
+    fn dedupe_skip_and_copy_anyway_plan_a_known_duplicate_differently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = init_app(dir.path());
+        crate::para::add(&mut app, "project", "client-x").expect("add");
+        let source = tempfile::tempdir().expect("tempdir");
+        std::fs::write(source.path().join("a.mov"), b"hello").expect("write");
+        let hash = xxhash_rust::xxh3::xxh3_128(b"hello");
+        app.emit(vec![Op::AssetSeen {
+            asset: AssetId(format!("xxh3:{hash:032x}")),
+            volume: "vol1".into(),
+            path: "elsewhere.mov".into(),
+            size: 5,
+            mtime_ms: 1000,
+        }])
+        .expect("emit");
+
+        let skip_plan = plan(
+            &app,
+            source.path(),
+            "project/client-x",
+            "raw",
+            plan::DedupeMode::Skip,
+        )
+        .expect("plan skip");
+        let copy_plan = plan(
+            &app,
+            source.path(),
+            "project/client-x",
+            "raw",
+            plan::DedupeMode::CopyAnyway,
+        )
+        .expect("plan copy");
+
+        assert_eq!(
+            skip_plan.plan.files[0].decision,
+            plan::Decision::Duplicate {
+                asset: AssetId(format!("xxh3:{hash:032x}")),
+                action: plan::DedupeMode::Skip,
+            }
+        );
+        assert_eq!(
+            copy_plan.plan.files[0].decision,
+            plan::Decision::Duplicate {
+                asset: AssetId(format!("xxh3:{hash:032x}")),
+                action: plan::DedupeMode::CopyAnyway,
+            }
+        );
+        assert_ne!(
+            skip_plan.plan.files[0].decision, copy_plan.plan.files[0].decision,
+            "skip and copy-anyway must plan the same duplicate file differently"
+        );
+    }
+
     #[test]
     fn render_ingest_subdir_uses_kind_dir_name_and_the_node_name() {
         let subdir = render_ingest_subdir(ParaKind::Area, "health", "{source-label}", "camera-a")

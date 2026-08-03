@@ -834,6 +834,15 @@ fn run_shared_ingest(
 /// path" — is preserved for `maj inbox process`. `maj ingest`'s own
 /// diagnostics print is a separate copy in the CLI's own
 /// `print_ingest_outcome`, right after its own `run_ingest` call.
+///
+/// One accepted deviation: pre-extraction, diagnostics printed (inside
+/// `run_ingest`) BEFORE this function's own per-file failure/rejection
+/// lines; now that both live in this one function, failures print first.
+/// Both are stderr-only ordering, never observed by anything but a human
+/// watching the terminal — an artifact of this function's own row
+/// iteration order, not a behavior anything depends on — so it's left as
+/// is rather than reordering to match a distinction the pre-extraction code
+/// never actually chose deliberately.
 fn report_failure_detail(row_name: &str, outcome: &engine::Outcome) {
     // See the `#[expect]` note on `load_markers` above.
     #[expect(

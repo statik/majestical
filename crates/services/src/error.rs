@@ -36,6 +36,22 @@ pub enum ServiceError {
         moves: Vec<crate::para::ArchiveMove>,
         source: anyhow::Error,
     },
+    /// `maj sync pull`'s abort-midway carrier: every targeted location's
+    /// transfer already ran to completion — `rows` is the same
+    /// [`crate::sync::LocationRow`] data a successful pull would have
+    /// returned, real completed segment/blob copies — before the
+    /// subsequent local-catalog apply step itself failed. Same shape as
+    /// [`ServiceError::ParaArchivePartial`]: pull's own per-location results
+    /// are a visit-every-row outcome (see this enum's doc), but the apply
+    /// step after that loop is a separate, abort-midway step, so its
+    /// failure still needs a carrier rather than silently dropping the
+    /// transfer work that already happened. A head renders `rows` (the same
+    /// way a successful pull would) before surfacing `source`.
+    #[error("sync pull apply failed after transfer completed")]
+    SyncPullApplyFailed {
+        rows: Vec<crate::sync::LocationRow>,
+        source: anyhow::Error,
+    },
     /// Escape hatch while extraction is in flight: wraps the anyhow chains
     /// the cmd_* bodies already produce. Individual verbs migrate to typed
     /// variants only when a head needs to match on them (YAGNI).

@@ -6,6 +6,7 @@
 //! derives `clap::ValueEnum`), converts it, and renders.
 
 use anyhow::{Context, Result};
+use majestical_services::error::ServiceError;
 use majestical_services::sync::{
     LocationRow, NO_LOCATIONS_HINT, Only, PullOutcome, PullRequest, PushRequest,
 };
@@ -150,13 +151,18 @@ pub(crate) struct PullArgs {
 /// `majestical_services::sync::pull`; this renders its
 /// [`majestical_services::sync::PullOutcome`].
 ///
-/// In `--json` mode the rows are held back and folded into one combined
-/// object printed only after the service call returns (see
-/// [`print_pull_summary`]), so an apply failure in `--json` mode prints
-/// NOTHING to stdout — unlike text mode, which has already printed its rows
-/// by then. Nothing is lost either way: the transfer already landed on disk
-/// regardless, and the next run's plan is empty for whatever transferred
-/// and simply re-applies for whatever didn't.
+/// The apply runs INSIDE `pull` now (not interleaved with this function's
+/// own printing, unlike the pre-extraction code) — so when it fails after
+/// every location's transfer already completed, `pull` returns
+/// `Err(ServiceError::SyncPullApplyFailed { rows, .. })` carrying those
+/// completed rows rather than losing them, and this function renders them
+/// on that path exactly as a successful pull's rows would be rendered
+/// (text mode only — `--json`'s one-document guarantee means an apply
+/// failure prints NOTHING to stdout, matching the old code's behavior when
+/// the same failure hit mid-function). Nothing is lost either way: the
+/// transfer already landed on disk regardless, and the next run's plan is
+/// empty for whatever transferred and simply re-applies for whatever
+/// didn't.
 ///
 /// # Errors
 /// See `majestical_services::sync::pull`'s doc, plus a nonzero exit under
@@ -167,7 +173,7 @@ pub(crate) fn cmd_pull(
     author: &str,
     args: &PullArgs,
 ) -> Result<()> {
-    let outcome = majestical_services::sync::pull(
+    let outcome = match majestical_services::sync::pull(
         catalog,
         machine_id,
         author,
@@ -175,7 +181,17 @@ pub(crate) fn cmd_pull(
             location: args.location.as_deref(),
             only: args.only.map(Into::into),
         },
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(ServiceError::SyncPullApplyFailed { rows, source }) => {
+            if !args.json {
+                print_text_rows(&rows, "pull");
+            }
+            print_failure_lines(&rows);
+            return Err(source);
+        }
+        Err(other) => return Err(other.into()),
+    };
 
     if !args.json {
         print_text_rows(&outcome.rows, "pull");

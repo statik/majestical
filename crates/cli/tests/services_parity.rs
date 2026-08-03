@@ -1101,6 +1101,108 @@ fn sync_pull_output_is_byte_identical() {
     );
 }
 
+/// `state/catalogs/<key>/catalog.db` — one key per test catalog root, so
+/// the first (and only) entry under `catalogs/` is always it. Mirrors
+/// `sync_smoke.rs::find_catalog_db`.
+#[cfg(test)]
+fn find_catalog_db(state: &Path) -> std::path::PathBuf {
+    let catalogs = state.join("catalogs");
+    let entry = std::fs::read_dir(&catalogs)
+        .expect("state dir")
+        .next()
+        .expect("one catalog key")
+        .expect("entry");
+    entry.path().join("catalog.db")
+}
+
+/// Pins the abort-midway case `ServiceError::SyncPullApplyFailed` exists
+/// for: the transfer completes (real segment copy, reported as a `Ran`
+/// row) but the subsequent local-catalog apply fails, and the CLI must
+/// still render that completed row before surfacing the apply error —
+/// exactly like the pre-extraction code, which printed rows before the
+/// apply ran at all. Forces the apply to fail deterministically by
+/// pre-creating a directory at the exact path `open_synced` will try to
+/// open as a sqlite file (`Connection::open` on a directory fails on every
+/// platform, no corrupted bytes needed) — independent catalogs, since the
+/// transfer itself is a real, first-application push+pull.
+#[test]
+fn sync_pull_apply_failure_output_is_byte_identical() {
+    fn seed_then_break_apply(base: &std::path::Path) -> (std::process::Output, std::path::PathBuf) {
+        let (source_root, source_state) = common::fixture_catalog(base);
+        let location = base.join("shuttle");
+        std::fs::create_dir_all(&location).expect("mkdir");
+        common::maj(&source_root, &source_state)
+            .args([
+                "sync",
+                "location",
+                "add",
+                "shuttle",
+                location.to_str().expect("utf8"),
+            ])
+            .assert()
+            .success();
+        common::maj(&source_root, &source_state)
+            .args(["sync", "push"])
+            .assert()
+            .success();
+
+        let dest_root = base.join("dest");
+        let dest_state = base.join("dest-state");
+        common::maj(&dest_root, &dest_state)
+            .args(["catalog", "init"])
+            .assert()
+            .success();
+        common::maj(&dest_root, &dest_state)
+            .args([
+                "sync",
+                "location",
+                "add",
+                "shuttle",
+                location.to_str().expect("utf8"),
+            ])
+            .assert()
+            .success();
+
+        // `sync location add` above already touched the state dir (writing
+        // sync.toml under it), so `catalogs/<key>/` already exists — block
+        // the apply before it ever runs.
+        let db_path = find_catalog_db(&dest_state);
+        std::fs::create_dir_all(&db_path).expect("mkdir catalog.db");
+
+        let output = common::maj(&dest_root, &dest_state)
+            .args(["sync", "pull"])
+            .output()
+            .expect("run pull");
+        (output, db_path)
+    }
+
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let (new, db_path_new) = seed_then_break_apply(dir_new.path());
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let (ref_out, db_path_ref) = seed_then_break_apply(dir_ref.path());
+
+    assert_eq!(new.status.code(), ref_out.status.code());
+    assert_ne!(
+        new.status.code(),
+        Some(0),
+        "an apply failure must be nonzero"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&new.stdout),
+        String::from_utf8_lossy(&ref_out.stdout),
+        "the completed transfer row must render identically before the apply error"
+    );
+    // The apply error embeds `catalog.db`'s absolute path — real, and
+    // structurally identical in shape between the two sides, but never
+    // textually equal across two independent tempdirs, so it's normalized
+    // before comparing the rest of stderr.
+    let new_stderr = String::from_utf8_lossy(&new.stderr)
+        .replace(db_path_new.to_str().expect("utf8"), "<CATALOG_DB>");
+    let ref_stderr = String::from_utf8_lossy(&ref_out.stderr)
+        .replace(db_path_ref.to_str().expect("utf8"), "<CATALOG_DB>");
+    assert_eq!(new_stderr, ref_stderr);
+}
+
 #[test]
 fn inbox_process_output_is_byte_identical() {
     // A clean pass moves the contribution to `.processed/`, so a second
@@ -1299,5 +1401,104 @@ fn ingest_real_run_output_is_byte_identical() {
     assert_eq!(
         new_json, old_json,
         "ingest JSON must match once run id and dest roots are normalized"
+    );
+}
+
+/// A first ingest (default `--dedupe skip`), then a second ingest of the
+/// identical bytes into a fresh destination with `--dedupe copy` — for
+/// [`ingest_dedupe_copy_output_is_byte_identical`]. `fixture_catalog`
+/// already scanned `base/src`, so this uses its own source directory to
+/// avoid colliding with those two fixture files.
+#[cfg(test)]
+fn run_dedupe_copy_reingest(base: &std::path::Path) -> std::process::Output {
+    let (root, state) = common::fixture_catalog(base);
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "p1"])
+        .assert()
+        .success();
+    let source = base.join("dedupe-src");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(source.join("a.mov"), b"duplicate-me").expect("write");
+    let dest1 = base.join("dest1");
+    std::fs::create_dir_all(&dest1).expect("mkdir");
+    common::maj(&root, &state)
+        .args([
+            "ingest",
+            source.to_str().expect("utf8"),
+            "--dest",
+            dest1.to_str().expect("utf8"),
+            "--para",
+            "project/p1",
+        ])
+        .assert()
+        .success();
+
+    let dest2 = base.join("dest2");
+    std::fs::create_dir_all(&dest2).expect("mkdir");
+    common::maj(&root, &state)
+        .args([
+            "ingest",
+            source.to_str().expect("utf8"),
+            "--dest",
+            dest2.to_str().expect("utf8"),
+            "--para",
+            "project/p1",
+            "--dedupe",
+            "copy",
+            "--json",
+        ])
+        .output()
+        .expect("run second ingest")
+}
+
+/// `--dedupe copy` is untested by the rest of the workspace suite — a
+/// sabotage that treated `DedupeMode::CopyAnyway` the same as `Skip` would
+/// still pass every other test. Ingests a file, then re-ingests the
+/// identical bytes into a second destination with `--dedupe copy`: the
+/// planner sees a known duplicate but must still place it (`placed: 1`),
+/// not skip it (`skipped_duplicates: 1`) — proven identical between the two
+/// binaries, modulo the second run's own fresh ULID and destination-root
+/// path (same normalization as `ingest_real_run_output_is_byte_identical`).
+#[test]
+fn ingest_dedupe_copy_output_is_byte_identical() {
+    let reference = Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(ingest --dedupe copy): /tmp/maj-ref missing — build it first");
+        return;
+    }
+
+    let dir_new = tempfile::tempdir().expect("tempdir");
+    let new = run_dedupe_copy_reingest(dir_new.path());
+    let dir_ref = tempfile::tempdir().expect("tempdir");
+    let old = run_dedupe_copy_reingest(dir_ref.path());
+
+    assert_eq!(new.status.code(), Some(0), "new binary: {new:?}");
+    assert_eq!(new.status.code(), old.status.code());
+
+    let mut new_json: serde_json::Value =
+        serde_json::from_slice(&new.stdout).expect("new stdout is JSON");
+    let mut old_json: serde_json::Value =
+        serde_json::from_slice(&old.stdout).expect("ref stdout is JSON");
+    assert_eq!(
+        new_json["placed"],
+        serde_json::json!(1),
+        "dedupe copy must place the duplicate, not skip it: {new_json}"
+    );
+    assert_eq!(new_json["skipped_duplicates"], serde_json::json!(0));
+    assert_eq!(old_json["placed"], serde_json::json!(1));
+    assert_eq!(old_json["skipped_duplicates"], serde_json::json!(0));
+
+    new_json["run"] = serde_json::json!("<ULID>");
+    old_json["run"] = serde_json::json!("<ULID>");
+    for doc in [&mut new_json, &mut old_json] {
+        if let Some(generations) = doc["generations"].as_array_mut() {
+            for g in generations {
+                g["root"] = serde_json::json!("<DEST_ROOT>");
+            }
+        }
+    }
+    assert_eq!(
+        new_json, old_json,
+        "ingest --dedupe copy JSON must match once run id and dest roots are normalized"
     );
 }

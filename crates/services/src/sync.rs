@@ -672,6 +672,27 @@ fn summarize_pull(rows: &[LocationRow]) -> (usize, Vec<String>, usize) {
     (applied, machines, blobs_fetched)
 }
 
+/// Internal carrier for [`pull_impl`]'s early return when the local-catalog
+/// apply fails after every location's transfer already completed: downcast
+/// back out of the `anyhow` chain by [`pull`] and turned into
+/// [`ServiceError::SyncPullApplyFailed`] so the completed transfer rows
+/// survive to the caller instead of being silently dropped by the early
+/// `Err`. Not part of the public API — [`pull`]'s callers only ever see the
+/// typed [`ServiceError`] variant. Mirrors `para::PartialArchiveFailure`.
+#[derive(Debug)]
+struct PullApplyFailure {
+    rows: Vec<LocationRow>,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for PullApplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for PullApplyFailure {}
+
 /// `maj sync pull`: fetch everything configured locations have that this
 /// catalog doesn't (segments + blobs), then apply the newly landed events to
 /// the local sqlite catalog. Like [`push`], refuses outright when there's no
@@ -681,13 +702,18 @@ fn summarize_pull(rows: &[LocationRow]) -> (usize, Vec<String>, usize) {
 /// failure at one location must never block already-landed segments from
 /// being applied — opening the sqlite catalog applies past its saved
 /// cursor, so the open below IS the apply; there is no separate step to
-/// call. Moved from `crates/cli/src/sync_cmd.rs::cmd_pull`.
+/// call. If THAT apply step itself fails, the transfer rows already
+/// completed must still reach the caller — see
+/// [`ServiceError::SyncPullApplyFailed`]. Moved from
+/// `crates/cli/src/sync_cmd.rs::cmd_pull`.
 ///
 /// # Errors
 /// Returns an error when there's no catalog at `catalog`, no sync locations
 /// are configured (or none match `req.location`), or the local sqlite
-/// catalog can't be opened/synced. Per-location failures are reported
-/// inside the returned outcome, never as an `Err` — see
+/// catalog can't be opened/synced — the latter as
+/// [`ServiceError::SyncPullApplyFailed`], carrying the transfer rows that
+/// already completed. Per-location transfer failures are reported inside
+/// the returned outcome, never as an `Err` — see
 /// [`PullOutcome::overall_failed`].
 pub fn pull(
     catalog: &Path,
@@ -695,7 +721,15 @@ pub fn pull(
     author: &str,
     req: &PullRequest<'_>,
 ) -> Result<PullOutcome, ServiceError> {
-    pull_impl(catalog, machine_id, author, req).map_err(ServiceError::from)
+    pull_impl(catalog, machine_id, author, req).map_err(|err| {
+        match err.downcast::<PullApplyFailure>() {
+            Ok(partial) => ServiceError::SyncPullApplyFailed {
+                rows: partial.rows,
+                source: partial.source,
+            },
+            Err(err) => ServiceError::from(err),
+        }
+    })
 }
 
 fn pull_impl(
@@ -715,9 +749,11 @@ fn pull_impl(
     // Apply pulled events to the local catalog BEFORE tallying the summary
     // below: a per-file blob failure elsewhere must still let already-
     // landed segments become searchable rather than leaving them stranded
-    // on disk unapplied.
-    let app = FsApp::open(catalog, machine_id, author)?;
-    crate::catalog::open_catalog(&app, catalog)?;
+    // on disk unapplied. A failure here must not lose `rows` — every
+    // location's transfer already genuinely completed by this point.
+    if let Err(source) = apply_pulled_events(catalog, machine_id, author) {
+        return Err(anyhow::Error::new(PullApplyFailure { rows, source }));
+    }
 
     let (applied_events, machines, blobs_fetched) = summarize_pull(&rows);
     Ok(PullOutcome {
@@ -726,6 +762,17 @@ fn pull_impl(
         machines,
         blobs_fetched,
     })
+}
+
+/// Opens the local sqlite catalog, applying past its saved cursor — the
+/// open IS the apply; there is no separate step to call. Split out of
+/// [`pull_impl`] purely so that function can attach `rows` to this specific
+/// failure via [`PullApplyFailure`] without the `?` operator discarding
+/// them.
+fn apply_pulled_events(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
+    let app = FsApp::open(catalog, machine_id, author)?;
+    crate::catalog::open_catalog(&app, catalog)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1110,5 +1157,69 @@ mod push_pull_tests {
             projection.para_node("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_some(),
             "the pulled event must be visible in the destination's own projection"
         );
+    }
+
+    /// Pins `ServiceError::SyncPullApplyFailed`'s shape: when the local
+    /// sqlite apply fails AFTER every location's transfer already
+    /// completed, the completed transfer rows must still reach the caller
+    /// rather than being silently dropped by the early `Err`. Forces the
+    /// apply to fail deterministically by pre-creating a directory at the
+    /// exact path `open_synced` will try to open as a sqlite file —
+    /// `Connection::open` on a directory fails every time, on every
+    /// platform, with no reliance on corrupting real bytes.
+    #[test]
+    fn pull_carries_completed_rows_when_the_local_apply_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+
+        let loc = dir.path().join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&source_root, "shuttle", &loc).expect("add");
+        push(
+            &source_root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+
+        let dest_root = dir.path().join("dest");
+        std::fs::create_dir_all(&dest_root).expect("mkdir");
+        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
+        location_add(&dest_root, "shuttle", &loc).expect("add on dest");
+
+        // Block the apply: put a directory where `open_synced` expects to
+        // open a sqlite file.
+        let paths = crate::state_dir::catalog_paths(&dest_root).expect("catalog_paths");
+        std::fs::create_dir_all(&paths.db_path).expect("mkdir catalog.db");
+
+        let err = pull(
+            &dest_root,
+            "m2",
+            "m2",
+            &PullRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect_err("apply must fail against a directory in place of catalog.db");
+        let ServiceError::SyncPullApplyFailed { rows, source } = err else {
+            panic!("expected SyncPullApplyFailed, got a different ServiceError variant");
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "the completed transfer row must survive the apply failure"
+        );
+        assert!(matches!(rows[0], LocationRow::Ran { .. }));
+        assert!(!source.to_string().is_empty());
     }
 }

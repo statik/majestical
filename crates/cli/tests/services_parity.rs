@@ -1544,3 +1544,31 @@ fn ingest_dedupe_copy_output_is_byte_identical() {
         "ingest --dedupe copy JSON must match once run id and dest roots are normalized"
     );
 }
+
+/// Guards the CLI's error-path notice drain: a diagnostic collected before a
+/// command fails must still reach stderr, ahead of the error text. `tag add`
+/// against an unknown asset reads the log first (counting the corrupt line,
+/// which records the warning) and only then refuses, so this pins BOTH
+/// stderr lines and their order — warning first, error second — plus the
+/// nonzero exit, against the reference binary that printed the warning
+/// mid-compute. Draining only on success would drop the warning and diverge.
+#[test]
+fn notice_then_error_stderr_survives_failed_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    // A real corrupt line in this machine's segment, so every subsequent
+    // read of the log skips one line and records the warning.
+    let machine_dir = root.join("events").join("test-machine");
+    let segment = std::fs::read_dir(&machine_dir)
+        .expect("machine events dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("one events jsonl");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    bytes.extend_from_slice(b"this is not json\n");
+    std::fs::write(&segment, bytes).expect("re-write segment");
+    // The refusal happens after the read and emits nothing, so neither
+    // binary mutates the log — a shared root is safe here.
+    diff_against_ref(&root, &state, &["tag", "add", "xxh3:nosuchasset", "x"]);
+}

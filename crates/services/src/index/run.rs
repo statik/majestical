@@ -228,9 +228,9 @@ pub fn run(
 
 fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexRunOutcome> {
     let (mut db, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, app.notices())?;
     let blobs = BlobStore::new(catalog_dir);
-    let caps = crate::index::capabilities(catalog_dir);
+    let caps = crate::index::capabilities(catalog_dir, app.notices());
     let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps);
     let items = split_and_cap_items(plan.items, req.limit);
 
@@ -241,6 +241,7 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
     };
     let caption_env = CaptionEnv {
         catalog_root: catalog_dir,
+        notices: app.notices(),
         vocab: tag_vocabulary(&projection),
         api_key: req.api_key.clone(),
     };
@@ -257,6 +258,7 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
 /// house 5-positional-parameter limit.
 struct CaptionEnv<'a> {
     catalog_root: &'a Path,
+    notices: &'a crate::notices::Notices,
     vocab: Vec<String>,
     api_key: Option<String>,
 }
@@ -1407,7 +1409,7 @@ fn run_caption_items(
     if items.is_empty() {
         return outcome;
     }
-    let config = match load_config(env.catalog_root) {
+    let config = match load_config(env.catalog_root, env.notices) {
         Ok(Some(config)) => config,
         // The planner only queued Caption items because a describer was
         // configured when caps were computed; a config removed/broken since

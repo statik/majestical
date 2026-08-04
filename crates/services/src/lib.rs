@@ -12,6 +12,7 @@ pub mod index;
 pub mod ingest;
 pub mod iso8601;
 pub mod meta;
+pub mod notices;
 pub mod para;
 pub mod query;
 pub mod scan;

@@ -3,6 +3,7 @@
 //! `majestical_services` outcome straight through — see `super`'s module doc
 //! for the shared wire contract.
 use super::MajServer;
+use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
@@ -172,7 +173,7 @@ impl MajServer {
     /// fresh from real files; never executes a transfer.
     #[tool]
     fn sync_status(&self) -> CallToolResult {
-        match majestical_services::sync::status(&self.catalog) {
+        match majestical_services::sync::status(&self.catalog, &Notices::new()) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
@@ -199,7 +200,7 @@ impl MajServer {
         if let Err(result) = self.ensure_catalog() {
             return result;
         }
-        match majestical_services::sync::locations_list(&self.catalog) {
+        match majestical_services::sync::locations_list(&self.catalog, &Notices::new()) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
@@ -213,7 +214,7 @@ impl MajServer {
         if let Err(result) = self.ensure_catalog() {
             return result;
         }
-        match majestical_services::describer_config::show(&self.catalog) {
+        match majestical_services::describer_config::show(&self.catalog, &Notices::new()) {
             Ok(Some(view)) => match serde_json::to_value(&view) {
                 Ok(describer) => CallToolResult::structured(
                     json!({ "configured": true, "describer": describer }),

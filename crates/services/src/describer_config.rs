@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 /// # Errors
 /// Returns an error if the local state dir can't be resolved.
-pub fn config_path(catalog_root: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog_root)?.join("describer.toml"))
+pub fn config_path(catalog_root: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    Ok(crate::state_dir::state_dir_for(catalog_root, notices)?.join("describer.toml"))
 }
 
 /// Loads the configured describer, if any.
@@ -18,8 +18,11 @@ pub fn config_path(catalog_root: &Path) -> Result<PathBuf> {
 /// # Errors
 /// Returns an error if the local state dir can't be resolved or an existing
 /// config file can't be read/parsed.
-pub fn load_config(catalog_root: &Path) -> Result<Option<DescriberConfig>> {
-    let path = config_path(catalog_root)?;
+pub fn load_config(
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<Option<DescriberConfig>> {
+    let path = config_path(catalog_root, notices)?;
     DescriberConfig::load(&path).with_context(|| format!("load {}", path.display()))
 }
 
@@ -63,12 +66,18 @@ pub fn to_view(config: &DescriberConfig) -> DescriberConfigView {
 /// # Errors
 /// Returns an error if the local state dir can't be resolved or an existing
 /// config file can't be read/parsed.
-pub fn show(catalog_root: &Path) -> Result<Option<DescriberConfigView>, ServiceError> {
-    show_impl(catalog_root).map_err(ServiceError::from)
+pub fn show(
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<Option<DescriberConfigView>, ServiceError> {
+    show_impl(catalog_root, notices).map_err(ServiceError::from)
 }
 
-fn show_impl(catalog_root: &Path) -> Result<Option<DescriberConfigView>> {
-    Ok(load_config(catalog_root)?.map(|config| to_view(&config)))
+fn show_impl(
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<Option<DescriberConfigView>> {
+    Ok(load_config(catalog_root, notices)?.map(|config| to_view(&config)))
 }
 
 /// Args for `maj describer set`, bundled to keep [`set`] within the house
@@ -88,11 +97,19 @@ pub struct SetArgs {
 /// # Errors
 /// Returns an error if the local state dir can't be resolved or the config
 /// file can't be written.
-pub fn set(catalog_root: &Path, args: &SetArgs) -> Result<DescriberConfigView, ServiceError> {
-    set_impl(catalog_root, args).map_err(ServiceError::from)
+pub fn set(
+    catalog_root: &Path,
+    args: &SetArgs,
+    notices: &crate::notices::Notices,
+) -> Result<DescriberConfigView, ServiceError> {
+    set_impl(catalog_root, args, notices).map_err(ServiceError::from)
 }
 
-fn set_impl(catalog_root: &Path, args: &SetArgs) -> Result<DescriberConfigView> {
+fn set_impl(
+    catalog_root: &Path,
+    args: &SetArgs,
+    notices: &crate::notices::Notices,
+) -> Result<DescriberConfigView> {
     let config = DescriberConfig {
         backend: args.backend,
         base_url: args
@@ -102,7 +119,7 @@ fn set_impl(catalog_root: &Path, args: &SetArgs) -> Result<DescriberConfigView> 
         model: args.model.clone(),
         api_key: args.api_key.clone(),
     };
-    let path = config_path(catalog_root)?;
+    let path = config_path(catalog_root, notices)?;
     config
         .store(&path)
         .with_context(|| format!("write {}", path.display()))?;
@@ -130,12 +147,20 @@ pub struct DescriberProbe {
 /// # Errors
 /// Returns an error if no describer is configured, or the backend can't be
 /// reached at all.
-pub fn test(catalog_root: &Path, api_key: Option<String>) -> Result<DescriberProbe, ServiceError> {
-    test_impl(catalog_root, api_key).map_err(ServiceError::from)
+pub fn test(
+    catalog_root: &Path,
+    api_key: Option<String>,
+    notices: &crate::notices::Notices,
+) -> Result<DescriberProbe, ServiceError> {
+    test_impl(catalog_root, api_key, notices).map_err(ServiceError::from)
 }
 
-fn test_impl(catalog_root: &Path, api_key: Option<String>) -> Result<DescriberProbe> {
-    let Some(config) = load_config(catalog_root)? else {
+fn test_impl(
+    catalog_root: &Path,
+    api_key: Option<String>,
+    notices: &crate::notices::Notices,
+) -> Result<DescriberProbe> {
+    let Some(config) = load_config(catalog_root, notices)? else {
         bail!("no describer configured — run `maj describer set`");
     };
     let base_url = config.base_url.clone();
@@ -154,12 +179,13 @@ fn test_impl(catalog_root: &Path, api_key: Option<String>) -> Result<DescriberPr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notices::Notices;
     use majestical_describe::BackendKind;
 
     #[test]
     fn show_of_an_unconfigured_catalog_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(show(dir.path()).expect("show").is_none());
+        assert!(show(dir.path(), &Notices::new()).expect("show").is_none());
     }
 
     #[test]
@@ -201,13 +227,14 @@ mod tests {
                 base_url: None,
                 api_key: Some("sk-secret".to_string()),
             },
+            &Notices::new(),
         )
         .expect("set");
         assert_eq!(view.model, "llava");
         assert_eq!(view.base_url, BackendKind::Ollama.default_base_url());
         assert!(view.api_key.is_some());
 
-        let stored = load_config(dir.path())
+        let stored = load_config(dir.path(), &crate::notices::Notices::new())
             .expect("load_config")
             .expect("config must be present after set");
         assert_eq!(stored.api_key.as_deref(), Some("sk-secret"));
@@ -224,6 +251,7 @@ mod tests {
                 base_url: None,
                 api_key: None,
             },
+            &Notices::new(),
         )
         .expect("set");
         assert_eq!(view.base_url, BackendKind::LmStudio.default_base_url());
@@ -232,7 +260,7 @@ mod tests {
     #[test]
     fn test_of_an_unconfigured_catalog_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = test(dir.path(), None).expect_err("must fail");
+        let err = test(dir.path(), None, &Notices::new()).expect_err("must fail");
         assert!(err.to_string().contains("no describer configured"));
     }
 
@@ -247,9 +275,11 @@ mod tests {
                 base_url: Some("http://127.0.0.1:1".to_string()),
                 api_key: None,
             },
+            &Notices::new(),
         )
         .expect("set");
-        let err = test(dir.path(), None).expect_err("must fail: nothing listens on port 1");
+        let err = test(dir.path(), None, &Notices::new())
+            .expect_err("must fail: nothing listens on port 1");
         assert!(err.to_string().contains("describer test against"));
     }
 }

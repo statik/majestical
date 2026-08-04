@@ -166,7 +166,12 @@ fn explicitly_requested_keyframes(kinds: Option<&[String]>) -> bool {
 /// read/written.
 fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> Result<()> {
     let outcome = majestical_services::index::run(app, catalog_dir, req)?;
-    majestical_services::index::update_failure_report(catalog_dir, &outcome, &req.kinds)?;
+    majestical_services::index::update_failure_report(
+        catalog_dir,
+        &outcome,
+        &req.kinds,
+        app.notices(),
+    )?;
     print_run_result(&outcome, json);
     Ok(())
 }

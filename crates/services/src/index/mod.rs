@@ -63,8 +63,8 @@ pub fn model_dir_if_present() -> Option<PathBuf> {
 /// describer is configured. An unreadable/unparsable `describer.toml`
 /// degrades to unconfigured with a stderr note — a broken describer config
 /// must never kill the rest of indexing.
-fn describer_model_tag(catalog_root: &Path) -> Option<String> {
-    match load_config(catalog_root) {
+fn describer_model_tag(catalog_root: &Path, notices: &crate::notices::Notices) -> Option<String> {
+    match load_config(catalog_root, notices) {
         Ok(config) => config.map(|c| c.model_tag()),
         Err(err) => {
             // See the `#[expect]` note on `warn_skipped_corrupt_lines` in
@@ -89,14 +89,14 @@ fn describer_model_tag(catalog_root: &Path) -> Option<String> {
 /// fetched into the cache, whether `ffmpeg`/`ffprobe` are on `PATH`, and
 /// whether the whisper/`MiniLM` models are installed.
 #[must_use]
-pub fn capabilities(catalog_root: &Path) -> Capabilities {
+pub fn capabilities(catalog_root: &Path, notices: &crate::notices::Notices) -> Capabilities {
     let model_tag = model_dir_if_present().map(|_| majestical_index::model::MODEL_TAG.to_string());
     Capabilities {
         model_tag,
         ffmpeg: majestical_index::video::ffmpeg_available(),
         whisper: whisper_model_dir_if_present().is_some(),
         text_model: minilm_model_dir_if_present().is_some(),
-        describer_tag: describer_model_tag(catalog_root),
+        describer_tag: describer_model_tag(catalog_root, notices),
     }
 }
 
@@ -261,16 +261,18 @@ pub fn update_failure_report(
     catalog_dir: &Path,
     outcome: &IndexRunOutcome,
     kinds: &BTreeSet<String>,
+    notices: &crate::notices::Notices,
 ) -> Result<(), ServiceError> {
-    update_failure_report_impl(catalog_dir, outcome, kinds).map_err(ServiceError::from)
+    update_failure_report_impl(catalog_dir, outcome, kinds, notices).map_err(ServiceError::from)
 }
 
 fn update_failure_report_impl(
     catalog_dir: &Path,
     outcome: &IndexRunOutcome,
     kinds: &BTreeSet<String>,
+    notices: &crate::notices::Notices,
 ) -> Result<()> {
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, notices)?;
     let previous = read_failure_report(&state_dir);
     let current = failure_report_json(outcome);
     let merged = merge_failure_report(previous, &current, kinds);
@@ -333,10 +335,10 @@ pub fn status(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome, Ser
 
 fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     let (_, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, app.notices())?;
     let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-    let caps = capabilities(catalog_dir);
+    let caps = capabilities(catalog_dir, app.notices());
     let plan = build_plan(&projection, &blobs, &kinds, &caps);
     let failures = read_failure_report(&state_dir);
     let transcripts_remedy = (plan.transcripts.needs_model > 0)
@@ -541,8 +543,9 @@ mod tests {
             captions: CaptionOutcome::default(),
         };
         let kinds: BTreeSet<String> = ["pdf".to_string()].into();
-        update_failure_report(&root, &outcome, &kinds).expect("update");
-        let state_dir = crate::state_dir::state_dir_for(&root).expect("state dir");
+        let notices = crate::notices::Notices::new();
+        update_failure_report(&root, &outcome, &kinds, &notices).expect("update");
+        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
         let report = read_failure_report(&state_dir);
         assert_eq!(report["pdf"][0]["error"], "not a valid pdf");
     }

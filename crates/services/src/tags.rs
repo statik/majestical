@@ -105,12 +105,22 @@ fn confirm_impl(app: &mut FsApp, asset: &str, tags: &[String]) -> Result<()> {
 /// # Errors
 /// Returns an error if the state dir can't be resolved or the rejection log
 /// can't be opened/appended.
-pub fn reject(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<(), ServiceError> {
-    reject_impl(catalog_root, asset, tags).map_err(ServiceError::from)
+pub fn reject(
+    catalog_root: &Path,
+    asset: &str,
+    tags: &[String],
+    notices: &crate::notices::Notices,
+) -> Result<(), ServiceError> {
+    reject_impl(catalog_root, asset, tags, notices).map_err(ServiceError::from)
 }
 
-fn reject_impl(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<()> {
-    let path = rejections_path(catalog_root)?;
+fn reject_impl(
+    catalog_root: &Path,
+    asset: &str,
+    tags: &[String],
+    notices: &crate::notices::Notices,
+) -> Result<()> {
+    let path = rejections_path(catalog_root, notices)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -142,8 +152,8 @@ pub struct Rejection {
 ///
 /// # Errors
 /// Returns an error if the local state dir can't be resolved.
-pub fn rejections_path(catalog_root: &Path) -> Result<PathBuf> {
-    Ok(state_dir::state_dir_for(catalog_root)?.join("tag-rejections.jsonl"))
+pub fn rejections_path(catalog_root: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    Ok(state_dir::state_dir_for(catalog_root, notices)?.join("tag-rejections.jsonl"))
 }
 
 /// Loads every rejection ever appended on this machine. A missing file
@@ -153,8 +163,11 @@ pub fn rejections_path(catalog_root: &Path) -> Result<PathBuf> {
 /// line that doesn't parse means something else corrupted it (a torn
 /// write, a stray edit), and silently dropping it would silently resurface
 /// a tag the user already rejected.
-fn load_rejections(catalog_root: &Path) -> Result<BTreeSet<(String, String)>> {
-    let path = rejections_path(catalog_root)?;
+fn load_rejections(
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<BTreeSet<(String, String)>> {
+    let path = rejections_path(catalog_root, notices)?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -214,9 +227,13 @@ fn read_tags_blob(path: &Path) -> Result<Vec<TagSuggestion>> {
 /// (the model tag is part of what's displayed), and confirming or
 /// rejecting that tag clears every one of them at once, since both act on
 /// the `(asset, tag)` pair alone.
-fn pending_suggestions(catalog_root: &Path, projection: &Projection) -> Result<Vec<SuggestionRow>> {
+fn pending_suggestions(
+    catalog_root: &Path,
+    projection: &Projection,
+    notices: &crate::notices::Notices,
+) -> Result<Vec<SuggestionRow>> {
     let blobs = BlobStore::new(catalog_root);
-    let rejections = load_rejections(catalog_root)?;
+    let rejections = load_rejections(catalog_root, notices)?;
     let mut pending = Vec::new();
     for (asset_hex, _model_tag, path) in blobs
         .iter_named("tags.json.zst")
@@ -277,7 +294,7 @@ pub fn suggestions(app: &FsApp, catalog_root: &Path) -> Result<SuggestionsOutcom
 
 fn suggestions_impl(app: &FsApp, catalog_root: &Path) -> Result<SuggestionsOutcome> {
     let projection = app.projection()?;
-    let pending = pending_suggestions(catalog_root, &projection)?;
+    let pending = pending_suggestions(catalog_root, &projection, app.notices())?;
     Ok(SuggestionsOutcome { pending })
 }
 
@@ -400,9 +417,11 @@ mod confirm_reject_tests {
             &root,
             "xxh3:abc",
             &["demo".to_string(), "landscape".to_string()],
+            &crate::notices::Notices::new(),
         )
         .expect("reject");
-        let path = rejections_path(&root).expect("rejections_path");
+        let path =
+            rejections_path(&root, &crate::notices::Notices::new()).expect("rejections_path");
         let text = std::fs::read_to_string(&path).expect("read");
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("landscape"));
@@ -413,7 +432,13 @@ mod confirm_reject_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (app, asset) = seeded_app(dir.path());
         let events_before = app.events().expect("events").len();
-        reject(&dir.path().join("cat"), &asset.0, &["demo".to_string()]).expect("reject");
+        reject(
+            &dir.path().join("cat"),
+            &asset.0,
+            &["demo".to_string()],
+            &crate::notices::Notices::new(),
+        )
+        .expect("reject");
         let events_after = app.events().expect("events").len();
         assert_eq!(
             events_after, events_before,

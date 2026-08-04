@@ -35,6 +35,7 @@ use anyhow::Context as _;
 use majestical_core::event::AssetId;
 use majestical_services::app::FsApp;
 use majestical_services::error::ServiceError;
+use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
@@ -233,7 +234,7 @@ fn tag_assets_result(
             Ok(json!({"asset": args.asset, "op": "confirm_suggestion", "tags": tags}))
         }
         TagOp::RejectSuggestion(tags) => {
-            majestical_services::tags::reject(catalog, &args.asset, tags)?;
+            majestical_services::tags::reject(catalog, &args.asset, tags, &Notices::new())?;
             Ok(json!({"asset": args.asset, "op": "reject_suggestion", "tags": tags}))
         }
     }
@@ -579,10 +580,11 @@ fn add_sync_location_result(
     args: &AddSyncLocationArgs,
 ) -> anyhow::Result<serde_json::Value> {
     if !args.confirm {
-        let already_configured = majestical_services::sync::locations_list(catalog)?
-            .locations
-            .iter()
-            .any(|location| location.name == args.name);
+        let already_configured =
+            majestical_services::sync::locations_list(catalog, &Notices::new())?
+                .locations
+                .iter()
+                .any(|location| location.name == args.name);
         return Ok(json!({
             "name": args.name,
             "path": args.path,
@@ -591,7 +593,7 @@ fn add_sync_location_result(
             "would": format!("add sync location '{}' at {}", args.name, args.path.display()),
         }));
     }
-    majestical_services::sync::location_add(catalog, &args.name, &args.path)?;
+    majestical_services::sync::location_add(catalog, &args.name, &args.path, &Notices::new())?;
     Ok(json!({"name": args.name, "path": args.path}))
 }
 
@@ -610,7 +612,7 @@ fn rm_sync_location_result(
     args: &RmSyncLocationArgs,
 ) -> anyhow::Result<serde_json::Value> {
     if !args.confirm {
-        let configured = majestical_services::sync::locations_list(catalog)?
+        let configured = majestical_services::sync::locations_list(catalog, &Notices::new())?
             .locations
             .iter()
             .any(|location| location.name == args.name);
@@ -620,7 +622,7 @@ fn rm_sync_location_result(
             "would": format!("remove sync location '{}'", args.name),
         }));
     }
-    majestical_services::sync::location_rm(catalog, &args.name)?;
+    majestical_services::sync::location_rm(catalog, &args.name, &Notices::new())?;
     Ok(json!({"name": args.name}))
 }
 
@@ -648,7 +650,7 @@ fn sync_transfer_dry_run(
     location: Option<&str>,
     push: bool,
 ) -> anyhow::Result<serde_json::Value> {
-    let status = majestical_services::sync::status(catalog)?;
+    let status = majestical_services::sync::status(catalog, &Notices::new())?;
     let planned: Vec<serde_json::Value> = status
         .rows
         .iter()
@@ -811,7 +813,7 @@ fn index_run_exec(
         let app = FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;
-    majestical_services::index::update_failure_report(catalog, &outcome, kinds)?;
+    majestical_services::index::update_failure_report(catalog, &outcome, kinds, &Notices::new())?;
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
 
@@ -837,7 +839,7 @@ fn set_describer_result(
 ) -> anyhow::Result<serde_json::Value> {
     let backend = parse_backend(&args.backend)?;
     if !args.confirm {
-        let current = majestical_services::describer_config::show(catalog)?;
+        let current = majestical_services::describer_config::show(catalog, &Notices::new())?;
         return Ok(json!({
             "backend": args.backend,
             "model": args.model,
@@ -856,6 +858,7 @@ fn set_describer_result(
             base_url: args.base_url.clone(),
             api_key: args.api_key.clone(),
         },
+        &Notices::new(),
     )?;
     serde_json::to_value(&view).map_err(anyhow::Error::from)
 }
@@ -870,7 +873,7 @@ struct TestDescriberArgs {
 }
 
 fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_json::Value> {
-    let configured = majestical_services::describer_config::show(catalog)?;
+    let configured = majestical_services::describer_config::show(catalog, &Notices::new())?;
     if !confirm {
         let would = if configured.is_some() {
             "probe the configured backend's connectivity, model presence, and vision capability"
@@ -879,8 +882,11 @@ fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_
         };
         return Ok(json!({"configured": configured, "would": would}));
     }
-    let probe =
-        majestical_services::describer_config::test(catalog, crate::describer_cmd::env_api_key())?;
+    let probe = majestical_services::describer_config::test(
+        catalog,
+        crate::describer_cmd::env_api_key(),
+        &Notices::new(),
+    )?;
     serde_json::to_value(&probe).map_err(anyhow::Error::from)
 }
 
@@ -1120,6 +1126,7 @@ impl MajServer {
                 location: args.location.as_deref(),
                 only,
             },
+            &Notices::new(),
         ) {
             Ok(outcome) => {
                 let failed = outcome.overall_failed();
@@ -1163,6 +1170,7 @@ impl MajServer {
                 location: args.location.as_deref(),
                 only,
             },
+            &Notices::new(),
         ) {
             Ok(outcome) => {
                 let failed = outcome.overall_failed();

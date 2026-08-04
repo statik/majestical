@@ -92,8 +92,8 @@ struct FailureMarker {
     fingerprint: String,
 }
 
-fn markers_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("inbox-failures.json"))
+fn markers_path(catalog: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    Ok(crate::state_dir::state_dir_for(catalog, notices)?.join("inbox-failures.json"))
 }
 
 /// A missing store is empty (nothing has ever failed); an unparsable one
@@ -102,8 +102,8 @@ fn markers_path(catalog: &Path) -> Result<PathBuf> {
 /// contribution — so losing it costs one extra hash/check next pass, never
 /// correctness, and it must never turn a corrupt cache file into a hard
 /// failure of the whole pass.
-fn load_markers(catalog: &Path) -> Result<FailureMarkers> {
-    let path = markers_path(catalog)?;
+fn load_markers(catalog: &Path, notices: &crate::notices::Notices) -> Result<FailureMarkers> {
+    let path = markers_path(catalog, notices)?;
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(FailureMarkers::default());
     };
@@ -131,8 +131,12 @@ fn load_markers(catalog: &Path) -> Result<FailureMarkers> {
 /// mid-write (or a concurrent reader — `maj inbox process` has no lock
 /// against a second copy of itself) never observes a truncated or
 /// half-written store, matching `sync::SyncConfig::store`.
-fn store_markers(catalog: &Path, markers: &FailureMarkers) -> Result<()> {
-    let path = markers_path(catalog)?;
+fn store_markers(
+    catalog: &Path,
+    markers: &FailureMarkers,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
+    let path = markers_path(catalog, notices)?;
     let text = serde_json::to_string_pretty(markers).context("serializing inbox failure store")?;
     let file_name = path.file_name().map_or_else(
         || "inbox-failures.json".to_string(),
@@ -405,14 +409,14 @@ fn process_impl(app: &mut FsApp, catalog: &Path, req: &ProcessRequest) -> Result
         req.inbox.display()
     );
     let inbox_key = inbox_key(&req.inbox)?;
-    let mut markers = load_markers(catalog)?;
+    let mut markers = load_markers(catalog, app.notices())?;
     let ctx = InboxCtx {
         catalog,
         req,
         inbox_key,
     };
     let result = run_pass(app, &ctx, &mut markers);
-    store_markers(catalog, &markers)?;
+    store_markers(catalog, &markers, app.notices())?;
     Ok(InboxOutcome { rows: result? })
 }
 

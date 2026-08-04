@@ -228,6 +228,7 @@ fn run_search(app: &FsApp, catalog_dir: &Path, query: &str, limit: usize) -> Res
             &db,
             &TermSearchArgs {
                 catalog_dir,
+                notices: app.notices(),
                 terms: &parsed.terms,
                 allowed: allowed.as_ref(),
                 limit,
@@ -342,6 +343,7 @@ fn in_sources(raw: &[crate::query::RawFilter]) -> Result<Option<BTreeSet<String>
 /// house 5-positional-parameter limit.
 struct TermSearchArgs<'a> {
     catalog_dir: &'a Path,
+    notices: &'a crate::notices::Notices,
     terms: &'a [String],
     allowed: Option<&'a BTreeSet<AssetId>>,
     limit: usize,
@@ -418,7 +420,7 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
     let (text_fts, mut text_meta) =
         text_fts_search(db, args.terms, text_sources.as_ref(), fts_limit)?;
 
-    let state_dir = crate::state_dir::state_dir_for(args.catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(args.catalog_dir, args.notices)?;
     let query_text = args.terms.join(" ");
     let (image_ids, keyframe_ts, embedded) = if image_semantic_enabled(args.sources) {
         semantic_candidates(&state_dir, &query_text, semantic_limit)
@@ -671,7 +673,7 @@ fn text_coverage_notices(
                 noun: info.noun,
                 covered,
                 eligible: eligible.len(),
-                remedy: source_remedy(info.source, args.catalog_dir),
+                remedy: source_remedy(info.source, args.catalog_dir, args.notices),
                 source: info.source.to_string(),
             });
         }
@@ -688,7 +690,7 @@ const INDEX_RUN_REMEDY: &str = "run `maj index run`";
 /// status` strings (see [`transcript_model_remedy`] and [`DESCRIBER_REMEDY`]
 /// — shared consts so the two surfaces can't drift) when a capability is
 /// missing, otherwise plain [`INDEX_RUN_REMEDY`].
-fn source_remedy(source: &str, catalog_dir: &Path) -> String {
+fn source_remedy(source: &str, catalog_dir: &Path, notices: &crate::notices::Notices) -> String {
     match source {
         "transcript" => {
             let whisper = whisper_model_dir_if_present().is_some();
@@ -700,7 +702,7 @@ fn source_remedy(source: &str, catalog_dir: &Path) -> String {
             // An unreadable describer config degrades to "unconfigured"
             // here, matching `index status`'s treatment — this only
             // selects which remedy line to print.
-            let configured = crate::describer_config::load_config(catalog_dir)
+            let configured = crate::describer_config::load_config(catalog_dir, notices)
                 .ok()
                 .flatten()
                 .is_some();

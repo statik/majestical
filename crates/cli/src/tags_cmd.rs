@@ -61,7 +61,10 @@ pub(crate) fn cmd_confirm(app: &mut FsApp, asset: &str, tags: &[String]) -> Resu
 /// Returns an error if the state dir can't be resolved or the rejection
 /// log can't be opened/appended.
 pub(crate) fn cmd_reject(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<()> {
-    majestical_services::tags::reject(catalog_root, asset, tags)?;
+    let notices = majestical_services::notices::Notices::new();
+    let result = majestical_services::tags::reject(catalog_root, asset, tags, &notices);
+    crate::drain_notices(&notices);
+    result?;
     println!(
         "{} tag(s) rejected on {asset} (this machine only)",
         tags.len()

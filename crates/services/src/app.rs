@@ -29,7 +29,7 @@ impl Clock for SystemClock {
 }
 
 /// Records a diagnostic when reading an event log skipped corrupt lines.
-/// Shared by `App::events` (a full read) and `commands::open_catalog` (an
+/// Shared by `App::events` (a full read) and `catalog::open_catalog` (an
 /// incremental or full sqlite sync) so the message can't drift between the
 /// two call sites that both count skipped lines from the same underlying log.
 pub fn note_skipped_corrupt_lines(

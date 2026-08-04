@@ -550,17 +550,10 @@ fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
 
 /// Prints every service-collected diagnostic to stderr, verbatim and in
 /// order — the CLI head's half of the `crates/services` notices contract.
-/// Called after each dispatch that opened an app, including on the error
-/// path, so a warning collected before a failure still reaches the user.
-fn print_notices(app: &FsApp) {
-    drain_notices(app.notices());
-}
-
-/// The same drain for service entry points that take no `FsApp` (`sync`,
-/// `describer`, `tags reject`): the head owns the sink there, and prints it
-/// as soon as the call returns — before rendering the outcome — so these
-/// lines keep the stderr position they had when services printed them
-/// directly.
+/// Service entry points that take no `FsApp` (`sync`, `describer`, `tags
+/// reject`) call this themselves as soon as the call returns, before
+/// rendering the outcome, so these lines keep the stderr position they had
+/// when services printed them directly.
 pub(crate) fn drain_notices(notices: &Notices) {
     for line in notices.drain() {
         eprintln!("{line}");
@@ -578,7 +571,7 @@ fn with_app(
 ) -> Result<()> {
     let mut app = FsApp::open(catalog, machine_id, author)?;
     let result = run(&mut app);
-    print_notices(&app);
+    drain_notices(app.notices());
     result
 }
 

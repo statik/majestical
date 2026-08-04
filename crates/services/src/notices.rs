@@ -51,4 +51,23 @@ mod tests {
         assert_eq!(notices.drain(), vec!["first", "second"]);
         assert!(notices.drain().is_empty(), "drain must empty the buffer");
     }
+
+    #[test]
+    fn a_poisoned_lock_still_collects_and_drains() {
+        let notices = std::sync::Arc::new(Notices::default());
+        notices.push("before");
+        let poisoner = std::sync::Arc::clone(&notices);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().expect("lock");
+            panic!("poisoning the mutex on purpose");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread must have panicked");
+        notices.push("after");
+        assert_eq!(
+            notices.drain(),
+            vec!["before", "after"],
+            "a panic elsewhere must not cost us diagnostics"
+        );
+    }
 }

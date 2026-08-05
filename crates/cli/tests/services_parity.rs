@@ -94,9 +94,11 @@ fn diff_against_ref_independent(
 /// output embeds an absolute path under the shared root (e.g. `para
 /// archive --root <dir>`'s "moved X -> Y" line), where two independently
 /// seeded roots would print two different, non-comparable paths.
-/// `between` undoes the `new` binary's filesystem side effect (e.g.
-/// renaming the archived directory back) so the `ref` binary's call is
-/// also a genuine first application against the same paths.
+/// `between` restores whatever shared state the `new` binary's call
+/// consumed — undoing a filesystem move by renaming the archived directory
+/// back, or dropping the derived state dir so a log the first call already
+/// synced past is read afresh — so the `ref` binary's call is also a
+/// genuine first application against the same paths.
 #[cfg(test)]
 fn diff_against_ref_with_between(root: &Path, state: &Path, args: &[&str], between: impl FnOnce()) {
     let reference = Path::new("/tmp/maj-ref");

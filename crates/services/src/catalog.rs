@@ -253,7 +253,9 @@ fn get_asset_impl(app: &FsApp, catalog_dir: &Path, asset_id: &str) -> Result<Opt
         verifications: build_verifications(&projection, &asset),
         has_thumb: thumb_exists(catalog_dir, asset_id),
         // The unknown-asset arm above returns before this, leaving anything
-        // collected in the buffer for the head's own leftover drain.
+        // collected in the buffer to the head: the CLI's `with_app` drains
+        // leftovers after every dispatch, while the MCP head builds an
+        // `FsApp` per call and currently drops the buffer with it.
         notices: app.notices().drain(),
     }))
 }

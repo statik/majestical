@@ -21,6 +21,13 @@ gui-check:
 gui-build:
     cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
 
+# The GUI workspace carries its own copy of the root lint table (a standalone
+# workspace cannot inherit one), so it needs its own gate — `just check` above
+# only ever sees the headless workspace.
+gui-lint:
+    cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
+    cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
 version-sync:
     ./scripts/version-sync.sh
 

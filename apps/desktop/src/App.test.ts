@@ -25,6 +25,12 @@ afterEach(() => {
 
 const ready: AppStatus = { catalog_path: "/catalogs/main", catalog_ready: true };
 
+// `UpdateBanner` mounts alongside every surface below and asks the updater
+// plugin what is newer. These tests are about the shell, so it is answered
+// with "nothing" rather than left to reject — `UpdateBanner.test.ts` is where
+// the offer and its failure paths are pinned.
+const UPDATE_CHECK = "plugin:updater|check";
+
 const hit: SearchHit = {
   asset: "xxh3:abc123",
   score: 1,
@@ -57,6 +63,7 @@ const detail: AssetDetail = {
 function mockStatus(status: AppStatus) {
   mockIPC((cmd) => {
     if (cmd === "app_status") return status;
+    if (cmd === UPDATE_CHECK) return null;
     if (cmd === "list_saved_searches") return { saved: [] };
     throw new Error(`unexpected command ${cmd}`);
   });
@@ -67,6 +74,7 @@ function mockStatus(status: AppStatus) {
 function mockCatalog(volumeLabels: string[]) {
   mockIPC((cmd) => {
     if (cmd === "app_status") return ready;
+    if (cmd === UPDATE_CHECK) return null;
     if (cmd === "list_saved_searches") return { saved: [] };
     if (cmd === "search_assets") return { count: 1, results: [hit] };
     if (cmd === "get_asset") return detail;

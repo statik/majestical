@@ -3,6 +3,7 @@
   import type { AppStatus } from "./lib/api";
   import Inspector from "./lib/Inspector.svelte";
   import SearchView from "./lib/SearchView.svelte";
+  import UpdateBanner from "./lib/UpdateBanner.svelte";
   import VolumesView from "./lib/VolumesView.svelte";
   import Welcome from "./lib/Welcome.svelte";
 
@@ -46,6 +47,12 @@
 </script>
 
 <main>
+  <!-- Mounted only once `app_status` has answered, so the update check can
+       never be what the first paint is waiting on. It outlives the branch
+       below: an update is worth offering whether or not a catalog is open. -->
+  {#if status !== null}
+    <UpdateBanner />
+  {/if}
   {#if error}
     <p class="error" role="alert">{error}</p>
     <button class="retry" onclick={() => void retry()}>Retry</button>

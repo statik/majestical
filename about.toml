@@ -1,0 +1,35 @@
+# The third-party license bundle shipped with each release, built from the
+# desktop app's dependency graph (apps/desktop/src-tauri/Cargo.toml). Because
+# this config sits at the repo root and the manifest does not, both paths are
+# passed explicitly — see the licenses step in .github/workflows/release.yml
+# and docs/RELEASING.md.
+#
+# `accepted` is exactly the license set the graph resolves to today, in
+# cargo-about's precedence order: a crate offering a choice is listed under
+# the first of these it allows, so Apache-2.0 leading is what puts the
+# Apache-or-MIT majority of the ecosystem under Apache-2.0. Nothing
+# speculative belongs here — an unlisted license fails the build, which is
+# the point: a new dependency on unfamiliar terms stops a release rather than
+# quietly joining the bundle.
+accepted = [
+  "Apache-2.0",  # 436 crates
+  "MIT",         # 149 crates
+  "BSD-3-Clause",       # brotli, encoding_rs, exr, ravif and five more
+  "BSD-2-Clause",       # arrayref, av1-grain, cedarwood, rav1e, v_frame
+  "ISC",                # ring, rustls-webpki, untrusted
+  "Unicode-3.0",        # the icu_* crates, via tauri's URL and text handling
+  "MPL-2.0",            # cssparser, cssparser-macros, dtoa-short, selectors, option-ext
+  "Zlib",               # foldhash
+  "BSL-1.0",            # xxhash-rust, the catalog's content-address hash
+  "Unlicense",          # whisper-rs, whisper-rs-sys
+  "CDLA-Permissive-2.0" # webpki-roots
+]
+
+# Both release targets, so a crate whose license differs per platform is
+# caught here rather than in one of the two matrix builds.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+# Neither ships in the bundle: build scripts run on the builder and dev
+# dependencies are test-only.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

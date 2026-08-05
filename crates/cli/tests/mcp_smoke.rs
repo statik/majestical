@@ -221,15 +221,16 @@ fn search_assets_rows_match_service_outcome() {
     );
 }
 
-/// The notices contract end-to-end: a diagnostic that used to be stderr
-/// (invisible to an MCP client, which never sees the server's stderr) now
-/// rides the outcome struct. Deterministic trigger: a corrupt event-log
-/// line. The query is filter-only, so no model needs to be installed for
-/// this to be the notice that shows up.
-#[test]
-fn search_assets_surfaces_notices_in_structured_content() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (root, state) = common::fixture_catalog(dir.path());
+/// Appends a line the event-log reader can't parse to this machine's only
+/// segment, so the next read of the log records the corrupt-line warning —
+/// the cheapest deterministic notice source these tests have. Only the read
+/// that first passes the corrupt line records it (the sqlite view remembers
+/// how far it synced), so the call under test must be the session's first.
+///
+/// `#[cfg(test)]` for the same reason it's on `Mcp`'s methods above: clippy's
+/// `allow-expect-in-tests` keys off the attribute, not the ambient cfg.
+#[cfg(test)]
+fn corrupt_the_event_log(root: &std::path::Path) {
     let machine_dir = root.join("events").join("test-machine");
     let segment = std::fs::read_dir(&machine_dir)
         .expect("machine events dir")
@@ -240,6 +241,18 @@ fn search_assets_surfaces_notices_in_structured_content() {
     let mut bytes = std::fs::read(&segment).expect("read segment");
     bytes.extend_from_slice(b"this is not json\n");
     std::fs::write(&segment, bytes).expect("re-write segment");
+}
+
+/// The notices contract end-to-end: a diagnostic that used to be stderr
+/// (invisible to an MCP client, which never sees the server's stderr) now
+/// rides the outcome struct. Deterministic trigger: a corrupt event-log
+/// line. The query is filter-only, so no model needs to be installed for
+/// this to be the notice that shows up.
+#[test]
+fn search_assets_surfaces_notices_in_structured_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    corrupt_the_event_log(&root);
 
     let mut mcp = Mcp::spawn(&root, &state);
     let resp = mcp.call_tool("search_assets", &serde_json::json!({"query": "tag:none"}));
@@ -743,6 +756,69 @@ fn every_mutating_tool_documents_the_confirm_gate() {
             "{name}: confirm must default to false, not be required: {tool}"
         );
     }
+}
+
+/// A hand-built write-tool response — one with no outcome struct of its own
+/// to carry a `notices` field — still hands its diagnostics to the client,
+/// via `with_notices`. `tag_assets`'s dry run reads the projection through
+/// the app whose sink collects the warning, so this exercises the fold on a
+/// response assembled entirely from `json!`.
+#[test]
+fn tag_assets_dry_run_folds_notices_into_its_hand_built_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({"asset": asset, "op": "add", "tag": "kf"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
+/// `get_asset`'s unknown-id arm is the one read-tool response with no
+/// outcome struct behind it: the asset that would have carried the notices
+/// does not exist. The buffer still reaches the client rather than dying
+/// with the per-call app.
+#[test]
+fn get_asset_not_found_folds_notices_into_its_hand_built_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "get_asset",
+        &serde_json::json!({"asset_id": "xxh3:deadbeefdeadbeefdeadbeefdeadbeef"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["found"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
 }
 
 #[test]

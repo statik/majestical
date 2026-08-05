@@ -166,6 +166,7 @@ fn explicitly_requested_keyframes(kinds: Option<&[String]>) -> bool {
 /// read/written.
 fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> Result<()> {
     let outcome = majestical_services::index::run(app, catalog_dir, req)?;
+    crate::print_notices(&outcome.notices);
     majestical_services::index::update_failure_report(
         catalog_dir,
         &outcome,
@@ -278,6 +279,7 @@ fn print_last_run_failures(failures: &serde_json::Value) {
 /// can't be resolved.
 pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let outcome = majestical_services::index::status(app, catalog_dir)?;
+    crate::print_notices(&outcome.notices);
     if json {
         println!(
             "{}",

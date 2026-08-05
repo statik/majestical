@@ -213,31 +213,37 @@ fn tag_assets_result(
                 args.asset
             ),
         };
-        return Ok(json!({
-            "asset": args.asset,
-            "op": args.op,
-            "current_tags": current_tags,
-            "would": would,
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "asset": args.asset,
+                "op": args.op,
+                "current_tags": current_tags,
+                "would": would,
+            }),
+            app.notices().drain(),
+        ));
     }
-    match op {
+    let done = match op {
         TagOp::Add(tag) => {
             majestical_services::tags::tag_add(app, &args.asset, tag)?;
-            Ok(json!({"asset": args.asset, "op": "add", "tag": tag}))
+            json!({"asset": args.asset, "op": "add", "tag": tag})
         }
         TagOp::Rm(tag) => {
             majestical_services::tags::tag_rm(app, &args.asset, tag)?;
-            Ok(json!({"asset": args.asset, "op": "rm", "tag": tag}))
+            json!({"asset": args.asset, "op": "rm", "tag": tag})
         }
         TagOp::ConfirmSuggestion(tags) => {
             majestical_services::tags::confirm(app, &args.asset, tags)?;
-            Ok(json!({"asset": args.asset, "op": "confirm_suggestion", "tags": tags}))
+            json!({"asset": args.asset, "op": "confirm_suggestion", "tags": tags})
         }
+        // `reject` is app-less (a state-dir file, never an event), so it
+        // records into the app's sink directly rather than a second one.
         TagOp::RejectSuggestion(tags) => {
-            majestical_services::tags::reject(catalog, &args.asset, tags, &Notices::new())?;
-            Ok(json!({"asset": args.asset, "op": "reject_suggestion", "tags": tags}))
+            majestical_services::tags::reject(catalog, &args.asset, tags, app.notices())?;
+            json!({"asset": args.asset, "op": "reject_suggestion", "tags": tags})
         }
-    }
+    };
+    Ok(super::with_notices(done, app.notices().drain()))
 }
 
 /// Params for `set_metadata`.
@@ -262,18 +268,24 @@ fn set_metadata_result(
         .next()
         .map(|(_, v)| v);
     if !args.confirm {
-        return Ok(json!({
-            "asset": args.asset,
-            "field": args.field,
-            "current_value": current_value,
-            "new_value": args.value,
-            "would": format!(
-                "set field '{}' on {} to '{}'", args.field, args.asset, args.value
-            ),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "asset": args.asset,
+                "field": args.field,
+                "current_value": current_value,
+                "new_value": args.value,
+                "would": format!(
+                    "set field '{}' on {} to '{}'", args.field, args.asset, args.value
+                ),
+            }),
+            app.notices().drain(),
+        ));
     }
     majestical_services::meta::meta_set(app, &args.asset, &args.field, &args.value)?;
-    Ok(json!({"asset": args.asset, "field": args.field, "value": args.value}))
+    Ok(super::with_notices(
+        json!({"asset": args.asset, "field": args.field, "value": args.value}),
+        app.notices().drain(),
+    ))
 }
 
 /// Params for `move_para`. Fields required depend on `op`: `add` needs
@@ -312,17 +324,23 @@ fn move_para_add(app: &mut FsApp, args: &MoveParaArgs) -> anyhow::Result<serde_j
         let already_exists = projection
             .para_nodes()
             .any(|(_, st)| !st.archived() && st.kind() == Some(kind) && st.name() == Some(name));
-        return Ok(json!({
-            "op": "add",
-            "kind": kind_str,
-            "name": name,
-            "already_exists": already_exists,
-            "would": format!("create a new {kind_str} node named '{name}'"),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "op": "add",
+                "kind": kind_str,
+                "name": name,
+                "already_exists": already_exists,
+                "would": format!("create a new {kind_str} node named '{name}'"),
+            }),
+            app.notices().drain(),
+        ));
     }
     let majestical_services::para::NodeId(node_id) =
         majestical_services::para::add(app, kind_str, name)?;
-    Ok(json!({"op": "add", "kind": kind_str, "name": name, "node_id": node_id}))
+    Ok(super::with_notices(
+        json!({"op": "add", "kind": kind_str, "name": name, "node_id": node_id}),
+        app.notices().drain(),
+    ))
 }
 
 fn move_para_rename(app: &mut FsApp, args: &MoveParaArgs) -> anyhow::Result<serde_json::Value> {
@@ -343,16 +361,22 @@ fn move_para_rename(app: &mut FsApp, args: &MoveParaArgs) -> anyhow::Result<serd
                     .para_node(&id)
                     .and_then(|st| st.name().map(str::to_string))
             });
-        return Ok(json!({
-            "op": "rename",
-            "node": node,
-            "new_name": name,
-            "current_name": current_name,
-            "would": format!("rename {node} to '{name}'"),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "op": "rename",
+                "node": node,
+                "new_name": name,
+                "current_name": current_name,
+                "would": format!("rename {node} to '{name}'"),
+            }),
+            app.notices().drain(),
+        ));
     }
     majestical_services::para::rename(app, node, name)?;
-    Ok(json!({"op": "rename", "node": node, "name": name}))
+    Ok(super::with_notices(
+        json!({"op": "rename", "node": node, "name": name}),
+        app.notices().drain(),
+    ))
 }
 
 /// `move_para`'s archive op: a natural-plan tool (`para::archive`'s own
@@ -412,7 +436,10 @@ fn scan_volume_result(app: &mut FsApp, args: &ScanVolumeArgs) -> anyhow::Result<
         }));
     }
     let outcome = majestical_services::scan::scan(app, &args.dir, args.volume.clone())?;
-    Ok(json!({"dir": args.dir, "assets": outcome.assets, "volume_id": outcome.volume_id}))
+    Ok(super::with_notices(
+        json!({"dir": args.dir, "assets": outcome.assets, "volume_id": outcome.volume_id}),
+        app.notices().drain(),
+    ))
 }
 
 /// Params for `verify_volume`.
@@ -580,21 +607,28 @@ fn add_sync_location_result(
     args: &AddSyncLocationArgs,
 ) -> anyhow::Result<serde_json::Value> {
     if !args.confirm {
-        let already_configured =
-            majestical_services::sync::locations_list(catalog, &Notices::new())?
-                .locations
-                .iter()
-                .any(|location| location.name == args.name);
-        return Ok(json!({
-            "name": args.name,
-            "path": args.path,
-            "already_configured": already_configured,
-            "path_accessible": args.path.is_dir(),
-            "would": format!("add sync location '{}' at {}", args.name, args.path.display()),
-        }));
+        let listed = majestical_services::sync::locations_list(catalog)?;
+        let already_configured = listed
+            .locations
+            .iter()
+            .any(|location| location.name == args.name);
+        return Ok(super::with_notices(
+            json!({
+                "name": args.name,
+                "path": args.path,
+                "already_configured": already_configured,
+                "path_accessible": args.path.is_dir(),
+                "would": format!("add sync location '{}' at {}", args.name, args.path.display()),
+            }),
+            listed.notices,
+        ));
     }
-    majestical_services::sync::location_add(catalog, &args.name, &args.path, &Notices::new())?;
-    Ok(json!({"name": args.name, "path": args.path}))
+    let notices = Notices::new();
+    majestical_services::sync::location_add(catalog, &args.name, &args.path, &notices)?;
+    Ok(super::with_notices(
+        json!({"name": args.name, "path": args.path}),
+        notices.drain(),
+    ))
 }
 
 /// Params for `rm_sync_location`.
@@ -612,18 +646,26 @@ fn rm_sync_location_result(
     args: &RmSyncLocationArgs,
 ) -> anyhow::Result<serde_json::Value> {
     if !args.confirm {
-        let configured = majestical_services::sync::locations_list(catalog, &Notices::new())?
+        let listed = majestical_services::sync::locations_list(catalog)?;
+        let configured = listed
             .locations
             .iter()
             .any(|location| location.name == args.name);
-        return Ok(json!({
-            "name": args.name,
-            "configured": configured,
-            "would": format!("remove sync location '{}'", args.name),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "name": args.name,
+                "configured": configured,
+                "would": format!("remove sync location '{}'", args.name),
+            }),
+            listed.notices,
+        ));
     }
-    majestical_services::sync::location_rm(catalog, &args.name, &Notices::new())?;
-    Ok(json!({"name": args.name}))
+    let notices = Notices::new();
+    majestical_services::sync::location_rm(catalog, &args.name, &notices)?;
+    Ok(super::with_notices(
+        json!({"name": args.name}),
+        notices.drain(),
+    ))
 }
 
 /// Params shared by `sync_push`/`sync_pull`.
@@ -650,7 +692,7 @@ fn sync_transfer_dry_run(
     location: Option<&str>,
     push: bool,
 ) -> anyhow::Result<serde_json::Value> {
-    let status = majestical_services::sync::status(catalog, &Notices::new())?;
+    let status = majestical_services::sync::status(catalog)?;
     let planned: Vec<serde_json::Value> = status
         .rows
         .iter()
@@ -679,7 +721,10 @@ fn sync_transfer_dry_run(
             }
         })
         .collect();
-    Ok(json!({"readonly": status.readonly, "planned": planned}))
+    Ok(super::with_notices(
+        json!({"readonly": status.readonly, "planned": planned}),
+        status.notices,
+    ))
 }
 
 /// Params for `inbox_process`.
@@ -809,11 +854,15 @@ fn index_run_exec(
         threads: args.threads,
         api_key: crate::describer_cmd::env_api_key(),
     };
-    let outcome = super::run_off_tokio_runtime(|| {
+    let mut outcome = super::run_off_tokio_runtime(|| {
         let app = FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;
-    majestical_services::index::update_failure_report(catalog, &outcome, kinds, &Notices::new())?;
+    let notices = Notices::new();
+    majestical_services::index::update_failure_report(catalog, &outcome, kinds, &notices)?;
+    // The marker update runs after the pass, so its diagnostics belong at the
+    // end of the run's own list rather than in a second field.
+    outcome.notices.extend(notices.drain());
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
 
@@ -838,17 +887,21 @@ fn set_describer_result(
     args: &SetDescriberArgs,
 ) -> anyhow::Result<serde_json::Value> {
     let backend = parse_backend(&args.backend)?;
+    let notices = Notices::new();
     if !args.confirm {
-        let current = majestical_services::describer_config::show(catalog, &Notices::new())?;
-        return Ok(json!({
-            "backend": args.backend,
-            "model": args.model,
-            "base_url": args.base_url,
-            "current": current,
-            "would": format!(
-                "configure the describer backend to {} model '{}'", args.backend, args.model
-            ),
-        }));
+        let current = majestical_services::describer_config::show(catalog, &notices)?;
+        return Ok(super::with_notices(
+            json!({
+                "backend": args.backend,
+                "model": args.model,
+                "base_url": args.base_url,
+                "current": current,
+                "would": format!(
+                    "configure the describer backend to {} model '{}'", args.backend, args.model
+                ),
+            }),
+            notices.drain(),
+        ));
     }
     let view = majestical_services::describer_config::set(
         catalog,
@@ -858,9 +911,12 @@ fn set_describer_result(
             base_url: args.base_url.clone(),
             api_key: args.api_key.clone(),
         },
-        &Notices::new(),
+        &notices,
     )?;
-    serde_json::to_value(&view).map_err(anyhow::Error::from)
+    Ok(super::with_notices(
+        serde_json::to_value(&view)?,
+        notices.drain(),
+    ))
 }
 
 /// Params for `test_describer`.
@@ -873,21 +929,28 @@ struct TestDescriberArgs {
 }
 
 fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_json::Value> {
-    let configured = majestical_services::describer_config::show(catalog, &Notices::new())?;
+    let notices = Notices::new();
+    let configured = majestical_services::describer_config::show(catalog, &notices)?;
     if !confirm {
         let would = if configured.is_some() {
             "probe the configured backend's connectivity, model presence, and vision capability"
         } else {
             "fail: no describer configured yet"
         };
-        return Ok(json!({"configured": configured, "would": would}));
+        return Ok(super::with_notices(
+            json!({"configured": configured, "would": would}),
+            notices.drain(),
+        ));
     }
     let probe = majestical_services::describer_config::test(
         catalog,
         crate::describer_cmd::env_api_key(),
-        &Notices::new(),
+        &notices,
     )?;
-    serde_json::to_value(&probe).map_err(anyhow::Error::from)
+    Ok(super::with_notices(
+        serde_json::to_value(&probe)?,
+        notices.drain(),
+    ))
 }
 
 /// Params for `rm_saved_search`.
@@ -908,14 +971,20 @@ fn rm_saved_search_result(
         .into_iter()
         .any(|saved| saved.name == args.name);
     if !args.confirm {
-        return Ok(json!({
-            "name": args.name,
-            "exists": exists,
-            "would": format!("remove saved search '{}'", args.name),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "name": args.name,
+                "exists": exists,
+                "would": format!("remove saved search '{}'", args.name),
+            }),
+            app.notices().drain(),
+        ));
     }
     majestical_services::search::searches_rm(app, &args.name)?;
-    Ok(json!({"name": args.name}))
+    Ok(super::with_notices(
+        json!({"name": args.name}),
+        app.notices().drain(),
+    ))
 }
 
 #[tool_router(router = write_tool_router, vis = "pub(super)")]
@@ -1126,7 +1195,6 @@ impl MajServer {
                 location: args.location.as_deref(),
                 only,
             },
-            &Notices::new(),
         ) {
             Ok(outcome) => {
                 let failed = outcome.overall_failed();
@@ -1170,7 +1238,6 @@ impl MajServer {
                 location: args.location.as_deref(),
                 only,
             },
-            &Notices::new(),
         ) {
             Ok(outcome) => {
                 let failed = outcome.overall_failed();

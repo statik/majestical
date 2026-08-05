@@ -61,25 +61,15 @@ pub fn model_dir_if_present() -> Option<PathBuf> {
 
 /// The configured describer's blob derivation tag, or `None` when no
 /// describer is configured. An unreadable/unparsable `describer.toml`
-/// degrades to unconfigured with a stderr note — a broken describer config
-/// must never kill the rest of indexing.
+/// degrades to unconfigured with a notice — a broken describer config must
+/// never kill the rest of indexing.
 fn describer_model_tag(catalog_root: &Path, notices: &crate::notices::Notices) -> Option<String> {
     match load_config(catalog_root, notices) {
         Ok(config) => config.map(|c| c.model_tag()),
         Err(err) => {
-            // See the `#[expect]` note on `warn_skipped_corrupt_lines` in
-            // app.rs: services inherits print_stderr = "deny" crate-wide;
-            // this is a verbatim stderr diagnostic moved from cli, not yet
-            // a rendered outcome.
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!(
-                    "note: ignoring broken describer config ({err:#}) — captions degrade to unconfigured"
-                );
-            }
+            notices.push(format!(
+                "note: ignoring broken describer config ({err:#}) — captions degrade to unconfigured"
+            ));
             None
         }
     }
@@ -161,9 +151,12 @@ pub fn build_plan(
 
 /// Reads the last run's failure marker. A missing file is an empty report
 /// (a fresh catalog has no last run to report on); an unparsable one is
-/// noted on stderr and treated as empty — the next run overwrites it.
+/// noted and treated as empty — the next run overwrites it.
 #[must_use]
-pub fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+pub fn read_failure_report(
+    state_dir: &Path,
+    notices: &crate::notices::Notices,
+) -> serde_json::Map<String, serde_json::Value> {
     let path = state_dir.join(FAILURES_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
         return serde_json::Map::new();
@@ -171,16 +164,10 @@ pub fn read_failure_report(state_dir: &Path) -> serde_json::Map<String, serde_js
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) {
         map
     } else {
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!(
-                "note: ignoring unparsable failure report at {} — treating as empty",
-                path.display()
-            );
-        }
+        notices.push(format!(
+            "note: ignoring unparsable failure report at {} — treating as empty",
+            path.display()
+        ));
         serde_json::Map::new()
     }
 }
@@ -273,7 +260,7 @@ fn update_failure_report_impl(
     notices: &crate::notices::Notices,
 ) -> Result<()> {
     let state_dir = crate::state_dir::state_dir_for(catalog_dir, notices)?;
-    let previous = read_failure_report(&state_dir);
+    let previous = read_failure_report(&state_dir, notices);
     let current = failure_report_json(outcome);
     let merged = merge_failure_report(previous, &current, kinds);
     write_failure_report(&state_dir, &merged)
@@ -320,6 +307,10 @@ pub struct IndexStatusOutcome {
     pub transcripts_remedy: Option<String>,
     pub captions_remedy: Option<String>,
     pub failed_last_run: serde_json::Value,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj index status`: the derivation queue's current state per kind
@@ -340,7 +331,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
     let caps = capabilities(catalog_dir, app.notices());
     let plan = build_plan(&projection, &blobs, &kinds, &caps);
-    let failures = read_failure_report(&state_dir);
+    let failures = read_failure_report(&state_dir, app.notices());
     let transcripts_remedy = (plan.transcripts.needs_model > 0)
         .then(|| transcript_model_remedy(caps.whisper, caps.text_model))
         .flatten();
@@ -356,6 +347,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
         transcripts_remedy,
         captions_remedy,
         failed_last_run: serde_json::Value::Object(failures),
+        notices: app.notices().drain(),
     })
 }
 
@@ -472,6 +464,7 @@ mod tests {
                 failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
             },
             captions: CaptionOutcome::default(),
+            notices: Vec::new(),
         };
         let report = failure_report_json(&outcomes);
         let map = report.as_object().expect("object");
@@ -541,12 +534,30 @@ mod tests {
                 failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
             },
             captions: CaptionOutcome::default(),
+            notices: Vec::new(),
         };
         let kinds: BTreeSet<String> = ["pdf".to_string()].into();
         let notices = crate::notices::Notices::new();
         update_failure_report(&root, &outcome, &kinds, &notices).expect("update");
         let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
-        let report = read_failure_report(&state_dir);
+        let report = read_failure_report(&state_dir, &notices);
         assert_eq!(report["pdf"][0]["error"], "not a valid pdf");
+    }
+
+    /// A marker file the next run will overwrite anyway must never be a hard
+    /// failure — it degrades to an empty report plus one notice.
+    #[test]
+    fn unparsable_failure_report_is_a_notice() {
+        let state = tempfile::tempdir().expect("tempdir");
+        std::fs::write(state.path().join(FAILURES_FILE), b"{ not json").expect("plant");
+        let notices = crate::notices::Notices::new();
+        let report = read_failure_report(state.path(), &notices);
+        assert!(report.is_empty());
+        let drained = notices.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].contains("ignoring unparsable failure report"),
+            "{drained:?}"
+        );
     }
 }

@@ -72,6 +72,16 @@ fn structured_ok<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+/// Folds any service-collected diagnostics into a hand-built tool response —
+/// the write-tool analogue of an outcome struct's own `notices` field. Absent
+/// when empty, same contract.
+fn with_notices(mut value: serde_json::Value, notices: Vec<String>) -> serde_json::Value {
+    if !notices.is_empty() {
+        value["notices"] = serde_json::Value::from(notices);
+    }
+    value
+}
+
 /// Runs `f` on a plain, tokio-unaffiliated OS thread. Every `#[tool]`
 /// handler's own thread is already inside this server's tokio runtime (see
 /// `serve` below), but some `majestical_services`/`majestical_index` calls

@@ -59,6 +59,10 @@ struct RunSavedSearchArgs {
 #[derive(Serialize)]
 struct SavedSearchesResult {
     saved: Vec<majestical_services::search::SavedSearch>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    notices: Vec<String>,
 }
 
 /// Runs `req` on a plain OS thread, off this server's own tokio runtime —
@@ -120,7 +124,10 @@ impl MajServer {
                 Ok(asset) => CallToolResult::structured(json!({ "found": true, "asset": asset })),
                 Err(err) => super::tool_error(err),
             },
-            Ok(None) => CallToolResult::structured(json!({ "found": false })),
+            Ok(None) => CallToolResult::structured(super::with_notices(
+                json!({ "found": false }),
+                app.notices().drain(),
+            )),
             Err(err) => super::tool_error(err),
         }
     }
@@ -147,7 +154,10 @@ impl MajServer {
             Err(result) => return result,
         };
         match majestical_services::search::searches_list(&app) {
-            Ok(saved) => super::structured_ok(&SavedSearchesResult { saved }),
+            Ok(saved) => super::structured_ok(&SavedSearchesResult {
+                saved,
+                notices: app.notices().drain(),
+            }),
             Err(err) => super::tool_error(err),
         }
     }
@@ -173,7 +183,7 @@ impl MajServer {
     /// fresh from real files; never executes a transfer.
     #[tool]
     fn sync_status(&self) -> CallToolResult {
-        match majestical_services::sync::status(&self.catalog, &Notices::new()) {
+        match majestical_services::sync::status(&self.catalog) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
@@ -200,7 +210,7 @@ impl MajServer {
         if let Err(result) = self.ensure_catalog() {
             return result;
         }
-        match majestical_services::sync::locations_list(&self.catalog, &Notices::new()) {
+        match majestical_services::sync::locations_list(&self.catalog) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
@@ -214,14 +224,19 @@ impl MajServer {
         if let Err(result) = self.ensure_catalog() {
             return result;
         }
-        match majestical_services::describer_config::show(&self.catalog, &Notices::new()) {
+        let notices = Notices::new();
+        match majestical_services::describer_config::show(&self.catalog, &notices) {
             Ok(Some(view)) => match serde_json::to_value(&view) {
-                Ok(describer) => CallToolResult::structured(
+                Ok(describer) => CallToolResult::structured(super::with_notices(
                     json!({ "configured": true, "describer": describer }),
-                ),
+                    notices.drain(),
+                )),
                 Err(err) => super::tool_error(err),
             },
-            Ok(None) => CallToolResult::structured(json!({ "configured": false })),
+            Ok(None) => CallToolResult::structured(super::with_notices(
+                json!({ "configured": false }),
+                notices.drain(),
+            )),
             Err(err) => super::tool_error(err),
         }
     }

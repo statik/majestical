@@ -370,6 +370,8 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         args.dedupe,
     )?;
 
+    crate::print_notices(&planned.notices);
+
     if args.dry_run {
         print_ingest_plan(&planned.plan, &planned.subdir, &args.dest, args.json);
         return Ok(());
@@ -389,6 +391,7 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         },
         &mut |line: &str| eprintln!("{line}"),
     )?;
+    crate::print_notices(&run.notices);
     print_ingest_outcome(&run.run_id, &run.outcome, &run.generations, args.json);
     anyhow::ensure!(
         run.outcome.failed.is_empty()

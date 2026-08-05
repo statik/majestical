@@ -98,6 +98,10 @@ pub struct IngestPlanOutcome {
     pub node_id: String,
     pub source_volume_id: String,
     pub source_volume_label: String,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// The plan half of `maj ingest`: resolves `para` to an active node,
@@ -140,6 +144,7 @@ fn plan_impl(
         node_id,
         source_volume_id,
         source_volume_label,
+        notices: app.notices().drain(),
     })
 }
 
@@ -169,6 +174,10 @@ pub struct IngestRun {
     pub run_id: String,
     pub outcome: engine::Outcome,
     pub generations: Vec<(PathBuf, mhl::WrittenGeneration)>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Runs (or resumes) one verified-copy pass: opens/creates the run's
@@ -252,6 +261,7 @@ fn run_ingest_impl(
         run_id,
         outcome,
         generations,
+        notices: app.notices().drain(),
     })
 }
 

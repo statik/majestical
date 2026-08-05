@@ -311,6 +311,10 @@ pub enum StatusRow {
 pub struct SyncStatusOutcome {
     pub rows: Vec<StatusRow>,
     pub readonly: bool,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Plans both directions for one location, read-only: it only ever calls
@@ -361,16 +365,14 @@ fn plan_both_directions(
 /// # Errors
 /// Returns an error when there's no catalog at `catalog_dir`, or no sync
 /// locations are configured.
-pub fn status(
-    catalog_dir: &Path,
-    notices: &crate::notices::Notices,
-) -> Result<SyncStatusOutcome, ServiceError> {
-    status_impl(catalog_dir, notices).map_err(ServiceError::from)
+pub fn status(catalog_dir: &Path) -> Result<SyncStatusOutcome, ServiceError> {
+    status_impl(catalog_dir).map_err(ServiceError::from)
 }
 
-fn status_impl(catalog_dir: &Path, notices: &crate::notices::Notices) -> Result<SyncStatusOutcome> {
+fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
+    let notices = crate::notices::Notices::new();
     ensure_catalog(catalog_dir)?;
-    let cfg = SyncConfig::load(&config_path(catalog_dir, notices)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     let targets = resolve_targets(&cfg, None)?;
     let rows = targets
         .into_iter()
@@ -379,6 +381,7 @@ fn status_impl(catalog_dir: &Path, notices: &crate::notices::Notices) -> Result<
     Ok(SyncStatusOutcome {
         rows,
         readonly: cfg.readonly,
+        notices: notices.drain(),
     })
 }
 
@@ -391,27 +394,27 @@ fn status_impl(catalog_dir: &Path, notices: &crate::notices::Notices) -> Result<
 pub struct LocationsOutcome {
     pub readonly: bool,
     pub locations: Vec<Location>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj sync location list`: this machine's configured sync locations.
 ///
 /// # Errors
 /// Returns an error if `sync.toml` exists but can't be read or parsed.
-pub fn locations_list(
-    catalog_dir: &Path,
-    notices: &crate::notices::Notices,
-) -> Result<LocationsOutcome, ServiceError> {
-    locations_list_impl(catalog_dir, notices).map_err(ServiceError::from)
+pub fn locations_list(catalog_dir: &Path) -> Result<LocationsOutcome, ServiceError> {
+    locations_list_impl(catalog_dir).map_err(ServiceError::from)
 }
 
-fn locations_list_impl(
-    catalog_dir: &Path,
-    notices: &crate::notices::Notices,
-) -> Result<LocationsOutcome> {
-    let cfg = SyncConfig::load(&config_path(catalog_dir, notices)?)?;
+fn locations_list_impl(catalog_dir: &Path) -> Result<LocationsOutcome> {
+    let notices = crate::notices::Notices::new();
+    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     Ok(LocationsOutcome {
         readonly: cfg.readonly,
         locations: cfg.locations,
+        notices: notices.drain(),
     })
 }
 
@@ -598,6 +601,10 @@ fn overall_failed(rows: &[LocationRow]) -> bool {
 #[derive(Debug, serde::Serialize)]
 pub struct PushOutcome {
     pub rows: Vec<LocationRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl PushOutcome {
@@ -642,21 +649,14 @@ pub struct PushRequest<'a> {
 /// readonly, or no sync locations are configured (or none match
 /// `req.location`). Per-location failures are reported inside the returned
 /// outcome, never as an `Err` — see [`PushOutcome::overall_failed`].
-pub fn push(
-    catalog: &Path,
-    req: &PushRequest<'_>,
-    notices: &crate::notices::Notices,
-) -> Result<PushOutcome, ServiceError> {
-    push_impl(catalog, req, notices).map_err(ServiceError::from)
+pub fn push(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome, ServiceError> {
+    push_impl(catalog, req).map_err(ServiceError::from)
 }
 
-fn push_impl(
-    catalog: &Path,
-    req: &PushRequest<'_>,
-    notices: &crate::notices::Notices,
-) -> Result<PushOutcome> {
+fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
+    let notices = crate::notices::Notices::new();
     ensure_catalog(catalog)?;
-    let config = config_path(catalog, notices)?;
+    let config = config_path(catalog, &notices)?;
     let cfg = SyncConfig::load(&config)?;
     anyhow::ensure!(
         !cfg.readonly,
@@ -668,7 +668,10 @@ fn push_impl(
         .into_iter()
         .map(|loc| location_row(catalog, loc, req.only, Direction::Push))
         .collect();
-    Ok(PushOutcome { rows })
+    Ok(PushOutcome {
+        rows,
+        notices: notices.drain(),
+    })
 }
 
 /// Everything `maj sync pull` renders: one row per targeted location, plus
@@ -682,6 +685,10 @@ pub struct PullOutcome {
     pub applied_events: usize,
     pub machines: Vec<String>,
     pub blobs_fetched: usize,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl PullOutcome {
@@ -789,9 +796,8 @@ pub fn pull(
     machine_id: &str,
     author: &str,
     req: &PullRequest<'_>,
-    notices: &crate::notices::Notices,
 ) -> Result<PullOutcome, ServiceError> {
-    pull_impl(catalog, machine_id, author, req, notices).map_err(|err| {
+    pull_impl(catalog, machine_id, author, req).map_err(|err| {
         match err.downcast::<PullApplyFailure>() {
             Ok(partial) => ServiceError::SyncPullApplyFailed {
                 rows: partial.rows,
@@ -807,10 +813,10 @@ fn pull_impl(
     machine_id: &str,
     author: &str,
     req: &PullRequest<'_>,
-    notices: &crate::notices::Notices,
 ) -> Result<PullOutcome> {
+    let notices = crate::notices::Notices::new();
     ensure_catalog(catalog)?;
-    let cfg = SyncConfig::load(&config_path(catalog, notices)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog, &notices)?)?;
     let targets = resolve_targets(&cfg, req.location)?;
     let rows: Vec<LocationRow> = targets
         .into_iter()
@@ -822,7 +828,7 @@ fn pull_impl(
     // landed segments become searchable rather than leaving them stranded
     // on disk unapplied. A failure here must not lose `rows` — every
     // location's transfer already genuinely completed by this point.
-    if let Err(source) = apply_pulled_events(catalog, machine_id, author) {
+    if let Err(source) = apply_pulled_events(catalog, machine_id, author, &notices) {
         return Err(anyhow::Error::new(PullApplyFailure { rows, source }));
     }
 
@@ -832,6 +838,7 @@ fn pull_impl(
         applied_events,
         machines,
         blobs_fetched,
+        notices: notices.drain(),
     })
 }
 
@@ -839,24 +846,33 @@ fn pull_impl(
 /// open IS the apply; there is no separate step to call. Split out of
 /// [`pull_impl`] purely so that function can attach `rows` to this specific
 /// failure via [`PullApplyFailure`] without the `?` operator discarding
-/// them.
-fn apply_pulled_events(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
+/// them. The app opened here is local to this step, so whatever it collected
+/// is folded into the pull's own sink before it goes out of scope.
+fn apply_pulled_events(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
     let app = FsApp::open(catalog, machine_id, author)?;
-    crate::catalog::open_catalog(&app, catalog)?;
+    let result = crate::catalog::open_catalog(&app, catalog);
+    for line in app.notices().drain() {
+        notices.push(line);
+    }
+    result?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notices::Notices;
 
     #[test]
     fn status_of_a_catalog_with_no_locations_errors_naming_the_remedy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("cat");
         std::fs::create_dir_all(root.join("events")).expect("mkdir");
-        let err = status(&root, &Notices::new()).expect_err("no locations must error");
+        let err = status(&root).expect_err("no locations must error");
         assert!(err.to_string().contains("no sync locations configured"));
     }
 
@@ -864,14 +880,14 @@ mod tests {
     fn status_of_a_nonexistent_catalog_names_catalog_init() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("nope");
-        let err = status(&root, &Notices::new()).expect_err("missing catalog must error");
+        let err = status(&root).expect_err("missing catalog must error");
         assert!(err.to_string().contains("maj catalog init"));
     }
 
     #[test]
     fn locations_list_of_an_unconfigured_catalog_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = locations_list(dir.path(), &Notices::new()).expect("locations_list");
+        let outcome = locations_list(dir.path()).expect("locations_list");
         assert!(outcome.locations.is_empty());
         assert!(!outcome.readonly);
     }
@@ -1134,7 +1150,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect_err("no locations must error");
         assert!(err.to_string().contains("no sync locations configured"));
@@ -1162,7 +1177,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect_err("readonly must refuse");
         assert!(err.to_string().contains("read-only sync member"));
@@ -1187,7 +1201,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect("push");
         assert_eq!(outcome.rows.len(), 1);
@@ -1216,7 +1229,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect("push");
         assert!(!push_outcome.overall_failed());
@@ -1234,7 +1246,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect("pull");
         assert!(!pull_outcome.overall_failed());
@@ -1277,7 +1288,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect("push");
 
@@ -1300,7 +1310,6 @@ mod push_pull_tests {
                 location: None,
                 only: None,
             },
-            &Notices::new(),
         )
         .expect_err("apply must fail against a directory in place of catalog.db");
         let ServiceError::SyncPullApplyFailed { rows, source } = err else {

@@ -437,3 +437,44 @@ pub fn use_existing_catalog(
         use_existing_catalog_impl,
     )
 }
+
+/// The two functions here that `tests/commands.rs` cannot reach: it drives
+/// the `*_impl` layer with a `CatalogCfg` in hand, so nothing over there
+/// resolves this machine's identity or reads the managed state back out.
+#[cfg(test)]
+mod tests {
+    use super::{AppState, CatalogCfg, machine_identity, selected_catalog};
+    use std::path::PathBuf;
+    use std::sync::RwLock;
+
+    /// Events this app authors are stamped with the hostname, so a `maj` user
+    /// on the same machine passing `--machine-id $(hostname)` writes events
+    /// that converge with the app's rather than looking like a second peer.
+    #[test]
+    fn the_machine_identity_is_this_machines_hostname() {
+        let expected = hostname::get().expect("a hostname on a test machine");
+
+        assert_eq!(machine_identity(), expected.to_string_lossy());
+    }
+
+    #[test]
+    fn the_selected_catalog_is_whatever_was_last_published_to_the_state() {
+        let state = AppState(RwLock::new(None));
+
+        assert!(
+            selected_catalog(&state).is_none(),
+            "before a catalog is chosen there is nothing to select"
+        );
+
+        *state.0.write().expect("state") = Some(CatalogCfg {
+            catalog: PathBuf::from("/catalogs/main"),
+            machine_id: "m".to_string(),
+            author: "a".to_string(),
+        });
+
+        let selected = selected_catalog(&state).expect("the published catalog");
+        assert_eq!(selected.catalog, PathBuf::from("/catalogs/main"));
+        assert_eq!(selected.machine_id, "m");
+        assert_eq!(selected.author, "a");
+    }
+}

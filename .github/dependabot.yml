@@ -17,6 +17,26 @@ updates:
         update-types:
           - version-update:semver-minor
           - version-update:semver-major
+  # The desktop head is a standalone cargo workspace (apps/desktop/src-tauri),
+  # so the root cargo entry above never sees it — it needs its own.
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gui-cargo-all:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /apps/desktop
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gui-npm-all:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

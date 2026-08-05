@@ -7,6 +7,30 @@ test:
 
 ci: check test
 
+# The GUI lives in its own cargo workspace (apps/desktop/src-tauri), so none of
+# the recipes above ever compile it and none of these compile the headless one.
+gui-install:
+    cd apps/desktop && pnpm install --frozen-lockfile
+
+# `pnpm build` is here rather than in gui-build because a debug `cargo build`
+# never reads frontendDist — nothing else would catch a broken production
+# bundle until the release job in phase 7B task 10.
+gui-check:
+    cd apps/desktop && pnpm check && pnpm lint && pnpm test && pnpm build
+
+gui-build:
+    cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+# The GUI workspace carries its own copy of the root lint table (a standalone
+# workspace cannot inherit one), so it needs its own gate — `just check` above
+# only ever sees the headless workspace.
+gui-lint:
+    cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
+    cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+version-sync:
+    ./scripts/version-sync.sh
+
 # Two-way ASC MHL conformance against the Python reference implementation.
 # `uv venv` doesn't install a `pip` binary — install via `uv pip` targeting
 # the venv's interpreter instead. Paths must be absolute: `cargo test` runs

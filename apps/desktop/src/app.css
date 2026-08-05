@@ -60,9 +60,19 @@ main {
   list-style: none;
 }
 
-.surfaces li[aria-current] {
+.surfaces button {
+  width: 100%;
   padding: 0.35rem 0.5rem;
+  border: 0;
   border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.surfaces button[aria-current] {
   background: var(--sunken);
   font-weight: 600;
 }
@@ -77,6 +87,63 @@ main {
 .loading,
 main > .error {
   padding: 1rem;
+}
+
+.retry {
+  margin-left: 1rem;
+  padding: 0.35rem 0.9rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.surface-title {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.empty {
+  color: var(--muted);
+}
+
+.volumes {
+  width: 100%;
+  margin-top: 0.75rem;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.volumes th,
+.volumes td {
+  padding: 0.4rem 0.6rem 0.4rem 0;
+  border-bottom: 1px solid var(--edge);
+  vertical-align: top;
+}
+
+.volumes th {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.volumes .label {
+  display: block;
+}
+
+.volumes .volume-id,
+.suspect {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.volumes .count {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .surface {
@@ -230,6 +297,69 @@ main > .error {
   display: flex;
   gap: 0.4rem;
   margin-top: 0.35rem;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.15rem 0.5rem;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+}
+
+.fields dt {
+  color: var(--muted);
+}
+
+.fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.verify,
+.inspector .keyframes {
+  margin-top: 1rem;
+}
+
+.verify h3,
+.inspector .keyframes h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.verify-state {
+  margin: 0.25rem 0 0;
+}
+
+.verifications {
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.verifications li {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.strip li {
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
 }
 
 .instances .path {

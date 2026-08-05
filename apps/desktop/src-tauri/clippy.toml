@@ -1,6 +1,0 @@
-# Copy of the repo root's clippy.toml (a standalone workspace resolves its
-# clippy config from its own root) — keep in lockstep with it, same as the
-# lint table copied into Cargo.toml.
-allow-unwrap-in-tests = true
-allow-expect-in-tests = true
-allow-panic-in-tests = true

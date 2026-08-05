@@ -134,6 +134,58 @@ jobs:
           key: hf-whisper-reference-${{ hashFiles('justfile') }}
       - run: brew install just
       - run: just whisper-conformance
+  version-sync:
+    name: Version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./scripts/version-sync.sh
+  gui:
+    name: GUI build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable (branch tip 2026-08-05)
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+      - name: Install webkit2gtk deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+      - name: Install protoc (lance build dependency, via services)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install protobuf
+          elif [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get install -y protobuf-compiler
+          else choco install protoc -y; fi
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          version: 11
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          # Floats within the 22 LTS line on purpose: jsdom 30 requires
+          # >= 22.22.2, so a pin to an earlier 22.x would break the tests.
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: apps/desktop
+      # `pnpm build` is not a cargo prerequisite (a debug build never reads
+      # frontendDist) — it is here so a broken production bundle fails now
+      # rather than in the release job.
+      - run: pnpm check && pnpm lint && pnpm test && pnpm build
+        working-directory: apps/desktop
+      - run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
   actions-lint:
     name: Workflow lint and audit
     runs-on: ubuntu-latest

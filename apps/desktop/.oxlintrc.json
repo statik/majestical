@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "import", "unicorn"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "pedantic": "warn"
+  },
+  "rules": {
+    // Vite's CSS entry (`import "./app.css"`) is a side-effect import by
+    // design; there is nothing to assign it to.
+    "import/no-unassigned-import": "off"
+  }
+}

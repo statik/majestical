@@ -1,0 +1,51 @@
+[package]
+name = "majestical-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone GUI workspace (phase 7 spec §7): the headless workspace's CI
+# never compiles the Tauri tree, and this tree never compiles headless-only
+# test suites.
+[workspace]
+
+[lib]
+name = "majestical_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-updater = "2.10.1"
+majestical-services = { path = "../../../crates/services" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+hostname = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+# Copy of the root workspace's lint table (a standalone workspace cannot
+# inherit it) — keep in lockstep manually; version-sync does not check this.
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"

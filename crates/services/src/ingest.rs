@@ -98,6 +98,10 @@ pub struct IngestPlanOutcome {
     pub node_id: String,
     pub source_volume_id: String,
     pub source_volume_label: String,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// The plan half of `maj ingest`: resolves `para` to an active node,
@@ -140,6 +144,7 @@ fn plan_impl(
         node_id,
         source_volume_id,
         source_volume_label,
+        notices: app.notices().drain(),
     })
 }
 
@@ -169,6 +174,10 @@ pub struct IngestRun {
     pub run_id: String,
     pub outcome: engine::Outcome,
     pub generations: Vec<(PathBuf, mhl::WrittenGeneration)>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Runs (or resumes) one verified-copy pass: opens/creates the run's
@@ -222,11 +231,18 @@ fn run_ingest_impl(
         .resume
         .map_or_else(|| ulid::Ulid::generate().to_string(), str::to_string);
     if exec.resume.is_some() {
-        check_resume_journal_exists(catalog_dir, &run_id)?;
+        check_resume_journal_exists(catalog_dir, &run_id, app.notices())?;
     }
     notice(&format!("run {run_id} — resume with: --resume {run_id}"));
     let dests = build_dest_specs(exec.dest, exec.subdir);
-    let outcome = run_ingest_engine(catalog_dir, &run_id, exec.plan, &dests, exec.jobs)?;
+    let outcome = run_ingest_engine(&RunEngineArgs {
+        catalog_dir,
+        run_id: &run_id,
+        ingest_plan: exec.plan,
+        dests: &dests,
+        jobs: exec.jobs,
+        notices: app.notices(),
+    })?;
     let hashdate_ms = physical_now_ms();
     let hashdate = iso8601_ms(hashdate_ms);
     let generations = write_ingest_generations(&dests, &outcome, &hashdate)
@@ -245,6 +261,7 @@ fn run_ingest_impl(
         run_id,
         outcome,
         generations,
+        notices: app.notices().drain(),
     })
 }
 
@@ -267,8 +284,12 @@ fn build_dest_specs(dest_roots: &[PathBuf], subdir: &str) -> Vec<engine::DestSpe
         .collect()
 }
 
-fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+fn journal_path_for(
+    catalog_dir: &Path,
+    run_id: &str,
+    notices: &crate::notices::Notices,
+) -> Result<PathBuf> {
+    let paths = crate::state_dir::catalog_paths(catalog_dir, notices)?;
     Ok(paths.runs_dir.join(format!("{run_id}.jsonl")))
 }
 
@@ -283,13 +304,28 @@ fn journal_path_for(catalog_dir: &Path, run_id: &str) -> Result<PathBuf> {
 /// still perform one-time legacy cleanup there — deleting a pre-phase-4
 /// `catalog.db` or moving `runs/*.jsonl` out — but that only ever removes
 /// stale derived files, never creates anything new.
-fn check_resume_journal_exists(catalog_dir: &Path, run_id: &str) -> Result<()> {
-    let journal_path = journal_path_for(catalog_dir, run_id)?;
+fn check_resume_journal_exists(
+    catalog_dir: &Path,
+    run_id: &str,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
+    let journal_path = journal_path_for(catalog_dir, run_id, notices)?;
     anyhow::ensure!(
         journal_path.is_file(),
         "no journal for run '{run_id}' — check the id printed at the start of the original run"
     );
     Ok(())
+}
+
+/// Args for `run_ingest_engine`, bundled to keep its own signature within
+/// the house 5-positional-parameter limit.
+struct RunEngineArgs<'a> {
+    catalog_dir: &'a Path,
+    run_id: &'a str,
+    ingest_plan: &'a plan::IngestPlan,
+    dests: &'a [engine::DestSpec],
+    jobs: Option<usize>,
+    notices: &'a crate::notices::Notices,
 }
 
 /// Opens (or resumes) the run's journal and executes the copy/verify engine.
@@ -300,14 +336,16 @@ fn check_resume_journal_exists(catalog_dir: &Path, run_id: &str) -> Result<()> {
 /// call `check_resume_journal_exists` first — this function creates the
 /// journal file if it's missing, which is correct for a fresh run but would
 /// silently paper over a typo'd `--resume` id.
-fn run_ingest_engine(
-    catalog_dir: &Path,
-    run_id: &str,
-    ingest_plan: &plan::IngestPlan,
-    dests: &[engine::DestSpec],
-    jobs: Option<usize>,
-) -> Result<engine::Outcome> {
-    let journal_path = journal_path_for(catalog_dir, run_id)?;
+fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
+    let RunEngineArgs {
+        catalog_dir,
+        run_id,
+        ingest_plan,
+        dests,
+        jobs,
+        notices,
+    } = *args;
+    let journal_path = journal_path_for(catalog_dir, run_id, notices)?;
     let resume_set = journal::Journal::load(&journal_path)
         .with_context(|| format!("loading journal at {}", journal_path.display()))?
         .placed;

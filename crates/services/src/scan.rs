@@ -44,6 +44,10 @@ pub fn mtime_ms_of(metadata: &std::fs::Metadata) -> u64 {
 pub struct ScanOutcome {
     pub assets: usize,
     pub volume_id: String,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj scan`: hashes every file under `dir` into the catalog as `AssetSeen`
@@ -140,6 +144,7 @@ fn scan_impl(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<Scan
     Ok(ScanOutcome {
         assets: n,
         volume_id,
+        notices: app.notices().drain(),
     })
 }
 

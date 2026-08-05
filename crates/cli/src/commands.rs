@@ -16,6 +16,7 @@ pub(crate) fn cmd_catalog_init(catalog: &Path, machine_id: &str, author: &str) -
 
 pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> Result<()> {
     let outcome = majestical_services::scan::scan(app, dir, volume)?;
+    crate::print_notices(&outcome.notices);
     println!("scanned: {} assets", outcome.assets);
     Ok(())
 }
@@ -41,6 +42,7 @@ pub(crate) fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
         }
         MetaCmd::Get { asset, field, json } => {
             let outcome = majestical_services::meta::meta_get(app, &asset, field.as_deref())?;
+            crate::print_notices(&outcome.notices);
             print_meta_get(&outcome, field.as_deref(), json);
         }
     }
@@ -83,6 +85,7 @@ pub(crate) fn print_meta_get(
 
 pub(crate) fn cmd_volumes_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let outcome = majestical_services::volumes::volumes_list(app, catalog_dir)?;
+    crate::print_notices(&outcome.notices);
     if json {
         let rows: Vec<_> = outcome
             .volumes
@@ -163,6 +166,7 @@ fn cmd_para_add(app: &mut FsApp, kind_str: &str, name: &str) -> Result<()> {
 
 fn cmd_para_list(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
     let outcome = majestical_services::para::para_list(app, catalog_dir)?;
+    crate::print_notices(&outcome.notices);
     if json {
         let rows: Vec<_> = outcome
             .nodes
@@ -220,6 +224,7 @@ fn cmd_para_archive(app: &mut FsApp, node: &str, roots: &[PathBuf], dry_run: boo
 
     match majestical_services::para::archive(app, node, roots, dry_run) {
         Ok(outcome) => {
+            crate::print_notices(&outcome.notices);
             print_archive_outcome(&outcome, dry_run);
             Ok(())
         }
@@ -365,6 +370,8 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         args.dedupe,
     )?;
 
+    crate::print_notices(&planned.notices);
+
     if args.dry_run {
         print_ingest_plan(&planned.plan, &planned.subdir, &args.dest, args.json);
         return Ok(());
@@ -384,6 +391,7 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         },
         &mut |line: &str| eprintln!("{line}"),
     )?;
+    crate::print_notices(&run.notices);
     print_ingest_outcome(&run.run_id, &run.outcome, &run.generations, args.json);
     anyhow::ensure!(
         run.outcome.failed.is_empty()

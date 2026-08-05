@@ -41,12 +41,15 @@ pub(crate) fn cmd_inbox_process(app: &mut FsApp, catalog: &Path, args: &InboxArg
     print_report(&outcome, args.json)
 }
 
-/// Prints the pass report, then applies the exit policy: a FRESH failure
+/// Prints every diagnostic the pass collected (to stderr, ahead of the
+/// report, so each line keeps the position it had when services printed it
+/// directly), then the pass report, then applies the exit policy: a FRESH failure
 /// (this run) fails the pass; a previously RECORDED failure is a notice
 /// only. Every fresh failure's detail also goes to stderr unconditionally
 /// (not just in text mode) — with `--json`, stdout carries only the JSON
 /// blob, so this is the only place that detail reaches the operator.
 fn print_report(outcome: &InboxOutcome, json: bool) -> Result<()> {
+    crate::print_notices(&outcome.notices);
     if json {
         print_report_json(&outcome.rows)?;
     } else if outcome.rows.is_empty() {

@@ -8,6 +8,7 @@ use crate::index::blob_read::{
     read_video_captions_blob,
 };
 use crate::index::run::ts_ms_i64;
+use crate::notices::Notices;
 use anyhow::Result;
 use majestical_catalog_sqlite::SqliteCatalog;
 use majestical_core::event::AssetId;
@@ -25,19 +26,23 @@ use std::path::Path;
 ///
 /// # Errors
 /// Returns an error on a blob-walk or sqlite failure; an individual
-/// undecodable blob is reported to stderr and skipped instead.
-pub(crate) fn heal_text_fts(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
-    heal_transcript_rows(db, blobs)?;
-    heal_ocr_rows(db, blobs)?;
-    heal_pdf_rows(db, blobs)?;
-    heal_caption_rows(db, blobs)?;
+/// undecodable blob is noted and skipped instead.
+pub(crate) fn heal_text_fts(
+    db: &mut SqliteCatalog,
+    blobs: &BlobStore,
+    notices: &Notices,
+) -> Result<()> {
+    heal_transcript_rows(db, blobs, notices)?;
+    heal_ocr_rows(db, blobs, notices)?;
+    heal_pdf_rows(db, blobs, notices)?;
+    heal_caption_rows(db, blobs, notices)?;
     Ok(())
 }
 
 /// Heals caption rows from stills (`caption.json.zst`, locator -1) and from
 /// videos (`captions.json.zst`, one row per described keyframe timestamp) —
 /// blobs from any describer tag, this machine's or a teammate's.
-fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore, notices: &Notices) -> Result<()> {
     let covered = db.text_assets("caption")?;
     for (hex, _, path) in blobs.iter_named("caption.json.zst")? {
         let asset = AssetId(format!("xxh3:{hex}"));
@@ -50,13 +55,7 @@ fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
             }
             Ok(_) => {}
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable caption blob: {err}");
-                }
+                notices.push(format!("note: skipping unreadable caption blob: {err}"));
             }
         }
     }
@@ -68,13 +67,9 @@ fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
         let described = match read_video_captions_blob(&path) {
             Ok(described) => described,
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable video captions blob: {err}");
-                }
+                notices.push(format!(
+                    "note: skipping unreadable video captions blob: {err}"
+                ));
                 continue;
             }
         };
@@ -90,7 +85,11 @@ fn heal_caption_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
     Ok(())
 }
 
-fn heal_transcript_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+fn heal_transcript_rows(
+    db: &mut SqliteCatalog,
+    blobs: &BlobStore,
+    notices: &Notices,
+) -> Result<()> {
     let covered = db.text_assets("transcript")?;
     for (hex, _, path) in blobs.iter_named("transcript.json.zst")? {
         let asset = AssetId(format!("xxh3:{hex}"));
@@ -100,13 +99,7 @@ fn heal_transcript_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()>
         let transcript = match read_transcript_blob(&path) {
             Ok(transcript) => transcript,
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable transcript blob: {err}");
-                }
+                notices.push(format!("note: skipping unreadable transcript blob: {err}"));
                 continue;
             }
         };
@@ -128,7 +121,7 @@ fn heal_transcript_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()>
 /// markers: kf blobs have variable names, so instead of a new `BlobStore`
 /// walker, each marker's sibling `kf-<ts>.json.zst` files are read directly
 /// — partially-OCR'd videos (no marker yet) are picked up once complete.
-fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore, notices: &Notices) -> Result<()> {
     let covered = db.text_assets("ocr")?;
     for (hex, _, path) in blobs.iter_named("image.json.zst")? {
         let asset = AssetId(format!("xxh3:{hex}"));
@@ -141,13 +134,7 @@ fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
             }
             Ok(_) => {}
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable ocr blob: {err}");
-                }
+                notices.push(format!("note: skipping unreadable ocr blob: {err}"));
             }
         }
     }
@@ -156,7 +143,7 @@ fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
         if covered.contains(&asset) {
             continue;
         }
-        let rows = keyframe_ocr_rows(&marker_path);
+        let rows = keyframe_ocr_rows(&marker_path, notices);
         let row_refs: Vec<(i64, &str)> =
             rows.iter().map(|(ts, text)| (*ts, text.as_str())).collect();
         if !row_refs.is_empty() {
@@ -169,7 +156,7 @@ fn heal_ocr_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
 /// Collects `(ts_ms, text)` rows from the `kf-<ts>.json.zst` OCR blobs
 /// sitting beside a video's `ocr-complete.json` marker, sorted by
 /// timestamp; unreadable entries are reported and skipped.
-fn keyframe_ocr_rows(marker_path: &Path) -> Vec<(i64, String)> {
+fn keyframe_ocr_rows(marker_path: &Path, notices: &Notices) -> Vec<(i64, String)> {
     let Some(dir) = marker_path.parent() else {
         return Vec::new();
     };
@@ -191,13 +178,9 @@ fn keyframe_ocr_rows(marker_path: &Path) -> Vec<(i64, String)> {
             Ok(text) if !text.trim().is_empty() => rows.push((ts_ms, text)),
             Ok(_) => {}
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable keyframe ocr blob: {err}");
-                }
+                notices.push(format!(
+                    "note: skipping unreadable keyframe ocr blob: {err}"
+                ));
             }
         }
     }
@@ -205,7 +188,7 @@ fn keyframe_ocr_rows(marker_path: &Path) -> Vec<(i64, String)> {
     rows
 }
 
-fn heal_pdf_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
+fn heal_pdf_rows(db: &mut SqliteCatalog, blobs: &BlobStore, notices: &Notices) -> Result<()> {
     let covered = db.text_assets("pdf")?;
     for (hex, _, path) in blobs.iter_named("text.json.zst")? {
         let asset = AssetId(format!("xxh3:{hex}"));
@@ -215,13 +198,7 @@ fn heal_pdf_rows(db: &mut SqliteCatalog, blobs: &BlobStore) -> Result<()> {
         let content = match read_pdf_blob(&path) {
             Ok(content) => content,
             Err(err) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!("note: skipping unreadable pdf text blob: {err}");
-                }
+                notices.push(format!("note: skipping unreadable pdf text blob: {err}"));
                 continue;
             }
         };

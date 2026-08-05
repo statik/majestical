@@ -12,6 +12,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
 use majestical_services::app::FsApp;
+use majestical_services::notices::Notices;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -547,6 +548,41 @@ fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
     }
 }
 
+/// Prints every service-collected diagnostic to stderr, verbatim and in
+/// order — the CLI head's half of the `crates/services` notices contract.
+/// Service entry points that take no `FsApp` (`sync`, `describer`, `tags
+/// reject`) call this themselves as soon as the call returns, before
+/// rendering the outcome, so these lines keep the stderr position they had
+/// when services printed them directly.
+pub(crate) fn drain_notices(notices: &Notices) {
+    print_notices(&notices.drain());
+}
+
+/// Prints the notices a verb carried home on its outcome struct — the same
+/// lines [`drain_notices`] prints, arriving on the outcome instead of the
+/// sink. Renderers call this BEFORE writing their stdout, so each line keeps
+/// the stderr position it had when services printed it directly.
+pub(crate) fn print_notices(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
+/// Opens the catalog, runs one command against it, then drains the app's
+/// notices — on the error path too, so a warning collected before a failure
+/// still reaches the user.
+fn with_app(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    run: impl FnOnce(&mut FsApp) -> Result<()>,
+) -> Result<()> {
+    let mut app = FsApp::open(catalog, machine_id, author)?;
+    let result = run(&mut app);
+    drain_notices(app.notices());
+    result
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let author = cli.author.clone().unwrap_or_else(|| cli.machine_id.clone());
@@ -554,18 +590,15 @@ fn main() -> Result<()> {
         Cmd::Catalog {
             cmd: CatalogCmd::Init,
         } => commands::cmd_catalog_init(&cli.catalog, &cli.machine_id, &author)?,
-        Cmd::Scan { dir, volume } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_scan(&mut app, &dir, volume)?;
-        }
-        Cmd::Tag { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_tag(&mut app, cmd)?;
-        }
-        Cmd::Tags { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            dispatch_tags(&mut app, &cli.catalog, cmd)?;
-        }
+        Cmd::Scan { dir, volume } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            commands::cmd_scan(app, &dir, volume)
+        })?,
+        Cmd::Tag { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            commands::cmd_tag(app, cmd)
+        })?,
+        Cmd::Tags { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            dispatch_tags(app, &cli.catalog, cmd)
+        })?,
         Cmd::Search {
             query,
             limit,
@@ -573,7 +606,6 @@ fn main() -> Result<()> {
             save,
             saved,
         } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             let args = search::SearchArgs {
                 query,
                 limit,
@@ -581,16 +613,16 @@ fn main() -> Result<()> {
                 save,
                 saved,
             };
-            search::cmd_search(&mut app, &cli.catalog, &args)?;
+            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+                search::cmd_search(app, &cli.catalog, &args)
+            })?;
         }
-        Cmd::Searches { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            search::cmd_searches(&mut app, cmd)?;
-        }
-        Cmd::Index { cmd } => {
-            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            dispatch_index(&app, &cli.catalog, cmd)?;
-        }
+        Cmd::Searches { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            search::cmd_searches(app, cmd)
+        })?,
+        Cmd::Index { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            dispatch_index(app, &cli.catalog, cmd)
+        })?,
         // Deliberately does not open a catalog: fetching the encoder model
         // is a machine-local cache operation, unrelated to any one
         // catalog's event log. `--catalog`/`--machine-id` are still
@@ -606,24 +638,22 @@ fn main() -> Result<()> {
         // config lives in the per-machine state dir, not the event log —
         // `Pull` opens the catalog internally, once it needs to apply.
         Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, &cli.machine_id, &author, cmd)?,
-        Cmd::Inbox { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            dispatch_inbox(&mut app, &cli.catalog, cmd)?;
-        }
+        Cmd::Inbox { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            dispatch_inbox(app, &cli.catalog, cmd)
+        })?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
         } => {
-            let app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_volumes_list(&app, &cli.catalog, json)?;
+            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+                commands::cmd_volumes_list(app, &cli.catalog, json)
+            })?;
         }
-        Cmd::Meta { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_meta(&mut app, cmd)?;
-        }
-        Cmd::Para { cmd } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
-            commands::cmd_para(&mut app, &cli.catalog, cmd)?;
-        }
+        Cmd::Meta { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            commands::cmd_meta(app, cmd)
+        })?,
+        Cmd::Para { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            commands::cmd_para(app, &cli.catalog, cmd)
+        })?,
         // Deliberately does not open a catalog: `verify` re-checks a
         // destination directory against its own ASC MHL history, which
         // needs neither the event log nor a machine identity. `--catalog`/
@@ -643,7 +673,6 @@ fn main() -> Result<()> {
             resume,
             json,
         } => {
-            let mut app = FsApp::open(&cli.catalog, &cli.machine_id, &author)?;
             let args = commands::IngestArgs {
                 source,
                 dest,
@@ -655,7 +684,9 @@ fn main() -> Result<()> {
                 resume,
                 json,
             };
-            commands::cmd_ingest(&mut app, &cli.catalog, &args)?;
+            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+                commands::cmd_ingest(app, &cli.catalog, &args)
+            })?;
         }
         // Deliberately does not open a catalog here: `mcp_cmd::serve` opens
         // (and re-opens) it per tool call, not at startup — see its own

@@ -228,9 +228,9 @@ pub fn run(
 
 fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexRunOutcome> {
     let (mut db, projection) = open_catalog(app, catalog_dir)?;
-    let state_dir = crate::state_dir::state_dir_for(catalog_dir)?;
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, app.notices())?;
     let blobs = BlobStore::new(catalog_dir);
-    let caps = crate::index::capabilities(catalog_dir);
+    let caps = crate::index::capabilities(catalog_dir, app.notices());
     let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps);
     let items = split_and_cap_items(plan.items, req.limit);
 
@@ -239,24 +239,31 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
         lance_dir: state_dir.join("lance"),
         coreml_cache_dir: state_dir.join("coreml-cache"),
     };
-    let caption_env = CaptionEnv {
+    let env = PassEnv {
         catalog_root: catalog_dir,
+        notices: app.notices(),
         vocab: tag_vocabulary(&projection),
         api_key: req.api_key.clone(),
     };
-    let outcome = run_all_kinds(&embed_paths, &blobs, &items, jobs, &caption_env)?;
+    let mut outcome = run_all_kinds(&embed_paths, &blobs, &items, jobs, &env)?;
 
-    heal_text_fts(&mut db, &blobs)?;
+    heal_text_fts(&mut db, &blobs, app.notices())?;
+    outcome.notices = app.notices().drain();
     Ok(outcome)
 }
 
-/// The caption runner's per-pass inputs beyond blobs/items: where the
+/// One pass's shared environment: the notices sink every executor records
+/// into, plus the caption runner's own inputs beyond blobs/items — where the
 /// describer config lives, the catalog's current tag vocabulary, and the
 /// describer API key (read from the environment by the CLI, passed in here
-/// — see [`IndexRunReq`]'s doc). Bundled to keep [`run_all_kinds`] within the
-/// house 5-positional-parameter limit.
-struct CaptionEnv<'a> {
+/// — see [`IndexRunReq`]'s doc). Named for the pass, not the caption kind,
+/// because the sink is pass-wide: [`run_all_kinds`] hands it to the embed,
+/// keyframe, and transcript-embed executors too, while the remaining fields
+/// are read only by [`run_caption_items`]. Bundled to keep [`run_all_kinds`]
+/// within the house 5-positional-parameter limit.
+struct PassEnv<'a> {
     catalog_root: &'a Path,
+    notices: &'a crate::notices::Notices,
     vocab: Vec<String>,
     api_key: Option<String>,
 }
@@ -280,17 +287,25 @@ fn run_all_kinds(
     blobs: &BlobStore,
     items: &KindItems,
     jobs: usize,
-    caption_env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> Result<IndexRunOutcome> {
     Ok(IndexRunOutcome {
         thumbs: run_thumb_items(blobs, &items.thumbs, jobs),
-        embed: run_embed_items(paths, blobs, &items.embeds)?,
-        keyframes: run_keyframe_items(paths, blobs, &items.keyframes)?,
+        embed: run_embed_items(paths, blobs, &items.embeds, env.notices)?,
+        keyframes: run_keyframe_items(paths, blobs, &items.keyframes, env.notices)?,
         transcribe: run_transcribe_items(blobs, &items.transcribes)?,
-        transcript_embed: run_transcript_embed_items(paths, blobs, &items.transcript_embeds)?,
+        transcript_embed: run_transcript_embed_items(
+            paths,
+            blobs,
+            &items.transcript_embeds,
+            env.notices,
+        )?,
         ocr: run_ocr_items(blobs, &items.ocr_images, &items.ocr_keyframes),
         pdf: run_pdf_text_items(blobs, &items.pdfs),
-        captions: run_caption_items(blobs, &items.captions, caption_env),
+        captions: run_caption_items(blobs, &items.captions, env),
+        // Drained by `run_impl` once every kind — and the `text_fts` heal
+        // that follows them — has had its say.
+        notices: Vec::new(),
     })
 }
 
@@ -400,21 +415,15 @@ fn remove_lance_state(dir: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error if the corrupt path can't be removed, or if the store
 /// still can't be opened and probed after that removal.
-fn open_or_rebuild(dir: &Path) -> Result<VectorStore> {
+fn open_or_rebuild(dir: &Path, notices: &crate::notices::Notices) -> Result<VectorStore> {
     match open_and_probe(dir) {
         Ok(store) => return Ok(store),
         Err(reason) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!(
-                    "note: lance vector store at {} is unreadable ({reason}) — removing and \
-                     rebuilding from blobs",
-                    dir.display()
-                );
-            }
+            notices.push(format!(
+                "note: lance vector store at {} is unreadable ({reason}) — removing and \
+                 rebuilding from blobs",
+                dir.display()
+            ));
         }
     }
     remove_lance_state(dir)?;
@@ -542,12 +551,13 @@ fn run_embed_items(
     paths: &EmbedPaths,
     blobs: &BlobStore,
     items: &[work::WorkItem],
+    notices: &crate::notices::Notices,
 ) -> Result<EmbedOutcome> {
     let embed_items: Vec<&work::WorkItem> = items
         .iter()
         .filter(|i| i.kind == WorkKind::ImageEmbed)
         .collect();
-    let store = open_or_rebuild(&paths.lance_dir)?;
+    let store = open_or_rebuild(&paths.lance_dir, notices)?;
 
     let (written, failed) = if embed_items.is_empty() {
         (0, Vec::new())
@@ -785,6 +795,7 @@ fn run_keyframe_items(
     paths: &EmbedPaths,
     blobs: &BlobStore,
     items: &[work::WorkItem],
+    notices: &crate::notices::Notices,
 ) -> Result<KeyframeOutcome> {
     if items.is_empty() {
         return Ok(KeyframeOutcome::default());
@@ -793,7 +804,7 @@ fn run_keyframe_items(
         return Ok(KeyframeOutcome::default());
     };
 
-    let store = open_or_rebuild(&paths.lance_dir)?;
+    let store = open_or_rebuild(&paths.lance_dir, notices)?;
     let model_tag = majestical_index::model::MODEL_TAG;
     // Loaded separately from `run_embed_items`'s encoder rather than shared
     // across both: each is only loaded at all when its own kind has pending
@@ -1054,9 +1065,10 @@ fn run_transcript_embed_items(
     paths: &EmbedPaths,
     blobs: &BlobStore,
     items: &[work::WorkItem],
+    notices: &crate::notices::Notices,
 ) -> Result<TranscriptEmbedOutcome> {
     let mut outcome = TranscriptEmbedOutcome::default();
-    let store = open_or_rebuild_text(&paths.lance_dir)?;
+    let store = open_or_rebuild_text(&paths.lance_dir, notices)?;
     let model_dir = if items.is_empty() {
         None
     } else {
@@ -1078,7 +1090,7 @@ fn run_transcript_embed_items(
             }
         }
     }
-    outcome.loaded = load_missing_text_vectors_from_blobs(&store, blobs)?;
+    outcome.loaded = load_missing_text_vectors_from_blobs(&store, blobs, notices)?;
     Ok(outcome)
 }
 
@@ -1091,8 +1103,12 @@ fn run_transcript_embed_items(
 /// after corruption, or a run interrupted between blob write and store add
 /// all converge here with zero re-inference. A chunk blob whose transcript
 /// blob is gone (or no longer chunks to that `start_ms`) is skipped with a
-/// counted stderr note rather than failing the pass.
-fn load_missing_text_vectors_from_blobs(store: &TextVectorStore, blobs: &BlobStore) -> Result<u64> {
+/// counted notice rather than failing the pass.
+fn load_missing_text_vectors_from_blobs(
+    store: &TextVectorStore,
+    blobs: &BlobStore,
+    notices: &crate::notices::Notices,
+) -> Result<u64> {
     let model_tag = MINILM.tag;
     let existing = store.existing_keys(model_tag)?;
     let mut chunk_cache: std::collections::BTreeMap<
@@ -1141,16 +1157,10 @@ fn load_missing_text_vectors_from_blobs(store: &TextVectorStore, blobs: &BlobSto
         store.add(batch)?;
     }
     if skipped > 0 {
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!(
-                "note: {skipped} chunk vector blob(s) skipped in the text-store rebuild — \
-                 transcript blob missing, or its chunking no longer matches"
-            );
-        }
+        notices.push(format!(
+            "note: {skipped} chunk vector blob(s) skipped in the text-store rebuild — \
+             transcript blob missing, or its chunking no longer matches"
+        ));
     }
     Ok(loaded)
 }
@@ -1401,35 +1411,29 @@ enum CaptionFailure {
 fn run_caption_items(
     blobs: &BlobStore,
     items: &[work::WorkItem],
-    env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> CaptionOutcome {
     let mut outcome = CaptionOutcome::default();
     if items.is_empty() {
         return outcome;
     }
-    let config = match load_config(env.catalog_root) {
+    let config = match load_config(env.catalog_root, env.notices) {
         Ok(Some(config)) => config,
         // The planner only queued Caption items because a describer was
         // configured when caps were computed; a config removed/broken since
         // then degrades to a no-op pass and the items re-plan later.
         Ok(None) => return outcome,
         Err(err) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!(
-                    "note: describer config unreadable ({err:#}) — captions skipped this pass"
-                );
-            }
+            env.notices.push(format!(
+                "note: describer config unreadable ({err:#}) — captions skipped this pass"
+            ));
             return outcome;
         }
     };
     let model_tag = config.model_tag();
     let describer = HttpDescriber::new(config, env.api_key.clone());
     for (index, item) in items.iter().enumerate() {
-        match caption_one_item(blobs, &describer, item, &model_tag, &env.vocab) {
+        match caption_one_item(blobs, &describer, item, &model_tag, env) {
             Ok(()) => outcome.written += 1,
             Err(CaptionFailure::Item(reason)) => {
                 outcome.failed.push((item.abs_path.clone(), reason));
@@ -1457,12 +1461,12 @@ fn caption_one_item(
     describer: &HttpDescriber,
     item: &work::WorkItem,
     model_tag: &str,
-    vocab: &[String],
+    env: &PassEnv<'_>,
 ) -> Result<(), CaptionFailure> {
     if media_kind(&item.abs_path.to_string_lossy()) == MediaKind::Video {
-        caption_video(blobs, describer, item, model_tag, vocab)
+        caption_video(blobs, describer, item, model_tag, env)
     } else {
-        caption_still(blobs, describer, item, model_tag, vocab)
+        caption_still(blobs, describer, item, model_tag, &env.vocab)
     }
 }
 
@@ -1513,10 +1517,10 @@ fn caption_video(
     describer: &HttpDescriber,
     item: &work::WorkItem,
     model_tag: &str,
-    vocab: &[String],
+    env: &PassEnv<'_>,
 ) -> Result<(), CaptionFailure> {
     let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
-    let described = match existing_video_captions(&captions_path) {
+    let described = match existing_video_captions(&captions_path, env.notices) {
         Some(described) => described,
         None => describe_video_keyframes(blobs, describer, item, model_tag)?,
     };
@@ -1525,7 +1529,7 @@ fn caption_video(
         Vec::new()
     } else {
         describer
-            .suggest_tags(TagSubject::Captions(&texts), vocab)
+            .suggest_tags(TagSubject::Captions(&texts), &env.vocab)
             .map_err(|e| CaptionFailure::Backend(e.to_string()))?
     };
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
@@ -1533,23 +1537,22 @@ fn caption_video(
 }
 
 /// An existing `Captions` blob's described rows, or `None` when the blob is
-/// missing OR unreadable — an unreadable blob gets a stderr note and is
-/// treated as absent, so the caller re-describes and overwrites it rather
-/// than failing the item every pass forever over the same corrupt bytes.
-fn existing_video_captions(captions_path: &Path) -> Option<Vec<(u64, String)>> {
+/// missing OR unreadable — an unreadable blob gets a notice and is treated
+/// as absent, so the caller re-describes and overwrites it rather than
+/// failing the item every pass forever over the same corrupt bytes.
+fn existing_video_captions(
+    captions_path: &Path,
+    notices: &crate::notices::Notices,
+) -> Option<Vec<(u64, String)>> {
     if !captions_path.is_file() {
         return None;
     }
     match crate::index::blob_read::read_video_captions_blob(captions_path) {
         Ok(described) => Some(described),
         Err(err) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!("note: unreadable captions blob ({err}) — re-describing");
-            }
+            notices.push(format!(
+                "note: unreadable captions blob ({err}) — re-describing"
+            ));
             None
         }
     }
@@ -1701,21 +1704,15 @@ fn write_json_blob_uncompressed(
 /// blob↔Lance diffs (`load_missing_vectors_from_blobs` for image/keyframe
 /// vectors, [`load_missing_text_vectors_from_blobs`] for chunk vectors)
 /// with zero re-inference.
-fn open_or_rebuild_text(dir: &Path) -> Result<TextVectorStore> {
+fn open_or_rebuild_text(dir: &Path, notices: &crate::notices::Notices) -> Result<TextVectorStore> {
     match open_and_probe_text(dir) {
         Ok(store) => return Ok(store),
         Err(reason) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!(
-                    "note: lance text store at {} is unreadable ({reason}) — removing and \
-                     rebuilding from blobs",
-                    dir.display()
-                );
-            }
+            notices.push(format!(
+                "note: lance text store at {} is unreadable ({reason}) — removing and \
+                 rebuilding from blobs",
+                dir.display()
+            ));
         }
     }
     remove_lance_state(dir)?;
@@ -1747,6 +1744,10 @@ pub struct IndexRunOutcome {
     pub ocr: OcrOutcome,
     pub pdf: PdfOutcome,
     pub captions: CaptionOutcome,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl IndexRunOutcome {
@@ -1987,7 +1988,8 @@ mod tests {
         seed_populated_lance_store(&lance_dir);
         corrupt_all_manifests(&lance_dir);
 
-        let store = open_or_rebuild(&lance_dir).expect("must recover, not panic or error");
+        let store = open_or_rebuild(&lance_dir, &crate::notices::Notices::new())
+            .expect("must recover, not panic or error");
         assert_eq!(
             store.existing_keys("m1").expect("keys").len(),
             0,
@@ -1995,7 +1997,7 @@ mod tests {
         );
         // A second call against the now-healthy store must be clean — no
         // note, no further rebuild.
-        open_or_rebuild(&lance_dir).expect("second open is clean");
+        open_or_rebuild(&lance_dir, &crate::notices::Notices::new()).expect("second open is clean");
     }
 
     /// Recovery from a truncated data file: `open` alone succeeds (the
@@ -2009,7 +2011,8 @@ mod tests {
         seed_populated_lance_store(&lance_dir);
         truncate_a_data_file(&lance_dir);
 
-        let store = open_or_rebuild(&lance_dir).expect("must recover");
+        let store =
+            open_or_rebuild(&lance_dir, &crate::notices::Notices::new()).expect("must recover");
         assert_eq!(store.existing_keys("m1").expect("keys").len(), 0);
     }
 
@@ -2024,7 +2027,8 @@ mod tests {
         let lance_path = dir.path().join("lance");
         std::fs::write(&lance_path, b"not a directory").expect("seed a plain file");
 
-        let store = open_or_rebuild(&lance_path).expect("must recover");
+        let store =
+            open_or_rebuild(&lance_path, &crate::notices::Notices::new()).expect("must recover");
         store
             .add(vec![majestical_index::vector_store::VectorRow {
                 asset_hex: "bb22".into(),

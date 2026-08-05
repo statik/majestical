@@ -42,12 +42,15 @@ fn state_dir_with_base(base: &Path, catalog_root: &Path) -> Result<PathBuf> {
 /// Returns an error if `catalog_root` cannot be canonicalized, if the state
 /// dir cannot be created, or if migrating legacy derived files out of the
 /// sync root fails.
-pub fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
+pub fn catalog_paths(
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<CatalogPaths> {
     let state_dir = state_dir_with_base(&state_base()?, catalog_root)?;
     let runs_dir = state_dir.join("runs");
     std::fs::create_dir_all(&runs_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
-    migrate_legacy(catalog_root, &runs_dir)?;
+    migrate_legacy(catalog_root, &runs_dir, notices)?;
     Ok(CatalogPaths {
         db_path: state_dir.join("catalog.db"),
         runs_dir,
@@ -62,33 +65,28 @@ pub fn catalog_paths(catalog_root: &Path) -> Result<CatalogPaths> {
 /// # Errors
 ///
 /// Returns an error under the same conditions as [`catalog_paths`].
-pub fn state_dir_for(catalog_root: &Path) -> Result<PathBuf> {
-    let paths = catalog_paths(catalog_root)?;
+pub fn state_dir_for(catalog_root: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    let paths = catalog_paths(catalog_root, notices)?;
     Ok(paths
         .db_path
         .parent()
         .map_or_else(|| catalog_root.to_path_buf(), Path::to_path_buf))
 }
 
-fn migrate_legacy(catalog_root: &Path, state_runs: &Path) -> Result<()> {
+fn migrate_legacy(
+    catalog_root: &Path,
+    state_runs: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
     let legacy_db = catalog_root.join("catalog.db");
     if legacy_db.is_file() {
         std::fs::remove_file(&legacy_db)
             .with_context(|| format!("removing legacy catalog.db at {}", legacy_db.display()))?;
-        // See the `#[expect]` note on `warn_skipped_corrupt_lines` in app.rs:
-        // services inherits print_stderr = "deny"; this is a verbatim
-        // stderr diagnostic moved from cli, not yet a rendered outcome.
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!("note: removed legacy catalog.db from the sync root (rebuilt locally)");
-        }
+        notices.push("note: removed legacy catalog.db from the sync root (rebuilt locally)");
     }
     let legacy_runs = catalog_root.join("runs");
     if legacy_runs.is_dir() {
-        migrate_legacy_journals(&legacy_runs, state_runs)?;
+        migrate_legacy_journals(&legacy_runs, state_runs, notices)?;
         // Junk left behind on purpose (a subdirectory, a stray dotfile) means
         // this can never be removed — that's expected, not an error.
         let _ = std::fs::remove_dir(&legacy_runs);
@@ -102,7 +100,11 @@ fn migrate_legacy(catalog_root: &Path, state_runs: &Path) -> Result<()> {
 /// at the destination is left alone (another machine may already have
 /// migrated it, and it's the copy actively in use) — only its now-redundant
 /// legacy source is removed.
-fn migrate_legacy_journals(legacy_runs: &Path, state_runs: &Path) -> Result<()> {
+fn migrate_legacy_journals(
+    legacy_runs: &Path,
+    state_runs: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
     let mut moved_any = false;
     for entry in std::fs::read_dir(legacy_runs)
         .with_context(|| format!("reading {}", legacy_runs.display()))?
@@ -136,14 +138,7 @@ fn migrate_legacy_journals(legacy_runs: &Path, state_runs: &Path) -> Result<()> 
         moved_any = true;
     }
     if moved_any {
-        // See the `#[expect]` note above in `migrate_legacy`.
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!("note: moved legacy run journals into the local state dir");
-        }
+        notices.push("note: moved legacy run journals into the local state dir");
     }
     Ok(())
 }
@@ -170,5 +165,22 @@ mod tests {
         let err = state_dir_with_base(base.path(), Path::new("/nonexistent-maj-root"))
             .expect_err("must fail");
         assert!(err.to_string().contains("canonicalizing catalog root"));
+    }
+
+    #[test]
+    fn legacy_catalog_db_removal_is_a_notice() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state_runs = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("catalog.db"), b"legacy").expect("plant legacy db");
+        let notices = crate::notices::Notices::new();
+        migrate_legacy(root.path(), state_runs.path(), &notices).expect("migrate");
+        let drained = notices.drain();
+        assert_eq!(
+            drained,
+            vec![
+                "note: removed legacy catalog.db from the sync root (rebuilt locally)".to_string()
+            ]
+        );
+        assert!(!root.path().join("catalog.db").exists());
     }
 }

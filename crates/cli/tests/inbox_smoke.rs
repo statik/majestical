@@ -1257,3 +1257,46 @@ fn a_zero_byte_file_inside_a_manifest_less_folder_is_named_on_stderr() {
         "the whole folder fails atomically — nothing partially moves"
     );
 }
+
+/// A pass that ingests anything routes its diagnostics through
+/// `ingest::run_ingest`, which drains the app's notice sink into its OWN
+/// outcome — an outcome `inbox::process` reads only for `outcome`, never for
+/// `notices`. Without the handback in `run_shared_ingest`, every notice
+/// collected before that point is silently swallowed.
+///
+/// The trigger is deliberately one-shot: the legacy-`catalog.db` migration
+/// note is pushed once, at the very top of `process` (the pass's first state-
+/// dir resolution), and the legacy file is deleted in the same breath — so
+/// unlike the corrupt-event-log warning, nothing regenerates it on a later
+/// read to mask the loss.
+#[test]
+fn a_notice_collected_before_an_ingest_is_not_swallowed_by_run_ingest() {
+    let s = Setup::new();
+    maj(&s.catalog(), &s.state())
+        .args(["para", "add", "resource", "inbox-triage"])
+        .assert()
+        .success();
+    std::fs::write(s.inbox().join("loose.jpg"), b"jpg-bytes").expect("write");
+    // A pre-phase-4 derived file in the sync root: resolving the state dir
+    // removes it and records exactly one note.
+    std::fs::write(s.catalog().join("catalog.db"), b"legacy").expect("plant legacy db");
+
+    let out = maj(&s.catalog(), &s.state())
+        .env("MAJ_INBOX_QUIESCENCE_MS", "0")
+        .args(["inbox", "process"])
+        .arg(s.inbox())
+        .args(["--dest"])
+        .arg(s.dest())
+        .args(["--triage-target", "resource/inbox-triage"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("removed legacy catalog.db"),
+        "the note must survive the ingest that drained the sink: {stderr}"
+    );
+    assert!(
+        s.inbox().join(".processed/loose.jpg").is_file(),
+        "the pass must actually have ingested something, or the drain never happened"
+    );
+}

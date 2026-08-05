@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use majestical_services::describer_config::{self, DescriberConfigView, SetArgs};
+use majestical_services::notices::Notices;
 
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var("MAJ_OPENROUTER_KEY")
@@ -13,13 +14,19 @@ pub(crate) fn env_api_key() -> Option<String> {
 }
 
 pub(crate) fn cmd_set(catalog_root: &Path, args: &SetArgs) -> anyhow::Result<()> {
-    let view = describer_config::set(catalog_root, args)?;
+    let notices = Notices::new();
+    let view = describer_config::set(catalog_root, args, &notices);
+    crate::drain_notices(&notices);
+    let view = view?;
     print_view(&view);
     Ok(())
 }
 
 pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
-    match describer_config::show(catalog_root)? {
+    let notices = Notices::new();
+    let shown = describer_config::show(catalog_root, &notices);
+    crate::drain_notices(&notices);
+    match shown? {
         Some(view) => print_view(&view),
         None => println!(
             "no describer configured — run `maj describer set --backend <ollama|lm-studio|open-router> --model <model>`"
@@ -29,7 +36,10 @@ pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
-    let probe = describer_config::test(catalog_root, env_api_key())?;
+    let notices = Notices::new();
+    let probe = describer_config::test(catalog_root, env_api_key(), &notices);
+    crate::drain_notices(&notices);
+    let probe = probe?;
     println!("backend reachable: yes");
     println!(
         "model {} listed: {}",

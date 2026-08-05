@@ -28,28 +28,20 @@ impl Clock for SystemClock {
     }
 }
 
-/// Warns on stderr when reading an event log skipped corrupt lines. Shared by
-/// `App::events` (a full read) and `commands::open_catalog` (an incremental
-/// or full sqlite sync) so the message can't drift between the two call
-/// sites that both count skipped lines from the same underlying log.
-pub fn warn_skipped_corrupt_lines(skipped: usize, catalog_root: &Path) {
+/// Records a diagnostic when reading an event log skipped corrupt lines.
+/// Shared by `App::events` (a full read) and `catalog::open_catalog` (an
+/// incremental or full sqlite sync) so the message can't drift between the
+/// two call sites that both count skipped lines from the same underlying log.
+pub fn note_skipped_corrupt_lines(
+    skipped: usize,
+    catalog_root: &Path,
+    notices: &crate::notices::Notices,
+) {
     if skipped > 0 {
-        // services inherits the workspace's print_stderr = "deny" (unlike
-        // cli's, which allows it crate-wide since CLI diagnostics are the
-        // product) — `#[expect]` documents the exception locally instead of
-        // weakening the lint crate-wide. This is the same user-facing
-        // stderr diagnostic moved verbatim from the pre-extraction cli
-        // crate; extracting it into a rendered outcome is later work.
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!(
-                "warning: skipped {skipped} corrupt event log line(s) in {}/events — damaged transport; affected metadata may be missing",
-                catalog_root.display()
-            );
-        }
+        notices.push(format!(
+            "warning: skipped {skipped} corrupt event log line(s) in {}/events — damaged transport; affected metadata may be missing",
+            catalog_root.display()
+        ));
     }
 }
 
@@ -58,6 +50,7 @@ pub struct App<L> {
     hlc: HlcClock,
     author: String,
     catalog_root: PathBuf,
+    notices: crate::notices::Notices,
 }
 
 /// The CLI's concrete adapter wiring: a real, filesystem-backed event log.
@@ -83,6 +76,7 @@ impl FsApp {
             hlc: HlcClock::new(machine, Box::new(SystemClock)),
             author: author.to_string(),
             catalog_root: root.to_path_buf(),
+            notices: crate::notices::Notices::new(),
         })
     }
 
@@ -100,6 +94,7 @@ impl FsApp {
             hlc: HlcClock::new(machine, Box::new(SystemClock)),
             author: author.to_string(),
             catalog_root: root.to_path_buf(),
+            notices: crate::notices::Notices::new(),
         })
     }
 }
@@ -111,12 +106,18 @@ impl<L: EventLog> App<L> {
         &self.log
     }
 
+    /// The diagnostics sink every head drains — see `crate::notices`.
+    pub fn notices(&self) -> &crate::notices::Notices {
+        &self.notices
+    }
+
     /// Loads every event currently in the log. Each call re-reads the log
     /// from disk; per-process caching arrives with the adapter refactor.
     ///
     /// Corrupt lines are skipped rather than failing the read; a warning is
-    /// printed to stderr so the user knows metadata may be missing, without
-    /// polluting stdout (which carries this process's data output).
+    /// recorded in [`Self::notices`] so the user knows metadata may be
+    /// missing, without polluting stdout (which carries this process's data
+    /// output).
     ///
     /// # Errors
     ///
@@ -127,7 +128,7 @@ impl<L: EventLog> App<L> {
             .log
             .read_all_reporting(&mut |_line| skipped += 1)
             .context("reading event log")?;
-        warn_skipped_corrupt_lines(skipped, &self.catalog_root);
+        note_skipped_corrupt_lines(skipped, &self.catalog_root, &self.notices);
         Ok(events)
     }
 
@@ -168,16 +169,9 @@ impl<L: EventLog> App<L> {
         if clamped > 0 {
             let days_ahead =
                 worst_remote_wall_ms.saturating_sub(physical_now_ms()) / (24 * 60 * 60 * 1000);
-            // See the `#[expect]` note in `warn_skipped_corrupt_lines` above.
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!(
-                    "warning: {clamped} event(s) carry timestamps more than 24h in the future (worst: ~{days_ahead}d ahead) — a peer's clock may be wrong; ordering was clamped locally"
-                );
-            }
+            self.notices.push(format!(
+                "warning: {clamped} event(s) carry timestamps more than 24h in the future (worst: ~{days_ahead}d ahead) — a peer's clock may be wrong; ordering was clamped locally"
+            ));
         }
         // ulid 3.x generates through a monotonic Generator; on same-millisecond
         // random-part overflow (astronomically rare), fall back to a fresh
@@ -201,5 +195,47 @@ impl<L: EventLog> App<L> {
             .collect();
         self.log.append(&events).context("appending events")?;
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsApp;
+
+    #[test]
+    fn corrupt_log_line_becomes_a_notice_not_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        app.emit(vec![majestical_core::event::Op::SavedSearchSet {
+            name: "n".into(),
+            query: "q".into(),
+        }])
+        .expect("emit");
+        // `FileEventLog` lays segments out as `events/<machine-id>/NNNN.jsonl`.
+        let machine_dir = root.join("events").join("m1");
+        let log_file = std::fs::read_dir(&machine_dir)
+            .expect("machine events dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("one events jsonl");
+        let mut bytes = std::fs::read(&log_file).expect("read log");
+        bytes.extend_from_slice(b"this is not json\n");
+        std::fs::write(&log_file, bytes).expect("re-write log");
+
+        let events = app.events().expect("events reads through corruption");
+        assert_eq!(events.len(), 1);
+        let notices = app.notices().drain();
+        assert_eq!(
+            notices.len(),
+            1,
+            "exactly one corrupt-line notice: {notices:?}"
+        );
+        assert!(
+            notices[0].contains("skipped 1 corrupt event log line(s)"),
+            "verbatim message preserved: {}",
+            notices[0]
+        );
     }
 }

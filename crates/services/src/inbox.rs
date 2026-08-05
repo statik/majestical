@@ -92,38 +92,28 @@ struct FailureMarker {
     fingerprint: String,
 }
 
-fn markers_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("inbox-failures.json"))
+fn markers_path(catalog: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    Ok(crate::state_dir::state_dir_for(catalog, notices)?.join("inbox-failures.json"))
 }
 
 /// A missing store is empty (nothing has ever failed); an unparsable one
-/// is noted on stderr and treated as empty too. The store is a skip-cache
+/// is noted and treated as empty too. The store is a skip-cache
 /// only — every fact it holds is re-derivable by re-checking the
 /// contribution — so losing it costs one extra hash/check next pass, never
 /// correctness, and it must never turn a corrupt cache file into a hard
 /// failure of the whole pass.
-fn load_markers(catalog: &Path) -> Result<FailureMarkers> {
-    let path = markers_path(catalog)?;
+fn load_markers(catalog: &Path, notices: &crate::notices::Notices) -> Result<FailureMarkers> {
+    let path = markers_path(catalog, notices)?;
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(FailureMarkers::default());
     };
     if let Ok(markers) = serde_json::from_slice(&bytes) {
         return Ok(markers);
     }
-    // See the `#[expect]` note on `warn_skipped_corrupt_lines` in app.rs:
-    // services inherits print_stderr = "deny" crate-wide; this is a
-    // verbatim stderr diagnostic moved from cli, not yet a rendered
-    // outcome.
-    #[expect(
-        clippy::print_stderr,
-        reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-    )]
-    {
-        eprintln!(
-            "note: ignoring unparsable inbox failure store at {} — treating as empty",
-            path.display()
-        );
-    }
+    notices.push(format!(
+        "note: ignoring unparsable inbox failure store at {} — treating as empty",
+        path.display()
+    ));
     Ok(FailureMarkers::default())
 }
 
@@ -131,8 +121,12 @@ fn load_markers(catalog: &Path) -> Result<FailureMarkers> {
 /// mid-write (or a concurrent reader — `maj inbox process` has no lock
 /// against a second copy of itself) never observes a truncated or
 /// half-written store, matching `sync::SyncConfig::store`.
-fn store_markers(catalog: &Path, markers: &FailureMarkers) -> Result<()> {
-    let path = markers_path(catalog)?;
+fn store_markers(
+    catalog: &Path,
+    markers: &FailureMarkers,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
+    let path = markers_path(catalog, notices)?;
     let text = serde_json::to_string_pretty(markers).context("serializing inbox failure store")?;
     let file_name = path.file_name().map_or_else(
         || "inbox-failures.json".to_string(),
@@ -226,7 +220,8 @@ pub enum ContribOutcome {
     /// landed in the inbox root at once — see [`process_triage_loose_files`]
     /// for why one bad file must never wedge the good ones in the same
     /// group forever. A fresh failure here still fails the pass (per-file
-    /// reasons already reached stderr by the time this is constructed).
+    /// reasons are already on the pass's notice sink by the time this is
+    /// constructed).
     PartlyIngested {
         placed: usize,
         skipped_duplicates: usize,
@@ -257,6 +252,10 @@ pub struct ContribRow {
 #[derive(Debug, serde::Serialize)]
 pub struct InboxOutcome {
     pub rows: Vec<ContribRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl InboxOutcome {
@@ -290,22 +289,15 @@ const QUIESCENCE_MS: u64 = 5 * 60 * 1000;
 /// `u64` is a likely operator typo — warned loudly, naming the bad value,
 /// rather than silently falling back to a default that would otherwise
 /// look like a working override doing nothing.
-fn quiescence_ms() -> u64 {
+fn quiescence_ms(notices: &crate::notices::Notices) -> u64 {
     let Ok(value) = std::env::var("MAJ_INBOX_QUIESCENCE_MS") else {
         return QUIESCENCE_MS;
     };
     value.parse().unwrap_or_else(|_| {
-        // See the `#[expect]` note on `load_markers` above.
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!(
-                "warning: MAJ_INBOX_QUIESCENCE_MS={value:?} is not a valid number of milliseconds \
-                 — falling back to the default {QUIESCENCE_MS}ms"
-            );
-        }
+        notices.push(format!(
+            "warning: MAJ_INBOX_QUIESCENCE_MS={value:?} is not a valid number of milliseconds \
+             — falling back to the default {QUIESCENCE_MS}ms"
+        ));
         QUIESCENCE_MS
     })
 }
@@ -405,15 +397,18 @@ fn process_impl(app: &mut FsApp, catalog: &Path, req: &ProcessRequest) -> Result
         req.inbox.display()
     );
     let inbox_key = inbox_key(&req.inbox)?;
-    let mut markers = load_markers(catalog)?;
+    let mut markers = load_markers(catalog, app.notices())?;
     let ctx = InboxCtx {
         catalog,
         req,
         inbox_key,
     };
     let result = run_pass(app, &ctx, &mut markers);
-    store_markers(catalog, &markers)?;
-    Ok(InboxOutcome { rows: result? })
+    store_markers(catalog, &markers, app.notices())?;
+    Ok(InboxOutcome {
+        rows: result?,
+        notices: app.notices().drain(),
+    })
 }
 
 /// The per-contribution loop, split out of [`process_impl`] purely so that
@@ -538,16 +533,9 @@ fn process_contribution(
         });
     }
     for unlisted in &check.unlisted {
-        // See the `#[expect]` note on `load_markers` above.
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!(
-                "note: {name}/{unlisted} is not in the manifest — left untouched, not ingested"
-            );
-        }
+        app.notices().push(format!(
+            "note: {name}/{unlisted} is not in the manifest — left untouched, not ingested"
+        ));
     }
     if !check.refused.is_empty() {
         let reason = check.refused.join("; ");
@@ -815,47 +803,50 @@ fn run_shared_ingest(
         // isn't a flag `maj inbox process` accepts anyway.
         &mut |_line: &str| {},
     )?;
-    report_failure_detail(site.row_name, &run.outcome);
+    // `run_ingest` drains the app's sink into its own outcome; this pass
+    // renders only `InboxOutcome`, so those lines are handed back to the
+    // sink `process` drains at the end — in the order they happened.
+    for line in run.notices {
+        app.notices().push(line);
+    }
+    report_failure_detail(site.row_name, &run.outcome, app.notices());
     tag_assets(app, ingest_plan, &run.outcome, site.tags)?;
     Ok(run.outcome)
 }
 
-/// Per-file failure/rejection detail, plus every diagnostic, printed to
-/// stderr — prefixed with `row_name` (failures/rejections only; a
-/// diagnostic is already a whole-run note, not attributable to one file) so
-/// two rows that each have a bad `clip.mov` don't print two identical,
-/// unattributed lines — from the one place every ingest call site
+/// Per-file failure/rejection detail, plus every diagnostic, recorded on
+/// the pass's notice sink — prefixed with `row_name` (failures/rejections
+/// only; a diagnostic is already a whole-run note, not attributable to one
+/// file) so two rows that each have a bad `clip.mov` don't produce two
+/// identical, unattributed lines — from the one place every ingest call site
 /// (manifested, triage folder, triage loose files) shares. Pre-extraction,
 /// this same unconditional diagnostics print lived inside
 /// `crate::ingest::run_ingest` itself (the `IngestReport::Silent` arm of
 /// `commands::print_ingest_outcome`, called before the CLI ever saw the
 /// result); since `run_ingest` now only returns data, this is where that
-/// same guarantee — "diagnostics always reach stderr, even off the silent
-/// path" — is preserved for `maj inbox process`. `maj ingest`'s own
+/// same guarantee — "diagnostics always reach the operator, even off the
+/// silent path" — is preserved for `maj inbox process`. `maj ingest`'s own
 /// diagnostics print is a separate copy in the CLI's own
 /// `print_ingest_outcome`, right after its own `run_ingest` call.
 ///
 /// One accepted deviation: pre-extraction, diagnostics printed (inside
 /// `run_ingest`) BEFORE this function's own per-file failure/rejection
-/// lines; now that both live in this one function, failures print first.
+/// lines; now that both live in this one function, failures come first.
 /// Both are stderr-only ordering, never observed by anything but a human
 /// watching the terminal — an artifact of this function's own row
 /// iteration order, not a behavior anything depends on — so it's left as
 /// is rather than reordering to match a distinction the pre-extraction code
 /// never actually chose deliberately.
-fn report_failure_detail(row_name: &str, outcome: &engine::Outcome) {
-    // See the `#[expect]` note on `load_markers` above.
-    #[expect(
-        clippy::print_stderr,
-        reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-    )]
-    {
-        for bad in outcome.failed.iter().chain(&outcome.rejected) {
-            eprintln!("{row_name}: {}: {}", bad.rel, bad.reason);
-        }
-        for note in &outcome.diagnostics {
-            eprintln!("diagnostic: {note}");
-        }
+fn report_failure_detail(
+    row_name: &str,
+    outcome: &engine::Outcome,
+    notices: &crate::notices::Notices,
+) {
+    for bad in outcome.failed.iter().chain(&outcome.rejected) {
+        notices.push(format!("{row_name}: {}: {}", bad.rel, bad.reason));
+    }
+    for note in &outcome.diagnostics {
+        notices.push(format!("diagnostic: {note}"));
     }
 }
 
@@ -924,7 +915,7 @@ fn process_manifest_less(
     loose_files: &[PathBuf],
     report: &mut Vec<ContribRow>,
 ) -> Result<()> {
-    let window_ms = quiescence_ms();
+    let window_ms = quiescence_ms(app.notices());
     let (quiescent_dirs, waiting_dirs): (Vec<&PathBuf>, Vec<&PathBuf>) =
         triage_dirs.iter().partition(|d| is_quiescent(d, window_ms));
     let (quiescent_files, waiting_files): (Vec<&PathBuf>, Vec<&PathBuf>) =
@@ -1046,7 +1037,7 @@ fn process_triage_dir(
 /// re-emit its `TagAdd`s every single pass forever, an unbounded write to
 /// the event log every peer replicates. Every file that `failed` or was
 /// `rejected` (e.g. 0 bytes) is left in the inbox for the operator to fix
-/// or remove — named on stderr by [`report_failure_detail`] — and picked
+/// or remove — named by [`report_failure_detail`] — and picked
 /// back up as a loose file on the next pass. A fresh failure/rejection
 /// still fails the whole run's exit code, the same polarity as any other
 /// operator fault, but never blocks the files that drained.
@@ -1288,6 +1279,7 @@ mod tests {
                     reason: "boom".to_string(),
                 },
             }],
+            notices: Vec::new(),
         };
         assert!(outcome.overall_failed());
     }
@@ -1316,6 +1308,7 @@ mod tests {
                     },
                 },
             ],
+            notices: Vec::new(),
         };
         assert!(!outcome.overall_failed());
     }
@@ -1331,6 +1324,7 @@ mod tests {
                     failed: 1,
                 },
             }],
+            notices: Vec::new(),
         };
         assert!(outcome.overall_failed());
     }
@@ -1374,5 +1368,38 @@ mod tests {
         .expect("process");
         assert!(outcome.rows.is_empty());
         assert!(!outcome.overall_failed());
+    }
+
+    /// A corrupt failure-marker store is a skip-cache miss, not a pass
+    /// failure — and the note saying so rides home on the outcome rather
+    /// than going straight to stderr.
+    #[test]
+    fn an_unparsable_marker_store_becomes_an_outcome_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let markers = markers_path(&root, app.notices()).expect("markers path");
+        std::fs::write(&markers, b"{ not json").expect("plant a corrupt store");
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("mkdir");
+        let outcome = process(
+            &mut app,
+            &root,
+            &ProcessRequest {
+                inbox,
+                dest: vec![],
+                triage_target: None,
+                keep: false,
+            },
+        )
+        .expect("process");
+        assert!(
+            outcome
+                .notices
+                .iter()
+                .any(|n| n.contains("ignoring unparsable inbox failure store")),
+            "{:?}",
+            outcome.notices
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! read the upcoming MCP `get_asset` tool and the GUI inspector both need —
 //! reads the in-memory [`Projection`] directly rather than opening the
 //! sqlite view, since nothing here needs a query planner.
-use crate::app::{FsApp, warn_skipped_corrupt_lines};
+use crate::app::{FsApp, note_skipped_corrupt_lines};
 use crate::error::ServiceError;
 use crate::volumes::volume_is_online;
 use anyhow::{Context, Result};
@@ -24,12 +24,12 @@ use std::path::Path;
 /// Returns an error if the local state dir can't be resolved or the sqlite
 /// catalog fails to open or sync.
 pub fn open_catalog(app: &FsApp, catalog_dir: &Path) -> Result<(SqliteCatalog, Projection)> {
-    let paths = crate::state_dir::catalog_paths(catalog_dir)?;
+    let paths = crate::state_dir::catalog_paths(catalog_dir, app.notices())?;
     let mut skipped = 0usize;
     let (db, projection, _mode) =
         SqliteCatalog::open_synced(&paths.db_path, app.log(), &mut |_line| skipped += 1)
             .context("opening sqlite catalog")?;
-    warn_skipped_corrupt_lines(skipped, catalog_dir);
+    note_skipped_corrupt_lines(skipped, catalog_dir, app.notices());
     Ok((db, projection))
 }
 
@@ -133,6 +133,10 @@ pub struct AssetDetail {
     pub fields: Vec<(String, String)>,
     pub verifications: Vec<AssetVerification>,
     pub has_thumb: bool,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// The lowercase form `ParaKind` serializes as elsewhere in the project (see
@@ -248,6 +252,12 @@ fn get_asset_impl(app: &FsApp, catalog_dir: &Path, asset_id: &str) -> Result<Opt
             .collect(),
         verifications: build_verifications(&projection, &asset),
         has_thumb: thumb_exists(catalog_dir, asset_id),
+        // The unknown-asset arm above returns before this, leaving anything
+        // collected in the buffer to the head: the CLI's `with_app` drains
+        // leftovers after every dispatch, and the MCP head folds them into
+        // its response — at the top level for that `{"found": false}` arm,
+        // nested here on the asset whenever one was found.
+        notices: app.notices().drain(),
     }))
 }
 

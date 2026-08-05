@@ -82,8 +82,8 @@ impl SyncConfig {
 ///
 /// # Errors
 /// Returns an error if the local state dir can't be resolved.
-pub fn config_path(catalog: &Path) -> Result<PathBuf> {
-    Ok(crate::state_dir::state_dir_for(catalog)?.join("sync.toml"))
+pub fn config_path(catalog: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
+    Ok(crate::state_dir::state_dir_for(catalog, notices)?.join("sync.toml"))
 }
 
 /// Locations to operate on: every configured location, or exactly the named
@@ -133,12 +133,22 @@ fn ensure_catalog(catalog: &Path) -> Result<(), ServiceError> {
 /// directory, `location` is not valid UTF-8, `name` is already configured,
 /// the skeleton directories can't be created, or the config can't be
 /// stored.
-pub fn location_add(catalog: &Path, name: &str, location: &Path) -> Result<(), ServiceError> {
-    location_add_impl(catalog, name, location).map_err(ServiceError::from)
+pub fn location_add(
+    catalog: &Path,
+    name: &str,
+    location: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<(), ServiceError> {
+    location_add_impl(catalog, name, location, notices).map_err(ServiceError::from)
 }
 
-fn location_add_impl(catalog: &Path, name: &str, location: &Path) -> Result<()> {
-    let config = config_path(catalog)?;
+fn location_add_impl(
+    catalog: &Path,
+    name: &str,
+    location: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
+    let config = config_path(catalog, notices)?;
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "sync location name must not be empty");
     anyhow::ensure!(
@@ -181,12 +191,16 @@ fn location_add_impl(catalog: &Path, name: &str, location: &Path) -> Result<()> 
 /// # Errors
 /// Returns an error when no location named `name` exists, or the config
 /// can't be stored.
-pub fn location_rm(catalog: &Path, name: &str) -> Result<(), ServiceError> {
-    location_rm_impl(catalog, name).map_err(ServiceError::from)
+pub fn location_rm(
+    catalog: &Path,
+    name: &str,
+    notices: &crate::notices::Notices,
+) -> Result<(), ServiceError> {
+    location_rm_impl(catalog, name, notices).map_err(ServiceError::from)
 }
 
-fn location_rm_impl(catalog: &Path, name: &str) -> Result<()> {
-    let config = config_path(catalog)?;
+fn location_rm_impl(catalog: &Path, name: &str, notices: &crate::notices::Notices) -> Result<()> {
+    let config = config_path(catalog, notices)?;
     let mut cfg = SyncConfig::load(&config)?;
     let before = cfg.locations.len();
     cfg.locations.retain(|l| l.name != name);
@@ -297,6 +311,10 @@ pub enum StatusRow {
 pub struct SyncStatusOutcome {
     pub rows: Vec<StatusRow>,
     pub readonly: bool,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Plans both directions for one location, read-only: it only ever calls
@@ -352,8 +370,13 @@ pub fn status(catalog_dir: &Path) -> Result<SyncStatusOutcome, ServiceError> {
 }
 
 fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
+    let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog_dir)?;
-    let cfg = SyncConfig::load(&config_path(catalog_dir)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     let targets = resolve_targets(&cfg, None)?;
     let rows = targets
         .into_iter()
@@ -362,6 +385,7 @@ fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
     Ok(SyncStatusOutcome {
         rows,
         readonly: cfg.readonly,
+        notices: notices.drain(),
     })
 }
 
@@ -374,6 +398,10 @@ fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
 pub struct LocationsOutcome {
     pub readonly: bool,
     pub locations: Vec<Location>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj sync location list`: this machine's configured sync locations.
@@ -385,10 +413,16 @@ pub fn locations_list(catalog_dir: &Path) -> Result<LocationsOutcome, ServiceErr
 }
 
 fn locations_list_impl(catalog_dir: &Path) -> Result<LocationsOutcome> {
-    let cfg = SyncConfig::load(&config_path(catalog_dir)?)?;
+    let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
+    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     Ok(LocationsOutcome {
         readonly: cfg.readonly,
         locations: cfg.locations,
+        notices: notices.drain(),
     })
 }
 
@@ -575,6 +609,10 @@ fn overall_failed(rows: &[LocationRow]) -> bool {
 #[derive(Debug, serde::Serialize)]
 pub struct PushOutcome {
     pub rows: Vec<LocationRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl PushOutcome {
@@ -624,8 +662,13 @@ pub fn push(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome, Servic
 }
 
 fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
+    let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog)?;
-    let config = config_path(catalog)?;
+    let config = config_path(catalog, &notices)?;
     let cfg = SyncConfig::load(&config)?;
     anyhow::ensure!(
         !cfg.readonly,
@@ -637,7 +680,10 @@ fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
         .into_iter()
         .map(|loc| location_row(catalog, loc, req.only, Direction::Push))
         .collect();
-    Ok(PushOutcome { rows })
+    Ok(PushOutcome {
+        rows,
+        notices: notices.drain(),
+    })
 }
 
 /// Everything `maj sync pull` renders: one row per targeted location, plus
@@ -651,6 +697,10 @@ pub struct PullOutcome {
     pub applied_events: usize,
     pub machines: Vec<String>,
     pub blobs_fetched: usize,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 impl PullOutcome {
@@ -776,8 +826,13 @@ fn pull_impl(
     author: &str,
     req: &PullRequest<'_>,
 ) -> Result<PullOutcome> {
+    let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog)?;
-    let cfg = SyncConfig::load(&config_path(catalog)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog, &notices)?)?;
     let targets = resolve_targets(&cfg, req.location)?;
     let rows: Vec<LocationRow> = targets
         .into_iter()
@@ -789,7 +844,7 @@ fn pull_impl(
     // landed segments become searchable rather than leaving them stranded
     // on disk unapplied. A failure here must not lose `rows` — every
     // location's transfer already genuinely completed by this point.
-    if let Err(source) = apply_pulled_events(catalog, machine_id, author) {
+    if let Err(source) = apply_pulled_events(catalog, machine_id, author, &notices) {
         return Err(anyhow::Error::new(PullApplyFailure { rows, source }));
     }
 
@@ -799,6 +854,7 @@ fn pull_impl(
         applied_events,
         machines,
         blobs_fetched,
+        notices: notices.drain(),
     })
 }
 
@@ -806,10 +862,20 @@ fn pull_impl(
 /// open IS the apply; there is no separate step to call. Split out of
 /// [`pull_impl`] purely so that function can attach `rows` to this specific
 /// failure via [`PullApplyFailure`] without the `?` operator discarding
-/// them.
-fn apply_pulled_events(catalog: &Path, machine_id: &str, author: &str) -> Result<()> {
+/// them. The app opened here is local to this step, so whatever it collected
+/// is folded into the pull's own sink before it goes out of scope.
+fn apply_pulled_events(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    notices: &crate::notices::Notices,
+) -> Result<()> {
     let app = FsApp::open(catalog, machine_id, author)?;
-    crate::catalog::open_catalog(&app, catalog)?;
+    let result = crate::catalog::open_catalog(&app, catalog);
+    for line in app.notices().drain() {
+        notices.push(line);
+    }
+    result?;
     Ok(())
 }
 
@@ -923,6 +989,7 @@ mod tests {
 #[cfg(test)]
 mod location_add_rm_tests {
     use super::*;
+    use crate::notices::Notices;
 
     fn catalog_dir(base: &Path) -> PathBuf {
         let root = base.join("cat");
@@ -936,14 +1003,14 @@ mod location_add_rm_tests {
         let catalog = catalog_dir(dir.path());
         let loc = dir.path().join("remote");
         std::fs::create_dir(&loc).expect("mkdir");
-        location_add(&catalog, "nas", &loc).expect("first add");
+        location_add(&catalog, "nas", &loc, &Notices::new()).expect("first add");
         assert!(
             loc.join("events").is_dir() && loc.join("blobs").is_dir(),
             "add initializes the events/ + blobs/ skeleton"
         );
-        let err = location_add(&catalog, "nas", &loc).expect_err("dup must fail");
+        let err = location_add(&catalog, "nas", &loc, &Notices::new()).expect_err("dup must fail");
         assert!(err.to_string().contains("already configured"));
-        let err = location_rm(&catalog, "ghost").expect_err("unknown rm");
+        let err = location_rm(&catalog, "ghost", &Notices::new()).expect_err("unknown rm");
         assert!(err.to_string().contains("no sync location named"));
     }
 
@@ -951,8 +1018,13 @@ mod location_add_rm_tests {
     fn add_rejects_an_unreachable_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog = catalog_dir(dir.path());
-        let err = location_add(&catalog, "nas", &dir.path().join("missing"))
-            .expect_err("unreachable path must fail");
+        let err = location_add(
+            &catalog,
+            "nas",
+            &dir.path().join("missing"),
+            &Notices::new(),
+        )
+        .expect_err("unreachable path must fail");
         assert!(err.to_string().contains("not an accessible directory"));
     }
 
@@ -960,7 +1032,8 @@ mod location_add_rm_tests {
     fn add_rejects_an_empty_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let catalog = catalog_dir(dir.path());
-        let err = location_add(&catalog, "  ", dir.path()).expect_err("empty name must fail");
+        let err = location_add(&catalog, "  ", dir.path(), &Notices::new())
+            .expect_err("empty name must fail");
         assert!(err.to_string().contains("must not be empty"));
     }
 
@@ -970,8 +1043,9 @@ mod location_add_rm_tests {
         let catalog = catalog_dir(dir.path());
         let loc = dir.path().join("remote");
         std::fs::create_dir(&loc).expect("mkdir");
-        location_add(&catalog, "  nas  ", &loc).expect("add");
-        let cfg = SyncConfig::load(&config_path(&catalog).expect("config_path")).expect("load");
+        location_add(&catalog, "  nas  ", &loc, &Notices::new()).expect("add");
+        let cfg = SyncConfig::load(&config_path(&catalog, &Notices::new()).expect("config_path"))
+            .expect("load");
         assert_eq!(cfg.locations[0].name, "nas");
         assert!(cfg.locations[0].path.is_absolute());
         assert_eq!(
@@ -986,9 +1060,10 @@ mod location_add_rm_tests {
         let catalog = catalog_dir(dir.path());
         let loc = dir.path().join("remote");
         std::fs::create_dir(&loc).expect("mkdir");
-        location_add(&catalog, "nas", &loc).expect("add");
-        location_rm(&catalog, "nas").expect("rm");
-        let cfg = SyncConfig::load(&config_path(&catalog).expect("config_path")).expect("load");
+        location_add(&catalog, "nas", &loc, &Notices::new()).expect("add");
+        location_rm(&catalog, "nas", &Notices::new()).expect("rm");
+        let cfg = SyncConfig::load(&config_path(&catalog, &Notices::new()).expect("config_path"))
+            .expect("load");
         assert!(cfg.locations.is_empty());
         assert!(loc.join("events").is_dir(), "rm must not touch the files");
     }
@@ -998,6 +1073,7 @@ mod location_add_rm_tests {
 mod push_pull_tests {
     use super::*;
     use crate::app::FsApp;
+    use crate::notices::Notices;
     use majestical_core::event::{Op, ParaKind};
 
     fn init_catalog(base: &Path, name: &str, machine: &str) -> (FsApp, PathBuf) {
@@ -1101,14 +1177,15 @@ mod push_pull_tests {
         let (_app, root) = init_catalog(dir.path(), "cat", "m1");
         // Directly write a readonly=true config with one location — the
         // refusal must happen before any location is even looked at.
-        let mut cfg = SyncConfig::load(&config_path(&root).expect("config_path")).expect("load");
+        let mut cfg = SyncConfig::load(&config_path(&root, &Notices::new()).expect("config_path"))
+            .expect("load");
         cfg.readonly = true;
         cfg.locations.push(Location {
             name: "nas".into(),
             path: dir.path().to_path_buf(),
             extra: toml::Table::new(),
         });
-        cfg.store(&config_path(&root).expect("config_path"))
+        cfg.store(&config_path(&root, &Notices::new()).expect("config_path"))
             .expect("store");
         let err = push(
             &root,
@@ -1125,13 +1202,14 @@ mod push_pull_tests {
     fn push_reports_a_skipped_row_for_an_unreachable_location() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (_app, root) = init_catalog(dir.path(), "cat", "m1");
-        let mut cfg = SyncConfig::load(&config_path(&root).expect("config_path")).expect("load");
+        let mut cfg = SyncConfig::load(&config_path(&root, &Notices::new()).expect("config_path"))
+            .expect("load");
         cfg.locations.push(Location {
             name: "gone".into(),
             path: dir.path().join("does-not-exist"),
             extra: toml::Table::new(),
         });
-        cfg.store(&config_path(&root).expect("config_path"))
+        cfg.store(&config_path(&root, &Notices::new()).expect("config_path"))
             .expect("store");
         let outcome = push(
             &root,
@@ -1160,7 +1238,7 @@ mod push_pull_tests {
 
         let loc = dir.path().join("shuttle");
         std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc).expect("add");
+        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
         let push_outcome = push(
             &source_root,
             &PushRequest {
@@ -1175,7 +1253,7 @@ mod push_pull_tests {
         let dest_root = dir.path().join("dest");
         std::fs::create_dir_all(&dest_root).expect("mkdir");
         let dest_app = FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc).expect("add on dest");
+        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
         let pull_outcome = pull(
             &dest_root,
             "m2",
@@ -1219,7 +1297,7 @@ mod push_pull_tests {
 
         let loc = dir.path().join("shuttle");
         std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc).expect("add");
+        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
         push(
             &source_root,
             &PushRequest {
@@ -1232,11 +1310,12 @@ mod push_pull_tests {
         let dest_root = dir.path().join("dest");
         std::fs::create_dir_all(&dest_root).expect("mkdir");
         FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc).expect("add on dest");
+        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
 
         // Block the apply: put a directory where `open_synced` expects to
         // open a sqlite file.
-        let paths = crate::state_dir::catalog_paths(&dest_root).expect("catalog_paths");
+        let paths =
+            crate::state_dir::catalog_paths(&dest_root, &Notices::new()).expect("catalog_paths");
         std::fs::create_dir_all(&paths.db_path).expect("mkdir catalog.db");
 
         let err = pull(

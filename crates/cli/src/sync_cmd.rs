@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use majestical_services::error::ServiceError;
+use majestical_services::notices::Notices;
 use majestical_services::sync::{
     LocationRow, NO_LOCATIONS_HINT, Only, PullOutcome, PullRequest, PushRequest,
 };
@@ -35,13 +36,19 @@ impl From<OnlyArg> for Only {
 }
 
 pub(crate) fn cmd_location_add(catalog: &Path, name: &str, location: &Path) -> Result<()> {
-    majestical_services::sync::location_add(catalog, name, location)?;
+    let notices = Notices::new();
+    let result = majestical_services::sync::location_add(catalog, name, location, &notices);
+    crate::drain_notices(&notices);
+    result?;
     println!("added sync location '{name}' at {}", location.display());
     Ok(())
 }
 
 pub(crate) fn cmd_location_rm(catalog: &Path, name: &str) -> Result<()> {
-    majestical_services::sync::location_rm(catalog, name)?;
+    let notices = Notices::new();
+    let result = majestical_services::sync::location_rm(catalog, name, &notices);
+    crate::drain_notices(&notices);
+    result?;
     println!("removed sync location '{name}' (its files were not touched)");
     Ok(())
 }
@@ -115,6 +122,7 @@ pub(crate) fn cmd_push(
             only: only.map(Into::into),
         },
     )?;
+    crate::print_notices(&outcome.notices);
 
     // Text rows, then failure lines (always, to stderr), then the JSON
     // document (a different stream — reordering it after the failure
@@ -175,7 +183,7 @@ pub(crate) fn cmd_pull(
     author: &str,
     args: &PullArgs,
 ) -> Result<()> {
-    let outcome = match majestical_services::sync::pull(
+    let pulled = majestical_services::sync::pull(
         catalog,
         machine_id,
         author,
@@ -183,7 +191,8 @@ pub(crate) fn cmd_pull(
             location: args.location.as_deref(),
             only: args.only.map(Into::into),
         },
-    ) {
+    );
+    let outcome = match pulled {
         Ok(outcome) => outcome,
         Err(ServiceError::SyncPullApplyFailed { rows, source }) => {
             if !args.json {
@@ -194,6 +203,7 @@ pub(crate) fn cmd_pull(
         }
         Err(other) => return Err(other.into()),
     };
+    crate::print_notices(&outcome.notices);
 
     if !args.json {
         print_text_rows(&outcome.rows, "pull");
@@ -330,6 +340,7 @@ fn json_rows(rows: &[LocationRow]) -> Vec<serde_json::Value> {
 /// locations are configured.
 pub(crate) fn cmd_status(catalog: &Path, json: bool) -> Result<()> {
     let outcome = majestical_services::sync::status(catalog)?;
+    crate::print_notices(&outcome.notices);
     if json {
         println!(
             "{}",
@@ -449,6 +460,7 @@ fn print_direction(label: &str, counts: &majestical_services::sync::DirectionCou
 
 pub(crate) fn cmd_location_list(catalog: &Path, json: bool) -> Result<()> {
     let outcome = majestical_services::sync::locations_list(catalog)?;
+    crate::print_notices(&outcome.notices);
     if json {
         println!(
             "{}",

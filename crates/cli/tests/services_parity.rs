@@ -94,9 +94,11 @@ fn diff_against_ref_independent(
 /// output embeds an absolute path under the shared root (e.g. `para
 /// archive --root <dir>`'s "moved X -> Y" line), where two independently
 /// seeded roots would print two different, non-comparable paths.
-/// `between` undoes the `new` binary's filesystem side effect (e.g.
-/// renaming the archived directory back) so the `ref` binary's call is
-/// also a genuine first application against the same paths.
+/// `between` restores whatever shared state the `new` binary's call
+/// consumed — undoing a filesystem move by renaming the archived directory
+/// back, or dropping the derived state dir so a log the first call already
+/// synced past is read afresh — so the `ref` binary's call is also a
+/// genuine first application against the same paths.
 #[cfg(test)]
 fn diff_against_ref_with_between(root: &Path, state: &Path, args: &[&str], between: impl FnOnce()) {
     let reference = Path::new("/tmp/maj-ref");
@@ -1543,4 +1545,68 @@ fn ingest_dedupe_copy_output_is_byte_identical() {
         new_json, old_json,
         "ingest --dedupe copy JSON must match once run id and dest roots are normalized"
     );
+}
+
+/// Guards the CLI's error-path notice drain: a diagnostic collected before a
+/// command fails must still reach stderr, ahead of the error text. `tag add`
+/// against an unknown asset reads the log first (counting the corrupt line,
+/// which records the warning) and only then refuses, so this pins BOTH
+/// stderr lines and their order — warning first, error second — plus the
+/// nonzero exit, against the reference binary that printed the warning
+/// mid-compute. Draining only on success would drop the warning and diverge.
+#[test]
+fn notice_then_error_stderr_survives_failed_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    // A real corrupt line in this machine's segment, so every subsequent
+    // read of the log skips one line and records the warning.
+    let machine_dir = root.join("events").join("test-machine");
+    let segment = std::fs::read_dir(&machine_dir)
+        .expect("machine events dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("one events jsonl");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    bytes.extend_from_slice(b"this is not json\n");
+    std::fs::write(&segment, bytes).expect("re-write segment");
+    // The refusal happens after the read and emits nothing, so neither
+    // binary mutates the log — a shared root is safe here.
+    diff_against_ref(&root, &state, &["tag", "add", "xxh3:nosuchasset", "x"]);
+}
+
+/// Pins stderr LINE ORDER for a successful search that produces two kinds of
+/// diagnostic: the corrupt-event-log warning (recorded while the log is
+/// read) and the semantic layers' unavailable notes (recorded later, while
+/// the query runs). The reference binary printed both the moment they
+/// happened, so the warning comes first. Any scheme that defers one class of
+/// notice to after the compute inverts that order — which is exactly what
+/// this catches. Both binaries resolve the same model cache, so whether the
+/// semantic notes appear at all is environment-relative but identical across
+/// the two arms.
+///
+/// The sqlite view records how far into the log it has synced, and only the
+/// sync that first reads past the corrupt line counts it — so the second arm
+/// would see a clean log and print nothing. Dropping the derived state dir
+/// between the two runs makes each arm's call a genuine first look at the
+/// same corrupted log; a full rebuild and an incremental sync both report
+/// the one skipped line identically.
+#[test]
+fn search_notice_order_matches_reference_with_corrupt_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let machine_dir = root.join("events").join("test-machine");
+    let segment = std::fs::read_dir(&machine_dir)
+        .expect("machine events dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("one events jsonl");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    bytes.extend_from_slice(b"this is not json\n");
+    std::fs::write(&segment, bytes).expect("re-write segment");
+    // A read-only verb: neither binary appends, so a shared root is safe.
+    diff_against_ref_with_between(&root, &state, &["search", "sunset", "--json"], || {
+        std::fs::remove_dir_all(&state).expect("drop the derived state dir");
+    });
 }

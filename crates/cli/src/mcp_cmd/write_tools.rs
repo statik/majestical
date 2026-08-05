@@ -257,11 +257,14 @@ fn set_metadata_result(
     app: &mut FsApp,
     args: &SetMetadataArgs,
 ) -> anyhow::Result<serde_json::Value> {
-    let projection = app.projection()?;
-    let asset_id = AssetId(args.asset.clone());
-    majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
-    let current_value = projection.field(&asset_id, &args.field).map(str::to_string);
+    // Dry-run only: `meta_set` builds the same projection and runs the same
+    // check on the confirm path, so loading one here too would replay the
+    // whole event log for a value that path never reads.
     if !args.confirm {
+        let projection = app.projection()?;
+        let asset_id = AssetId(args.asset.clone());
+        majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
+        let current_value = projection.field(&asset_id, &args.field).map(str::to_string);
         return Ok(super::with_notices(
             json!({
                 "asset": args.asset,

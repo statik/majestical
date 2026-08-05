@@ -1086,20 +1086,31 @@ fn tag_assets_dry_run_fails_on_unknown_asset() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
     let mut mcp = Mcp::spawn(&root, &state);
-    let resp = mcp.call_tool(
-        "tag_assets",
-        &serde_json::json!({
-            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
-            "op": "add",
-            "tag": "kf",
-            "confirm": false
+    let unknown = "xxh3:ffffffffffffffffffffffffffffffff";
+    // All three, not just `add`: the guard names its covered ops one by one,
+    // so exercising a single op would let any of the others silently drift
+    // into the unguarded `reject_suggestion` arm. Each op carries the
+    // payload its own parse requires — `tag` for add/rm, `tags` for
+    // confirm_suggestion.
+    let cases = [
+        serde_json::json!({"asset": unknown, "op": "add", "tag": "kf", "confirm": false}),
+        serde_json::json!({"asset": unknown, "op": "rm", "tag": "kf", "confirm": false}),
+        serde_json::json!({
+            "asset": unknown, "op": "confirm_suggestion", "tags": ["kf"], "confirm": false
         }),
-    );
-    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("error text");
-    assert!(text.contains("unknown asset"), "{text}");
+    ];
+    for args in cases {
+        let resp = mcp.call_tool("tag_assets", &args);
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "{args}: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("error text for {args}"));
+        assert!(text.contains("unknown asset"), "{args}: {text}");
+    }
 }
 
 /// The other half of the guard: `tags::reject` records the pair as given
@@ -1782,26 +1793,37 @@ fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
 /// The watchlist's "dry run over-promises" fix: `meta_set` validates the
 /// asset on execute, so its preview must fail on an unknown asset id
 /// exactly like `confirm: true` would, never describe the write as
-/// achievable.
+/// achievable. Both arms are asserted because they reach that verdict by
+/// different routes — the preview through `set_metadata_result`'s own
+/// guard, the execute path through `meta_set`'s — and only the preview's
+/// guard lives in this crate. Without the `confirm: true` half, dropping
+/// `meta_set`'s check would leave the two arms disagreeing again with
+/// nothing here to notice.
 #[test]
 fn set_metadata_dry_run_fails_on_unknown_asset() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
     let mut mcp = Mcp::spawn(&root, &state);
-    let resp = mcp.call_tool(
-        "set_metadata",
-        &serde_json::json!({
-            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
-            "field": "rating",
-            "value": "5",
-            "confirm": false
-        }),
-    );
-    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("error text");
-    assert!(text.contains("unknown asset"), "{text}");
+    for confirm in [false, true] {
+        let resp = mcp.call_tool(
+            "set_metadata",
+            &serde_json::json!({
+                "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+                "field": "rating",
+                "value": "5",
+                "confirm": confirm
+            }),
+        );
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "confirm={confirm}: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("error text for confirm={confirm}"));
+        assert!(text.contains("unknown asset"), "confirm={confirm}: {text}");
+    }
 }
 
 /// Closes the cargo-mutants gap on `set_describer_result`'s

@@ -33,8 +33,8 @@ zstd = "0.13.3"
 ort = "=2.0.0-rc.13"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 lancedb = "=0.33.0"      # build requires protoc: brew install protobuf
-arrow-array = "=58.3.0"  # lockstep with lancedb — do not bump independently
-arrow-schema = "=58.3.0"
+arrow-array = "=59.1.0"  # lockstep with lancedb — do not bump independently
+arrow-schema = "=59.1.0"
 # Only "rt": the sync VectorStore wrapper drives everything through one
 # current-thread runtime's block_on, never spawning or using channels/
 # Mutex/Notify, so "sync" (and its Send+Sync-bound API surface) adds nothing.
@@ -56,7 +56,7 @@ httpmock = "0.8.3"
 # crate are exactly the kind of thing that silently drifts into a build
 # break (cargo allows only one version of a `links` crate per build graph
 # regardless of what any individual crate asks for).
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 whisper-rs = { version = "0.16.0", features = ["metal"] }
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"

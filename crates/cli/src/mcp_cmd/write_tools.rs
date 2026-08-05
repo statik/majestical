@@ -16,12 +16,15 @@
 //!   `{"would": ...}` description from the request plus whatever current
 //!   state is cheap to read (existing tags, whether a catalog already
 //!   exists, directory contents) — real state, never a guess. A preview
-//!   whose operation validates the asset id (`set_metadata`, and
-//!   `tag_assets`'s `add`/`rm`/`confirm_suggestion`) runs that same check
-//!   first, so it fails exactly where `confirm: true` would rather than
-//!   promising a write that cannot happen. `tag_assets`'s
-//!   `reject_suggestion` is the deliberate exception: it validates nothing
-//!   on execute either, so its preview must not validate either.
+//!   whose operation rejects an unknown asset id checks the id up front
+//!   (`set_metadata`, and `tag_assets`'s `add`/`rm`/`confirm_suggestion`)
+//!   so it fails there rather than promising a write that cannot happen.
+//!   `rm` is the partial case: it never checks the asset at all, failing
+//!   instead on a tag that is not currently set, so its preview catches an
+//!   unknown id but still over-promises on a KNOWN asset whose tag is
+//!   unset. `tag_assets`'s `reject_suggestion` is the deliberate
+//!   exception: it validates nothing on execute either, so its preview
+//!   must not validate either.
 //! - `verify_volume`'s dry run only reports whether ASC MHL history exists
 //!   yet; the actual verify always mutates (a new generation is appended),
 //!   so there is no side-effect-free way to preview its `altered`/`missing`

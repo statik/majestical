@@ -1072,9 +1072,13 @@ fn tag_assets_defaults_to_dry_run() {
 }
 
 /// The watchlist's "dry run over-promises" fix, for the `tag_assets` ops
-/// that validate on execute (`add` here; `rm` and `confirm_suggestion`
-/// likewise): a preview must fail on an unknown asset id exactly like
-/// `confirm: true` would, never describe the write as achievable.
+/// that reject an unknown asset id on execute (`add` here; `rm` and
+/// `confirm_suggestion` likewise): a preview must fail on an unknown asset
+/// id exactly like `confirm: true` would, never describe the write as
+/// achievable. `add` and `confirm_suggestion` reject it by validating the
+/// asset; `rm` never checks the asset, reaching the same verdict only
+/// because the tag cannot be set on an id that does not exist — so its
+/// preview stays over-promising on a KNOWN asset whose tag is unset.
 /// `reject_suggestion` is the exception — see
 /// [`tag_assets_reject_suggestion_dry_run_succeeds_on_unknown_asset`].
 #[test]

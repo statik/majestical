@@ -15,7 +15,10 @@
 //!   `catalog_init`, `scan_volume`, ...): the dry run builds a small
 //!   `{"would": ...}` description from the request plus whatever current
 //!   state is cheap to read (existing tags, whether a catalog already
-//!   exists, directory contents) — real state, never a guess.
+//!   exists, directory contents) — real state, never a guess. An
+//!   asset-scoped one (`tag_assets`, `set_metadata`) validates the asset id
+//!   before describing anything, so a preview fails exactly where `confirm:
+//!   true` would rather than promising a write that cannot happen.
 //! - `verify_volume`'s dry run only reports whether ASC MHL history exists
 //!   yet; the actual verify always mutates (a new generation is appended),
 //!   so there is no side-effect-free way to preview its `altered`/`missing`
@@ -172,10 +175,9 @@ fn tag_assets_result(
     let op = parse_tag_op(args)?;
     if !args.confirm {
         let projection = app.projection()?;
-        let current_tags: Vec<String> = projection
-            .tags(&AssetId(args.asset.clone()))
-            .into_iter()
-            .collect();
+        let asset_id = AssetId(args.asset.clone());
+        majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
+        let current_tags: Vec<String> = projection.tags(&asset_id).into_iter().collect();
         let would = match &op {
             ValidatedTagOp::Add(tag) => format!("add tag '{tag}' to {}", args.asset),
             ValidatedTagOp::Rm(tag) => format!("remove tag '{tag}' from {}", args.asset),
@@ -236,11 +238,10 @@ fn set_metadata_result(
     app: &mut FsApp,
     args: &SetMetadataArgs,
 ) -> anyhow::Result<serde_json::Value> {
-    let current_value = majestical_services::meta::meta_get(app, &args.asset, Some(&args.field))?
-        .fields
-        .into_iter()
-        .next()
-        .map(|(_, v)| v);
+    let projection = app.projection()?;
+    let asset_id = AssetId(args.asset.clone());
+    majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
+    let current_value = projection.field(&asset_id, &args.field).map(str::to_string);
     if !args.confirm {
         return Ok(super::with_notices(
             json!({

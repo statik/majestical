@@ -1040,6 +1040,30 @@ fn tag_assets_defaults_to_dry_run() {
     );
 }
 
+/// The watchlist's "dry run over-promises" fix: a preview must fail on an
+/// unknown asset id exactly like `confirm: true` would, never describe the
+/// write as achievable.
+#[test]
+fn tag_assets_dry_run_fails_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({
+            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+            "op": "add",
+            "tag": "kf",
+            "confirm": false
+        }),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(text.contains("unknown asset"), "{text}");
+}
+
 #[test]
 fn tag_assets_confirm_executes_and_is_visible_to_cli() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1635,9 +1659,8 @@ fn scan_volume_dry_run_then_confirm_makes_the_file_searchable() {
 /// Closes the cargo-mutants gap on `set_metadata_result`'s
 /// `Ok(Default::default())`/`delete !` survivors and the
 /// `MajServer::set_metadata` wrapper survivor. Uses a known asset
-/// throughout — it does NOT prove the dry-run validates the asset exists;
-/// see the watchlist's "dry-run previews over-promise on an unknown asset
-/// id" item, still open.
+/// throughout; the unknown-id half is
+/// [`set_metadata_dry_run_fails_on_unknown_asset`].
 #[test]
 fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1682,6 +1705,30 @@ fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     let known = mcp.call_tool("get_asset", &serde_json::json!({"asset_id": asset}));
     let fields = &known["result"]["structuredContent"]["asset"]["fields"];
     assert_eq!(fields["rating"], serde_json::json!("5"), "{fields}");
+}
+
+/// The watchlist's "dry run over-promises" fix: a preview must fail on an
+/// unknown asset id exactly like `confirm: true` would, never describe the
+/// write as achievable.
+#[test]
+fn set_metadata_dry_run_fails_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "set_metadata",
+        &serde_json::json!({
+            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+            "field": "rating",
+            "value": "5",
+            "confirm": false
+        }),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(text.contains("unknown asset"), "{text}");
 }
 
 /// Closes the cargo-mutants gap on `set_describer_result`'s

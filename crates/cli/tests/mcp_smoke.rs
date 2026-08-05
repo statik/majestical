@@ -880,6 +880,37 @@ fn tag_assets_dry_run_folds_notices_into_its_hand_built_response() {
     );
 }
 
+/// `set_metadata`'s dry run is hand-built the same way `tag_assets`'s is,
+/// and reads its current value straight off the app's own projection so the
+/// sink that collected the warning is the one `with_notices` drains.
+/// Routing that read through `meta::meta_get` instead would drain the sink
+/// into a `MetaOutcome` this response discards, silently losing every
+/// diagnostic — which is what this test pins.
+#[test]
+fn set_metadata_dry_run_folds_notices_into_its_hand_built_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "set_metadata",
+        &serde_json::json!({"asset": asset, "field": "rating", "value": "5"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
 /// `get_asset`'s unknown-id arm is the one read-tool response with no
 /// outcome struct behind it: the asset that would have carried the notices
 /// does not exist. The buffer still reaches the client rather than dying
@@ -1040,9 +1071,12 @@ fn tag_assets_defaults_to_dry_run() {
     );
 }
 
-/// The watchlist's "dry run over-promises" fix: a preview must fail on an
-/// unknown asset id exactly like `confirm: true` would, never describe the
-/// write as achievable.
+/// The watchlist's "dry run over-promises" fix, for the `tag_assets` ops
+/// that validate on execute (`add` here; `rm` and `confirm_suggestion`
+/// likewise): a preview must fail on an unknown asset id exactly like
+/// `confirm: true` would, never describe the write as achievable.
+/// `reject_suggestion` is the exception — see
+/// [`tag_assets_reject_suggestion_dry_run_succeeds_on_unknown_asset`].
 #[test]
 fn tag_assets_dry_run_fails_on_unknown_asset() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1062,6 +1096,40 @@ fn tag_assets_dry_run_fails_on_unknown_asset() {
         .as_str()
         .expect("error text");
     assert!(text.contains("unknown asset"), "{text}");
+}
+
+/// The other half of the guard: `tags::reject` records the pair as given
+/// without checking it against any current suggestion, so a rejection on an
+/// unknown asset id succeeds — a harmless no-op line rather than a full
+/// blob scan on every reject. Its preview must therefore NOT validate, or
+/// the dry run would fail where `confirm: true` succeeds.
+#[test]
+fn tag_assets_reject_suggestion_dry_run_succeeds_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({
+            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+            "op": "reject_suggestion",
+            "tags": ["kf"],
+            "confirm": false
+        }),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert!(
+        structured["would"]
+            .as_str()
+            .is_some_and(|s| s.contains("reject suggested tag(s)")),
+        "the preview must still describe the rejection: {structured}"
+    );
 }
 
 #[test]
@@ -1707,9 +1775,10 @@ fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     assert_eq!(fields["rating"], serde_json::json!("5"), "{fields}");
 }
 
-/// The watchlist's "dry run over-promises" fix: a preview must fail on an
-/// unknown asset id exactly like `confirm: true` would, never describe the
-/// write as achievable.
+/// The watchlist's "dry run over-promises" fix: `meta_set` validates the
+/// asset on execute, so its preview must fail on an unknown asset id
+/// exactly like `confirm: true` would, never describe the write as
+/// achievable.
 #[test]
 fn set_metadata_dry_run_fails_on_unknown_asset() {
     let dir = tempfile::tempdir().expect("tempdir");

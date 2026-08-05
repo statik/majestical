@@ -15,10 +15,13 @@
 //!   `catalog_init`, `scan_volume`, ...): the dry run builds a small
 //!   `{"would": ...}` description from the request plus whatever current
 //!   state is cheap to read (existing tags, whether a catalog already
-//!   exists, directory contents) — real state, never a guess. An
-//!   asset-scoped one (`tag_assets`, `set_metadata`) validates the asset id
-//!   before describing anything, so a preview fails exactly where `confirm:
-//!   true` would rather than promising a write that cannot happen.
+//!   exists, directory contents) — real state, never a guess. A preview
+//!   whose operation validates the asset id (`set_metadata`, and
+//!   `tag_assets`'s `add`/`rm`/`confirm_suggestion`) runs that same check
+//!   first, so it fails exactly where `confirm: true` would rather than
+//!   promising a write that cannot happen. `tag_assets`'s
+//!   `reject_suggestion` is the deliberate exception: it validates nothing
+//!   on execute either, so its preview must not validate either.
 //! - `verify_volume`'s dry run only reports whether ASC MHL history exists
 //!   yet; the actual verify always mutates (a new generation is appended),
 //!   so there is no side-effect-free way to preview its `altered`/`missing`
@@ -176,7 +179,20 @@ fn tag_assets_result(
     if !args.confirm {
         let projection = app.projection()?;
         let asset_id = AssetId(args.asset.clone());
-        majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
+        // `reject` appends the pair to this machine's rejection log as
+        // given, without checking it against any current suggestion (see
+        // [`majestical_services::tags::reject`]) — a rejection on an
+        // unknown id is a harmless no-op line, not a failure. Guarding its
+        // preview would fail where `confirm: true` succeeds, the exact
+        // inverse of what the other three ops need.
+        match &op {
+            ValidatedTagOp::Add(_)
+            | ValidatedTagOp::Rm(_)
+            | ValidatedTagOp::ConfirmSuggestion(_) => {
+                majestical_services::catalog::ensure_asset_known(&projection, &asset_id)?;
+            }
+            ValidatedTagOp::RejectSuggestion(_) => {}
+        }
         let current_tags: Vec<String> = projection.tags(&asset_id).into_iter().collect();
         let would = match &op {
             ValidatedTagOp::Add(tag) => format!("add tag '{tag}' to {}", args.asset),

@@ -25,7 +25,11 @@ accepted = [
   "BSD-2-Clause",
   "ISC",                 # ring and its dependencies
   "Unicode-3.0",         # the icu_* crates, via tauri's URL and text handling
-  "MPL-2.0",             # cssparser and selectors via tauri; option-ext via lancedb
+  # option-ext arrives through `dirs`, and `dirs` has four parents here — tauri,
+  # lance-index (via lancedb), and our own majestical-index and
+  # majestical-services, which declare it directly. Dropping any one of them
+  # leaves the license in the bundle.
+  "MPL-2.0",             # cssparser and selectors via tauri; option-ext via dirs
   "Zlib",                # foldhash
   "BSL-1.0",             # xxhash-rust, the catalog's content-address hash
   "Unlicense",           # whisper-rs, whisper-rs-sys

@@ -85,6 +85,10 @@ test("applying an update installs it, then restarts into it", async () => {
 });
 
 test("an install that fails leaves the banner up to try again", async () => {
+  // Failure injection, not a missing handler: the install is the command
+  // under test and it is meant to fail with this message. `mockCommands`
+  // throws too, but its throw means "this test did not plan for that
+  // command" — the opposite of what is being simulated here.
   mockIPC((cmd) => {
     if (cmd === "plugin:updater|check") return metadata;
     throw new Error("download failed: connection reset");

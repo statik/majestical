@@ -120,7 +120,8 @@ it should be repeated by hand whenever `lib.rs`'s plugin registration or
 ## Backlog pointer
 
 `docs/superpowers/plans/2026-07-29-phase2-watchlist.md` now carries a "Phase
-7B deferrals" section (21 items, each attributed) and a "cargo-mutants triage
+7B deferrals" section (21 new items plus one carried forward, each attributed)
+and a "cargo-mutants triage
 (phase 7B)" section recording five scoped runs and every survivor's
 disposition. Three phase-7A items are marked closed there with their PR
 numbers: the stderr diagnostics (#71, #72), the four schemars-enum params
@@ -217,6 +218,28 @@ Write a phase 7C spec + plan in the established format before any code.
   not match the public key` in the desktop job's log; the only definitive
   proof is an installed app taking a real update. `docs/RELEASING.md` has
   the grep.
+- **A minisign public key is self-checking — decode it, never eyeball it.**
+  The `pubkey` in `tauri.conf.json` is base64 over a two-line minisign file:
+  an `untrusted comment:` line naming the key id, and a second base64 line
+  whose payload is `Ed` + an 8-byte key id + the 32-byte key. The comment
+  therefore restates, in hex, what the payload carries in binary, and the two
+  must agree:
+
+  ```bash
+  jq -r '.plugins.updater.pubkey' apps/desktop/src-tauri/tauri.conf.json \
+    | base64 -d                                   # comment line + payload line
+  jq -r '.plugins.updater.pubkey' apps/desktop/src-tauri/tauri.conf.json \
+    | base64 -d | tail -n +2 | base64 -d | xxd    # Ed | key id | key
+  ```
+
+  Bytes 2-9 of the payload are the key id **little-endian**: `46 4e da c4 d3
+  d6 3a 9d` reads back as `9D3AD6D3C4DA4E46`, which is exactly what the
+  comment line says. This is not a hypothetical check — it caught a real
+  transcription corruption while the updater was being armed in Task 10.
+  Anything that transports this key by hand (a commit, a secret, a paste
+  between machines) can corrupt it in ways that still look plausible, and a
+  corrupt pubkey is not visible until installed apps start rejecting updates.
+  Decode it.
 - **A single-word CSS class collision is invisible to role and text
   queries.** `.volumes` styling the search card's badge row once laid the
   volumes table out as a flex container, head and body side by side, with

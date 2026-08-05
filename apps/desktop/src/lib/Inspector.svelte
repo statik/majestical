@@ -84,7 +84,9 @@
       {/if}
       <p class="asset-id">{detail.asset}</p>
 
-      {#each detail.notices ?? [] as notice (notice)}
+      <!-- Unkeyed for the same reason as the search surface: one outcome can
+           carry the same notice twice, and a keyed each throws on a repeat. -->
+      {#each detail.notices ?? [] as notice}
         <p class="notice">{notice}</p>
       {/each}
 
@@ -101,7 +103,7 @@
       {/if}
 
       <ul class="instances">
-        {#each detail.instances as instance (instance.volume + instance.path)}
+        {#each detail.instances as instance}
           <li>
             <span class="badge"
               >{instance.volume_label}{instance.online ? "●" : "○"}</span

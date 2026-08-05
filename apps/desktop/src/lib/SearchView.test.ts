@@ -115,6 +115,49 @@ test("notices and coverage render verbatim, with nothing to dismiss them", async
   expect(screen.queryAllByRole("button")).toEqual([]);
 });
 
+test("a notice repeated in one outcome renders twice, results intact", async () => {
+  // Reachable on real data: a saved-search run drains the same corrupt-log
+  // notice from both the projection load and the catalog open, byte for byte.
+  const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
+  mockIPC((cmd) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    return { count: 1, results: [hit("kept")], notices: [notice, notice] };
+  });
+
+  render(SearchView, { onselect: () => {} });
+  await userEvent.type(screen.getByRole("searchbox"), "q");
+
+  await waitFor(() => expect(screen.getAllByText(notice)).toHaveLength(2));
+  expect(screen.getByText("1 results")).toBeTruthy();
+  expect(screen.getByText("kept")).toBeTruthy();
+});
+
+test("clearing the box cancels the search still in flight", async () => {
+  let resolveFirst!: (value: SearchOutcome) => void;
+  let calls = 0;
+  mockIPC((cmd) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    calls += 1;
+    return new Promise<SearchOutcome>((resolve) => {
+      resolveFirst = resolve;
+    });
+  });
+
+  render(SearchView, { onselect: () => {} });
+  const box = screen.getByRole("searchbox");
+  await userEvent.type(box, "a");
+  await waitFor(() => expect(calls).toBe(1));
+  await userEvent.clear(box);
+
+  resolveFirst({ count: 1, results: [hit("late")] });
+  await new Promise((resolve) => {
+    setTimeout(resolve, 50);
+  });
+
+  expect(screen.queryByText("late")).toBeNull();
+  expect(screen.queryByText(/results/u)).toBeNull();
+});
+
 test("a failed search reports the command's whole message chain", async () => {
   const message =
     "unknown filter key 'colour' — known keys: tag, vol/volume, para, kind, online, before, after, in";

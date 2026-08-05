@@ -1683,7 +1683,13 @@ test("a stale response never overwrites a newer query's results", async () => {
   await waitFor(() => expect(call).toBe(2));
   await waitFor(() => screen.getByText(/second/));
   resolveFirst({ count: 1, results: [hit("stale")] });   // late arrival
-  await waitFor(() => expect(screen.queryByText(/stale/)).toBeNull());
+  // Settle, THEN assert. `waitFor(() => expect(...).toBeNull())` runs its
+  // callback once synchronously, so it passes before an unguarded assignment
+  // has even run — a vacuous test that a broken guard still satisfies. Assert
+  // the newer result survived too, or "nothing rendered" also passes.
+  await new Promise((resolve) => { setTimeout(resolve, 50); });
+  expect(screen.queryByText("stale")).toBeNull();
+  expect(screen.getByText("second")).toBeTruthy();
 });
 
 test("notices and coverage render verbatim and are not dismissable", async () => {

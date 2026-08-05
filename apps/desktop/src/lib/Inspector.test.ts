@@ -59,6 +59,19 @@ test("a selection renders the asset's name, tags, PARA and volume badges", async
   expect(screen.getByText("Archive○")).toBeTruthy();
 });
 
+test("a notice repeated in one detail renders twice, detail intact", async () => {
+  const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
+  mockIPC((cmd) => {
+    if (cmd === "get_asset") return { ...detail, notices: [notice, notice] };
+    throw new Error(`unexpected command ${cmd}`);
+  });
+  render(Inspector, { assetId: "xxh3:abc123" });
+
+  await waitFor(() => expect(screen.getAllByText(notice)).toHaveLength(2));
+  expect(screen.getByText("sunset.mov")).toBeTruthy();
+  expect(screen.getByText("golden-hour")).toBeTruthy();
+});
+
 test("an asset the catalog does not know says so", async () => {
   mockIPC((cmd) => {
     if (cmd === "get_asset") return null;

@@ -43,6 +43,10 @@
   function queueSearch(text: string) {
     clearTimeout(debounce);
     if (!text.trim()) {
+      // An empty box owns the surface too: taking the next number cancels an
+      // in-flight search for the text just deleted, which would otherwise
+      // render results under a box asking for nothing.
+      requestSeq += 1;
       outcome = null;
       return;
     }
@@ -97,7 +101,9 @@
     </div>
   {/if}
 
-  {#each savedNotices as notice (notice)}
+  <!-- Notice lists are deliberately unkeyed: the same notice can legitimately
+       appear twice in one outcome, and a keyed each throws on a repeat. -->
+  {#each savedNotices as notice}
     <p class="notice">{notice}</p>
   {/each}
 
@@ -108,7 +114,7 @@
   {#if outcome}
     <p class="count">{outcome.count} results</p>
 
-    {#each outcome.notices ?? [] as notice (notice)}
+    {#each outcome.notices ?? [] as notice}
       <p class="notice">{notice}</p>
     {/each}
     {#if outcome.semantic_coverage && outcome.semantic_coverage.embedded < outcome.semantic_coverage.eligible}
@@ -132,7 +138,7 @@
               <img src={thumbUrl(hit.asset)} alt="" loading="lazy" />
               <span class="name">{hit.name}</span>
               <span class="volumes">
-                {#each hit.volumes as volume (volume.id)}
+                {#each hit.volumes as volume}
                   <span class="badge">{volume.label}{volume.online ? "●" : "○"}</span>
                 {/each}
               </span>

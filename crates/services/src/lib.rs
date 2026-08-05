@@ -15,6 +15,7 @@ pub mod meta;
 pub mod notices;
 pub mod para;
 pub mod query;
+pub mod runtime;
 pub mod scan;
 pub mod search;
 pub mod state_dir;

@@ -110,3 +110,91 @@ pub fn read(catalog: &Path, kind: Kind, asset_id: &str) -> Result<Vec<u8>, BlobE
         },
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, read};
+    use majestical_index::blob::{BlobStore, asset_hex};
+    use std::path::Path;
+
+    /// `asset_hex` accepts exactly 32 lowercase hex digits after the prefix.
+    const ASSET: &str = "xxh3:0123456789abcdef0123456789abcdef";
+
+    fn write_blob(catalog: &Path, kind: Kind, bytes: &[u8]) {
+        let hex = asset_hex(ASSET).expect("a well-formed fixture id");
+        let store = BlobStore::new(catalog);
+        let path = store.path_for(hex, &kind.derivation());
+        store.write_atomic(&path, bytes).expect("write the blob");
+    }
+
+    #[test]
+    fn a_derived_blob_reads_back_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The keyframe manifest is stored uncompressed, so what was written is
+        // what a head serves — no zstd step on either side.
+        let manifest = br#"{"model_tag":"m","detected":2,"timestamps":[10,20]}"#;
+        write_blob(dir.path(), Kind::Keyframes, manifest);
+
+        let bytes = read(dir.path(), Kind::Keyframes, ASSET).expect("the manifest");
+
+        assert_eq!(bytes, manifest);
+    }
+
+    #[test]
+    fn an_id_that_is_not_xxh3_hex_is_rejected_before_any_file_is_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let err = read(dir.path(), Kind::Thumb, "../../../etc/passwd")
+            .expect_err("a traversal payload is not an asset id");
+
+        assert_eq!(
+            err.to_string(),
+            "../../../etc/passwd: not a valid asset id (expected xxh3:<hex>)"
+        );
+    }
+
+    /// The remedy is the whole point of this error: it names the blob in words
+    /// a person uses and the exact `--kinds` value that derives it.
+    #[test]
+    fn a_blob_nobody_has_derived_names_its_own_remedy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let thumb = read(dir.path(), Kind::Thumb, ASSET).expect_err("nothing derived yet");
+        let keyframes = read(dir.path(), Kind::Keyframes, ASSET).expect_err("nothing derived yet");
+
+        assert_eq!(
+            thumb.to_string(),
+            format!("no thumbnail for {ASSET} — run `maj index run --kinds thumbs` to derive it")
+        );
+        assert_eq!(
+            keyframes.to_string(),
+            format!(
+                "no keyframe manifest for {ASSET} — \
+                 run `maj index run --kinds keyframes` to derive it"
+            )
+        );
+    }
+
+    /// A read that fails for any reason other than absence is the server's
+    /// problem, not a missing derivation — a directory where the blob file
+    /// belongs is the cheapest way to produce one.
+    #[test]
+    fn a_read_failure_that_is_not_absence_is_reported_as_a_read_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hex = asset_hex(ASSET).expect("a well-formed fixture id");
+        let path = BlobStore::new(dir.path()).path_for(hex, &Kind::Thumb.derivation());
+        std::fs::create_dir_all(&path).expect("a directory in the blob's place");
+
+        let err = read(dir.path(), Kind::Thumb, ASSET).expect_err("a directory is not a blob");
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("reading thumbnail blob at "),
+            "must name the blob and the path it failed at: {message}"
+        );
+        assert!(
+            !message.contains("maj index run"),
+            "a read failure must not claim the blob merely needs deriving: {message}"
+        );
+    }
+}

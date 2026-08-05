@@ -1,9 +1,10 @@
-import { clearMocks, mockConvertFileSrc, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { render, screen } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, expect, test } from "vitest";
 import "./app.css";
 import SearchView from "./lib/SearchView.svelte";
+import { mockCommands } from "./lib/test-support";
 import VolumesView from "./lib/VolumesView.svelte";
 
 // `app.css` is one global sheet, so a class name means the same thing to every
@@ -28,22 +29,19 @@ beforeAll(() => {
 afterEach(clearMocks);
 
 test("the volumes table is laid out as a table", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") {
-      return {
-        volumes: [
-          {
-            id: "label:Card",
-            label: "Card",
-            last_seen_ms: 1_700_000_000_000,
-            online: true,
-            asset_count: 42,
-            clock_suspect: false,
-          },
-        ],
-      };
-    }
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    list_volumes: () => ({
+      volumes: [
+        {
+          id: "label:Card",
+          label: "Card",
+          last_seen_ms: 1_700_000_000_000,
+          online: true,
+          asset_count: 42,
+          clock_suspect: false,
+        },
+      ],
+    }),
   });
   const { container } = render(VolumesView);
 
@@ -54,9 +52,9 @@ test("the volumes table is laid out as a table", async () => {
 
 test("a search card's volume badges still sit in a row", async () => {
   mockConvertFileSrc("macos");
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    return {
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({
       count: 1,
       results: [
         {
@@ -69,7 +67,7 @@ test("a search card's volume badges still sit in a row", async () => {
           para: null,
         },
       ],
-    };
+    }),
   });
   const { container } = render(SearchView, { onselect: () => {} });
   await userEvent.type(screen.getByRole("searchbox"), "q");

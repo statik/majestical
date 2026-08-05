@@ -1,7 +1,10 @@
 # Majestical — Phase 7B handoff
 
-Written 2026-08-03 at the close of Phase 7A. Read this first; everything else
-is linked from here. Supersedes `HANDOFF-phase7.md` (kept for history).
+Written 2026-08-03 at the close of Phase 7A. **Superseded by
+`HANDOFF-phase7C.md` — read that first.** Kept for history: this file is
+still the reference for phase 7A's own architecture (`crates/services`,
+`maj mcp`) and for the reference-binary parity harness. Supersedes
+`HANDOFF-phase7.md`.
 
 ## What this project is
 

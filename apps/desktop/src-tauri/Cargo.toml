@@ -19,9 +19,10 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
-# Initialized in task 10; the dep ships now so capabilities/default.json's
-# updater:default ACL resolves at build time.
 tauri-plugin-updater = "2.10.1"
+# `relaunch()` after an update installs. Registered now: unlike the updater,
+# this plugin takes no configuration and so cannot fail to initialize.
+tauri-plugin-process = "2.3.1"
 majestical-services = { path = "../../../crates/services" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

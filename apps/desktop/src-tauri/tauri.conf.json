@@ -18,6 +18,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -25,5 +26,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlEM0FENkQzQzREQTRFNDYKUldSR1R0ckUwOVk2bmZMc0F0c1dUOVl0SVRCZWZoczRYaExCeVlEWjlmc094L3lQQmpmNjJpaDQK",
+      "endpoints": [
+        "https://github.com/statik/majestical/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

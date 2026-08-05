@@ -221,3 +221,79 @@ stay rows inside successful outcomes; partial progress is always attached.
 - Live (streaming) notice delivery for long-running verbs — chunk 0
   delivers notices at completion; if GUI UX needs mid-run progress, that
   rides the MCP progress-notification item above.
+
+## As-built (phase 7B)
+
+What shipped, where it differs from the design above. Written as what IS,
+not as a change log.
+
+**Two commands and a config file the design did not name.** The GUI needs to
+answer "which catalog, and is it usable" before it renders anything, and it
+needs to remember the answer across launches. `app_status` reports the
+selected catalog's path and whether it opens; `use_existing_catalog` adopts a
+catalog the user already has, beside `initialize_catalog` which creates one.
+Between them they are what the first-run surface is built from. The choice
+persists in a small JSON file under the platform config directory
+(`apps/desktop/src-tauri/src/config.rs`), read once at startup by
+`restore_persisted_catalog`. A config naming a catalog that has since
+disappeared is not an error: the state carries it and `app_status` reports
+`catalog_ready: false`, which is exactly what the first-run surface renders.
+
+**Registering a Tauri plugin and configuring it are one edit, not two.** The
+updater plugin's config has no default for `pubkey`, so
+`.plugin(tauri_plugin_updater::Builder::new().build())` without a
+`plugins.updater` block in `tauri.conf.json` fails to deserialize its
+configuration and the app exits on startup instead of opening a window. The
+two must land together. Arming the updater turned out to be three edits, not
+two: the plugin registration, the `plugins.updater` block, and
+`bundle.createUpdaterArtifacts: true` — without the third the bundler
+produces no `.tar.gz`/`.sig` pair and `latest.json` ships listing no
+platforms. All three are documented in `docs/RELEASING.md`.
+
+**The services graph is macOS-only, and that gates the CI matrix.**
+`crates/index` depends on `objc2`, Vision and PDFKit unconditionally, so
+everything downstream of it — including the Tauri app — builds on macOS
+alone. The CI matrix is therefore 3-OS for the frontend gates (`pnpm
+check`/`lint`/`test`/`build`, which are genuinely cross-platform) and
+macOS-only for every Rust step. Discovered by the first matrix run on #77.
+
+**The notices mechanism as built.** Chunk 0's design held; three refinements
+are worth stating. Sync uses a local sink rather than the ambient one, which
+keeps a pull's notices attached to that pull — at the cost that a call
+failing before its drain loses them (recorded as a 7B deferral, with
+`pull_impl` the case that would gain most from a notices payload on
+`ServiceError`). `maj mcp` folds notices into each structured result through
+a `with_notices` helper rather than each tool doing it by hand. The GUI's
+`searches_list` is a thin wrapper around the service call because the GUI
+wants the saved searches and the notices together; the CLI drains at
+end-of-command instead.
+
+**The schemars-enum snapshot correction.** The plan assumed the MCP schema
+snapshot in `mcp_smoke.rs` pinned these four parameters and would need
+updating. It did not pin them at all — the snapshot was silent about their
+type. So the work was not "update the snapshot" but "add the pin": a tripwire
+asserting each enum's allowed values, without which the derive could be
+dropped again with nothing failing.
+
+**Vacuous tests the plan carried, corrected at the source.** Two patterns
+were found and fixed where they were written, not worked around.
+`waitFor(() => expect(x).toBeNull())` passes on its first check, before the
+thing it is meant to exclude has had any chance to arrive — the assertions
+that need to prove absence now wait a fixed interval first and then assert.
+And a test that clears state before asserting a failure can mask the failure
+it exists to catch. `styles.test.ts` carries the third: it asserts computed
+layout, which is only meaningful if the real stylesheet is in the document,
+so a `beforeAll` guard fails the suite if the sheet is empty — the vitest
+default hands CSS back as an empty string, under which every assertion in the
+file would otherwise pass against no stylesheet at all.
+
+**Smaller divergences.** `PassEnv` was renamed for what it does rather than
+how it is passed. Blob reading was extracted to
+`crates/services/src/index/blobs.rs` so `maj mcp`'s `majestical://` resources
+and the app's `thumb://` protocol share one lookup and one remedy text
+instead of a copy each. Svelte's `{#each}` over notices is deliberately
+unkeyed: the same notice can legitimately arrive twice in one outcome (a
+saved-search run drains the same corrupt-log warning from both the projection
+load and the catalog open), and a keyed each throws on the repeat instead of
+rendering it. The shared vitest mocking helpers live in
+`apps/desktop/src/lib/test-support.ts`.

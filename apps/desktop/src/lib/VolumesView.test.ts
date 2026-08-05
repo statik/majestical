@@ -1,7 +1,8 @@
-import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
 import { afterEach, expect, test } from "vitest";
 import type { VolumeRow } from "./api";
+import { mockCommands, rejectCommand } from "./test-support";
 import VolumesView from "./VolumesView.svelte";
 
 afterEach(clearMocks);
@@ -25,10 +26,7 @@ const archive: VolumeRow = {
 };
 
 test("every volume gets a row: label, state, asset count and last seen", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") return { volumes: [card, archive] };
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ list_volumes: () => ({ volumes: [card, archive] }) });
   render(VolumesView);
 
   const rows = await screen.findAllByRole("row");
@@ -48,10 +46,7 @@ test("every volume gets a row: label, state, asset count and last seen", async (
 });
 
 test("the online glyphs carry the word they stand for", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") return { volumes: [card, archive] };
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ list_volumes: () => ({ volumes: [card, archive] }) });
   render(VolumesView);
 
   // The CLI's own glyphs, named for anyone who cannot see the difference
@@ -63,11 +58,10 @@ test("the online glyphs carry the word they stand for", async () => {
 });
 
 test("a volume whose last-seen time outran the clock is marked suspect", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") {
-      return { volumes: [card, { ...archive, clock_suspect: true }] };
-    }
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    list_volumes: () => ({
+      volumes: [card, { ...archive, clock_suspect: true }],
+    }),
   });
   render(VolumesView);
 
@@ -79,9 +73,8 @@ test("a volume whose last-seen time outran the clock is marked suspect", async (
 
 test("notices render above the table, with nothing to dismiss them", async () => {
   const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") return { volumes: [card], notices: [notice] };
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    list_volumes: () => ({ volumes: [card], notices: [notice] }),
   });
   const { container } = render(VolumesView);
 
@@ -100,8 +93,7 @@ test("notices render above the table, with nothing to dismiss them", async () =>
 
 test("a failed listing reports the command's whole message chain", async () => {
   const message = "no catalog selected yet — initialize or choose one first";
-  // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-  mockIPC(() => Promise.reject({ message }));
+  mockCommands({ list_volumes: () => rejectCommand(message) });
   render(VolumesView);
 
   const alert = await screen.findByRole("alert");
@@ -110,10 +102,7 @@ test("a failed listing reports the command's whole message chain", async () => {
 });
 
 test("a catalog with no volumes yet says so instead of showing an empty table", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_volumes") return { volumes: [] };
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ list_volumes: () => ({ volumes: [] }) });
   const { container } = render(VolumesView);
 
   expect(await screen.findByText(/No volumes yet/u)).toBeTruthy();

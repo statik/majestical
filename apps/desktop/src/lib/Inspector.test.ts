@@ -1,34 +1,20 @@
-import { clearMocks, mockConvertFileSrc, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { AssetDetail, AssetVerification } from "./api";
 import Inspector from "./Inspector.svelte";
+import { mockCommands, rejectCommand, stubManifest } from "./test-support";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
   // Every rendered asset asks the `thumb://` protocol for its keyframe
   // manifest. The default answer is the ordinary one: this asset has none.
-  stubKeyframes(reply(404, "no keyframe manifest for xxh3:abc123"));
+  stubManifest(404, "no keyframe manifest for xxh3:abc123");
 });
 afterEach(() => {
   clearMocks();
   vi.unstubAllGlobals();
 });
-
-/** The slice of `Response` the manifest reader uses — jsdom has no fetch
- *  stack of its own, so the protocol's answers are built by hand. */
-function reply(status: number, body: string): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: () => Promise.resolve(JSON.parse(body) as unknown),
-    text: () => Promise.resolve(body),
-  } as Response;
-}
-
-function stubKeyframes(response: Response) {
-  vi.stubGlobal("fetch", () => Promise.resolve(response));
-}
 
 const detail: AssetDetail = {
   asset: "xxh3:abc123",
@@ -76,16 +62,12 @@ const newer: AssetVerification = {
 };
 
 function mockAsset(found: AssetDetail | null) {
-  mockIPC((cmd) => {
-    if (cmd === "get_asset") return found;
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ get_asset: () => found });
 }
 
 test("no selection renders nothing at all", () => {
-  mockIPC((cmd) => {
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  // No handlers at all: any invoke this renders would fail the test by name.
+  mockCommands({});
   const { container } = render(Inspector, { assetId: null });
 
   expect(container.textContent).toBe("");
@@ -136,8 +118,7 @@ test("an asset the catalog does not know says so", async () => {
 
 test("a failed lookup reports the command's whole message chain", async () => {
   const message = "no catalog selected yet — initialize or choose one first";
-  // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-  mockIPC(() => Promise.reject({ message }));
+  mockCommands({ get_asset: () => rejectCommand(message) });
   render(Inspector, { assetId: "xxh3:abc123" });
 
   const alert = await screen.findByRole("alert");
@@ -188,11 +169,9 @@ test("an asset nobody has verified says so, with no history to open", async () =
 
 test("the keyframe strip lists the manifest's timestamps as timecodes", async () => {
   mockAsset(detail);
-  stubKeyframes(
-    reply(
-      200,
-      '{"model_tag":"siglip2-b16-v1","detected":2,"timestamps":[1500,65500]}',
-    ),
+  stubManifest(
+    200,
+    '{"model_tag":"siglip2-b16-v1","detected":2,"timestamps":[1500,65500]}',
   );
   render(Inspector, { assetId: "xxh3:abc123" });
 
@@ -217,11 +196,9 @@ test("an asset with no keyframe manifest shows no strip", async () => {
 
 test("a manifest listing fewer keyframes than were detected says how many", async () => {
   mockAsset(detail);
-  stubKeyframes(
-    reply(
-      200,
-      '{"model_tag":"siglip2-b16-v1","detected":5,"timestamps":[1500,65500]}',
-    ),
+  stubManifest(
+    200,
+    '{"model_tag":"siglip2-b16-v1","detected":5,"timestamps":[1500,65500]}',
   );
   render(Inspector, { assetId: "xxh3:abc123" });
 
@@ -232,9 +209,7 @@ test("a manifest listing fewer keyframes than were detected says how many", asyn
 
 test("a manifest that cannot be read reports why without hiding the asset", async () => {
   mockAsset(detail);
-  stubKeyframes(
-    reply(503, "no catalog selected yet — initialize or choose one first"),
-  );
+  stubManifest(503, "no catalog selected yet — initialize or choose one first");
   render(Inspector, { assetId: "xxh3:abc123" });
 
   expect(await screen.findByText(/no catalog selected yet/u)).toBeTruthy();

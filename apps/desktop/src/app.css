@@ -374,6 +374,42 @@ main > .error {
   font-size: 0.8rem;
 }
 
+/* Fixed, so the shell grid is laid out the same whether or not an update is
+   waiting — the banner never reflows a surface out from under a click. */
+.update-banner {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: Canvas;
+  box-shadow: 0 2px 12px rgb(0 0 0 / 18%);
+}
+
+.update-banner p {
+  margin: 0;
+}
+
+.update-banner button {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.update-banner .dismiss {
+  border: 0;
+  color: var(--muted);
+}
+
 .welcome {
   max-width: 34rem;
   margin: 0 auto;

@@ -204,6 +204,21 @@ fn search_assets_rows_match_service_outcome() {
     assert!(hit["name"].is_string(), "{hit}");
     assert_eq!(hit["known"], serde_json::json!(true), "{hit}");
     assert_eq!(hit["name"], serde_json::json!("a.txt"), "{hit}");
+
+    // The other half of the notices contract: when nothing went wrong the
+    // field is absent from the wire entirely, rather than riding along as an
+    // empty array on every response. The query has to be FILTER-ONLY to pin
+    // this — a term search consults the semantic layers, which legitimately
+    // record "unavailable" notes on a machine with no models installed, so
+    // the same assertion on the term search above would pass or fail by
+    // accident of what the test machine happens to have fetched.
+    let filtered = mcp.call_tool("search_assets", &serde_json::json!({"query": "tag:demo"}));
+    let structured = &filtered["result"]["structuredContent"];
+    assert_eq!(structured["count"], serde_json::json!(1), "{structured}");
+    assert!(
+        structured.get("notices").is_none(),
+        "an uneventful search must not carry a notices field: {structured}"
+    );
 }
 
 /// The notices contract end-to-end: a diagnostic that used to be stderr

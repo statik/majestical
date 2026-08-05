@@ -758,6 +758,98 @@ fn every_mutating_tool_documents_the_confirm_gate() {
     }
 }
 
+/// The four enum-shaped params must advertise their closed value set in
+/// `tools/list`, so a client discovers the legal values instead of guessing
+/// a string and finding out at call time. schemars renders a fieldless enum
+/// as a `$ref` into the schema's own `$defs`, so the value set is asserted
+/// there rather than inline on the property. A failure here means the
+/// published schema shape changed (schemars' representation, or the order of
+/// the values) — this is a tripwire, not a bug detector, so update it
+/// deliberately once the new shape is the one intended.
+#[test]
+fn enum_params_publish_their_value_sets_in_the_schema() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request("tools/list", &serde_json::json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for (tool_name, param, def, values) in [
+        (
+            "tag_assets",
+            "op",
+            "TagOp",
+            &["add", "rm", "confirm_suggestion", "reject_suggestion"][..],
+        ),
+        ("move_para", "op", "ParaOp", &["add", "rename", "archive"]),
+        ("ingest_source", "dedupe", "DedupeMode", &["skip", "copy"]),
+        (
+            "set_describer",
+            "backend",
+            "DescriberBackend",
+            &["ollama", "lm-studio", "open-router"],
+        ),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == serde_json::json!(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name}: missing from tools/list: {resp}"));
+        let schema = &tool["inputSchema"];
+        assert_eq!(
+            schema["properties"][param]["$ref"],
+            serde_json::json!(format!("#/$defs/{def}")),
+            "{tool_name}.{param} must reference its enum definition: {schema}"
+        );
+        let published = schema["$defs"][def]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool_name}.{param}: no enum value set: {schema}"));
+        let published: Vec<&str> = published
+            .iter()
+            .map(|v| v.as_str().expect("enum value is a string"))
+            .collect();
+        assert_eq!(
+            published, values,
+            "{tool_name}.{param} must publish exactly today's wire strings"
+        );
+    }
+}
+
+/// A typo'd enum value dies at the parameter-schema layer, before any tool
+/// logic runs — the schema-level validation that replaces the old
+/// hand-rolled `parse_*` bail. The failure must be visible to the client as
+/// a tool error naming the legal values, never a structured dry-run success
+/// the caller could mistake for a plan.
+#[test]
+fn tag_assets_rejects_unknown_op_at_the_parameter_layer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({"asset": asset, "op": "bogus", "confirm": false}),
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "unknown op must fail: {resp}"
+    );
+    assert!(
+        resp["result"]["structuredContent"].get("would").is_none(),
+        "a rejected op must not return a dry-run plan: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(
+        text.contains("failed to deserialize parameters") && text.contains("bogus"),
+        "the error must name the rejected value and the layer that rejected it: {text}"
+    );
+    assert!(
+        text.contains("confirm_suggestion"),
+        "the error must name the legal values: {text}"
+    );
+}
+
 /// A hand-built write-tool response — one with no outcome struct of its own
 /// to carry a `notices` field — still hands its diagnostics to the client,
 /// via `with_notices`. `tag_assets`'s dry run reads the projection through
@@ -774,6 +866,37 @@ fn tag_assets_dry_run_folds_notices_into_its_hand_built_response() {
     let resp = mcp.call_tool(
         "tag_assets",
         &serde_json::json!({"asset": asset, "op": "add", "tag": "kf"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
+/// `set_metadata`'s dry run is hand-built the same way `tag_assets`'s is,
+/// and reads its current value straight off the app's own projection so the
+/// sink that collected the warning is the one `with_notices` drains.
+/// Routing that read through `meta::meta_get` instead would drain the sink
+/// into a `MetaOutcome` this response discards, silently losing every
+/// diagnostic — which is what this test pins.
+#[test]
+fn set_metadata_dry_run_folds_notices_into_its_hand_built_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "set_metadata",
+        &serde_json::json!({"asset": asset, "field": "rating", "value": "5"}),
     );
     assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
     let structured = &resp["result"]["structuredContent"];
@@ -945,6 +1068,82 @@ fn tag_assets_defaults_to_dry_run() {
         search["result"]["structuredContent"]["count"],
         serde_json::json!(0),
         "a dry run must not touch the catalog: {search}"
+    );
+}
+
+/// The watchlist's "dry run over-promises" fix, for the `tag_assets` ops
+/// that reject an unknown asset id on execute (`add` here; `rm` and
+/// `confirm_suggestion` likewise): a preview must fail on an unknown asset
+/// id exactly like `confirm: true` would, never describe the write as
+/// achievable. `add` and `confirm_suggestion` reject it by validating the
+/// asset; `rm` never checks the asset, reaching the same verdict only
+/// because the tag cannot be set on an id that does not exist — so its
+/// preview stays over-promising on a KNOWN asset whose tag is unset.
+/// `reject_suggestion` is the exception — see
+/// [`tag_assets_reject_suggestion_dry_run_succeeds_on_unknown_asset`].
+#[test]
+fn tag_assets_dry_run_fails_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let unknown = "xxh3:ffffffffffffffffffffffffffffffff";
+    // All three, not just `add`: the guard names its covered ops one by one,
+    // so exercising a single op would let any of the others silently drift
+    // into the unguarded `reject_suggestion` arm. Each op carries the
+    // payload its own parse requires — `tag` for add/rm, `tags` for
+    // confirm_suggestion.
+    let cases = [
+        serde_json::json!({"asset": unknown, "op": "add", "tag": "kf", "confirm": false}),
+        serde_json::json!({"asset": unknown, "op": "rm", "tag": "kf", "confirm": false}),
+        serde_json::json!({
+            "asset": unknown, "op": "confirm_suggestion", "tags": ["kf"], "confirm": false
+        }),
+    ];
+    for args in cases {
+        let resp = mcp.call_tool("tag_assets", &args);
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "{args}: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("error text for {args}"));
+        assert!(text.contains("unknown asset"), "{args}: {text}");
+    }
+}
+
+/// The other half of the guard: `tags::reject` records the pair as given
+/// without checking it against any current suggestion, so a rejection on an
+/// unknown asset id succeeds — a harmless no-op line rather than a full
+/// blob scan on every reject. Its preview must therefore NOT validate, or
+/// the dry run would fail where `confirm: true` succeeds.
+#[test]
+fn tag_assets_reject_suggestion_dry_run_succeeds_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({
+            "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+            "op": "reject_suggestion",
+            "tags": ["kf"],
+            "confirm": false
+        }),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert!(
+        structured["would"]
+            .as_str()
+            .is_some_and(|s| s.contains("reject suggested tag(s)")),
+        "the preview must still describe the rejection: {structured}"
     );
 }
 
@@ -1543,9 +1742,8 @@ fn scan_volume_dry_run_then_confirm_makes_the_file_searchable() {
 /// Closes the cargo-mutants gap on `set_metadata_result`'s
 /// `Ok(Default::default())`/`delete !` survivors and the
 /// `MajServer::set_metadata` wrapper survivor. Uses a known asset
-/// throughout — it does NOT prove the dry-run validates the asset exists;
-/// see the watchlist's "dry-run previews over-promise on an unknown asset
-/// id" item, still open.
+/// throughout; the unknown-id half is
+/// [`set_metadata_dry_run_fails_on_unknown_asset`].
 #[test]
 fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1590,6 +1788,42 @@ fn set_metadata_dry_run_then_confirm_is_visible_via_get_asset() {
     let known = mcp.call_tool("get_asset", &serde_json::json!({"asset_id": asset}));
     let fields = &known["result"]["structuredContent"]["asset"]["fields"];
     assert_eq!(fields["rating"], serde_json::json!("5"), "{fields}");
+}
+
+/// The watchlist's "dry run over-promises" fix: `meta_set` validates the
+/// asset on execute, so its preview must fail on an unknown asset id
+/// exactly like `confirm: true` would, never describe the write as
+/// achievable. Both arms are asserted because they reach that verdict by
+/// different routes — the preview through `set_metadata_result`'s own
+/// guard, the execute path through `meta_set`'s — and only the preview's
+/// guard lives in this crate. Without the `confirm: true` half, dropping
+/// `meta_set`'s check would leave the two arms disagreeing again with
+/// nothing here to notice.
+#[test]
+fn set_metadata_dry_run_fails_on_unknown_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    for confirm in [false, true] {
+        let resp = mcp.call_tool(
+            "set_metadata",
+            &serde_json::json!({
+                "asset": "xxh3:ffffffffffffffffffffffffffffffff",
+                "field": "rating",
+                "value": "5",
+                "confirm": confirm
+            }),
+        );
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "confirm={confirm}: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("error text for confirm={confirm}"));
+        assert!(text.contains("unknown asset"), "confirm={confirm}: {text}");
+    }
 }
 
 /// Closes the cargo-mutants gap on `set_describer_result`'s

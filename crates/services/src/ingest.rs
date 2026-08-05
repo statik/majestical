@@ -19,6 +19,34 @@ use majestical_ingest::{engine, journal, mhl, plan, template};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. Narrower than `plan::DedupeMode`: `skip`/`copy` only,
+// because `Link` still needs the per-destination existing-instance lookup
+// `maj ingest`'s own clap arg also excludes. The doc comment below ships
+// verbatim as the wire `description`, so it is written for the client.
+/// `skip` leaves a file already known to the catalog where it is; `copy`
+/// copies it anyway.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupeMode {
+    Skip,
+    Copy,
+}
+
+impl From<DedupeMode> for plan::DedupeMode {
+    fn from(v: DedupeMode) -> Self {
+        match v {
+            DedupeMode::Skip => Self::Skip,
+            // Same semantics under a different name: copy despite being a
+            // known duplicate.
+            DedupeMode::Copy => Self::CopyAnyway,
+        }
+    }
+}
+
 /// Resolves `para` to an active PARA node's (id, kind, name). Ingest targets
 /// must be non-archived even when addressed by a raw node id — unlike
 /// `resolve_para_node`'s general allowance for archived nodes (needed so an
@@ -545,6 +573,21 @@ mod tests {
 
     fn init_app(dir: &Path) -> FsApp {
         FsApp::init(&dir.join("cat"), "m1", "m1").expect("init")
+    }
+
+    #[test]
+    fn dedupe_mode_wire_strings_are_pinned() {
+        for (mode, wire) in [(DedupeMode::Skip, "skip"), (DedupeMode::Copy, "copy")] {
+            assert_eq!(
+                serde_json::to_value(mode).expect("ser"),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<DedupeMode>(serde_json::json!(wire)).expect("de"),
+                mode
+            );
+        }
+        assert!(serde_json::from_value::<DedupeMode>(serde_json::json!("bogus")).is_err());
     }
 
     #[test]

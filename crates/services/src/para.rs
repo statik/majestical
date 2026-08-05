@@ -8,6 +8,22 @@ use majestical_core::event::{Op, ParaKind};
 use majestical_core::projection::Projection;
 use std::path::{Path, PathBuf};
 
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. Distinct from `ParaKind`, which says what a node IS;
+// this says what to DO to one. The doc comment below ships verbatim as the
+// wire `description`, so it is written for the client, not for us.
+/// `add` creates a PARA node, `rename` renames one, `archive` archives one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ParaOp {
+    Add,
+    Rename,
+    Archive,
+}
+
 /// # Errors
 /// Returns an error if `kind` isn't one of `project`, `area`, `resource`, or
 /// `archive`.
@@ -376,6 +392,25 @@ fn para_list_impl(app: &FsApp, catalog_dir: &Path) -> Result<ParaOutcome> {
 mod para_list_tests {
     use super::*;
     use majestical_core::event::{Op, ParaKind};
+
+    #[test]
+    fn para_op_wire_strings_are_pinned() {
+        for (op, wire) in [
+            (ParaOp::Add, "add"),
+            (ParaOp::Rename, "rename"),
+            (ParaOp::Archive, "archive"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(op).expect("ser"),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<ParaOp>(serde_json::json!(wire)).expect("de"),
+                op
+            );
+        }
+        assert!(serde_json::from_value::<ParaOp>(serde_json::json!("bogus")).is_err());
+    }
 
     #[test]
     fn para_list_reports_every_created_node() {

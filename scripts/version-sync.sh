@@ -12,7 +12,7 @@ gui=$(grep -m1 '^version' apps/desktop/src-tauri/Cargo.toml | cut -d'"' -f2)
 # trips shellcheck's SC2055, and these read as "any of the three drifted".
 if [[ "$root" != "$npm_pkg" ]] || [[ "$root" != "$conf" ]] || [[ "$root" != "$gui" ]]; then
   echo "version mismatch: workspace=$root package.json=$npm_pkg tauri.conf.json=$conf src-tauri=$gui" >&2
-  echo "fix: set all four to the same version before tagging a release" >&2
+  echo "fix: set them all to the same version before tagging a release" >&2
   exit 1
 fi
 

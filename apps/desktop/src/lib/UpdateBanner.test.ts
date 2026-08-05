@@ -2,6 +2,7 @@ import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { mockCommands } from "./test-support";
 import UpdateBanner from "./UpdateBanner.svelte";
 
 // Every failure path in `updater.ts` ends in a `console.debug`, and these
@@ -25,10 +26,7 @@ const metadata = {
 };
 
 test("an available update is offered by version", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "plugin:updater|check") return metadata;
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ "plugin:updater|check": () => metadata });
   render(UpdateBanner);
 
   expect(await screen.findByText("Update to v0.2.0 available")).toBeTruthy();
@@ -36,10 +34,7 @@ test("an available update is offered by version", async () => {
 });
 
 test("nothing is offered when the endpoint has nothing newer", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "plugin:updater|check") return null;
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ "plugin:updater|check": () => null });
   const { container } = render(UpdateBanner);
 
   await waitFor(() =>
@@ -63,12 +58,19 @@ test("a rejected check is swallowed, not surfaced", async () => {
 
 test("applying an update installs it, then restarts into it", async () => {
   const calls: string[] = [];
-  mockIPC((cmd) => {
-    calls.push(cmd);
-    if (cmd === "plugin:updater|check") return metadata;
-    if (cmd === "plugin:updater|download_and_install") return null;
-    if (cmd === "plugin:process|restart") return null;
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    "plugin:updater|check": () => {
+      calls.push("check");
+      return metadata;
+    },
+    "plugin:updater|download_and_install": () => {
+      calls.push("install");
+      return null;
+    },
+    "plugin:process|restart": () => {
+      calls.push("restart");
+      return null;
+    },
   });
   render(UpdateBanner);
 
@@ -76,12 +78,10 @@ test("applying an update installs it, then restarts into it", async () => {
     await screen.findByRole("button", { name: "Restart to apply" }),
   );
 
-  await waitFor(() => expect(calls).toContain("plugin:process|restart"));
+  await waitFor(() => expect(calls).toContain("restart"));
   // Order matters: restarting before the bytes are installed would relaunch
   // the same version.
-  expect(calls.indexOf("plugin:updater|download_and_install")).toBeLessThan(
-    calls.indexOf("plugin:process|restart"),
-  );
+  expect(calls.indexOf("install")).toBeLessThan(calls.indexOf("restart"));
 });
 
 test("an install that fails leaves the banner up to try again", async () => {
@@ -102,10 +102,7 @@ test("an install that fails leaves the banner up to try again", async () => {
 });
 
 test("dismissing takes the banner away for the session", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "plugin:updater|check") return metadata;
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  mockCommands({ "plugin:updater|check": () => metadata });
   const { container } = render(UpdateBanner);
 
   await userEvent.click(

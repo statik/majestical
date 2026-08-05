@@ -1,9 +1,10 @@
-import { clearMocks, mockConvertFileSrc, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import type { SearchHit, SearchOutcome } from "./api";
 import SearchView from "./SearchView.svelte";
+import { mockCommands, rejectCommand } from "./test-support";
 
 // `convertFileSrc` reads a webview-only internal, so every result thumbnail
 // throws without this stub. The OS only picks the URL spelling.
@@ -26,13 +27,12 @@ const noResults: SearchOutcome = { count: 0, results: [] };
 
 test("typing debounces to a single search for the final query", async () => {
   const queries: string[] = [];
-  mockIPC((cmd, args) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    if (cmd === "search_assets") {
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: (args) => {
       queries.push((args as { query: string }).query);
       return noResults;
-    }
-    throw new Error(`unexpected command ${cmd}`);
+    },
   });
 
   render(SearchView, { onselect: () => {} });
@@ -43,10 +43,12 @@ test("typing debounces to a single search for the final query", async () => {
 
 test("surrounding whitespace never reaches the backend", async () => {
   const queries: string[] = [];
-  mockIPC((cmd, args) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    queries.push((args as { query: string }).query);
-    return noResults;
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: (args) => {
+      queries.push((args as { query: string }).query);
+      return noResults;
+    },
   });
 
   render(SearchView, { onselect: () => {} });
@@ -58,15 +60,17 @@ test("surrounding whitespace never reaches the backend", async () => {
 test("a stale response never overwrites a newer query's results", async () => {
   let resolveFirst!: (value: SearchOutcome) => void;
   let calls = 0;
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    calls += 1;
-    if (calls === 1) {
-      return new Promise<SearchOutcome>((resolve) => {
-        resolveFirst = resolve;
-      });
-    }
-    return { count: 1, results: [hit("second")] };
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise<SearchOutcome>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { count: 1, results: [hit("second")] };
+    },
   });
 
   render(SearchView, { onselect: () => {} });
@@ -93,9 +97,9 @@ test("a stale response never overwrites a newer query's results", async () => {
 test("notices and coverage render verbatim, with nothing to dismiss them", async () => {
   const notice =
     "warning: skipped 1 corrupt event log line(s) in /x/events — damaged transport; affected metadata may be missing";
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    return {
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({
       count: 0,
       results: [],
       notices: [notice],
@@ -110,7 +114,7 @@ test("notices and coverage render verbatim, with nothing to dismiss them", async
           source: "transcript",
         },
       ],
-    };
+    }),
   });
 
   render(SearchView, { onselect: () => {} });
@@ -133,9 +137,13 @@ test("a notice repeated in one outcome renders twice, results intact", async () 
   // Reachable on real data: a saved-search run drains the same corrupt-log
   // notice from both the projection load and the catalog open, byte for byte.
   const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    return { count: 1, results: [hit("kept")], notices: [notice, notice] };
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({
+      count: 1,
+      results: [hit("kept")],
+      notices: [notice, notice],
+    }),
   });
 
   render(SearchView, { onselect: () => {} });
@@ -149,12 +157,14 @@ test("a notice repeated in one outcome renders twice, results intact", async () 
 test("clearing the box cancels the search still in flight", async () => {
   let resolveFirst!: (value: SearchOutcome) => void;
   let calls = 0;
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    calls += 1;
-    return new Promise<SearchOutcome>((resolve) => {
-      resolveFirst = resolve;
-    });
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => {
+      calls += 1;
+      return new Promise<SearchOutcome>((resolve) => {
+        resolveFirst = resolve;
+      });
+    },
   });
 
   render(SearchView, { onselect: () => {} });
@@ -176,12 +186,13 @@ test("a failed search reports its whole message chain and drops stale results", 
   const message =
     "unknown filter key 'colour' — known keys: tag, vol/volume, para, kind, online, before, after, in";
   let calls = 0;
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    calls += 1;
-    if (calls === 1) return { count: 1, results: [hit("earlier")] };
-    // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-    return Promise.reject({ message });
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => {
+      calls += 1;
+      if (calls === 1) return { count: 1, results: [hit("earlier")] };
+      return rejectCommand(message);
+    },
   });
 
   render(SearchView, { onselect: () => {} });
@@ -199,10 +210,9 @@ test("a failed search reports its whole message chain and drops stale results", 
 });
 
 test("clearing the box drops a failed search's error", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-    return Promise.reject({ message: "unknown filter key 'colour'" });
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => rejectCommand("unknown filter key 'colour'"),
   });
 
   render(SearchView, { onselect: () => {} });
@@ -217,9 +227,13 @@ test("clearing the box drops a failed search's error", async () => {
 
 test("what a search returned is announced, not just drawn", async () => {
   const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    return { count: 1, results: [hit("kept")], notices: [notice] };
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({
+      count: 1,
+      results: [hit("kept")],
+      notices: [notice],
+    }),
   });
 
   render(SearchView, { onselect: () => {} });
@@ -237,9 +251,9 @@ test("what a search returned is announced, not just drawn", async () => {
 });
 
 test("a result's volume badge names the state its glyph stands for", async () => {
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    return { count: 1, results: [hit("kept")] };
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({ count: 1, results: [hit("kept")] }),
   });
 
   render(SearchView, { onselect: () => {} });
@@ -251,15 +265,14 @@ test("a result's volume badge names the state its glyph stands for", async () =>
 
 test("a saved-search chip runs that saved search", async () => {
   const names: string[] = [];
-  mockIPC((cmd, args) => {
-    if (cmd === "list_saved_searches") {
-      return { saved: [{ name: "b-roll", query: "tag:broll" }] };
-    }
-    if (cmd === "run_saved_search") {
+  mockCommands({
+    list_saved_searches: () => ({
+      saved: [{ name: "b-roll", query: "tag:broll" }],
+    }),
+    run_saved_search: (args) => {
       names.push((args as { name: string }).name);
       return { count: 1, results: [hit("clip")] };
-    }
-    throw new Error(`unexpected command ${cmd}`);
+    },
   });
 
   render(SearchView, { onselect: () => {} });

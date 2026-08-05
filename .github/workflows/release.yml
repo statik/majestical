@@ -99,8 +99,8 @@ jobs:
             through a shared folder.
 
             macOS only, Apple silicon and Intel. Unsigned — Gatekeeper warns on
-            first run (`xattr -d com.apple.quarantine`). `licenses.html` lists
-            the third-party crates bundled with the app.
+            first run (`xattr -d com.apple.quarantine /Applications/Majestical.app`).
+            `licenses.html` lists the third-party crates bundled with the app.
   cli:
     name: maj binary and license bundle
     # Both uploads go into the draft the desktop job creates, so they wait for

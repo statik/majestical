@@ -1,22 +1,16 @@
-import { clearMocks, mockConvertFileSrc, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
+import { mockCommands, rejectCommand, stubManifest } from "./lib/test-support";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
   // The inspector asks the `thumb://` protocol for a keyframe manifest; this
   // app has none for the fixture asset.
-  vi.stubGlobal("fetch", () =>
-    Promise.resolve({
-      ok: false,
-      status: 404,
-      json: () => Promise.resolve({}),
-      text: () => Promise.resolve("no keyframe manifest"),
-    } as Response),
-  );
+  stubManifest(404, "no keyframe manifest");
 });
 afterEach(() => {
   clearMocks();
@@ -61,36 +55,32 @@ const detail: AssetDetail = {
 };
 
 function mockStatus(status: AppStatus) {
-  mockIPC((cmd) => {
-    if (cmd === "app_status") return status;
-    if (cmd === UPDATE_CHECK) return null;
-    if (cmd === "list_saved_searches") return { saved: [] };
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    app_status: () => status,
+    [UPDATE_CHECK]: () => null,
+    list_saved_searches: () => ({ saved: [] }),
   });
 }
 
 /** Every command the shell reaches for once a catalog is ready; the catalog
  *  holds one volume per label given. */
 function mockCatalog(volumeLabels: string[]) {
-  mockIPC((cmd) => {
-    if (cmd === "app_status") return ready;
-    if (cmd === UPDATE_CHECK) return null;
-    if (cmd === "list_saved_searches") return { saved: [] };
-    if (cmd === "search_assets") return { count: 1, results: [hit] };
-    if (cmd === "get_asset") return detail;
-    if (cmd === "list_volumes") {
-      return {
-        volumes: volumeLabels.map((label) => ({
-          id: `label:${label}`,
-          label,
-          last_seen_ms: 1_700_000_000_000,
-          online: false,
-          asset_count: 3,
-          clock_suspect: false,
-        })),
-      };
-    }
-    throw new Error(`unexpected command ${cmd}`);
+  mockCommands({
+    app_status: () => ready,
+    [UPDATE_CHECK]: () => null,
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => ({ count: 1, results: [hit] }),
+    get_asset: () => detail,
+    list_volumes: () => ({
+      volumes: volumeLabels.map((label) => ({
+        id: `label:${label}`,
+        label,
+        last_seen_ms: 1_700_000_000_000,
+        online: false,
+        asset_count: 3,
+        clock_suspect: false,
+      })),
+    }),
   });
 }
 
@@ -163,15 +153,13 @@ test("leaving the search surface closes the inspector with it", async () => {
 test("a failed startup offers a retry that asks again", async () => {
   const message = "catalog at /catalogs/main is 2 schema versions ahead";
   let calls = 0;
-  mockIPC((cmd) => {
-    if (cmd === "list_saved_searches") return { saved: [] };
-    if (cmd !== "app_status") throw new Error(`unexpected command ${cmd}`);
-    calls += 1;
-    if (calls === 1) {
-      // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-      return Promise.reject({ message });
-    }
-    return ready;
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    [UPDATE_CHECK]: () => null,
+    app_status: () => {
+      calls += 1;
+      return calls === 1 ? rejectCommand(message) : ready;
+    },
   });
   render(App);
 

@@ -2,6 +2,9 @@
   import { onDestroy } from "svelte";
   import { api, errorMessage } from "./api";
   import type { SavedSearch, SearchOutcome } from "./api";
+  import { timecode } from "./format";
+  import Notices from "./Notices.svelte";
+  import OnlineBadge from "./OnlineBadge.svelte";
   import { thumbUrl } from "./thumb";
 
   let { onselect }: { onselect: (assetId: string) => void } = $props();
@@ -73,13 +76,6 @@
       error = errorMessage(failure);
     }
   }
-
-  /** `@MmSSs`, the timecode `maj search` prints for a keyframe hit. */
-  function timecode(ms: number): string {
-    const minutes = Math.floor(ms / 60_000);
-    const seconds = Math.floor((ms % 60_000) / 1000);
-    return `@${minutes}m${String(seconds).padStart(2, "0")}s`;
-  }
 </script>
 
 <div class="surface">
@@ -106,35 +102,38 @@
     </div>
   {/if}
 
-  <!-- Notice lists are deliberately unkeyed: the same notice can legitimately
-       appear twice in one outcome, and a keyed each throws on a repeat. -->
-  {#each savedNotices as notice}
-    <p class="notice">{notice}</p>
-  {/each}
+  <Notices notices={savedNotices} />
 
   {#if error}
     <p class="error" role="alert">{error}</p>
   {/if}
 
-  {#if outcome}
-    <p class="count">{outcome.count} results</p>
+  <!-- The live region is always in the document, empty between searches: a
+       `role="status"` element created together with its text is not reliably
+       announced, so what changes has to be the region's contents. -->
+  <div role="status">
+    {#if outcome}
+      <p class="count">{outcome.count} results</p>
 
-    {#each outcome.notices ?? [] as notice}
-      <p class="notice">{notice}</p>
-    {/each}
-    {#if outcome.semantic_coverage && outcome.semantic_coverage.embedded < outcome.semantic_coverage.eligible}
-      <p class="notice">
-        semantic index: {outcome.semantic_coverage.embedded} of {outcome
-          .semantic_coverage.eligible} eligible assets
-      </p>
+      <Notices notices={outcome.notices} />
+      {#if outcome.semantic_coverage && outcome.semantic_coverage.embedded < outcome.semantic_coverage.eligible}
+        <p class="notice">
+          semantic index: {outcome.semantic_coverage.embedded} of {outcome
+            .semantic_coverage.eligible} eligible assets
+        </p>
+      {/if}
+      <!-- Keyed by source: one notice per `TEXT_SOURCE_INFO` entry, so the
+           source key cannot repeat. -->
+      {#each outcome.text_coverage ?? [] as coverage (coverage.source)}
+        <p class="notice">
+          {coverage.label}: {coverage.covered} of {coverage.eligible}
+          {coverage.noun} — {coverage.remedy}
+        </p>
+      {/each}
     {/if}
-    {#each outcome.text_coverage ?? [] as coverage (coverage.source)}
-      <p class="notice">
-        {coverage.label}: {coverage.covered} of {coverage.eligible}
-        {coverage.noun} — {coverage.remedy}
-      </p>
-    {/each}
+  </div>
 
+  {#if outcome}
     <ul class="grid">
       {#each outcome.results as hit (hit.asset)}
         <li>
@@ -144,7 +143,7 @@
               <span class="name">{hit.name}</span>
               <span class="volumes">
                 {#each hit.volumes as volume}
-                  <span class="badge">{volume.label}{volume.online ? "●" : "○"}</span>
+                  <OnlineBadge label={volume.label} online={volume.online} />
                 {/each}
               </span>
               {#if hit.timestamp_ms !== undefined}

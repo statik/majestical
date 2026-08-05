@@ -9,5 +9,8 @@ export default defineConfig({
   plugins: [svelte(), svelteTesting()],
   clearScreen: false,
   server: { port: 1420, strictPort: true },
-  test: { environment: "jsdom" },
+  // `css` defaults to false, which hands every CSS import back as an empty
+  // string — `styles.test.ts` asserts on computed layout and needs the real
+  // sheet in the document, so it is processed and injected for real.
+  test: { environment: "jsdom", css: true },
 });

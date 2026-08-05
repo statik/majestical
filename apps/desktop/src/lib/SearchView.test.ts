@@ -1,5 +1,5 @@
 import { clearMocks, mockConvertFileSrc, mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { render, screen, waitFor, within } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import type { SearchHit, SearchOutcome } from "./api";
@@ -213,6 +213,40 @@ test("clearing the box drops a failed search's error", async () => {
   await userEvent.clear(box);
 
   await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+});
+
+test("what a search returned is announced, not just drawn", async () => {
+  const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
+  mockIPC((cmd) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    return { count: 1, results: [hit("kept")], notices: [notice] };
+  });
+
+  render(SearchView, { onselect: () => {} });
+  // The live region exists before the results do: one created together with
+  // its text is not reliably announced.
+  const live = screen.getByRole("status");
+  expect(live.textContent).toBe("");
+
+  await userEvent.type(screen.getByRole("searchbox"), "q");
+
+  await waitFor(() =>
+    expect(within(live).getByText("1 results")).toBeTruthy(),
+  );
+  expect(within(live).getByText(notice)).toBeTruthy();
+});
+
+test("a result's volume badge names the state its glyph stands for", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    return { count: 1, results: [hit("kept")] };
+  });
+
+  render(SearchView, { onselect: () => {} });
+  await userEvent.type(screen.getByRole("searchbox"), "q");
+
+  expect(await screen.findByRole("img", { name: "Card online" })).toBeTruthy();
+  expect(screen.getByText("Card●")).toBeTruthy();
 });
 
 test("a saved-search chip runs that saved search", async () => {

@@ -8,10 +8,12 @@ use majestical_core::event::{Op, ParaKind};
 use majestical_core::projection::Projection;
 use std::path::{Path, PathBuf};
 
-/// `move_para`'s wire-level op — a real enum so the MCP JSON schema (and a
-/// future GUI dropdown) carries the closed value set instead of a free
-/// string validated only at call time. Distinct from `ParaKind`, which says
-/// what a node IS; this says what to DO to one.
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. Distinct from `ParaKind`, which says what a node IS;
+// this says what to DO to one. The doc comment below ships verbatim as the
+// wire `description`, so it is written for the client, not for us.
+/// `add` creates a PARA node, `rename` renames one, `archive` archives one.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]

@@ -762,7 +762,10 @@ fn every_mutating_tool_documents_the_confirm_gate() {
 /// `tools/list`, so a client discovers the legal values instead of guessing
 /// a string and finding out at call time. schemars renders a fieldless enum
 /// as a `$ref` into the schema's own `$defs`, so the value set is asserted
-/// there rather than inline on the property.
+/// there rather than inline on the property. A failure here means the
+/// published schema shape changed (schemars' representation, or the order of
+/// the values) — this is a tripwire, not a bug detector, so update it
+/// deliberately once the new shape is the one intended.
 #[test]
 fn enum_params_publish_their_value_sets_in_the_schema() {
     let dir = tempfile::tempdir().expect("tempdir");

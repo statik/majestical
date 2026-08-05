@@ -7,11 +7,14 @@ use anyhow::{Context as _, Result, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 use std::path::{Path, PathBuf};
 
-/// `set_describer`'s wire-level backend name — a real enum so the MCP JSON
-/// schema (and a future GUI dropdown) carries the closed value set instead
-/// of a free string validated only at call time. The kebab-case wire strings
-/// match `BackendKind`'s own `as_str`, which the stored `describer.toml` and
-/// `maj describer set --backend` already use.
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. The kebab-case wire strings match `BackendKind`'s own
+// `as_str`, which the stored `describer.toml` and `maj describer set
+// --backend` already use. The doc comment below ships verbatim as the wire
+// `description`, so it is written for the client.
+/// Which service generates captions and tag suggestions: `ollama` and
+/// `lm-studio` run locally, `open-router` is a hosted API.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]

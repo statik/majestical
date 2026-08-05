@@ -19,10 +19,12 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// `tag_assets`'s wire-level op — a real enum so the MCP JSON schema (and a
-/// future GUI dropdown) carries the closed value set instead of a free
-/// string validated only at call time. `Add`/`Rm` act on folksonomy tags
-/// directly; `ConfirmSuggestion`/`RejectSuggestion` act on pending AI
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. The doc comment below ships verbatim as the wire
+// `description`, so it is written for the client, not for us.
+/// `add`/`rm` set or remove a folksonomy tag directly;
+/// `confirm_suggestion`/`reject_suggestion` act on pending AI tag
 /// suggestions.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,

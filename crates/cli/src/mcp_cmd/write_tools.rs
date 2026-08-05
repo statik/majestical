@@ -200,21 +200,21 @@ fn tag_assets_result(
     let done = match op {
         ValidatedTagOp::Add(tag) => {
             majestical_services::tags::tag_add(app, &args.asset, tag)?;
-            json!({"asset": args.asset, "op": "add", "tag": tag})
+            json!({"asset": args.asset, "op": args.op, "tag": tag})
         }
         ValidatedTagOp::Rm(tag) => {
             majestical_services::tags::tag_rm(app, &args.asset, tag)?;
-            json!({"asset": args.asset, "op": "rm", "tag": tag})
+            json!({"asset": args.asset, "op": args.op, "tag": tag})
         }
         ValidatedTagOp::ConfirmSuggestion(tags) => {
             majestical_services::tags::confirm(app, &args.asset, tags)?;
-            json!({"asset": args.asset, "op": "confirm_suggestion", "tags": tags})
+            json!({"asset": args.asset, "op": args.op, "tags": tags})
         }
         // `reject` is app-less (a state-dir file, never an event), so it
         // records into the app's sink directly rather than a second one.
         ValidatedTagOp::RejectSuggestion(tags) => {
             majestical_services::tags::reject(catalog, &args.asset, tags, app.notices())?;
-            json!({"asset": args.asset, "op": "reject_suggestion", "tags": tags})
+            json!({"asset": args.asset, "op": args.op, "tags": tags})
         }
     };
     Ok(super::with_notices(done, app.notices().drain()))

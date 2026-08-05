@@ -19,11 +19,14 @@ use majestical_ingest::{engine, journal, mhl, plan, template};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The ingest dedupe surface MCP/GUI expose — a real enum so the schema (and
-/// a future GUI dropdown) carries the closed value set instead of a free
-/// string validated only at call time. Narrower than `plan::DedupeMode`:
-/// `skip`/`copy` only, because `Link` still needs the per-destination
-/// existing-instance lookup `maj ingest`'s own clap arg also excludes.
+// A real enum rather than a free string so the MCP JSON schema (and a future
+// GUI dropdown) carries the closed value set, instead of a typo round-tripping
+// to a call-time error. Narrower than `plan::DedupeMode`: `skip`/`copy` only,
+// because `Link` still needs the per-destination existing-instance lookup
+// `maj ingest`'s own clap arg also excludes. The doc comment below ships
+// verbatim as the wire `description`, so it is written for the client.
+/// `skip` leaves a file already known to the catalog where it is; `copy`
+/// copies it anyway.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
@@ -37,6 +40,8 @@ impl From<DedupeMode> for plan::DedupeMode {
     fn from(v: DedupeMode) -> Self {
         match v {
             DedupeMode::Skip => Self::Skip,
+            // Same semantics under a different name: copy despite being a
+            // known duplicate.
             DedupeMode::Copy => Self::CopyAnyway,
         }
     }

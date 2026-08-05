@@ -821,6 +821,101 @@ fn get_asset_not_found_folds_notices_into_its_hand_built_response() {
     );
 }
 
+/// `list_saved_searches` has no service outcome struct to ride: the verb
+/// returns a bare `Vec<SavedSearch>`, so the wire object is this module's own
+/// `SavedSearchesResult`. Pins that its `notices` field is actually populated
+/// from the per-call app rather than left at its default.
+#[test]
+fn list_saved_searches_folds_notices_into_its_local_result_struct() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_saved_searches", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
+/// `get_asset`'s found arm carries its notices NESTED, on the `AssetDetail`
+/// the service drained them into — `structuredContent.asset.notices`, not the
+/// top level. Pinning the location keeps a reader from concluding the buffer
+/// is dropped on this path just because nothing sits beside `found`.
+#[test]
+fn get_asset_found_carries_notices_nested_on_the_asset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    // Resolved BEFORE the log is corrupted: `asset_id_of` runs its own `maj`,
+    // and a read that passes the corrupt line first would consume the warning.
+    let asset_id = common::asset_id_of(&root, &state, "a.txt");
+    corrupt_the_event_log(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("get_asset", &serde_json::json!({"asset_id": asset_id}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["found"], serde_json::json!(true), "{structured}");
+    assert!(
+        structured["notices"].is_null(),
+        "the found arm carries them on the asset, not beside `found`: {structured}"
+    );
+    let notices = structured["asset"]["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must ride the asset: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
+/// `index_run`'s executed arm updates the on-disk failure marker AFTER the
+/// pass returns, through a sink of its own. Those lines are appended to the
+/// run outcome's existing `notices` rather than shipped as a second field —
+/// pins that the append happens at all. The catalog is empty and no models
+/// are installed, so every kind degrades to a no-op and the pass is quick.
+#[test]
+fn index_run_appends_the_failure_report_note_to_the_run_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    // Materializes the per-catalog state dir so the marker can be planted in
+    // it — the same trick `search_with_a_planted_fake_model_does_not_panic_the_server`
+    // uses to find that directory.
+    common::maj(&root, &state)
+        .args(["volumes", "list"])
+        .assert()
+        .success();
+    let catalog_dbs = common::walkdir_find(&state, "catalog.db");
+    assert_eq!(catalog_dbs.len(), 1, "{catalog_dbs:?}");
+    let catalog_state_dir = catalog_dbs[0].parent().expect("parent");
+    std::fs::write(catalog_state_dir.join("index-failures.json"), b"{ not json")
+        .expect("plant an unparsable marker");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("index_run", &serde_json::json!({"confirm": true}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("ignoring unparsable failure report"))),
+        "the marker-update note must be folded in: {structured}"
+    );
+}
+
 #[test]
 fn tag_assets_defaults_to_dry_run() {
     let dir = tempfile::tempdir().expect("tempdir");

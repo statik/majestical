@@ -544,6 +544,28 @@ mod tests {
         assert_eq!(report["pdf"][0]["error"], "not a valid pdf");
     }
 
+    /// `status` is the verb that shows the last run's failures, so its own
+    /// read of a corrupt marker is exactly the diagnostic a caller needs —
+    /// pins that the outcome actually carries it home rather than the sink
+    /// being drained into a value nobody reads.
+    #[test]
+    fn status_carries_the_unparsable_failure_report_note_on_its_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let app = FsApp::init(&root, "m1", "m1").expect("init");
+        let state_dir = crate::state_dir::state_dir_for(&root, app.notices()).expect("state dir");
+        std::fs::write(state_dir.join(FAILURES_FILE), b"{ not json").expect("plant");
+        let outcome = status(&app, &root).expect("status");
+        assert!(
+            outcome
+                .notices
+                .iter()
+                .any(|n| n.contains("ignoring unparsable failure report")),
+            "{:?}",
+            outcome.notices
+        );
+    }
+
     /// A marker file the next run will overwrite anyway must never be a hard
     /// failure — it degrades to an empty report plus one notice.
     #[test]

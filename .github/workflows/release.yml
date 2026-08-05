@@ -68,14 +68,17 @@ jobs:
         working-directory: apps/desktop
       # Creates the draft release on first run and attaches this target's
       # bundles; the second matrix job finds the same draft and adds its own.
+      # Both jobs list-then-create, so check that a tag produced exactly one
+      # draft carrying both architectures (docs/RELEASING.md, step 5).
       #
-      # The signing secrets are what arm the updater. Without them the Tauri
-      # CLI still builds and bundles, just unsigned — which is the state this
-      # workflow is designed to run in until the keypair exists (see
-      # docs/RELEASING.md). `uploadUpdaterJson` is on so that the arming
-      # commit needs no workflow change; until `bundle.createUpdaterArtifacts`
-      # is turned on there are no `.sig` files to describe, and latest.json
-      # lands listing no platforms.
+      # The signing secrets are required, not optional: with a pubkey in
+      # tauri.conf.json and createUpdaterArtifacts on, the Tauri CLI refuses
+      # to bundle without a private key and this job fails at that step. That
+      # is deliberate — a release that silently shipped unsigned bundles would
+      # be one no installed app could ever verify an update from.
+      #
+      # A key that does not match the configured pubkey does NOT fail here; it
+      # only logs a warning. docs/RELEASING.md says what to grep for.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f  # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

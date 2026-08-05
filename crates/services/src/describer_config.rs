@@ -7,6 +7,31 @@ use anyhow::{Context as _, Result, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 use std::path::{Path, PathBuf};
 
+/// `set_describer`'s wire-level backend name — a real enum so the MCP JSON
+/// schema (and a future GUI dropdown) carries the closed value set instead
+/// of a free string validated only at call time. The kebab-case wire strings
+/// match `BackendKind`'s own `as_str`, which the stored `describer.toml` and
+/// `maj describer set --backend` already use.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum DescriberBackend {
+    Ollama,
+    LmStudio,
+    OpenRouter,
+}
+
+impl From<DescriberBackend> for BackendKind {
+    fn from(v: DescriberBackend) -> Self {
+        match v {
+            DescriberBackend::Ollama => Self::Ollama,
+            DescriberBackend::LmStudio => Self::LmStudio,
+            DescriberBackend::OpenRouter => Self::OpenRouter,
+        }
+    }
+}
+
 /// # Errors
 /// Returns an error if the local state dir can't be resolved.
 pub fn config_path(catalog_root: &Path, notices: &crate::notices::Notices) -> Result<PathBuf> {
@@ -181,6 +206,25 @@ mod tests {
     use super::*;
     use crate::notices::Notices;
     use majestical_describe::BackendKind;
+
+    #[test]
+    fn describer_backend_wire_strings_are_pinned() {
+        for (backend, wire) in [
+            (DescriberBackend::Ollama, "ollama"),
+            (DescriberBackend::LmStudio, "lm-studio"),
+            (DescriberBackend::OpenRouter, "open-router"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(backend).expect("ser"),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<DescriberBackend>(serde_json::json!(wire)).expect("de"),
+                backend
+            );
+        }
+        assert!(serde_json::from_value::<DescriberBackend>(serde_json::json!("bogus")).is_err());
+    }
 
     #[test]
     fn show_of_an_unconfigured_catalog_is_none() {

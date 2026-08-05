@@ -4585,6 +4585,7 @@ dependencies = [
  "majestical-ingest",
  "majestical-sync",
  "plist",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "tempfile",

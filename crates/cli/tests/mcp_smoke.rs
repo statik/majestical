@@ -758,6 +758,95 @@ fn every_mutating_tool_documents_the_confirm_gate() {
     }
 }
 
+/// The four enum-shaped params must advertise their closed value set in
+/// `tools/list`, so a client discovers the legal values instead of guessing
+/// a string and finding out at call time. schemars renders a fieldless enum
+/// as a `$ref` into the schema's own `$defs`, so the value set is asserted
+/// there rather than inline on the property.
+#[test]
+fn enum_params_publish_their_value_sets_in_the_schema() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request("tools/list", &serde_json::json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for (tool_name, param, def, values) in [
+        (
+            "tag_assets",
+            "op",
+            "TagOp",
+            &["add", "rm", "confirm_suggestion", "reject_suggestion"][..],
+        ),
+        ("move_para", "op", "ParaOp", &["add", "rename", "archive"]),
+        ("ingest_source", "dedupe", "DedupeMode", &["skip", "copy"]),
+        (
+            "set_describer",
+            "backend",
+            "DescriberBackend",
+            &["ollama", "lm-studio", "open-router"],
+        ),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == serde_json::json!(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name}: missing from tools/list: {resp}"));
+        let schema = &tool["inputSchema"];
+        assert_eq!(
+            schema["properties"][param]["$ref"],
+            serde_json::json!(format!("#/$defs/{def}")),
+            "{tool_name}.{param} must reference its enum definition: {schema}"
+        );
+        let published = schema["$defs"][def]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool_name}.{param}: no enum value set: {schema}"));
+        let published: Vec<&str> = published
+            .iter()
+            .map(|v| v.as_str().expect("enum value is a string"))
+            .collect();
+        assert_eq!(
+            published, values,
+            "{tool_name}.{param} must publish exactly today's wire strings"
+        );
+    }
+}
+
+/// A typo'd enum value dies at the parameter-schema layer, before any tool
+/// logic runs — the schema-level validation that replaces the old
+/// hand-rolled `parse_*` bail. The failure must be visible to the client as
+/// a tool error naming the legal values, never a structured dry-run success
+/// the caller could mistake for a plan.
+#[test]
+fn tag_assets_rejects_unknown_op_at_the_parameter_layer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "tag_assets",
+        &serde_json::json!({"asset": asset, "op": "bogus", "confirm": false}),
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "unknown op must fail: {resp}"
+    );
+    assert!(
+        resp["result"]["structuredContent"].get("would").is_none(),
+        "a rejected op must not return a dry-run plan: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(
+        text.contains("failed to deserialize parameters") && text.contains("bogus"),
+        "the error must name the rejected value and the layer that rejected it: {text}"
+    );
+    assert!(
+        text.contains("confirm_suggestion"),
+        "the error must name the legal values: {text}"
+    );
+}
+
 /// A hand-built write-tool response — one with no outcome struct of its own
 /// to carry a `notices` field — still hands its diagnostics to the client,
 /// via `with_notices`. `tag_assets`'s dry run reads the projection through

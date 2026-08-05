@@ -19,6 +19,22 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// `tag_assets`'s wire-level op — a real enum so the MCP JSON schema (and a
+/// future GUI dropdown) carries the closed value set instead of a free
+/// string validated only at call time. `Add`/`Rm` act on folksonomy tags
+/// directly; `ConfirmSuggestion`/`RejectSuggestion` act on pending AI
+/// suggestions.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TagOp {
+    Add,
+    Rm,
+    ConfirmSuggestion,
+    RejectSuggestion,
+}
+
 /// `maj tag add`: adds a folksonomy tag to an already-known asset.
 ///
 /// # Errors
@@ -447,6 +463,26 @@ mod confirm_reject_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_op_wire_strings_are_pinned() {
+        for (op, wire) in [
+            (TagOp::Add, "add"),
+            (TagOp::Rm, "rm"),
+            (TagOp::ConfirmSuggestion, "confirm_suggestion"),
+            (TagOp::RejectSuggestion, "reject_suggestion"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(op).expect("ser"),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<TagOp>(serde_json::json!(wire)).expect("de"),
+                op
+            );
+        }
+        assert!(serde_json::from_value::<TagOp>(serde_json::json!("bogus")).is_err());
+    }
 
     #[test]
     fn suggestions_of_an_empty_catalog_is_empty() {

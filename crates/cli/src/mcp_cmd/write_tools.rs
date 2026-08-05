@@ -91,18 +91,6 @@ fn inject_executed(
     }
 }
 
-/// Parses the `maj ingest --dedupe` surface this tool exposes (`skip`/
-/// `copy` only — `DedupeMode::Link` needs a per-destination existing-
-/// instance lookup not wired up yet, same restriction `maj ingest`'s own
-/// clap arg applies).
-fn parse_dedupe(value: &str) -> anyhow::Result<majestical_ingest::plan::DedupeMode> {
-    match value {
-        "skip" => Ok(majestical_ingest::plan::DedupeMode::Skip),
-        "copy" => Ok(majestical_ingest::plan::DedupeMode::CopyAnyway),
-        other => anyhow::bail!("unknown dedupe mode '{other}' — one of: skip, copy"),
-    }
-}
-
 /// Parses `sync_push`/`sync_pull`'s `only` transfer-class filter.
 fn parse_only(only: Option<&str>) -> anyhow::Result<Option<majestical_services::sync::Only>> {
     let Some(only) = only else { return Ok(None) };
@@ -120,21 +108,6 @@ fn parse_only(only: Option<&str>) -> anyhow::Result<Option<majestical_services::
     Ok(Some(parsed))
 }
 
-/// Parses `set_describer`'s backend name (the same three values `maj
-/// describer set --backend` accepts).
-fn parse_backend(value: &str) -> anyhow::Result<majestical_describe::BackendKind> {
-    match value {
-        "ollama" => Ok(majestical_describe::BackendKind::Ollama),
-        "lm-studio" => Ok(majestical_describe::BackendKind::LmStudio),
-        "open-router" => Ok(majestical_describe::BackendKind::OpenRouter),
-        other => {
-            anyhow::bail!(
-                "unknown describer backend '{other}' — one of: ollama, lm-studio, open-router"
-            )
-        }
-    }
-}
-
 /// Params for `tag_assets`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TagAssetsArgs {
@@ -143,7 +116,7 @@ struct TagAssetsArgs {
     /// `add`/`rm` set or remove a folksonomy tag directly (use `tag`).
     /// `confirm_suggestion`/`reject_suggestion` act on pending AI tag
     /// suggestions (use `tags` — see `suggest_tags_review`).
-    op: String,
+    op: majestical_services::tags::TagOp,
     /// The tag for `add`/`rm`.
     #[serde(default)]
     tag: Option<String>,
@@ -156,10 +129,11 @@ struct TagAssetsArgs {
     confirm: bool,
 }
 
-/// `tag_assets`'s parsed, validated op — built once so the dry-run
-/// description and the real mutation can't disagree about which fields a
-/// given `op` needs.
-enum TagOp<'a> {
+/// `tag_assets`'s validated op paired with the payload that op requires —
+/// built once so the dry-run description and the real mutation can't
+/// disagree about which fields a given [`majestical_services::tags::TagOp`]
+/// needs.
+enum ValidatedTagOp<'a> {
     Add(&'a str),
     Rm(&'a str),
     ConfirmSuggestion(&'a [String]),
@@ -172,21 +146,21 @@ fn non_empty_tags(tags: Option<&Vec<String>>) -> anyhow::Result<&[String]> {
     Ok(tags)
 }
 
-fn parse_tag_op(args: &TagAssetsArgs) -> anyhow::Result<TagOp<'_>> {
-    match args.op.as_str() {
-        "add" => Ok(TagOp::Add(
+fn parse_tag_op(args: &TagAssetsArgs) -> anyhow::Result<ValidatedTagOp<'_>> {
+    use majestical_services::tags::TagOp;
+    match args.op {
+        TagOp::Add => Ok(ValidatedTagOp::Add(
             args.tag.as_deref().context("op 'add' requires 'tag'")?,
         )),
-        "rm" => Ok(TagOp::Rm(
+        TagOp::Rm => Ok(ValidatedTagOp::Rm(
             args.tag.as_deref().context("op 'rm' requires 'tag'")?,
         )),
-        "confirm_suggestion" => Ok(TagOp::ConfirmSuggestion(non_empty_tags(
+        TagOp::ConfirmSuggestion => Ok(ValidatedTagOp::ConfirmSuggestion(non_empty_tags(
             args.tags.as_ref(),
         )?)),
-        "reject_suggestion" => Ok(TagOp::RejectSuggestion(non_empty_tags(args.tags.as_ref())?)),
-        other => anyhow::bail!(
-            "unknown tag_assets op '{other}' — one of: add, rm, confirm_suggestion, reject_suggestion"
-        ),
+        TagOp::RejectSuggestion => Ok(ValidatedTagOp::RejectSuggestion(non_empty_tags(
+            args.tags.as_ref(),
+        )?)),
     }
 }
 
@@ -203,12 +177,12 @@ fn tag_assets_result(
             .into_iter()
             .collect();
         let would = match &op {
-            TagOp::Add(tag) => format!("add tag '{tag}' to {}", args.asset),
-            TagOp::Rm(tag) => format!("remove tag '{tag}' from {}", args.asset),
-            TagOp::ConfirmSuggestion(tags) => {
+            ValidatedTagOp::Add(tag) => format!("add tag '{tag}' to {}", args.asset),
+            ValidatedTagOp::Rm(tag) => format!("remove tag '{tag}' from {}", args.asset),
+            ValidatedTagOp::ConfirmSuggestion(tags) => {
                 format!("confirm suggested tag(s) {tags:?} on {}", args.asset)
             }
-            TagOp::RejectSuggestion(tags) => format!(
+            ValidatedTagOp::RejectSuggestion(tags) => format!(
                 "reject suggested tag(s) {tags:?} on {} (this machine only, never synced)",
                 args.asset
             ),
@@ -224,21 +198,21 @@ fn tag_assets_result(
         ));
     }
     let done = match op {
-        TagOp::Add(tag) => {
+        ValidatedTagOp::Add(tag) => {
             majestical_services::tags::tag_add(app, &args.asset, tag)?;
             json!({"asset": args.asset, "op": "add", "tag": tag})
         }
-        TagOp::Rm(tag) => {
+        ValidatedTagOp::Rm(tag) => {
             majestical_services::tags::tag_rm(app, &args.asset, tag)?;
             json!({"asset": args.asset, "op": "rm", "tag": tag})
         }
-        TagOp::ConfirmSuggestion(tags) => {
+        ValidatedTagOp::ConfirmSuggestion(tags) => {
             majestical_services::tags::confirm(app, &args.asset, tags)?;
             json!({"asset": args.asset, "op": "confirm_suggestion", "tags": tags})
         }
         // `reject` is app-less (a state-dir file, never an event), so it
         // records into the app's sink directly rather than a second one.
-        TagOp::RejectSuggestion(tags) => {
+        ValidatedTagOp::RejectSuggestion(tags) => {
             majestical_services::tags::reject(catalog, &args.asset, tags, app.notices())?;
             json!({"asset": args.asset, "op": "reject_suggestion", "tags": tags})
         }
@@ -293,8 +267,8 @@ fn set_metadata_result(
 /// optional `roots`).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MoveParaArgs {
-    /// One of: add, rename, archive.
-    op: String,
+    /// What to do to the node: create it, rename it, or archive it.
+    op: majestical_services::para::ParaOp,
     /// PARA kind for `add` (project, area, resource, archive).
     #[serde(default)]
     kind: Option<String>,
@@ -494,8 +468,8 @@ fn default_ingest_template() -> String {
     "{date}/{source-label}".to_string()
 }
 
-fn default_dedupe() -> String {
-    "skip".to_string()
+fn default_dedupe() -> majestical_services::ingest::DedupeMode {
+    majestical_services::ingest::DedupeMode::Skip
 }
 
 /// Params for `ingest_source`.
@@ -514,7 +488,7 @@ struct IngestSourceArgs {
     /// `skip` (default) leaves a known duplicate alone; `copy` copies it
     /// anyway.
     #[serde(default = "default_dedupe")]
-    dedupe: String,
+    dedupe: majestical_services::ingest::DedupeMode,
     /// Parallel copy workers (default: CPU cores, max 8).
     #[serde(default)]
     jobs: Option<usize>,
@@ -529,9 +503,13 @@ fn ingest_source_result(
     app: &mut FsApp,
     args: &IngestSourceArgs,
 ) -> anyhow::Result<serde_json::Value> {
-    let dedupe = parse_dedupe(&args.dedupe)?;
-    let planned =
-        majestical_services::ingest::plan(app, &args.source, &args.para, &args.template, dedupe)?;
+    let planned = majestical_services::ingest::plan(
+        app,
+        &args.source,
+        &args.para,
+        &args.template,
+        args.dedupe.into(),
+    )?;
     if !args.confirm {
         return serde_json::to_value(&planned).map_err(anyhow::Error::from);
     }
@@ -875,8 +853,8 @@ fn index_run_exec(
 /// Params for `set_describer`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetDescriberArgs {
-    /// One of: ollama, lm-studio, open-router.
-    backend: String,
+    /// Which describer service to talk to.
+    backend: majestical_services::describer_config::DescriberBackend,
     model: String,
     #[serde(default)]
     base_url: Option<String>,
@@ -892,7 +870,7 @@ fn set_describer_result(
     catalog: &Path,
     args: &SetDescriberArgs,
 ) -> anyhow::Result<serde_json::Value> {
-    let backend = parse_backend(&args.backend)?;
+    let backend: majestical_describe::BackendKind = args.backend.into();
     let notices = Notices::new();
     if !args.confirm {
         let current = majestical_services::describer_config::show(catalog, &notices)?;
@@ -903,7 +881,8 @@ fn set_describer_result(
                 "base_url": args.base_url,
                 "current": current,
                 "would": format!(
-                    "configure the describer backend to {} model '{}'", args.backend, args.model
+                    "configure the describer backend to {} model '{}'",
+                    backend.as_str(), args.model
                 ),
             }),
             notices.drain(),
@@ -1097,13 +1076,14 @@ impl MajServer {
             Ok(app) => app,
             Err(result) => return result,
         };
-        match args.op.as_str() {
-            "add" => confirm_gate(args.confirm, move_para_add(&mut app, &args)),
-            "rename" => confirm_gate(args.confirm, move_para_rename(&mut app, &args)),
-            "archive" => move_para_archive(&mut app, &args),
-            other => super::tool_error(anyhow::anyhow!(
-                "unknown move_para op '{other}' — one of: add, rename, archive"
-            )),
+        match args.op {
+            majestical_services::para::ParaOp::Add => {
+                confirm_gate(args.confirm, move_para_add(&mut app, &args))
+            }
+            majestical_services::para::ParaOp::Rename => {
+                confirm_gate(args.confirm, move_para_rename(&mut app, &args))
+            }
+            majestical_services::para::ParaOp::Archive => move_para_archive(&mut app, &args),
         }
     }
 

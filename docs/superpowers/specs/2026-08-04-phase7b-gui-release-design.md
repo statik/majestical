@@ -257,6 +257,20 @@ alone. The CI matrix is therefore 3-OS for the frontend gates (`pnpm
 check`/`lint`/`test`/`build`, which are genuinely cross-platform) and
 macOS-only for every Rust step. Discovered by the first matrix run on #77.
 
+**Releases are Apple silicon only; the spec's `x86_64` commitment was
+already unbuildable.** `ort-sys` 2.0.0-rc.13 ships no prebuilt ONNX Runtime
+for `x86_64-apple-darwin`, so `crates/index` fails in the build script with
+`no prebuilt binaries available for target x86_64-apple-darwin`. This dates
+from phase 5, when `ort` entered the tree — the release workflow as it then
+stood built only the CLI and had not run since, so nothing exercised Intel
+and nothing reported it. The design section above promises both
+architectures; that promise was void before it was written down here, which
+is the part worth remembering. The `v0.1.0-rc2` dry run found it: the
+`aarch64` leg went green through signing, the `x86_64` leg failed in
+`ort-sys`. The desktop job now builds one target and carries no matrix, and
+`maj` ships as a single-architecture tarball rather than a `lipo`'d
+universal binary. Recorded as a watchlist item with the three routes back.
+
 **The notices mechanism as built.** Chunk 0's design held; three refinements
 are worth stating. Sync uses a local sink rather than the ambient one, which
 keeps a pull's notices attached to that pull — at the cost that a call

@@ -1468,11 +1468,27 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
 - **`about.hbs` emits duplicate HTML ids** (Task 10). One `h2` per crate
   version — 155 of them for 11 licenses — sharing ids by license. Invalid
   HTML in a generated artifact nobody navigates by anchor.
-- **`tauri-action`'s draft creation races** (Task 10). Both matrix jobs
-  list-then-create and then rewrite `latest.json`, so a lost race yields two
-  drafts each holding half the artifacts. The mitigation today is an operator
-  check in `docs/RELEASING.md` step 5. The structural fix — serialize release
-  creation ahead of the matrix — is pre-registered, not built.
+- **`x86_64-apple-darwin` release artifacts are blocked by `ort`** (the
+  `v0.1.0-rc2` dry run; user decision 2026-08-05). `ort-sys` 2.0.0-rc.13's
+  distribution table lists `aarch64-apple-darwin` as its only macOS target,
+  so an Intel build stops in the build script with `no prebuilt binaries
+  available for target x86_64-apple-darwin`. This has been true since phase 5
+  introduced `ort`; the release workflow predated that and had gone unrun
+  against Intel since, so the spec's two-architecture commitment was
+  unbuildable for two phases without anything saying so. The release now
+  targets Apple silicon alone. Three routes back, none taken: build ONNX
+  Runtime from source in CI (slow, and a second toolchain to maintain),
+  vendor a prebuilt via `ORT_LIB_LOCATION` (someone must produce and host
+  it), or make the semantic stack optional at build time so an Intel binary
+  can ship without it (the only one that also helps anyone else, and the
+  largest). Revisit if `ort` restores the target.
+- **`tauri-action`'s draft creation races** (Task 10; narrowed 2026-08-05).
+  Two concurrent matrix jobs list-then-create and then rewrite
+  `latest.json`, so a lost race yields two drafts each holding half the
+  artifacts. Dropping to one desktop target removed the concurrency, so the
+  race cannot fire as the workflow stands — this is dormant, not fixed.
+  Restoring a second target brings it back, and the fix then is to create the
+  release in a job of its own ahead of the matrix.
 - **`zizmor`'s auditor persona reports two informationals** (Task 10):
   secrets-outside-env (the signing secrets should live in a GitHub
   Environment) and the `rust-toolchain` pin. Neither is a finding at the

@@ -199,6 +199,8 @@ test("the keyframe strip lists the manifest's timestamps as timecodes", async ()
   // `@MmSSs`, the timecode `maj search` prints for a keyframe hit.
   expect(await screen.findByText("@0m01s")).toBeTruthy();
   expect(screen.getByText("@1m05s")).toBeTruthy();
+  // Every detected keyframe was indexed: there is no gap to report.
+  expect(screen.queryByText(/detected keyframes indexed/u)).toBeNull();
 });
 
 test("an asset with no keyframe manifest shows no strip", async () => {

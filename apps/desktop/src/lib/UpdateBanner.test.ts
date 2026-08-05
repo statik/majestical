@@ -49,10 +49,10 @@ test("nothing is offered when the endpoint has nothing newer", async () => {
 });
 
 test("a rejected check is swallowed, not surfaced", async () => {
-  // What today's unarmed builds actually do: the updater plugin is not
-  // registered, so the command does not exist.
+  // Offline, endpoint unreachable, or a signature that does not verify — the
+  // plugin rejects, and the shell must not learn about it.
   mockIPC((cmd) => {
-    throw new Error(`Command ${cmd} not found`);
+    throw new Error(`Command ${cmd} failed: error sending request`);
   });
   const { container } = render(UpdateBanner);
 

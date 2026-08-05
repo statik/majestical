@@ -1,10 +1,10 @@
 // The in-app update check, which is best-effort in the strongest sense:
 // nothing in this module throws, and every reason there is no update to offer
 // looks the same from the outside — no release published yet, the machine is
-// offline, GitHub is unreachable, or the updater plugin is not registered on
-// this build at all (it isn't, until the arming commit — see the comment on
-// `run` in src-tauri/src/lib.rs). An update is an offer, not an event worth
-// interrupting anyone over, so failures are logged and dropped.
+// offline, GitHub is unreachable, or the signature on what came back does not
+// verify. An update is an offer, not an event worth interrupting anyone over,
+// so failures are logged and dropped. In dev this reaches the network for
+// real, against the endpoint in tauri.conf.json.
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";

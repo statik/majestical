@@ -22,21 +22,14 @@ pub fn run() {
     )]
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        // ARMING THE UPDATER takes three edits, listed in docs/RELEASING.md.
-        // Two of them must land in the same commit: the `plugins.updater`
-        // block in tauri.conf.json, and
-        //
-        //     .plugin(tauri_plugin_updater::Builder::new().build())
-        //
-        // here. Neither works alone. The updater's `Config::pubkey` has no
-        // serde default, so a registered plugin with no config block fails to
+        // Paired with the `plugins.updater` block in tauri.conf.json, and it
+        // must stay paired: the updater's `Config::pubkey` has no serde
+        // default, so registering the plugin with no config block fails to
         // deserialize `plugins.updater` from `null`, which makes plugin
         // initialization — and therefore `run` below — return an error the
-        // app cannot start through. Verified by running the built binary: it
-        // panicked with `PluginInitialization("updater", ...)` before opening
-        // a window. Until the signing keypair exists the app ships with
-        // neither, and `lib/updater.ts` treats the resulting "no such
-        // command" as one more reason there is no update to offer.
+        // app cannot start through. Removing one without the other does not
+        // degrade the update check, it stops the app from opening a window.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(commands::AppState(std::sync::RwLock::new(None)))
         .setup(|app| Ok(commands::restore_persisted_catalog(app.handle())?))

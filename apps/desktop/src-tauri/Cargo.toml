@@ -19,8 +19,6 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
-# Registered by the arming commit, not here — see `run` in lib.rs. The dep
-# ships now so capabilities/default.json's `updater:default` ACL resolves.
 tauri-plugin-updater = "2.10.1"
 # `relaunch()` after an update installs. Registered now: unlike the updater,
 # this plugin takes no configuration and so cannot fail to initialize.

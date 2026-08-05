@@ -111,7 +111,7 @@
   <!-- The live region is always in the document, empty between searches: a
        `role="status"` element created together with its text is not reliably
        announced, so what changes has to be the region's contents. -->
-  <div class="live" role="status">
+  <div role="status">
     {#if outcome}
       <p class="count">{outcome.count} results</p>
 

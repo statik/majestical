@@ -109,21 +109,26 @@ main > .error {
   color: var(--muted);
 }
 
-.volumes {
+/* This sheet is global, so a class name is shared by every surface that uses
+   it. Names here are either surface-specific (`volume-table`) or one shared
+   thing rendered the same way everywhere (`.notice`, `.badge`, `.error`) —
+   never the same short word meaning two different things, which silently
+   hands one surface's layout to another. */
+.volume-table {
   width: 100%;
   margin-top: 0.75rem;
   border-collapse: collapse;
   text-align: left;
 }
 
-.volumes th,
-.volumes td {
+.volume-table th,
+.volume-table td {
   padding: 0.4rem 0.6rem 0.4rem 0;
   border-bottom: 1px solid var(--edge);
   vertical-align: top;
 }
 
-.volumes th {
+.volume-table th {
   color: var(--muted);
   font-size: 0.75rem;
   font-weight: 600;
@@ -131,17 +136,17 @@ main > .error {
   text-transform: uppercase;
 }
 
-.volumes .label {
+.volume-table .label {
   display: block;
 }
 
-.volumes .volume-id,
+.volume-table .volume-id,
 .suspect {
   color: var(--muted);
   font-size: 0.75rem;
 }
 
-.volumes .count {
+.asset-count {
   margin: 0;
   font-variant-numeric: tabular-nums;
 }
@@ -242,7 +247,9 @@ main > .error {
   font-size: 0.8rem;
 }
 
-.volumes {
+/* Scoped to the card: an unscoped `.volumes` also caught the volumes
+   surface's table and laid its head and body out side by side. */
+.card .volumes {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;

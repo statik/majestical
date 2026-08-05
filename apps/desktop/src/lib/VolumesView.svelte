@@ -36,7 +36,7 @@
     {#if outcome.volumes.length === 0}
       <p class="empty">No volumes yet — scan one to put it in the catalog.</p>
     {:else}
-      <table class="volumes">
+      <table class="volume-table">
         <thead>
           <tr>
             <th scope="col">Volume</th>
@@ -58,7 +58,7 @@
                 <span class="volume-id">{volume.id}</span>
               </td>
               <td><OnlineBadge online={volume.online} /></td>
-              <td class="count">{volume.asset_count}</td>
+              <td class="asset-count">{volume.asset_count}</td>
               <td>
                 {isoDay(volume.last_seen_ms)}
                 {#if volume.clock_suspect}

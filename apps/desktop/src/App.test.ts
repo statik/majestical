@@ -62,8 +62,9 @@ function mockStatus(status: AppStatus) {
   });
 }
 
-/** Every command the shell reaches for once a catalog is ready. */
-function mockCatalog(counts: { volumes: string[] }) {
+/** Every command the shell reaches for once a catalog is ready; the catalog
+ *  holds one volume per label given. */
+function mockCatalog(volumeLabels: string[]) {
   mockIPC((cmd) => {
     if (cmd === "app_status") return ready;
     if (cmd === "list_saved_searches") return { saved: [] };
@@ -71,7 +72,7 @@ function mockCatalog(counts: { volumes: string[] }) {
     if (cmd === "get_asset") return detail;
     if (cmd === "list_volumes") {
       return {
-        volumes: counts.volumes.map((label) => ({
+        volumes: volumeLabels.map((label) => ({
           id: `label:${label}`,
           label,
           last_seen_ms: 1_700_000_000_000,
@@ -113,7 +114,7 @@ test("with a ready catalog the shell shows the search surface", async () => {
 });
 
 test("the sidebar swaps surfaces, and says which one you are on", async () => {
-  mockCatalog({ volumes: ["Card"] });
+  mockCatalog(["Card"]);
   render(App);
 
   const volumes = await screen.findByRole("button", { name: "Volumes" });
@@ -135,7 +136,7 @@ test("the sidebar swaps surfaces, and says which one you are on", async () => {
 });
 
 test("leaving the search surface closes the inspector with it", async () => {
-  mockCatalog({ volumes: ["Card"] });
+  mockCatalog(["Card"]);
   const { container } = render(App);
 
   await userEvent.type(await screen.findByRole("searchbox"), "sunset");

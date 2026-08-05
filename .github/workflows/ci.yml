@@ -192,9 +192,15 @@ jobs:
       # rather than in the release job.
       - run: pnpm check && pnpm lint && pnpm test && pnpm build
         working-directory: apps/desktop
-      - run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
-        if: runner.os == 'macOS'
       - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+        if: runner.os == 'macOS'
+      # No bare `cargo build` step: clippy above type-checks every target and
+      # the tests link what they need, so building separately only repeats
+      # work. `tauri_parity`'s cross-binary check wants a `maj` binary, which
+      # lives in the other workspace and would cost a second full compile of
+      # the services graph to produce here — it skips loudly in this job and
+      # runs locally through `just gui-test`.
+      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
         if: runner.os == 'macOS'
   actions-lint:
     name: Workflow lint and audit

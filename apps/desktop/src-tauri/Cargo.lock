@@ -4943,7 +4943,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hostname",
+ "majestical-core",
+ "majestical-index",
  "majestical-services",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tauri",

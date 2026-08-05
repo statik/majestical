@@ -21,6 +21,14 @@ gui-check:
 gui-build:
     cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
 
+# `tauri_parity`'s cross-binary test compares the GUI's search rows against
+# `maj search --json`, so build a `maj` first and point MAJ_BIN at it —
+# without one that test skips (loudly) and the rest still run.
+gui-test:
+    cargo build -p majestical-cli
+    MAJ_BIN="{{justfile_directory()}}/target/debug/maj" \
+        cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
 # The GUI workspace carries its own copy of the root lint table (a standalone
 # workspace cannot inherit one), so it needs its own gate — `just check` above
 # only ever sees the headless workspace.

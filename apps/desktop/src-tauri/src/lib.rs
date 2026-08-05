@@ -1,6 +1,9 @@
 //! The desktop head: a Tauri shell over `majestical_services`. Commands are
 //! thin wrappers returning services outcome structs as-is (parity by
 //! construction, same rule as `maj mcp`).
+pub mod commands;
+pub mod config;
+pub mod thumb_protocol;
 
 /// Builds and runs the Tauri app.
 ///
@@ -19,6 +22,21 @@ pub fn run() {
     )]
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(commands::AppState(std::sync::RwLock::new(None)))
+        .setup(|app| Ok(commands::restore_persisted_catalog(app.handle())?))
+        .register_uri_scheme_protocol("thumb", |ctx, request| {
+            thumb_protocol::respond(ctx.app_handle(), &request.uri().to_string())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::app_status,
+            commands::search_assets,
+            commands::get_asset,
+            commands::list_volumes,
+            commands::list_saved_searches,
+            commands::run_saved_search,
+            commands::initialize_catalog,
+            commands::use_existing_catalog,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running majestical desktop");
 }

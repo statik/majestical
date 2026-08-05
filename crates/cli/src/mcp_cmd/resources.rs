@@ -14,24 +14,14 @@
 //! frame extraction from the source video is watchlisted, not implemented
 //! here (Task 9 records the deviation).
 //!
-//! Both derivations are keyed by the encoder's model tag
-//! (`majestical_index::model::MODEL_TAG`, the `SigLIP2` vision tower) — the
-//! same tag `crates/services/src/index/run.rs` resolves `ImageEmbedding`,
-//! `KeyframeEmbedding`, and `KeyframeManifest` blobs through today (there is
-//! only one vision encoder in this catalog; the tag is a constant, not a
-//! per-call resolution), so this reads through the SAME constant rather
-//! than re-deriving it.
-//!
-//! The keyframe manifest blob is written as plain JSON, NOT zstd-compressed
-//! — unlike every other JSON derivation blob (transcripts, OCR, captions).
-//! `run_keyframe_items` (`crates/services/src/index/run.rs`) writes
-//! `keyframes_manifest_json`'s bytes straight through `BlobStore::write_atomic`
-//! with no zstd step, so this resource reads the blob bytes straight through
-//! too, with no decompression.
+//! The blob lookup itself — path derivation, the model tag both keyframe
+//! derivations are keyed by, and the "run `maj index run` to derive it"
+//! remedy — lives in `majestical_services::index::blobs`, shared with the
+//! desktop app's `thumb://` protocol; this module only maps that lookup's
+//! errors onto MCP's own error kinds.
 use super::MajServer;
 use base64::Engine as _;
-use majestical_index::blob::{BlobStore, Derivation, asset_hex};
-use majestical_index::model::MODEL_TAG;
+use majestical_services::index::blobs::{self, BlobError};
 use rmcp::ErrorData as McpError;
 use rmcp::model::{ReadResourceResult, ResourceContents, ResourceTemplate};
 
@@ -84,31 +74,25 @@ pub(super) fn read(server: &MajServer, uri: &str) -> Result<ReadResourceResult, 
     ))
 }
 
+/// Maps a blob lookup failure onto MCP's error kinds: a malformed asset id
+/// is the caller's mistake (`invalid_params`), a blob that hasn't been
+/// derived yet is a not-found carrying the `maj index run` remedy, and any
+/// other read failure is the server's problem.
+fn blob_error(err: &BlobError) -> McpError {
+    match err {
+        BlobError::MalformedAssetId { .. } => McpError::invalid_params(format!("{err}"), None),
+        BlobError::NotDerived { .. } => McpError::resource_not_found(format!("{err}"), None),
+        BlobError::Read { .. } => McpError::internal_error(format!("{err}"), None),
+    }
+}
+
 fn read_thumb(
     server: &MajServer,
     uri: &str,
     asset_id: &str,
 ) -> Result<ReadResourceResult, McpError> {
-    let Some(hex) = asset_hex(asset_id) else {
-        return Err(McpError::invalid_params(
-            format!("{asset_id}: not a valid asset id (expected xxh3:<hex>)"),
-            None,
-        ));
-    };
-    let store = BlobStore::new(&server.catalog);
-    let path = store.path_for(hex, &Derivation::Thumb);
-    let bytes = std::fs::read(&path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => McpError::resource_not_found(
-            format!(
-                "no thumbnail for {asset_id} — run `maj index run --kinds thumbs` to derive it"
-            ),
-            None,
-        ),
-        _ => McpError::internal_error(
-            format!("reading thumbnail blob at {}: {err}", path.display()),
-            None,
-        ),
-    })?;
+    let bytes = blobs::read(&server.catalog, blobs::Kind::Thumb, asset_id)
+        .map_err(|err| blob_error(&err))?;
     let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(ReadResourceResult::new(vec![
         ResourceContents::blob(blob, uri).with_mime_type("image/webp"),
@@ -120,35 +104,8 @@ fn read_keyframes(
     uri: &str,
     asset_id: &str,
 ) -> Result<ReadResourceResult, McpError> {
-    let Some(hex) = asset_hex(asset_id) else {
-        return Err(McpError::invalid_params(
-            format!("{asset_id}: not a valid asset id (expected xxh3:<hex>)"),
-            None,
-        ));
-    };
-    let store = BlobStore::new(&server.catalog);
-    let path = store.path_for(
-        hex,
-        &Derivation::KeyframeManifest {
-            model_tag: MODEL_TAG,
-        },
-    );
-    let bytes = std::fs::read(&path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => McpError::resource_not_found(
-            format!(
-                "no keyframe manifest for {asset_id} — run `maj index run --kinds keyframes` \
-                 to derive it"
-            ),
-            None,
-        ),
-        _ => McpError::internal_error(
-            format!(
-                "reading keyframe manifest blob at {}: {err}",
-                path.display()
-            ),
-            None,
-        ),
-    })?;
+    let bytes = blobs::read(&server.catalog, blobs::Kind::Keyframes, asset_id)
+        .map_err(|err| blob_error(&err))?;
     let text = String::from_utf8(bytes).map_err(|err| {
         McpError::internal_error(
             format!("keyframe manifest for {asset_id} is not valid UTF-8: {err}"),

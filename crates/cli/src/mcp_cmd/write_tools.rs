@@ -842,7 +842,7 @@ fn index_run_dry(
 }
 
 /// Unlike [`index_run_dry`], this opens its OWN `FsApp` — inside
-/// [`super::run_off_tokio_runtime`]'s spawned thread, never crossing the
+/// [`majestical_services::runtime::run_off_tokio_runtime`]'s spawned thread, never crossing the
 /// thread boundary as a reference — for that isolation to work: `App`'s HLC
 /// clock holds a `Box<dyn Clock>`, so `&FsApp` itself isn't `Send`, and
 /// reusing the caller's already-open `FsApp` across the thread boundary
@@ -861,7 +861,7 @@ fn index_run_exec(
         threads: args.threads,
         api_key: crate::describer_cmd::env_api_key(),
     };
-    let mut outcome = super::run_off_tokio_runtime(|| {
+    let mut outcome = majestical_services::runtime::run_off_tokio_runtime(|| {
         let app = FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;

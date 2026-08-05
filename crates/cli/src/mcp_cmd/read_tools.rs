@@ -69,9 +69,10 @@ struct SavedSearchesResult {
 /// Runs `req` on a plain OS thread, off this server's own tokio runtime —
 /// `search::search`'s semantic layer opens a Lance vector store whenever a
 /// query has terms and a model is installed, and that store builds and
-/// enters its own tokio runtime internally (see `super::run_off_tokio_runtime`'s
-/// doc for why that panics from inside this server's `#[tool]` handler
-/// threads otherwise). Opens its own `FsApp` inside the spawned thread
+/// enters its own tokio runtime internally (see
+/// `majestical_services::runtime::run_off_tokio_runtime`'s doc for why that
+/// panics from inside this server's `#[tool]` handler threads otherwise).
+/// Opens its own `FsApp` inside the spawned thread
 /// (never crossing the thread boundary as a reference), same reason
 /// `write_tools::index_run_exec` does: `App`'s HLC clock holds a
 /// `Box<dyn Clock>`, so `&FsApp` isn't `Send`.
@@ -81,7 +82,7 @@ fn run_search_off_runtime(
     author: &str,
     req: &majestical_services::search::SearchRequest,
 ) -> anyhow::Result<majestical_services::search::SearchOutcome> {
-    super::run_off_tokio_runtime(|| {
+    majestical_services::runtime::run_off_tokio_runtime(|| {
         let mut app = majestical_services::app::FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::search::search(&mut app, catalog, req)?)
     })

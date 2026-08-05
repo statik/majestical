@@ -23,15 +23,23 @@ tauri-plugin-dialog = "2.7.2"
 # updater:default ACL resolves at build time.
 tauri-plugin-updater = "2.10.1"
 majestical-services = { path = "../../../crates/services" }
-# Unused until task 7 — these are the command layer's deps, staged here so the
-# workspace shape is settled before the commands land.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# The machine id and author every event this app writes is stamped with.
 hostname = "0.4"
+# `thumb://` asset ids arrive percent-encoded (`convertFileSrc` runs
+# `encodeURIComponent`), so the protocol handler decodes the path segment.
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# The command tests seed real catalogs: `majestical-core` builds the `Op`
+# literals to emit, and `majestical-index` computes the exact `BlobStore`
+# paths the thumb tests plant blobs at (rather than hand-deriving the layout
+# and risking drift from it).
+majestical-core = { path = "../../../crates/core" }
+majestical-index = { path = "../../../crates/index" }
 
 [lints.clippy]
 # Copy of the root workspace's lint table (a standalone workspace cannot

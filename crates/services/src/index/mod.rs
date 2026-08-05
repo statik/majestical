@@ -6,10 +6,12 @@
 //! derivation engine itself — every per-kind runner, the worker pool, and
 //! the `text_fts` heal — lives in the `run`/`heal`/`blob_read` submodules,
 //! split out to keep any one file well under the house line-length
-//! comfort zone. `run`'s public surface ([`run::run`], [`run::IndexRunReq`],
+//! comfort zone. [`blobs`] is the read side heads serve derived blobs
+//! through. `run`'s public surface ([`run::run`], [`run::IndexRunReq`],
 //! [`run::IndexRunOutcome`], and the per-kind outcome structs) is
 //! re-exported here so callers only ever need `services::index::`.
 mod blob_read;
+pub mod blobs;
 mod heal;
 mod run;
 

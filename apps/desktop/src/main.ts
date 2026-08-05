@@ -7,4 +7,4 @@ if (!target) {
   throw new Error("mount point #app is missing from index.html");
 }
 
-export default mount(App, { target });
+mount(App, { target });

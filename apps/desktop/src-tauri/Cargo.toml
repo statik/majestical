@@ -19,8 +19,12 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
+# Initialized in task 10; the dep ships now so capabilities/default.json's
+# updater:default ACL resolves at build time.
 tauri-plugin-updater = "2.10.1"
 majestical-services = { path = "../../../crates/services" }
+# Unused until task 7 — these are the command layer's deps, staged here so the
+# workspace shape is settled before the commands land.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

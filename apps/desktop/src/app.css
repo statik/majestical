@@ -4,8 +4,256 @@
   box-sizing: border-box;
 }
 
+:root {
+  color-scheme: light dark;
+  --edge: color-mix(in srgb, currentcolor 15%, transparent);
+  --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+  --muted: color-mix(in srgb, currentcolor 60%, transparent);
+  --alert: light-dark(#b3261e, #f2b8b5);
+}
+
 body {
   margin: 0;
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+main {
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Layout C: sidebar, surface, inspector — the inspector column has no width
+   until something is selected, and the Inspector renders nothing until then. */
+.shell {
+  display: grid;
+  grid-template-columns: 220px 1fr 0;
+  height: 100%;
+}
+
+.shell.with-inspector {
+  grid-template-columns: 220px 1fr 320px;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  overflow: hidden;
+  background: var(--sunken);
+  border-right: 1px solid var(--edge);
+}
+
+.brand {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.surfaces {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.surfaces li[aria-current] {
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  background: var(--sunken);
+  font-weight: 600;
+}
+
+.catalog-path {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.loading,
+main > .error {
+  padding: 1rem;
+}
+
+.surface {
+  padding: 1rem;
+  overflow-y: auto;
+}
+
+.omnibox {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.chip {
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.count {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+}
+
+/* Degradation notices are the record of what the catalog could not do; they
+   stay on screen, so nothing here hides or shrinks them. */
+.notice {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.error {
+  margin: 0.5rem 0 0;
+  color: var(--alert);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.card img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 4px;
+  background: var(--sunken);
+  object-fit: cover;
+}
+
+/* Filenames and transcript snippets both carry long unbroken tokens that
+   would otherwise push the card wider than its grid column. */
+.name,
+.snippet {
+  overflow-wrap: anywhere;
+}
+
+.unknown,
+.snippet,
+.timecode,
+.badge {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.volumes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.inspector {
+  padding: 1rem;
+  overflow-y: auto;
+  border-left: 1px solid var(--edge);
+}
+
+.preview {
+  width: 100%;
+  border-radius: 4px;
+  background: var(--sunken);
+}
+
+.inspector .name {
+  margin: 0.5rem 0 0;
+  font-size: 1rem;
+}
+
+.asset-id,
+.size {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.tags,
+.instances {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.tags li {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.instances li {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.instances .path {
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+.welcome {
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: 4rem 1.5rem;
+}
+
+.welcome .actions {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.welcome button {
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }

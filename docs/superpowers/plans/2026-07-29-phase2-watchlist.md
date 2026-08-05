@@ -1059,8 +1059,18 @@ were found during execution.
   own doc comment (`crates/cli/src/mcp_cmd/mod.rs:108-119`), added during
   Task 6's implementation; the plan document itself doesn't flag it in
   prose. Unresolved at closing.
-- **Enum-shaped string parameters have no schemars enum, losing
-  schema-level validation/documentation.** Four `write_tools.rs` fields
+- **CLOSED IN PHASE 7B (#75): Enum-shaped string parameters have no schemars
+  enum, losing schema-level validation/documentation.** All four fields now
+  take a `schemars`-derived enum, so the allowed values appear in the tool's
+  JSON schema and a typo'd value is rejected by the MCP layer before any
+  handler runs. Two findings worth carrying: `rmcp` rejects a bad enum value
+  as a protocol-level error (not a tool result), and the pre-existing schema
+  snapshot in `mcp_smoke.rs` did NOT pin these fields at all — the snapshot
+  correction plus a tripwire asserting each enum's values landed with the
+  change, because without them the derive could be dropped again invisibly.
+  Original finding follows.
+
+  Four `write_tools.rs` fields
   are each a closed set of string literals, documented only in a doc
   comment and hand-parsed at call time with a `match`/`bail!` that errors
   on anything else: `TagAssetsArgs::op` (`:145`, one of
@@ -1073,8 +1083,25 @@ were found during execution.
   `:124-135`). A real `schemars`-derived enum on each would surface the
   allowed values in the tool's JSON schema itself, catching a typo'd value
   at the client before the call round-trips instead of after.
-- **Dry-run previews over-promise on an unknown asset id.** `set_metadata`'s
-  dry-run branch (`crates/cli/src/mcp_cmd/write_tools.rs:254-273`) calls
+- **CLOSED IN PHASE 7B (#75): Dry-run previews over-promise on an unknown
+  asset id.** Both `set_metadata`'s and `tag_assets`' dry-run branches now
+  validate the asset exists before describing a write, so a preview and a
+  `confirm: true` call on the same unknown id agree. Two carve-outs stayed,
+  deliberately, and are the honest scope of the fix:
+
+  - `tag_assets`' `reject_suggestion` op is unguarded on BOTH preview and
+    execute. Rejecting a suggestion for an asset the catalog never knew is a
+    no-op rather than an error, and making the preview stricter than the
+    execute path would be the same divergence in the other direction.
+  - `tag_assets`' `rm` op still over-promises in one narrower case: an asset
+    the catalog DOES know, carrying a tag it does not have. The existence
+    check passes, the preview says "would remove", and the real `tag_rm`
+    then fails on its empty `tag_add_ids` lookup. Closing that would mean
+    the preview reimplementing `tag_rm`'s own guard.
+
+  Original finding follows.
+
+  `set_metadata`'s dry-run branch (`crates/cli/src/mcp_cmd/write_tools.rs:254-273`) calls
   `meta::meta_get`, which does not validate the asset exists
   (`crates/services/src/meta.rs:85-100` has no `ensure_asset_known` call —
   unlike `meta_set_impl`, `:52-62`, which does) — an unknown asset id
@@ -1107,7 +1134,21 @@ were found during execution.
   each hand-write the same string. Exporting the const (or a small public
   helper) would remove the risk of the literal drifting from the real
   directory name in exactly one of these call sites.
-- **MCP clients never see stderr diagnostics.** `crates/services` inherits
+- **CLOSED IN PHASE 7B (#71, #72): MCP clients never see stderr
+  diagnostics.** Every one of the 28 stderr sites now writes to a
+  thread-local notices sink (`crates/services/src/notices.rs`) instead of
+  `eprintln!`, and each verb's outcome struct carries a `notices: Vec<String>`
+  field that the sink drains into. All three heads read the same field: the
+  CLI prints it to stderr as before (so no user-visible change), `maj mcp`
+  folds it into the structured result via `with_notices`, and the GUI renders
+  it above each surface. The `#[expect(clippy::print_stderr)]` blocks in
+  `crates/services` are gone with the `eprintln!`s they covered. What the
+  fix does NOT cover is recorded under "Phase 7B deferrals" below — chiefly
+  the `Err` path (a service call that fails drops the notices its sink was
+  holding) and per-site `with_notices` foldings that no test pins. Original
+  finding follows.
+
+  `crates/services` inherits
   the workspace's `print_stderr = "deny"` (unlike `crates/cli`, which
   allows it crate-wide since CLI diagnostics are the product), so every
   stderr notice moved verbatim from the pre-extraction CLI carries its own
@@ -1335,6 +1376,192 @@ unviable, **51 missed**:
   default string (`:463`, mutated to `"xyzzy"`) — no test asserts the
   exact default template text, only that omitting `template` doesn't
   error; cosmetic, matching the phase-4 "display/diagnostic-only" category.
+
+## Phase 7B deferrals
+
+Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
+#82, and PR7) and this closing task. Each item names where it came from.
+
+- **The sqlite sync-offset suppresses repeat corrupt-log notices**
+  (pre-existing, surfaced by Task 1's notices work). The projection records
+  how far it has read; a second call over the same log resumes past the
+  corrupt lines and so emits no notice for them. A user who runs the same
+  verb twice sees the warning once. Correct as caching, wrong as reporting —
+  the damage is still there on the second call.
+- **`maj searches list`'s shared-tty interleaving is inverted** relative to
+  the other verbs (Task 1 design decision, accepted). Notices drain to
+  stderr after the listing reaches stdout rather than before it. On a shared
+  terminal the warning therefore appears below the rows it qualifies. No
+  parity test can see this: each stream is captured separately, so
+  cross-stream order is invisible to the harness that would otherwise pin it.
+- **The order-parity test cannot exercise the `NoModel` arms** (Task 2). The
+  semantic-miss notices only arise on a machine with a describer model
+  installed; on a model-less machine — which is what CI is — those match
+  arms are never entered, so the test proves ordering for every other notice
+  source and stays silent about those.
+- **The skip-if-empty notices contract is wire-pinned on only two structs**
+  (Task 3). `notices` is `#[serde(skip_serializing_if = "Vec::is_empty")]`
+  on every outcome struct, but only `AssetDetail` and `SearchOutcome` have a
+  test asserting the field is absent — not null, not `[]` — from the
+  serialized JSON when there is nothing to report. The rest rely on the
+  attribute being copied correctly.
+- **A failing service call loses the notices its sink was holding** (Task 3,
+  narrow but real). Notices are drained on the `Ok` path; an `Err` returns
+  without draining, so a call that collected warnings and then failed
+  reports the failure alone. The 7C fix shape is a notices payload on
+  `ServiceError` itself. `sync::pull_impl` gains the most from it: its sink
+  holds the buffer `apply_pulled_events` folded, and that is exactly what is
+  dropped at `PullApplyFailure` — the moment a user most wants to know what
+  else went wrong.
+- **`with_notices`' per-site foldings are largely unpinned** (Task 3,
+  confirmed by this phase's mutants runs). The helper itself has tests; the
+  ~20 call sites that each decide which outcome to fold notices into do not,
+  so a site folding the wrong thing — or not folding at all — is caught only
+  by review.
+- **CLI and MCP disagree about where a failure report's notices appear**
+  (Task 3). `index_cmd` drains at end-of-command; the MCP path folds into the
+  outcome. Same warnings, different position relative to the failure report
+  they describe.
+- **`move_para_archive` serializes without notices on either arm** (Task 3).
+  Both the dry-run and the executed response are built by hand rather than
+  through the outcome struct, so notices collected during the call are not
+  in either.
+- **`get_asset` carries notices at two JSON depths** (Task 3). They are
+  pinned as a contract, so this is a documented shape rather than a bug, but
+  it leaves a real client-layer ergonomics question for the GUI. It also has
+  a genuine divergence inside it: the GUI's `get_asset` command returns
+  `Ok(None)` for an unknown asset and drops the notices with it, where MCP's
+  `found: false` response folds them in.
+- **`MoveParaArgs.kind` and sync's `only` filter are still free strings**
+  (Task 4). They are the next two `schemars`-enum candidates, left out of
+  #75 only because the four fields it did close were the ones with a
+  hand-written `match`/`bail!` behind them.
+- **The services graph is macOS-only, so 3-OS Rust CI is impossible**
+  (discovered by PR #77's first matrix run). `crates/index` depends on
+  `objc2`, Vision and PDFKit unconditionally, and everything downstream of it
+  inherits that — the Rust steps in the CI matrix therefore run on macOS
+  alone. The frontend gates (`pnpm check`/`lint`/`test`/`build`) stay 3-OS
+  and are genuinely cross-platform. Porting means target-gating those
+  dependencies and supplying non-Apple OCR and PDF fallbacks; it is a phase
+  of its own, not a cleanup.
+- **The TypeScript wire layer is unpinned against Rust** (Task 7). Nothing
+  cross-checks `api.ts`'s field names or its camelCase argument names against
+  the Rust structs and `#[tauri::command]` signatures they mirror — a renamed
+  serde field breaks the GUI at runtime and no test anywhere fails. Fix
+  shape: a Rust-serialized fixture parsed under the TS types inside vitest.
+- **The Lance scoped-thread rule is review-enforced on both async heads**
+  (Task 7). `run_off_tokio_runtime` must wrap any call that may open a Lance
+  store; omitting it panics only on a machine that has a model installed and
+  an index built, which no fixture has. No test can catch the omission, and
+  this phase's mutants run confirmed the tooling cannot either — see the
+  triage section below.
+- **The `__eh_frame` linker note now also appears on the GUI binary**
+  (Task 7). Dev-profile only, cosmetic, unchanged in character from the
+  headless workspace's long-standing one.
+- **A keyframe manifest whose timestamps are all zero renders nothing**
+  (Task 9). Unreachable today because `over_half_failed` withholds the
+  manifest entirely in that case. If that guard ever changes, the strip needs
+  an explicit zero state rather than an empty one.
+- **`clock_suspect`'s explanation lives only in `title=`** (Task 9). Hover
+  text is unreachable by keyboard and unreliable for screen readers; the
+  marker itself is announced, its reason is not.
+- **`about.hbs` emits duplicate HTML ids** (Task 10). One `h2` per crate
+  version — 155 of them for 11 licenses — sharing ids by license. Invalid
+  HTML in a generated artifact nobody navigates by anchor.
+- **`tauri-action`'s draft creation races** (Task 10). Both matrix jobs
+  list-then-create and then rewrite `latest.json`, so a lost race yields two
+  drafts each holding half the artifacts. The mitigation today is an operator
+  check in `docs/RELEASING.md` step 5. The structural fix — serialize release
+  creation ahead of the matrix — is pre-registered, not built.
+- **`zizmor`'s auditor persona reports two informationals** (Task 10):
+  secrets-outside-env (the signing secrets should live in a GitHub
+  Environment) and the `rust-toolchain` pin. Neither is a finding at the
+  default persona. Both are 7C hardening.
+- **Cross-binary `tauri_parity` loud-skips in CI** (Task 7, restated at
+  closing). Without `MAJ_BIN` the test that compares the GUI's rows against
+  `maj search --json` announces a skip and passes. Only `just gui-test`
+  builds a `maj` first, so the parity claim is proved locally and not in CI.
+- **The GUI's sync commands rebuild the projection per call on the dispatch
+  thread** (Task 7). Only the two search commands go through `blocking`.
+  Escalate the others if the UI is ever seen to hitch.
+- **Keyframe-image extraction is still deferred** (carried unchanged from
+  phase 7A — see that section's first item). Nothing in 7B touched it: the
+  GUI's inspector renders the manifest's timestamps as timecodes, which is
+  the same manifest the MCP resource serves, and still not an image.
+
+### cargo-mutants triage (phase 7B)
+
+Five scoped runs (this repo's version, 27.1.0), each foreground and one at a
+time. The two GUI runs used `--in-place` so they build against the existing
+target directory: cargo-mutants otherwise copies the tree to a scratch dir
+and rebuilds the Tauri graph cold, which put the baseline alone at several
+times the whole run's mutant budget. `--in-place` restores the sources when
+it finishes; `git status` was checked clean after each.
+
+```bash
+cargo mutants --package majestical-services --timeout 300   --file crates/services/src/notices.rs
+cargo mutants --package majestical-services --timeout 300   --file crates/services/src/runtime.rs
+cargo mutants --package majestical-services --timeout 300   --file crates/services/src/index/blobs.rs
+cargo mutants --in-place --manifest-path apps/desktop/src-tauri/Cargo.toml   --timeout 300 --file src/commands.rs
+cargo mutants --in-place --manifest-path apps/desktop/src-tauri/Cargo.toml   --timeout 300 --file src/thumb_protocol.rs
+```
+
+**`crates/services/src/notices.rs`**: 4 mutants tested in 5m, **4 caught, 0
+missed**. The sink's own tests cover it completely.
+
+**`crates/services/src/runtime.rs`**: 1 mutant tested in 5m, **1 unviable, 0
+viable**. Worth stating plainly, because it settles a pre-registered
+expectation: the Lance rule cannot be checked by this tool at all. The only
+mutation cargo-mutants generates for this file replaces
+`run_off_tokio_runtime`'s body with `Ok(Default::default())`, which does not
+compile — `T: Send` carries no `Default` bound. The mutation that WOULD
+matter, dropping the `std::thread::scope` and calling `f` inline, is not in
+the tool's catalogue. The rule stays review-enforced, as recorded above.
+
+**`crates/services/src/index/blobs.rs`**: 9 mutants, **8 missed on the first
+run, all 8 closed with new tests** (re-run: 8 caught, 1 unviable). The file
+was extracted this phase and had no `#[cfg(test)]` module of its own; both
+its callers live in other packages (`maj mcp`'s `majestical://` resources and
+the desktop app's `thumb://` protocol), so a `--package majestical-services`
+run exercised none of it. The survivors were `Kind::noun` and
+`Kind::kinds_flag`'s return strings (4), `read`'s whole body (3), and the
+`NotFound` match arm (1) — between them, every word of the remedy text and
+the difference between "not derived yet" and "the read failed". Four tests
+now pin the round trip, the malformed-id rejection, both kinds' exact remedy
+strings, and a non-absence read failure reported as one.
+
+**`apps/desktop/src-tauri/src/commands.rs`**: 28 mutants, **4 missed on the
+first run, 2 closed with new tests, 2 accepted** (re-run: 6 caught, 2 missed,
+20 unviable). The 20 unviable are the `#[tauri::command]` wrappers whose
+return types have no `Default`.
+
+- *Closed:* `machine_identity` mutated to `"xyzzy"` survived — nothing
+  asserted the app stamps its events with the hostname, which is what makes a
+  `maj` user on the same machine a converging peer rather than a second one.
+  `selected_catalog` mutated to `None` survived — `tests/commands.rs` drives
+  the `*_impl` layer with a `CatalogCfg` in hand and read the state lock by
+  hand where it did check publication. Two unit tests in `commands.rs` (where
+  `hostname` and `AppState` are both in scope) close both.
+- *Accepted:* `restore_persisted_catalog -> Ok(())` and `get_asset ->
+  Ok(None)`. Both take `AppHandle`/`State`, which cannot be constructed
+  without a running Tauri app; there is no mock app anywhere in this suite,
+  which is precisely why every command has an `_impl` the tests drive
+  directly. Confirmed by hand rather than assumed: with
+  `restore_persisted_catalog`'s body replaced by `Ok(())`, the entire GUI
+  suite — 2 lib tests, 23 `commands.rs` tests, and 2 `tauri_parity` tests
+  with `MAJ_BIN` set so the cross-binary comparison genuinely ran — still
+  passes. Reverted after confirming. `get_asset`'s impl is pinned by
+  `get_asset_returns_detail_for_known_and_none_for_unknown`; what survives is
+  the one delegation line. Reaching either would mean enabling `tauri`'s
+  `test` feature and building a mock app — a 7C call, recorded here.
+
+**`apps/desktop/src-tauri/src/thumb_protocol.rs`**: 51 mutants tested in 5m,
+**16 caught, 32 unviable, 3 missed — all 3 accepted**, and all three are the
+same function: `respond(app: &AppHandle, uri)`, replaced with an empty/one-byte
+`Response`. Same root cause as the two accepted above — `respond` exists only
+to pull the selected catalog out of the `AppHandle` and hand it to `handle`,
+which is the seam the tests drive and which is fully caught. Every route,
+status and body of the protocol is covered through `handle`.
 
 ## Done in phase 6
 

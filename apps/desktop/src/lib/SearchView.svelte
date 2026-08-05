@@ -42,16 +42,18 @@
 
   function queueSearch(text: string) {
     clearTimeout(debounce);
-    if (!text.trim()) {
+    const trimmed = text.trim();
+    if (!trimmed) {
       // An empty box owns the surface too: taking the next number cancels an
       // in-flight search for the text just deleted, which would otherwise
-      // render results under a box asking for nothing.
+      // render results — or an error — under a box asking for nothing.
       requestSeq += 1;
       outcome = null;
+      error = null;
       return;
     }
     debounce = setTimeout(
-      () => void runSearch(() => api.searchAssets(text)),
+      () => void runSearch(() => api.searchAssets(trimmed)),
       DEBOUNCE_MS,
     );
   }
@@ -65,6 +67,9 @@
       outcome = result;
     } catch (failure) {
       if (seq !== requestSeq) return;
+      // The failed query owns the surface: leaving the previous query's count
+      // and grid under the error would attribute those results to this one.
+      outcome = null;
       error = errorMessage(failure);
     }
   }

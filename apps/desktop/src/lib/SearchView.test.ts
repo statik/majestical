@@ -41,6 +41,20 @@ test("typing debounces to a single search for the final query", async () => {
   await waitFor(() => expect(queries).toEqual(["sunset"]));
 });
 
+test("surrounding whitespace never reaches the backend", async () => {
+  const queries: string[] = [];
+  mockIPC((cmd, args) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    queries.push((args as { query: string }).query);
+    return noResults;
+  });
+
+  render(SearchView, { onselect: () => {} });
+  await userEvent.type(screen.getByRole("searchbox"), "  sunset  ");
+
+  await waitFor(() => expect(queries).toEqual(["sunset"]));
+});
+
 test("a stale response never overwrites a newer query's results", async () => {
   let resolveFirst!: (value: SearchOutcome) => void;
   let calls = 0;
@@ -158,20 +172,47 @@ test("clearing the box cancels the search still in flight", async () => {
   expect(screen.queryByText(/results/u)).toBeNull();
 });
 
-test("a failed search reports the command's whole message chain", async () => {
+test("a failed search reports its whole message chain and drops stale results", async () => {
   const message =
     "unknown filter key 'colour' — known keys: tag, vol/volume, para, kind, online, before, after, in";
+  let calls = 0;
   mockIPC((cmd) => {
     if (cmd === "list_saved_searches") return { saved: [] };
+    calls += 1;
+    if (calls === 1) return { count: 1, results: [hit("earlier")] };
     // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
     return Promise.reject({ message });
   });
 
   render(SearchView, { onselect: () => {} });
-  await userEvent.type(screen.getByRole("searchbox"), "colour:red");
+  const box = screen.getByRole("searchbox");
+  await userEvent.type(box, "sunset");
+  await screen.findByText("earlier");
+  // Append rather than clear: an empty box drops the results on its own, which
+  // would let this pass without the catch clearing them.
+  await userEvent.type(box, " colour:red");
 
   const alert = await screen.findByRole("alert");
   expect(alert.textContent).toBe(message);
+  expect(screen.queryByText("earlier")).toBeNull();
+  expect(screen.queryByText("1 results")).toBeNull();
+});
+
+test("clearing the box drops a failed search's error", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "list_saved_searches") return { saved: [] };
+    // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
+    return Promise.reject({ message: "unknown filter key 'colour'" });
+  });
+
+  render(SearchView, { onselect: () => {} });
+  const box = screen.getByRole("searchbox");
+  await userEvent.type(box, "colour:red");
+  await screen.findByRole("alert");
+
+  await userEvent.clear(box);
+
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
 });
 
 test("a saved-search chip runs that saved search", async () => {

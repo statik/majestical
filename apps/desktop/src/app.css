@@ -160,7 +160,10 @@ main > .error {
   object-fit: cover;
 }
 
-.name {
+/* Filenames and transcript snippets both carry long unbroken tokens that
+   would otherwise push the card wider than its grid column. */
+.name,
+.snippet {
   overflow-wrap: anywhere;
 }
 

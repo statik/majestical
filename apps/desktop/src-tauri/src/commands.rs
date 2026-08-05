@@ -82,7 +82,7 @@ pub struct AppStatus {
 #[derive(Serialize)]
 pub struct SavedSearches {
     pub saved: Vec<SavedSearch>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<String>,
 }
 

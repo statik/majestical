@@ -21,8 +21,12 @@
 /// context) has no such context to collide with.
 ///
 /// # Errors
-/// Returns whatever `f` returns; a panic inside `f` is resumed on the
-/// calling thread rather than swallowed.
+/// Returns whatever `f` returns.
+///
+/// # Panics
+/// Resumes a panic from `f` on the calling thread rather than swallowing
+/// it, so the spawned thread's failure surfaces exactly as an in-line call's
+/// would.
 pub fn run_off_tokio_runtime<T: Send>(
     f: impl FnOnce() -> anyhow::Result<T> + Send,
 ) -> anyhow::Result<T> {

@@ -30,6 +30,9 @@ pub fn respond(app: &AppHandle, uri: &str) -> Response<Vec<u8>> {
     handle(crate::commands::selected_catalog(&state).as_ref(), uri)
 }
 
+/// The whole protocol as a plain function of its two inputs — the selected
+/// catalog (`None` when the user has picked none yet) and the request URI —
+/// so `tests/commands.rs` drives every route and status without a webview.
 #[must_use]
 pub fn handle(cfg: Option<&CatalogCfg>, uri: &str) -> Response<Vec<u8>> {
     let Some(cfg) = cfg else {

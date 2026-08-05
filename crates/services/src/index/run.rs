@@ -239,25 +239,29 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
         lance_dir: state_dir.join("lance"),
         coreml_cache_dir: state_dir.join("coreml-cache"),
     };
-    let caption_env = CaptionEnv {
+    let env = PassEnv {
         catalog_root: catalog_dir,
         notices: app.notices(),
         vocab: tag_vocabulary(&projection),
         api_key: req.api_key.clone(),
     };
-    let mut outcome = run_all_kinds(&embed_paths, &blobs, &items, jobs, &caption_env)?;
+    let mut outcome = run_all_kinds(&embed_paths, &blobs, &items, jobs, &env)?;
 
     heal_text_fts(&mut db, &blobs, app.notices())?;
     outcome.notices = app.notices().drain();
     Ok(outcome)
 }
 
-/// The caption runner's per-pass inputs beyond blobs/items: where the
+/// One pass's shared environment: the notices sink every executor records
+/// into, plus the caption runner's own inputs beyond blobs/items — where the
 /// describer config lives, the catalog's current tag vocabulary, and the
 /// describer API key (read from the environment by the CLI, passed in here
-/// — see [`IndexRunReq`]'s doc). Bundled to keep [`run_all_kinds`] within the
-/// house 5-positional-parameter limit.
-struct CaptionEnv<'a> {
+/// — see [`IndexRunReq`]'s doc). Named for the pass, not the caption kind,
+/// because the sink is pass-wide: [`run_all_kinds`] hands it to the embed,
+/// keyframe, and transcript-embed executors too, while the remaining fields
+/// are read only by [`run_caption_items`]. Bundled to keep [`run_all_kinds`]
+/// within the house 5-positional-parameter limit.
+struct PassEnv<'a> {
     catalog_root: &'a Path,
     notices: &'a crate::notices::Notices,
     vocab: Vec<String>,
@@ -283,22 +287,22 @@ fn run_all_kinds(
     blobs: &BlobStore,
     items: &KindItems,
     jobs: usize,
-    caption_env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> Result<IndexRunOutcome> {
     Ok(IndexRunOutcome {
         thumbs: run_thumb_items(blobs, &items.thumbs, jobs),
-        embed: run_embed_items(paths, blobs, &items.embeds, caption_env.notices)?,
-        keyframes: run_keyframe_items(paths, blobs, &items.keyframes, caption_env.notices)?,
+        embed: run_embed_items(paths, blobs, &items.embeds, env.notices)?,
+        keyframes: run_keyframe_items(paths, blobs, &items.keyframes, env.notices)?,
         transcribe: run_transcribe_items(blobs, &items.transcribes)?,
         transcript_embed: run_transcript_embed_items(
             paths,
             blobs,
             &items.transcript_embeds,
-            caption_env.notices,
+            env.notices,
         )?,
         ocr: run_ocr_items(blobs, &items.ocr_images, &items.ocr_keyframes),
         pdf: run_pdf_text_items(blobs, &items.pdfs),
-        captions: run_caption_items(blobs, &items.captions, caption_env),
+        captions: run_caption_items(blobs, &items.captions, env),
         // Drained by `run_impl` once every kind — and the `text_fts` heal
         // that follows them — has had its say.
         notices: Vec::new(),
@@ -1407,7 +1411,7 @@ enum CaptionFailure {
 fn run_caption_items(
     blobs: &BlobStore,
     items: &[work::WorkItem],
-    env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> CaptionOutcome {
     let mut outcome = CaptionOutcome::default();
     if items.is_empty() {
@@ -1457,7 +1461,7 @@ fn caption_one_item(
     describer: &HttpDescriber,
     item: &work::WorkItem,
     model_tag: &str,
-    env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> Result<(), CaptionFailure> {
     if media_kind(&item.abs_path.to_string_lossy()) == MediaKind::Video {
         caption_video(blobs, describer, item, model_tag, env)
@@ -1513,7 +1517,7 @@ fn caption_video(
     describer: &HttpDescriber,
     item: &work::WorkItem,
     model_tag: &str,
-    env: &CaptionEnv<'_>,
+    env: &PassEnv<'_>,
 ) -> Result<(), CaptionFailure> {
     let captions_path = blobs.path_for(&item.asset_hex, &Derivation::Captions { model_tag });
     let described = match existing_video_captions(&captions_path, env.notices) {

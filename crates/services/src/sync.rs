@@ -371,6 +371,10 @@ pub fn status(catalog_dir: &Path) -> Result<SyncStatusOutcome, ServiceError> {
 
 fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
     let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog_dir)?;
     let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     let targets = resolve_targets(&cfg, None)?;
@@ -410,6 +414,10 @@ pub fn locations_list(catalog_dir: &Path) -> Result<LocationsOutcome, ServiceErr
 
 fn locations_list_impl(catalog_dir: &Path) -> Result<LocationsOutcome> {
     let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
     Ok(LocationsOutcome {
         readonly: cfg.readonly,
@@ -655,6 +663,10 @@ pub fn push(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome, Servic
 
 fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
     let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog)?;
     let config = config_path(catalog, &notices)?;
     let cfg = SyncConfig::load(&config)?;
@@ -815,6 +827,10 @@ fn pull_impl(
     req: &PullRequest<'_>,
 ) -> Result<PullOutcome> {
     let notices = crate::notices::Notices::new();
+    // Accepted tradeoff: an `Err` from any step below drops this sink
+    // unread. Only the one-shot state-dir migration notes can precede the
+    // first fallible step, so nothing recurring is lost; carrying notices
+    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog)?;
     let cfg = SyncConfig::load(&config_path(catalog, &notices)?)?;
     let targets = resolve_targets(&cfg, req.location)?;

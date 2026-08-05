@@ -59,8 +59,9 @@ struct RunSavedSearchArgs {
 #[derive(Serialize)]
 struct SavedSearchesResult {
     saved: Vec<majestical_services::search::SavedSearch>,
-    /// Diagnostics collected during this operation, verbatim — the lines the
-    /// CLI prints to stderr. Absent from the wire when empty.
+    /// Diagnostics collected during this call, verbatim — this struct exists
+    /// only on the MCP wire, so there is no CLI rendering of these. Absent
+    /// from the wire when empty, matching every outcome struct's own field.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     notices: Vec<String>,
 }

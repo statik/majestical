@@ -427,13 +427,16 @@ fn scan_volume_result(app: &mut FsApp, args: &ScanVolumeArgs) -> anyhow::Result<
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
             .count();
-        return Ok(json!({
-            "dir": args.dir,
-            "resolved_volume_id": resolved_volume_id,
-            "resolved_volume_label": resolved_volume_label,
-            "would_scan_files": would_scan_files,
-            "would": format!("hash {would_scan_files} file(s) under {} into the catalog", args.dir.display()),
-        }));
+        return Ok(super::with_notices(
+            json!({
+                "dir": args.dir,
+                "resolved_volume_id": resolved_volume_id,
+                "resolved_volume_label": resolved_volume_label,
+                "would_scan_files": would_scan_files,
+                "would": format!("hash {would_scan_files} file(s) under {} into the catalog", args.dir.display()),
+            }),
+            app.notices().drain(),
+        ));
     }
     let outcome = majestical_services::scan::scan(app, &args.dir, args.volume.clone())?;
     Ok(super::with_notices(
@@ -822,6 +825,9 @@ fn index_run_dry(
     args: &IndexRunArgs,
 ) -> anyhow::Result<serde_json::Value> {
     let status = majestical_services::index::status(app, catalog)?;
+    // No fold here: notices ride NESTED on the embedded status, the same
+    // convention `get_asset`'s found arm follows — a serialized outcome
+    // keeps its own `notices`; only hand-built summaries fold at the top.
     Ok(json!({
         "kinds": kinds,
         "limit": args.limit,

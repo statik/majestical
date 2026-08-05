@@ -14,6 +14,7 @@ use std::path::Path;
 /// be resolved.
 pub(crate) fn cmd_suggestions(app: &FsApp, catalog_root: &Path) -> Result<()> {
     let outcome = majestical_services::tags::suggestions(app, catalog_root)?;
+    crate::print_notices(&outcome.notices);
     if outcome.pending.is_empty() {
         println!(
             "no pending suggestions — captions/tags derive during \

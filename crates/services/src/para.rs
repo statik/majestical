@@ -146,6 +146,10 @@ pub enum MoveStatus {
 pub struct ArchiveOutcome {
     pub moves: Vec<ArchiveMove>,
     pub executed: bool,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Internal carrier for [`archive_impl`]'s early return when a multi-root
@@ -284,6 +288,7 @@ fn archive_impl(
         return Ok(ArchiveOutcome {
             moves: Vec::new(),
             executed: !dry_run,
+            notices: app.notices().drain(),
         });
     }
     // A node of kind `archive` already materializes under `Archives/` (its
@@ -316,6 +321,7 @@ fn archive_impl(
     Ok(ArchiveOutcome {
         moves,
         executed: !dry_run,
+        notices: app.notices().drain(),
     })
 }
 
@@ -333,6 +339,10 @@ pub struct ParaNodeRow {
 #[derive(serde::Serialize)]
 pub struct ParaOutcome {
     pub nodes: Vec<ParaNodeRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj para list`: every PARA node the catalog has ever created.
@@ -356,7 +366,10 @@ fn para_list_impl(app: &FsApp, catalog_dir: &Path) -> Result<ParaOutcome> {
             archived,
         })
         .collect();
-    Ok(ParaOutcome { nodes })
+    Ok(ParaOutcome {
+        nodes,
+        notices: app.notices().drain(),
+    })
 }
 
 #[cfg(test)]

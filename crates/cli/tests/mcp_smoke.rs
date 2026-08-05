@@ -206,6 +206,45 @@ fn search_assets_rows_match_service_outcome() {
     assert_eq!(hit["name"], serde_json::json!("a.txt"), "{hit}");
 }
 
+/// The notices contract end-to-end: a diagnostic that used to be stderr
+/// (invisible to an MCP client, which never sees the server's stderr) now
+/// rides the outcome struct. Deterministic trigger: a corrupt event-log
+/// line. The query is filter-only, so no model needs to be installed for
+/// this to be the notice that shows up.
+#[test]
+fn search_assets_surfaces_notices_in_structured_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let machine_dir = root.join("events").join("test-machine");
+    let segment = std::fs::read_dir(&machine_dir)
+        .expect("machine events dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("one events jsonl");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    bytes.extend_from_slice(b"this is not json\n");
+    std::fs::write(&segment, bytes).expect("re-write segment");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("search_assets", &serde_json::json!({"query": "tag:none"}));
+    assert_ne!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "a corrupt line degrades the read, it does not fail the tool: {resp}"
+    );
+    let structured = &resp["result"]["structuredContent"];
+    let notices = structured["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notices must reach the wire: {structured}"));
+    assert!(
+        notices.iter().any(|note| note
+            .as_str()
+            .is_some_and(|s| s.contains("corrupt event log line"))),
+        "the corrupt-log warning must be one of them: {structured}"
+    );
+}
+
 /// Regression test for the nested-tokio-runtime panic `search_assets`/
 /// `run_saved_search` could hit on a real machine: once a user has `maj
 /// model fetch`ed a real model and `maj index run` built an index, every
@@ -336,6 +375,16 @@ fn get_asset_unknown_is_a_value_not_an_error() {
         "fields must serialize as a JSON object, not an array-of-pairs: {structured}"
     );
     assert_eq!(fields["shot"], serde_json::json!("sunset"), "{structured}");
+    // The other half of the notices contract: nothing went wrong reading
+    // this catalog, so the field is absent from the wire entirely rather
+    // than riding along as an empty array on every response. `get_asset`
+    // is the right place to pin it — it only reads the projection, so
+    // unlike a term search it cannot pick up a note from whichever models
+    // happen to be installed on the machine running the test.
+    assert!(
+        structured["asset"].get("notices").is_none(),
+        "an uneventful read must not carry a notices field: {structured}"
+    );
 }
 
 #[test]

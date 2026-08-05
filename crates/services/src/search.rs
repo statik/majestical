@@ -110,6 +110,10 @@ pub struct SearchOutcome {
     /// Per-source text coverage notices; empty for filter-only queries.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub text_coverage: Vec<TextCoverageNotice>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// A saved search's name and the query text it runs.
@@ -166,13 +170,17 @@ fn search_impl(app: &mut FsApp, catalog_dir: &Path, req: &SearchRequest) -> Resu
     } else {
         bail!("give a query string or --saved <name>");
     };
-    let outcome = run_search(&*app, catalog_dir, &query, req.limit)?;
+    let mut outcome = run_search(&*app, catalog_dir, &query, req.limit)?;
     if let Some(name) = &req.save {
         app.emit(vec![Op::SavedSearchSet {
             name: name.clone(),
             query: query.clone(),
         }])?;
     }
+    // Drained last so a clock-clamp warning from the `--save` emit above is
+    // carried home too, and in one place so every line keeps the order it
+    // was recorded in.
+    outcome.notices = app.notices().drain();
     Ok(outcome)
 }
 
@@ -304,6 +312,9 @@ fn build_outcome(
         results,
         semantic_coverage,
         text_coverage,
+        // Filled by `search_impl`, which is the only frame here holding the
+        // app whose buffer the notices accumulate in.
+        notices: Vec::new(),
     })
 }
 
@@ -423,12 +434,12 @@ fn term_search(db: &SqliteCatalog, args: &TermSearchArgs<'_>) -> Result<TermSear
     let state_dir = crate::state_dir::state_dir_for(args.catalog_dir, args.notices)?;
     let query_text = args.terms.join(" ");
     let (image_ids, keyframe_ts, embedded) = if image_semantic_enabled(args.sources) {
-        semantic_candidates(&state_dir, &query_text, semantic_limit)
+        semantic_candidates(&state_dir, &query_text, semantic_limit, args.notices)
     } else {
         (Vec::new(), HashMap::new(), None)
     };
     let (chunk_ids, chunk_meta) = if args.sources.is_none_or(|s| s.contains("transcript")) {
-        text_semantic_candidates(&state_dir, &query_text, semantic_limit)
+        text_semantic_candidates(&state_dir, &query_text, semantic_limit, args.notices)
     } else {
         (Vec::new(), HashMap::new())
     };
@@ -859,8 +870,8 @@ fn dedupe_hits(hits: Vec<VectorHit>) -> (Vec<AssetId>, HashMap<AssetId, i64>) {
 /// Runs the semantic side of a search: embeds `query` with the text tower
 /// and nearest-neighbor searches the local Lance vector store. Degrades to
 /// `(empty, empty, None)` on any miss — semantic search is additive to name
-/// search, never a hard requirement — printing the specific stderr note for
-/// the reason (see [`SemanticMiss`]).
+/// search, never a hard requirement — recording the specific note for the
+/// reason (see [`SemanticMiss`]) into `notices`.
 ///
 /// Returns ranked asset ids (nearest first, deduped), each ranked asset's
 /// nearest keyframe timestamp, and `Some(embedded distinct asset count)`
@@ -869,28 +880,17 @@ fn semantic_candidates(
     state_dir: &Path,
     query: &str,
     limit: usize,
+    notices: &crate::notices::Notices,
 ) -> (Vec<AssetId>, HashMap<AssetId, i64>, Option<u64>) {
     let (model_dir, store, embedded) = match open_semantic_index(state_dir) {
         Ok(opened) => opened,
         Err(miss) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!("{}", miss.note());
-            }
+            notices.push(miss.note());
             return (Vec::new(), HashMap::new(), None);
         }
     };
     let Some(vector) = embed_query(&model_dir, query) else {
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!("{}", SemanticMiss::NoModel.note());
-        }
+        notices.push(SemanticMiss::NoModel.note());
         return (Vec::new(), HashMap::new(), None);
     };
     let hits = match store.search(&vector, majestical_index::model::MODEL_TAG, limit) {
@@ -903,13 +903,7 @@ fn semantic_candidates(
             // reads the `vector` column, only `search` does). Either way
             // it's `Unreadable`, not `EmptyIndex` — discarding `err` here
             // would silently relabel "unreadable" as "empty".
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!("{}", SemanticMiss::Unreadable(err.to_string()).note());
-            }
+            notices.push(SemanticMiss::Unreadable(err.to_string()).note());
             return (Vec::new(), HashMap::new(), None);
         }
     };
@@ -1026,34 +1020,23 @@ fn dedupe_text_chunk_hits(hits: Vec<TextChunkHit>) -> (Vec<AssetId>, HashMap<Ass
 /// Runs the transcript-semantic side of a search: embeds `query` with
 /// `MiniLM` and nearest-neighbor searches the local `text_chunks` table.
 /// Degrades to `(empty, empty)` on any miss — additive, never a hard
-/// requirement — printing the specific stderr note for the reason (see
-/// [`TextSemanticMiss`]), mirroring [`semantic_candidates`].
+/// requirement — recording the specific note for the reason (see
+/// [`TextSemanticMiss`]) into `notices`, mirroring [`semantic_candidates`].
 fn text_semantic_candidates(
     state_dir: &Path,
     query: &str,
     limit: usize,
+    notices: &crate::notices::Notices,
 ) -> (Vec<AssetId>, HashMap<AssetId, TextMeta>) {
     let (model_dir, store) = match open_text_semantic_index(state_dir) {
         Ok(opened) => opened,
         Err(miss) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!("{}", miss.note());
-            }
+            notices.push(miss.note());
             return (Vec::new(), HashMap::new());
         }
     };
     let Some(vector) = embed_text_query(&model_dir, query) else {
-        #[expect(
-            clippy::print_stderr,
-            reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-        )]
-        {
-            eprintln!("{}", TextSemanticMiss::NoModel.note());
-        }
+        notices.push(TextSemanticMiss::NoModel.note());
         return (Vec::new(), HashMap::new());
     };
     let hits = match store.search(&vector, MINILM.tag, limit) {
@@ -1061,13 +1044,7 @@ fn text_semantic_candidates(
         Err(err) => {
             // Same open-passed-but-read-failed reasoning as
             // `semantic_candidates`: `Unreadable`, never relabeled empty.
-            #[expect(
-                clippy::print_stderr,
-                reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-            )]
-            {
-                eprintln!("{}", TextSemanticMiss::Unreadable(err.to_string()).note());
-            }
+            notices.push(TextSemanticMiss::Unreadable(err.to_string()).note());
             return (Vec::new(), HashMap::new());
         }
     };
@@ -1239,6 +1216,55 @@ mod tests {
         // spurious notices for text-only catalogs".
         assert!(out.text_coverage.is_empty());
         assert!(out.semantic_coverage.is_none());
+    }
+
+    /// A diagnostic collected while the verb computes must ride the outcome
+    /// home, not escape to stderr from inside services. A filter-only query
+    /// keeps this off the semantic layer entirely, so the assertion doesn't
+    /// depend on which models happen to be installed.
+    #[test]
+    fn search_outcome_carries_collected_notices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = crate::app::FsApp::init(&root, "m1", "m1").expect("init");
+        app.emit(vec![majestical_core::event::Op::AssetSeen {
+            asset: majestical_core::event::AssetId("xxh3:0123456789abcdef0123456789abcdef".into()),
+            volume: "vol1".into(),
+            path: "clip.txt".into(),
+            size: 5,
+            mtime_ms: 1000,
+        }])
+        .expect("emit");
+        // `FileEventLog` lays segments out as `events/<machine-id>/NNNN.jsonl`.
+        let machine_dir = root.join("events").join("m1");
+        let log_file = std::fs::read_dir(&machine_dir)
+            .expect("machine events dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("one events jsonl");
+        let mut bytes = std::fs::read(&log_file).expect("read log");
+        bytes.extend_from_slice(b"this is not json\n");
+        std::fs::write(&log_file, bytes).expect("re-write log");
+
+        let out = search(
+            &mut app,
+            &root,
+            &SearchRequest {
+                query: Some("tag:missing".into()),
+                limit: 10,
+                saved: None,
+                save: None,
+            },
+        )
+        .expect("search");
+        assert!(
+            out.notices
+                .iter()
+                .any(|note| note.contains("corrupt event log line")),
+            "the corrupt-log warning must reach the caller: {:?}",
+            out.notices
+        );
     }
 }
 

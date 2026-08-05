@@ -34,6 +34,7 @@ pub(crate) fn cmd_search(app: &mut FsApp, catalog_dir: &Path, args: &SearchArgs)
         save: args.save.clone(),
     };
     let outcome = majestical_services::search::search(app, catalog_dir, &req)?;
+    crate::print_notices(&outcome.notices);
     print_search_results(&outcome, args.json, args.limit);
     if let Some(name) = &args.save {
         eprintln!("saved search '{name}'");

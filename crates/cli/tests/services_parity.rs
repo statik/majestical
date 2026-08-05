@@ -1572,3 +1572,39 @@ fn notice_then_error_stderr_survives_failed_command() {
     // binary mutates the log — a shared root is safe here.
     diff_against_ref(&root, &state, &["tag", "add", "xxh3:nosuchasset", "x"]);
 }
+
+/// Pins stderr LINE ORDER for a successful search that produces two kinds of
+/// diagnostic: the corrupt-event-log warning (recorded while the log is
+/// read) and the semantic layers' unavailable notes (recorded later, while
+/// the query runs). The reference binary printed both the moment they
+/// happened, so the warning comes first. Any scheme that defers one class of
+/// notice to after the compute inverts that order — which is exactly what
+/// this catches. Both binaries resolve the same model cache, so whether the
+/// semantic notes appear at all is environment-relative but identical across
+/// the two arms.
+///
+/// The sqlite view records how far into the log it has synced, and only the
+/// sync that first reads past the corrupt line counts it — so the second arm
+/// would see a clean log and print nothing. Dropping the derived state dir
+/// between the two runs makes each arm's call a genuine first look at the
+/// same corrupted log; a full rebuild and an incremental sync both report
+/// the one skipped line identically.
+#[test]
+fn search_notice_order_matches_reference_with_corrupt_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let machine_dir = root.join("events").join("test-machine");
+    let segment = std::fs::read_dir(&machine_dir)
+        .expect("machine events dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("one events jsonl");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    bytes.extend_from_slice(b"this is not json\n");
+    std::fs::write(&segment, bytes).expect("re-write segment");
+    // A read-only verb: neither binary appends, so a shared root is safe.
+    diff_against_ref_with_between(&root, &state, &["search", "sunset", "--json"], || {
+        std::fs::remove_dir_all(&state).expect("drop the derived state dir");
+    });
+}

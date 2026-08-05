@@ -133,6 +133,10 @@ pub struct AssetDetail {
     pub fields: Vec<(String, String)>,
     pub verifications: Vec<AssetVerification>,
     pub has_thumb: bool,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// The lowercase form `ParaKind` serializes as elsewhere in the project (see
@@ -248,6 +252,9 @@ fn get_asset_impl(app: &FsApp, catalog_dir: &Path, asset_id: &str) -> Result<Opt
             .collect(),
         verifications: build_verifications(&projection, &asset),
         has_thumb: thumb_exists(catalog_dir, asset_id),
+        // The unknown-asset arm above returns before this, leaving anything
+        // collected in the buffer for the head's own leftover drain.
+        notices: app.notices().drain(),
     }))
 }
 

@@ -555,7 +555,15 @@ fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
 /// rendering the outcome, so these lines keep the stderr position they had
 /// when services printed them directly.
 pub(crate) fn drain_notices(notices: &Notices) {
-    for line in notices.drain() {
+    print_notices(&notices.drain());
+}
+
+/// Prints the notices a verb carried home on its outcome struct — the same
+/// lines [`drain_notices`] prints, arriving on the outcome instead of the
+/// sink. Renderers call this BEFORE writing their stdout, so each line keeps
+/// the stderr position it had when services printed it directly.
+pub(crate) fn print_notices(lines: &[String]) {
+    for line in lines {
         eprintln!("{line}");
     }
 }

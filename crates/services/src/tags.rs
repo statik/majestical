@@ -204,6 +204,10 @@ pub struct SuggestionRow {
 #[derive(serde::Serialize)]
 pub struct SuggestionsOutcome {
     pub pending: Vec<SuggestionRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Reads a zstd-compressed JSON `Vec<TagSuggestion>` blob.
@@ -219,7 +223,7 @@ fn read_tags_blob(path: &Path) -> Result<Vec<TagSuggestion>> {
 /// rejected on this machine. Suggestions themselves come from
 /// `tags.json.zst` blobs written by the caption runner — derived data, so
 /// "pending" is always computed live rather than persisted anywhere.
-/// A blob that fails to read or decode is skipped with a stderr note
+/// A blob that fails to read or decode is skipped with a notice
 /// rather than failing the whole listing — it may be mid-write by another
 /// process, and one bad blob shouldn't hide every other asset's
 /// suggestions. Blobs from more than one describer model tag can list the
@@ -243,20 +247,10 @@ fn pending_suggestions(
         let suggestions = match read_tags_blob(&path) {
             Ok(suggestions) => suggestions,
             Err(error) => {
-                // See the `#[expect]` note on `warn_skipped_corrupt_lines`
-                // in app.rs: services inherits print_stderr = "deny"
-                // crate-wide; this is a verbatim stderr diagnostic moved
-                // from cli, not yet a rendered outcome.
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "verbatim stderr diagnostic moved from cli; not yet a rendered outcome"
-                )]
-                {
-                    eprintln!(
-                        "note: skipping unreadable tag-suggestions blob {}: {error}",
-                        path.display()
-                    );
-                }
+                notices.push(format!(
+                    "note: skipping unreadable tag-suggestions blob {}: {error}",
+                    path.display()
+                ));
                 continue;
             }
         };
@@ -295,7 +289,10 @@ pub fn suggestions(app: &FsApp, catalog_root: &Path) -> Result<SuggestionsOutcom
 fn suggestions_impl(app: &FsApp, catalog_root: &Path) -> Result<SuggestionsOutcome> {
     let projection = app.projection()?;
     let pending = pending_suggestions(catalog_root, &projection, app.notices())?;
-    Ok(SuggestionsOutcome { pending })
+    Ok(SuggestionsOutcome {
+        pending,
+        notices: app.notices().drain(),
+    })
 }
 
 #[cfg(test)]

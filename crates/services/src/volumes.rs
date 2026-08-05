@@ -29,6 +29,10 @@ pub struct VolumeRow {
 #[derive(Serialize)]
 pub struct VolumesOutcome {
     pub volumes: Vec<VolumeRow>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// Cheap phase-2 "is this volume mounted right now" heuristic, not true
@@ -89,7 +93,10 @@ fn volumes_list_impl(app: &FsApp, catalog_dir: &Path) -> Result<VolumesOutcome> 
             clock_suspect: *last_seen_ms > suspect_ceiling,
         })
         .collect();
-    Ok(VolumesOutcome { volumes: rows })
+    Ok(VolumesOutcome {
+        volumes: rows,
+        notices: app.notices().drain(),
+    })
 }
 
 #[cfg(test)]

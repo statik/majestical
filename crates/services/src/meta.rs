@@ -67,6 +67,10 @@ fn meta_set_impl(app: &mut FsApp, asset: &str, field: &str, value: &str) -> Resu
 pub struct MetaOutcome {
     #[serde(serialize_with = "serialize_pairs_as_map")]
     pub fields: Vec<(String, String)>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
 }
 
 /// `maj meta get <asset> [field]`: looks up one field, or every field set on
@@ -96,7 +100,10 @@ fn meta_get_impl(app: &FsApp, asset: &str, field: Option<&str>) -> Result<MetaOu
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     };
-    Ok(MetaOutcome { fields })
+    Ok(MetaOutcome {
+        fields,
+        notices: app.notices().drain(),
+    })
 }
 
 #[cfg(test)]

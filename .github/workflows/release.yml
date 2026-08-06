@@ -31,16 +31,38 @@ jobs:
               ;;
           esac
           echo "tag ok: $GITHUB_REF_NAME builds $declared"
+  # Stamps the rolling draft (maintained by release-drafter.yml as PRs merge)
+  # with the pushed tag and hands its id to the build jobs. Creating the
+  # release here, ahead of any build, is what makes the draft single by
+  # construction: tauri-action only uploads to an existing release and never
+  # runs its own list-then-create.
+  draft:
+    name: Stamp draft release
+    needs: version-sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release-id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9  # v7.7.0
+        id: draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ github.ref_name }}
+          # A suffixed tag (v0.2.0-rc1) is a pipeline dry run; mark it so.
+          prerelease: ${{ contains(github.ref_name, '-') }}
   # Apple silicon only. `ort-sys` ships no prebuilt ONNX Runtime for
   # x86_64-apple-darwin (its dist table lists aarch64 alone among macOS
   # targets), so an Intel build fails in the build script with "no prebuilt
   # binaries available for target x86_64-apple-darwin" long before anything
   # is bundled. docs/RELEASING.md records the decision and what would undo
-  # it. No matrix: one target does not need one, and a single job cannot
-  # race itself to create the draft.
+  # it. No matrix: one target does not need one, and the draft job above
+  # owns release creation regardless.
   desktop:
     name: Desktop app (aarch64-apple-darwin)
-    needs: version-sync
+    needs: [version-sync, draft]
     runs-on: macos-latest
     permissions:
       contents: write
@@ -69,10 +91,11 @@ jobs:
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
         working-directory: apps/desktop
-      # Creates the draft release and attaches this target's bundles. It is
-      # the only job that creates a release, which is what keeps the draft
-      # single — tauri-action lists-then-creates, so two of these running
-      # concurrently could each make one.
+      # Attaches this target's bundles and latest.json to the draft the
+      # `draft` job stamped. With releaseId set, tauri-action never creates a
+      # release, so restoring a second target cannot split the draft. The
+      # release body is release-drafter's accumulated changelog
+      # (.github/release-drafter.yml), not a string in this file.
       #
       # The signing secrets are required, not optional: with a pubkey in
       # tauri.conf.json and createUpdaterArtifacts on, the Tauri CLI refuses
@@ -90,31 +113,15 @@ jobs:
         with:
           projectPath: apps/desktop
           tauriScript: pnpm tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: Majestical ${{ github.ref_name }}
-          releaseDraft: true
+          releaseId: ${{ needs.draft.outputs.release-id }}
           uploadUpdaterJson: true
           args: --target aarch64-apple-darwin
-          releaseBody: |
-            The Majestical desktop app and the `maj` command-line catalog: scan
-            folders into a content-addressed catalog, tag with folksonomy
-            semantics, search offline, and converge catalogs across machines
-            through a shared folder.
-
-            **Requires an Apple silicon Mac** (M1 or later) running macOS
-            10.15 or newer. There is no Intel build: the semantic search stack
-            depends on ONNX Runtime, which publishes no prebuilt library for
-            Intel macOS.
-
-            Not notarized by Apple, so Gatekeeper warns on first run
-            (`xattr -d com.apple.quarantine /Applications/Majestical.app`).
-            Updates are signed and verified in-app. `licenses.html` lists the
-            third-party crates bundled with the app.
   cli:
     name: maj binary and license bundle
-    # Both uploads go into the draft the desktop job creates, so they wait for
-    # it. They ride one job because both want a macOS Rust toolchain, and the
-    # CLI's own build already pays for one.
+    # Both uploads go into the draft the `draft` job stamped; waiting on the
+    # desktop job keeps the upload order stable. They ride one job because
+    # both want a macOS Rust toolchain, and the CLI's own build already pays
+    # for one.
     needs: [version-sync, desktop]
     runs-on: macos-latest
     permissions:

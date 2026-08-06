@@ -1,0 +1,67 @@
+# Maintains a rolling draft release: every PR merged to main lands here as a
+# changelog line, so at tag time the notes already exist and cutting a release
+# needs no commit to write them. release.yml stamps this draft with the pushed
+# tag and the build jobs attach their artifacts to it.
+#
+# Labels drive the categories below. PRs are labeled automatically from their
+# conventional-commit titles (the autolabeler at the bottom); squash-merge
+# keeps titles and commits aligned, so nothing needs labeling by hand.
+name-template: 'Majestical v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+category-template: '### $TITLE'
+change-template: '- $TITLE (#$NUMBER)'
+change-title-escapes: '\<*_&`#@'
+categories:
+  - title: Features
+    labels: [enhancement]
+  - title: Fixes
+    labels: [bug]
+  - title: Documentation
+    labels: [documentation]
+  - title: Dependencies
+    labels: [dependencies]
+  - title: Internal
+    labels: [internal]
+exclude-labels: [skip-changelog]
+# The resolved version is a suggestion shown in the draft's name — the actual
+# version bump is manual (docs/RELEASING.md), since it must be compiled into
+# the binaries before tagging.
+version-resolver:
+  major:
+    labels: [major]
+  minor:
+    labels: [enhancement]
+  patch:
+    labels: [bug, documentation, dependencies, internal]
+  default: patch
+autolabeler:
+  # A `!` before the colon is the conventional-commit breaking-change marker.
+  - label: major
+    title: ['/^[a-z]+(\(.+\))?!:/']
+  - label: enhancement
+    title: ['/^feat(\(.+\))?:/']
+  - label: bug
+    title: ['/^fix(\(.+\))?:/']
+  - label: documentation
+    title: ['/^docs(\(.+\))?:/']
+  - label: internal
+    title: ['/^(chore|refactor|test|ci|build|perf|style)(\(.+\))?:/']
+template: |
+  The Majestical desktop app and the `maj` command-line catalog: scan
+  folders into a content-addressed catalog, tag with folksonomy
+  semantics, search offline, and converge catalogs across machines
+  through a shared folder.
+
+  **Requires an Apple silicon Mac** (M1 or later) running macOS
+  10.15 or newer. There is no Intel build: the semantic search stack
+  depends on ONNX Runtime, which publishes no prebuilt library for
+  Intel macOS.
+
+  Not notarized by Apple, so Gatekeeper warns on first run
+  (`xattr -d com.apple.quarantine /Applications/Majestical.app`).
+  Updates are signed and verified in-app. `licenses.html` lists the
+  third-party crates bundled with the app.
+
+  ## What's changed
+
+  $CHANGES

@@ -1,8 +1,14 @@
 # Releasing
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces a
-**draft** GitHub release. Nothing reaches users until someone publishes that
-draft by hand, so a tag is safe to push and a bad build is safe to delete.
+Release notes write themselves as work merges:
+`.github/workflows/release-drafter.yml` maintains a rolling **draft** GitHub
+release that gains a changelog line per merged PR, categorized by label
+(configuration in `.github/release-drafter.yml` — see
+[Release notes and labels](#release-notes-and-labels)). Pushing a `v*` tag
+runs `.github/workflows/release.yml`, which stamps that draft with the tag
+and attaches the build artifacts. Nothing reaches users until someone
+publishes the draft by hand, so a tag is safe to push and a bad build is
+safe to delete.
 
 The draft receives:
 
@@ -73,7 +79,7 @@ a machine class Apple stopped selling.
 4. **Tag and push.** The tag must name the version just built — the workflow's
    first job checks this and stops the release if it does not. A `-rc1` style
    suffix is allowed, for exercising the pipeline without cutting a real
-   release.
+   release; a suffixed tag marks the draft as a prerelease.
 
    ```bash
    git tag v0.2.0
@@ -82,23 +88,22 @@ a machine class Apple stopped selling.
    ```
 
 5. **Watch it, then publish.** A Tauri release build is slow; the desktop
-   job plus the CLI job take a while.
+   job plus the CLI job take a while. The notes are already in the draft;
+   any final wording changes happen in the GitHub UI, not in a commit.
 
    ```bash
    # `gh run watch` with no argument prompts for a run; name the release run.
    gh run watch "$(gh run list --workflow=release.yml --limit 1 \
      --json databaseId --jq '.[0].databaseId')"
-   gh release list --limit 5     # exactly one draft for the tag
-   gh release view v0.2.0        # the draft, with its assets
+   gh release view v0.2.0        # the draft: drafted notes plus assets
    gh release edit v0.2.0 --draft=false
    ```
 
-   Confirm there is **one** draft for the tag. Only the desktop job creates a
-   release, so nothing should be able to split it — `tauri-action` lists
-   releases and then creates one if it finds none, which is a race only when
-   two jobs do it at once. Restoring a second target would reintroduce that,
-   and the fix then is to create the release in its own job ahead of the
-   matrix rather than to watch for duplicates.
+   The draft is single by construction: the release workflow's `draft` job
+   stamps the rolling draft (creating it only if none exists) before any
+   build starts, and `tauri-action` is handed its id, so no build job ever
+   creates a release. Restoring a second build target cannot split the
+   draft.
 
 To abandon a release, delete the draft and the tag:
 
@@ -107,6 +112,28 @@ gh release delete v0.2.0 --yes
 git -c credential.helper='!gh auth git-credential' \
   push --delete https://github.com/statik/majestical.git v0.2.0
 ```
+
+The next merge to main recreates the rolling draft with the same accumulated
+changelog, so deleting a draft never loses notes.
+
+## Release notes and labels
+
+release-drafter labels each PR from its conventional-commit title —
+`feat:` → `enhancement`, `fix:` → `bug`, `docs:` → `documentation`,
+`chore:`/`refactor:`/`test:`/`ci:`/`build:`/`perf:`/`style:` → `internal`,
+and a `!` before the colon (breaking change) → `major`. Dependabot applies
+`dependencies` itself. Each label files the PR under the matching heading
+in the rolling draft. Label a PR `skip-changelog` to keep it out of the
+notes entirely.
+
+The draft's name suggests the next version, resolved from those labels:
+`major` → major bump, `enhancement` → minor, everything else → patch. It is
+a suggestion only — step 1 above is still where the version is actually
+set, and the tag check still holds the release to what was built.
+
+The boilerplate above the changelog (system requirements, Gatekeeper note)
+lives in the `template` key of `.github/release-drafter.yml`; editing it is
+an ordinary PR, not a release-day change.
 
 ## Updater keys
 

@@ -1,44 +1,89 @@
 name: Release
+# One-click releases: run this workflow from main (Actions → Release → Run
+# workflow, or `gh workflow run release.yml`). The version is computed from
+# conventional commits since the last tag; the release notes are the rolling
+# draft release-drafter maintains as PRs merge. Nothing needs a version-bump
+# commit — versions are stamped into the build tree by scripts/version-stamp.sh
+# and never committed; git tags are the source of truth, and the tag itself is
+# created when the release is published.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to release, e.g. 0.2.0 or 0.2.0-rc1. Empty computes it from
+          conventional commits since the last tag (fix → patch, feat → minor,
+          breaking → major, clamped to 0.x).
+        required: false
+        default: ""
+      publish:
+        description: >-
+          Publish when the builds finish (creates the git tag and offers the
+          update to installed apps). Off leaves a draft to review or discard.
+        type: boolean
+        default: true
 permissions: {}
+concurrency:
+  group: release
+  cancel-in-progress: false
 jobs:
-  version-sync:
-    name: Version sync
+  version:
+    name: Resolve version
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.out.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: ./scripts/version-sync.sh
-      # version-sync.sh proves the five files agree with each other; nothing in
-      # it knows what tag is being built. A tag naming a different version than
-      # the binaries carry would produce a release that is wrong in the one
-      # place users read first.
-      - name: Tag names the version being built
+      - id: tag
+        if: inputs.version == ''
+        uses: mathieudutour/github-tag-action@d28fa2ccfbd16e871a4bdf35e11b3ad1bd56c0c1  # v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          dry_run: true
+          # default_bump: false is load-bearing: it makes a history with no
+          # feat/fix/breaking commit produce an empty new_tag, which is what
+          # stops a notes-only release below. Do not remove it.
+          default_bump: false
+          release_branches: main
+          fetch_all_tags: true
+      - id: out
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          PREV_VERSION: ${{ steps.tag.outputs.previous_version }}
+          NEW_VERSION: ${{ steps.tag.outputs.new_version }}
+          NEW_TAG: ${{ steps.tag.outputs.new_tag }}
         run: |
           set -euo pipefail
-          declared=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          case "$GITHUB_REF_NAME" in
-            "v$declared" | "v$declared-"*) ;;
-            *)
-              echo "tag $GITHUB_REF_NAME does not name version $declared" >&2
-              echo "fix: tag v$declared (optionally with a -rc1 style suffix)" >&2
-              exit 1
-              ;;
-          esac
-          echo "tag ok: $GITHUB_REF_NAME builds $declared"
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "releases build main; this ran from $GITHUB_REF_NAME" >&2
+            echo "fix: dispatch the workflow from the main branch" >&2
+            exit 1
+          fi
+          if [ -n "$IN_VERSION" ]; then
+            version="${IN_VERSION#v}"
+          elif [ -z "$NEW_TAG" ]; then
+            echo "no releasable commits since the last tag (no feat/fix/breaking merges)" >&2
+            echo "fix: pass an explicit version to release anyway" >&2
+            exit 1
+          else
+            version="$(./scripts/clamp-version.sh "$PREV_VERSION" "$NEW_VERSION")"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
   # Stamps the rolling draft (maintained by release-drafter.yml as PRs merge)
-  # with the pushed tag and hands its id to the build jobs. Creating the
+  # with the release tag and hands its id to the build jobs. Creating the
   # release here, ahead of any build, is what makes the draft single by
   # construction: tauri-action only uploads to an existing release and never
-  # runs its own list-then-create.
+  # runs its own list-then-create. The commitish pin matters: publishing
+  # creates the tag there, and main may advance while the builds run.
   draft:
     name: Stamp draft release
-    needs: version-sync
+    needs: version
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -50,9 +95,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag: ${{ github.ref_name }}
-          # A suffixed tag (v0.2.0-rc1) is a pipeline dry run; mark it so.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag: v${{ needs.version.outputs.version }}
+          commitish: ${{ github.sha }}
+          # A suffixed version (0.2.0-rc1) is a pipeline dry run; mark it so.
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
   # Apple silicon only. `ort-sys` ships no prebuilt ONNX Runtime for
   # x86_64-apple-darwin (its dist table lists aarch64 alone among macOS
   # targets), so an Intel build fails in the build script with "no prebuilt
@@ -62,7 +108,7 @@ jobs:
   # owns release creation regardless.
   desktop:
     name: Desktop app (aarch64-apple-darwin)
-    needs: [version-sync, draft]
+    needs: [version, draft]
     runs-on: macos-latest
     permissions:
       contents: write
@@ -91,6 +137,12 @@ jobs:
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
         working-directory: apps/desktop
+      # Build-time only; not committed. Ends with version-sync.sh, so a stamp
+      # that misses a file stops the release here.
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: ./scripts/version-stamp.sh "$VERSION"
       # Attaches this target's bundles and latest.json to the draft the
       # `draft` job stamped. With releaseId set, tauri-action never creates a
       # release, so restoring a second target cannot split the draft. The
@@ -122,10 +174,12 @@ jobs:
     # desktop job keeps the upload order stable. They ride one job because
     # both want a macOS Rust toolchain, and the CLI's own build already pays
     # for one.
-    needs: [version-sync, desktop]
+    needs: [version, draft, desktop]
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -135,6 +189,8 @@ jobs:
           targets: aarch64-apple-darwin
       - name: Install protoc (lance build dependency, via services)
         run: brew install protobuf
+      - name: Stamp version
+        run: ./scripts/version-stamp.sh "$VERSION"
       # Not a universal binary: `maj` links the same ONNX Runtime the app
       # does, and there is no Intel build of it to lipo against.
       - name: Build maj binary
@@ -146,7 +202,7 @@ jobs:
       - name: Package and checksum
         run: |
           set -euo pipefail
-          tar czf "maj-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" maj
+          tar czf "maj-v${VERSION}-aarch64-apple-darwin.tar.gz" maj
           shasum -a 256 maj-*.tar.gz > checksums.txt
           cat checksums.txt
       # `--features cli` is not optional: cargo-about 0.9 gates its binary
@@ -167,6 +223,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "v$VERSION" \
             maj-*.tar.gz checksums.txt licenses.html \
             --clobber
+  # Publishing is what creates the git tag (at the commitish the draft job
+  # pinned) and what makes installed apps see the update. Skipped when the
+  # dispatch set publish off; the draft then waits for a human to publish or
+  # delete it.
+  publish:
+    name: Publish release
+    needs: [version, draft, desktop, cli]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Flip the draft to published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.draft.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false --jq '"published " + .tag_name + ": " + .html_url'

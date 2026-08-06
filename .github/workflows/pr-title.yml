@@ -1,0 +1,19 @@
+name: PR title
+# Conventional PR titles are load-bearing twice over: squash-merge makes the
+# title the commit message that release.yml computes the next version from
+# (a mistyped `feat:` is a release that never happens), and release-drafter
+# files the PR under a changelog heading by parsing the same title.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions: {}
+jobs:
+  lint:
+    name: Conventional title
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50  # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

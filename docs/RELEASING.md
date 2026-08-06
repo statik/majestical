@@ -1,16 +1,35 @@
 # Releasing
 
-Release notes write themselves as work merges:
-`.github/workflows/release-drafter.yml` maintains a rolling **draft** GitHub
-release that gains a changelog line per merged PR, categorized by label
-(configuration in `.github/release-drafter.yml` — see
-[Release notes and labels](#release-notes-and-labels)). Pushing a `v*` tag
-runs `.github/workflows/release.yml`, which stamps that draft with the tag
-and attaches the build artifacts. Nothing reaches users until someone
-publishes the draft by hand, so a tag is safe to push and a bad build is
-safe to delete.
+A release is one click: run the **Release** workflow from main (Actions →
+Release → Run workflow, or `gh workflow run release.yml`). Nothing in the
+flow needs a version-bump commit:
 
-The draft receives:
+- The **version** is computed from conventional commits since the last tag —
+  `fix:` → patch, `feat:` → minor, a `!` breaking marker → major, clamped to
+  the 0.x range by `scripts/clamp-version.sh` until 1.0.0 ships
+  deliberately. The workflow's `version` input overrides the computation;
+  with no releasable commits and no input, the run stops instead of
+  releasing nothing new.
+- The **notes** are the rolling draft that
+  `.github/workflows/release-drafter.yml` maintains as PRs merge (see
+  [Release notes and labels](#release-notes-and-labels)).
+- The **binaries** carry the computed version because
+  `scripts/version-stamp.sh` writes it into the five version locations in
+  the build tree before building. The stamp is never committed: the
+  versions in the repository stay frozen, and git tags are the source of
+  truth for what was released. `scripts/version-sync.sh` still guards that
+  the five locations agree with each other — in CI against drift, and at
+  the end of every stamp against a stamp that missed a file.
+- The **git tag** is created when the release is published, pointing at the
+  main commit the draft was pinned to when the run started. Pushing a tag
+  by hand no longer triggers anything.
+
+Publishing is the run's last job. Nothing reaches users until it runs: with
+the `publish` input on (the default), the run ends published and installed
+apps see the update; with it off, the draft waits for
+`gh release edit vX.Y.Z --draft=false` or deletion.
+
+The release receives:
 
 - `Majestical.app.tar.gz` and a `.dmg` for `aarch64-apple-darwin`, built by
   `tauri-action`
@@ -57,60 +76,36 @@ a machine class Apple stopped selling.
 
 ## Cutting a release
 
-1. **Bump the version in five places.** `scripts/version-sync.sh` is the list:
-   `Cargo.toml`, `apps/desktop/package.json`,
-   `apps/desktop/src-tauri/Cargo.toml`,
-   `apps/desktop/src-tauri/tauri.conf.json`, and
-   `apps/desktop/src-tauri/Cargo.lock`.
+```bash
+gh workflow run release.yml
+# `gh run watch` with no argument prompts for a run; name the release run.
+sleep 5 && gh run watch "$(gh run list --workflow=release.yml --limit 1 \
+  --json databaseId --jq '.[0].databaseId')"
+```
 
-2. **Refresh the GUI lockfile.** Editing `src-tauri/Cargo.toml` does not
-   rewrite the lockfile entry beside it; only a build does.
+A Tauri release build is slow; the desktop job plus the CLI job take a
+while. When the run finishes, the release is published and the tag exists —
+check the desktop job's log for the key-mismatch warning described under
+[Updater keys](#updater-keys).
 
-   ```bash
-   cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
-   ```
+The draft is single by construction: the `draft` job stamps the rolling
+draft (creating it only if none exists) before any build starts, and
+`tauri-action` is handed its id, so no build job ever creates a release.
+Restoring a second build target cannot split the draft.
 
-3. **Check the versions agree**, then commit and merge as usual.
-
-   ```bash
-   just version-sync
-   ```
-
-4. **Tag and push.** The tag must name the version just built — the workflow's
-   first job checks this and stops the release if it does not. A `-rc1` style
-   suffix is allowed, for exercising the pipeline without cutting a real
-   release; a suffixed tag marks the draft as a prerelease.
-
-   ```bash
-   git tag v0.2.0
-   git -c credential.helper='!gh auth git-credential' \
-     push https://github.com/statik/majestical.git v0.2.0
-   ```
-
-5. **Watch it, then publish.** A Tauri release build is slow; the desktop
-   job plus the CLI job take a while. The notes are already in the draft;
-   any final wording changes happen in the GitHub UI, not in a commit.
-
-   ```bash
-   # `gh run watch` with no argument prompts for a run; name the release run.
-   gh run watch "$(gh run list --workflow=release.yml --limit 1 \
-     --json databaseId --jq '.[0].databaseId')"
-   gh release view v0.2.0        # the draft: drafted notes plus assets
-   gh release edit v0.2.0 --draft=false
-   ```
-
-   The draft is single by construction: the release workflow's `draft` job
-   stamps the rolling draft (creating it only if none exists) before any
-   build starts, and `tauri-action` is handed its id, so no build job ever
-   creates a release. Restoring a second build target cannot split the
-   draft.
-
-To abandon a release, delete the draft and the tag:
+To exercise the pipeline without shipping, give the run an `-rc` version and
+keep the result a draft:
 
 ```bash
-gh release delete v0.2.0 --yes
-git -c credential.helper='!gh auth git-credential' \
-  push --delete https://github.com/statik/majestical.git v0.2.0
+gh workflow run release.yml -f version=0.2.0-rc1 -f publish=false
+```
+
+The draft is marked prerelease and its bundles carry the rc version. To
+abandon it — or any unpublished draft — delete it; no tag exists until a
+release is published, so there is nothing else to clean up:
+
+```bash
+gh release delete v0.2.0-rc1 --yes
 ```
 
 The next merge to main recreates the rolling draft with the same accumulated
@@ -121,22 +116,24 @@ changelog, so deleting a draft never loses notes.
 release-drafter files each PR under a heading by parsing its
 conventional-commit title — `feat:` → Features, `fix:` → Fixes, `docs:` →
 Documentation, `chore:`/`refactor:`/`test:`/`ci:`/`build:`/`perf:`/`style:`
-→ Internal, anything unparseable → Other. Squash-merge keeps PR titles and
-commits aligned, so this needs no labeling. Three labels do carry meaning:
-`dependencies` (applied by Dependabot itself) files a PR under
-Dependencies, `skip-changelog` keeps a PR out of the notes entirely, and
-`major` forces a major version suggestion when a title lacked the `!`
-breaking-change marker.
+→ Internal, anything unparseable → Other. The release workflow computes the
+next version from the same titles, which is why
+`.github/workflows/pr-title.yml` rejects PRs whose titles do not parse:
+squash-merge makes the title the commit message, and a mistyped `feat:` is
+a release that never happens. Three labels carry meaning: `dependencies`
+(applied by Dependabot itself) files a PR under Dependencies,
+`skip-changelog` keeps a PR out of the notes entirely, and `major` forces a
+major version suggestion in the rolling draft's name.
 
-The draft's name suggests the next version, resolved from the same titles:
-a `!` breaking marker (or the `major` label) → major bump, any `feat:` →
-minor, everything else → patch. It is a suggestion only — step 1 above is
-still where the version is actually set, and the tag check still holds the
-release to what was built.
+Between releases the rolling draft's name shows release-drafter's own
+next-version estimate. It is cosmetic — the version that ships is the one
+the release workflow computes at dispatch time.
 
-The boilerplate above the changelog (system requirements, Gatekeeper note)
-lives in the `template` key of `.github/release-drafter.yml`; editing it is
-an ordinary PR, not a release-day change.
+To adjust wording, edit the draft in the GitHub UI any time before
+publishing; no commit is involved. The boilerplate above the changelog
+(system requirements, Gatekeeper note) lives in the `template` key of
+`.github/release-drafter.yml`; editing it is an ordinary PR, not a
+release-day change.
 
 ## Updater keys
 
@@ -202,7 +199,7 @@ on, `tauri-cli` treats the private key as required and the desktop job fails
 at the bundling step: `A public key has been found, but no private key` when
 the variable is absent, or `failed to decode secret key` when it is present
 but empty, which is what a missing GitHub secret produces. The result is no
-draft with desktop bundles in it. That is the better failure — a loud stop
+release with desktop bundles in it. That is the better failure — a loud stop
 beats silently shipping unsigned artifacts that no installed app can ever
 verify.
 

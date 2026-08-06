@@ -2,21 +2,13 @@ name: Release drafter
 on:
   push:
     branches: [main]
-  # On pull_request events release-drafter only runs its autolabeler, which
-  # labels the PR from its conventional-commit title; `edited` is included so
-  # a corrected title relabels. Plain pull_request, not pull_request_target:
-  # this repo takes no fork PRs, and the _target trigger's checkout-of-
-  # untrusted-code hazard is not worth reintroducing for them.
-  pull_request:
-    types: [opened, reopened, synchronize, edited]
 permissions: {}
 jobs:
   draft:
     name: Update rolling draft
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # create/update the draft release
-      pull-requests: write  # autolabeler
+      contents: write  # create/update the draft release
     steps:
       - uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9  # v7.7.0
         env:

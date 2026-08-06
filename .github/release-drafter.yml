@@ -3,9 +3,12 @@
 # needs no commit to write them. release.yml stamps this draft with the pushed
 # tag and the build jobs attach their artifacts to it.
 #
-# Labels drive the categories below. PRs are labeled automatically from their
-# conventional-commit titles (the autolabeler at the bottom); squash-merge
-# keeps titles and commits aligned, so nothing needs labeling by hand.
+# Categories match conventional-commit PR titles directly (`when:
+# conventional:`); squash-merge keeps titles and commits aligned, so nothing
+# needs labeling. The exceptions are labels: `dependencies` (Dependabot
+# applies it itself), `skip-changelog` to keep a PR out of the notes, and
+# `major` to force a major version suggestion on a PR whose title lacked the
+# `!` breaking-change marker.
 name-template: 'Majestical v$RESOLVED_VERSION'
 tag-template: 'v$RESOLVED_VERSION'
 category-template: '### $TITLE'
@@ -13,39 +16,44 @@ change-template: '- $TITLE (#$NUMBER)'
 change-title-escapes: '\<*_&`#@'
 categories:
   - title: Features
-    labels: [enhancement]
+    semver-increment: minor
+    when:
+      conventional:
+        type: feat
   - title: Fixes
-    labels: [bug]
+    when:
+      conventional:
+        type: fix
   - title: Documentation
-    labels: [documentation]
+    when:
+      conventional:
+        type: docs
+  # Before Internal, exclusive, so Dependabot's chore(deps)/build(deps)
+  # titles land here once rather than in both categories.
   - title: Dependencies
-    labels: [dependencies]
+    exclusive: true
+    when:
+      label: dependencies
   - title: Internal
-    labels: [internal]
-exclude-labels: [skip-changelog]
-# The resolved version is a suggestion shown in the draft's name — the actual
-# version bump is manual (docs/RELEASING.md), since it must be compiled into
-# the binaries before tagging.
-version-resolver:
-  major:
-    labels: [major]
-  minor:
-    labels: [enhancement]
-  patch:
-    labels: [bug, documentation, dependencies, internal]
-  default: patch
-autolabeler:
-  # A `!` before the colon is the conventional-commit breaking-change marker.
-  - label: major
-    title: ['/^[a-z]+(\(.+\))?!:/']
-  - label: enhancement
-    title: ['/^feat(\(.+\))?:/']
-  - label: bug
-    title: ['/^fix(\(.+\))?:/']
-  - label: documentation
-    title: ['/^docs(\(.+\))?:/']
-  - label: internal
-    title: ['/^(chore|refactor|test|ci|build|perf|style)(\(.+\))?:/']
+    when:
+      conventional:
+        types: [chore, refactor, test, ci, build, perf, style]
+  # Bucket for changes no category above matched (non-conventional titles).
+  - title: Other
+  - type: pre-exclude
+    when:
+      label: skip-changelog
+  # The resolved version is a suggestion shown in the draft's name — the
+  # actual version bump is manual (docs/RELEASING.md), since it must be
+  # compiled into the binaries before tagging.
+  - type: version-resolver
+    semver-increment: major
+    when:
+      - conventional:
+          breaking: true
+      - label: major
+  - type: version-resolver
+    semver-increment: patch
 template: |
   The Majestical desktop app and the `maj` command-line catalog: scan
   folders into a content-addressed catalog, tag with folksonomy

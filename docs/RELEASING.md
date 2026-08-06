@@ -118,18 +118,21 @@ changelog, so deleting a draft never loses notes.
 
 ## Release notes and labels
 
-release-drafter labels each PR from its conventional-commit title —
-`feat:` → `enhancement`, `fix:` → `bug`, `docs:` → `documentation`,
-`chore:`/`refactor:`/`test:`/`ci:`/`build:`/`perf:`/`style:` → `internal`,
-and a `!` before the colon (breaking change) → `major`. Dependabot applies
-`dependencies` itself. Each label files the PR under the matching heading
-in the rolling draft. Label a PR `skip-changelog` to keep it out of the
-notes entirely.
+release-drafter files each PR under a heading by parsing its
+conventional-commit title — `feat:` → Features, `fix:` → Fixes, `docs:` →
+Documentation, `chore:`/`refactor:`/`test:`/`ci:`/`build:`/`perf:`/`style:`
+→ Internal, anything unparseable → Other. Squash-merge keeps PR titles and
+commits aligned, so this needs no labeling. Three labels do carry meaning:
+`dependencies` (applied by Dependabot itself) files a PR under
+Dependencies, `skip-changelog` keeps a PR out of the notes entirely, and
+`major` forces a major version suggestion when a title lacked the `!`
+breaking-change marker.
 
-The draft's name suggests the next version, resolved from those labels:
-`major` → major bump, `enhancement` → minor, everything else → patch. It is
-a suggestion only — step 1 above is still where the version is actually
-set, and the tag check still holds the release to what was built.
+The draft's name suggests the next version, resolved from the same titles:
+a `!` breaking marker (or the `major` label) → major bump, any `feat:` →
+minor, everything else → patch. It is a suggestion only — step 1 above is
+still where the version is actually set, and the tag check still holds the
+release to what was built.
 
 The boilerplate above the changelog (system requirements, Gatekeeper note)
 lives in the `template` key of `.github/release-drafter.yml`; editing it is

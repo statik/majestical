@@ -1,0 +1,75 @@
+# Maintains a rolling draft release: every PR merged to main lands here as a
+# changelog line, so at tag time the notes already exist and cutting a release
+# needs no commit to write them. release.yml stamps this draft with the pushed
+# tag and the build jobs attach their artifacts to it.
+#
+# Categories match conventional-commit PR titles directly (`when:
+# conventional:`); squash-merge keeps titles and commits aligned, so nothing
+# needs labeling. The exceptions are labels: `dependencies` (Dependabot
+# applies it itself), `skip-changelog` to keep a PR out of the notes, and
+# `major` to force a major version suggestion on a PR whose title lacked the
+# `!` breaking-change marker.
+name-template: 'Majestical v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+category-template: '### $TITLE'
+change-template: '- $TITLE (#$NUMBER)'
+change-title-escapes: '\<*_&`#@'
+categories:
+  - title: Features
+    semver-increment: minor
+    when:
+      conventional:
+        type: feat
+  - title: Fixes
+    when:
+      conventional:
+        type: fix
+  - title: Documentation
+    when:
+      conventional:
+        type: docs
+  # Before Internal, exclusive, so Dependabot's chore(deps)/build(deps)
+  # titles land here once rather than in both categories.
+  - title: Dependencies
+    exclusive: true
+    when:
+      label: dependencies
+  - title: Internal
+    when:
+      conventional:
+        types: [chore, refactor, test, ci, build, perf, style]
+  # Bucket for changes no category above matched (non-conventional titles).
+  - title: Other
+  - type: pre-exclude
+    when:
+      label: skip-changelog
+  # The resolved version is a suggestion shown in the draft's name — the
+  # actual version bump is manual (docs/RELEASING.md), since it must be
+  # compiled into the binaries before tagging.
+  - type: version-resolver
+    semver-increment: major
+    when:
+      - conventional:
+          breaking: true
+      - label: major
+  - type: version-resolver
+    semver-increment: patch
+template: |
+  The Majestical desktop app and the `maj` command-line catalog: scan
+  folders into a content-addressed catalog, tag with folksonomy
+  semantics, search offline, and converge catalogs across machines
+  through a shared folder.
+
+  **Requires an Apple silicon Mac** (M1 or later) running macOS
+  10.15 or newer. There is no Intel build: the semantic search stack
+  depends on ONNX Runtime, which publishes no prebuilt library for
+  Intel macOS.
+
+  Not notarized by Apple, so Gatekeeper warns on first run
+  (`xattr -d com.apple.quarantine /Applications/Majestical.app`).
+  Updates are signed and verified in-app. `licenses.html` lists the
+  third-party crates bundled with the app.
+
+  ## What's changed
+
+  $CHANGES

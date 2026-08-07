@@ -42,9 +42,12 @@ stamp_toml apps/desktop/src-tauri/Cargo.toml
 stamp_json apps/desktop/package.json
 stamp_json apps/desktop/src-tauri/tauri.conf.json
 
-# The lockfiles record each workspace member's version. Only path-local
-# crates change, so this needs no network and no build.
-cargo update --workspace --offline
-cargo update --workspace --offline --manifest-path apps/desktop/src-tauri/Cargo.toml
+# The lockfiles record each workspace member's version. `--workspace` limits
+# the update to the path-local crates, so registry dependencies stay locked;
+# no build happens. Not `--offline`: resolution still reads the crates.io
+# index, which a fresh CI runner has never cached — the v0.2.0-rc1 dry run
+# failed exactly there.
+cargo update --workspace
+cargo update --workspace --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 ./scripts/version-sync.sh

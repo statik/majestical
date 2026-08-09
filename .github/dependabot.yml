@@ -17,8 +17,15 @@ updates:
         update-types:
           - version-update:semver-minor
           - version-update:semver-major
+      # arrow-* moves in lockstep with lancedb (Cargo.toml pins =58.3.0);
+      # bump them together when lancedb itself moves to a newer arrow.
+      # PR #74 showed the independent bump cannot compile.
+      - dependency-name: arrow-array
+      - dependency-name: arrow-schema
   # The desktop head is a standalone cargo workspace (apps/desktop/src-tauri),
-  # so the root cargo entry above never sees it — it needs its own.
+  # so the root cargo entry above never sees it — it needs its own. Its
+  # workspace path-includes the root crates, so dependabot edits the root
+  # Cargo.toml through it: the ignore list must mirror the root's.
   - package-ecosystem: cargo
     directory: /apps/desktop/src-tauri
     schedule:
@@ -28,6 +35,13 @@ updates:
     groups:
       gui-cargo-all:
         patterns: ["*"]
+    ignore:
+      - dependency-name: rusqlite
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: arrow-array
+      - dependency-name: arrow-schema
   - package-ecosystem: npm
     directory: /apps/desktop
     schedule:
@@ -37,6 +51,14 @@ updates:
     groups:
       gui-npm-all:
         patterns: ["*"]
+    ignore:
+      # TypeScript 7 (the Go-native port) is not a drop-in: svelte-check
+      # requires TS6 and TS7 installed side by side plus a --tsgo flag
+      # (PR #78). Migrate deliberately when the toolchain supports TS7
+      # standalone, then drop this ignore.
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
   - package-ecosystem: github-actions
     directory: /
     schedule:

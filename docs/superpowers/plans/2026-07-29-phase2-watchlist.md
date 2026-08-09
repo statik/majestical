@@ -1504,6 +1504,23 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
   phase 7A — see that section's first item). Nothing in 7B touched it: the
   GUI's inspector renders the manifest's timestamps as timecodes, which is
   the same manifest the MCP resource serves, and still not an image.
+- **arrow 59 is blocked on lancedb** (dependabot triage, 2026-08-09).
+  Dependabot PRs #74 and #79 bumped `arrow-array`/`arrow-schema` to 59.1.0
+  against lancedb 0.33.0's arrow-58 API and failed to compile
+  (`RecordBatch: Scannable` unsatisfied) — exactly what the Cargo.toml
+  lockstep comment warns against. Both PRs closed; `dependabot.yml` now
+  ignores both crates in both cargo ecosystems. When lancedb releases
+  against arrow 59, bump all three together and drop the ignores.
+- **TypeScript 7 is not a drop-in** (dependabot triage, 2026-08-09). PR #78
+  failed on all three GUI builds: svelte-check requires TS6 and TS7
+  installed side by side via an npm alias plus a `--tsgo` flag. PR closed;
+  `dependabot.yml` now ignores typescript majors. Migrate deliberately when
+  the toolchain supports TS7 standalone, then drop the ignore.
+- **The GUI cargo ecosystem's dependabot entry sidestepped the root's
+  ignores** (dependabot triage, 2026-08-09). The src-tauri workspace
+  path-includes the root crates, so its dependabot entry edits the root
+  Cargo.toml — PR #79 re-proposed the rusqlite 0.40 bump the root entry
+  already ignores. The two ignore lists are now mirrored and must stay so.
 
 ### cargo-mutants triage (phase 7B)
 

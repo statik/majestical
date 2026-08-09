@@ -13,7 +13,13 @@
 //! no separate MCP-specific rendering layer. A `ServiceError` becomes a
 //! tool-level error (`CallToolResult::error`, `isError: true`) carrying the
 //! error's full Display chain (`{:#}`), which is where a `ServiceError`'s
-//! remedy text (e.g. "run `maj catalog init` first") already lives.
+//! remedy text (e.g. "run `maj catalog init` first") already lives. When
+//! the failing call had already collected notices (a `ServiceError::
+//! WithNotices` carrier — the four sync verbs attach these on failure, see
+//! `majestical_services::notices::Notices::attach_on_err`), those notices
+//! lead as their own text blocks, one per line, before the inner error's
+//! Display chain: MCP has no stderr, so these blocks are the only channel
+//! a failure's warnings have. See `split_notices`/`tool_error_split` below.
 //!
 //! Split into submodules by concern: `read_tools` (the 10 read-only tools),
 //! `write_tools` (the 16 mutating tools, each gated behind a `confirm`
@@ -22,9 +28,11 @@
 //! and keyframe manifests). This file keeps only what every submodule
 //! shares: the `MajServer` struct itself, the `open_app`/`ensure_catalog`
 //! guards every tool and resource opens the catalog through, the
-//! `tool_error`/`structured_ok` result builders, the `ServerHandler` impl
-//! (tool routers summed, resources capability enabled, both resource
-//! methods delegating to `resources`), and `serve`.
+//! `tool_error`/`structured_ok`/`with_notices` result builders plus the
+//! failure-path `split_notices`/`error_blocks_with_notices`/
+//! `tool_error_split` trio, the `ServerHandler` impl (tool routers summed,
+//! resources capability enabled, both resource methods delegating to
+//! `resources`), and `serve`.
 mod read_tools;
 mod resources;
 mod write_tools;

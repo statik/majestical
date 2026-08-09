@@ -1676,6 +1676,66 @@ fn add_sync_location_dry_run_with_a_broken_config_leads_with_its_notices() {
     );
 }
 
+/// `add_sync_location_result`'s EXECUTE arm (`confirm: true`) calls
+/// `sync::location_add` directly — unlike the four sync verbs
+/// (`status`/`locations_list`/`push`/`pull`), `location_add` is not one of
+/// `Notices::attach_on_err`'s boundaries, so without the helper explicitly
+/// routing its result through `notices.attach_on_err`, a notice collected
+/// before a failure (here: `config_path`'s state-dir migration removing a
+/// legacy `catalog.db` — destructive, already happened by the time the
+/// duplicate-name check fails) would drop silently instead of reaching the
+/// caller. Same fixture family as the dry-run test above, but this time
+/// the failure is `location_add_impl`'s own duplicate-name `ensure!`, and
+/// `confirm: true` drives the execute arm.
+#[test]
+fn add_sync_location_confirmed_failure_carries_its_notices() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "nas"])
+        .arg(&nas)
+        .assert()
+        .success();
+    // Planted AFTER the location-add call above (which already resolved
+    // the state dir once with no legacy file present) so the confirmed
+    // add-location call below — reusing the same name, "nas" — is the
+    // FIRST `config_path` resolution to see it.
+    std::fs::write(root.join("catalog.db"), b"legacy").expect("plant legacy db");
+    let dup_path = dir.path().join("nas-dup");
+    std::fs::create_dir_all(&dup_path).expect("mkdir");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "add_sync_location",
+        &serde_json::json!({
+            "name": "nas", "path": dup_path.to_str().expect("utf8"), "confirm": true
+        }),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let texts: Vec<String> = resp["result"]["content"]
+        .as_array()
+        .expect("content array")
+        .iter()
+        .map(|block| block["text"].as_str().expect("text block").to_string())
+        .collect();
+    assert!(
+        texts[0].contains("removed legacy catalog.db"),
+        "the carried notice must lead: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("already configured")),
+        "the duplicate-name failure must still render: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("diagnostic(s) were collected")),
+        "the carrier's own label must never leak: {texts:?}"
+    );
+}
+
 /// Closes the cargo-mutants gap on `rm_sync_location_result`'s
 /// `Ok(Default::default())`/`delete !`/`==`->`!=` survivors and the
 /// `MajServer::rm_sync_location` wrapper survivor.

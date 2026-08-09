@@ -65,12 +65,11 @@ impl CommandError {
 
 impl<E: Into<anyhow::Error>> From<E> for CommandError {
     fn from(err: E) -> Self {
-        // This split only recognizes a chain-head `ServiceError::WithNotices`
-        // (`downcast::<ServiceError>` inspects the outermost error type
-        // only) — a `*_impl` that calls `.context()` on a service result
-        // before the `?` wraps `WithNotices` inside an opaque `anyhow`
-        // layer, and the downcast below misses it, silently dropping the
-        // notices into `message` instead of `notices`.
+        // `downcast` recovers a `ServiceError` anywhere in anyhow's context
+        // chain, dropping any `.context()` strings on it from `message` —
+        // put remedy text on the `ServiceError` itself. Wrapping it in
+        // another typed error, or reformatting with `anyhow!("{e}")`,
+        // hides it from the downcast and leaks the carrier label instead.
         let err: anyhow::Error = err.into();
         let (notices, err) = match err.downcast::<ServiceError>() {
             Ok(ServiceError::WithNotices { notices, source }) => {

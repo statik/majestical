@@ -57,7 +57,8 @@ httpmock = "0.8.3"
 # break (cargo allows only one version of a `links` crate per build graph
 # regardless of what any individual crate asks for).
 rusqlite = { version = "0.37", features = ["bundled"] }
-whisper-rs = { version = "0.16.0", features = ["metal"] }
+# metal is added per-target in crates/index — CPU-only elsewhere
+whisper-rs = { version = "0.16.0" }
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
 # Vision's default features pull in AVFoundation/CoreML/CoreMedia/CoreVideo

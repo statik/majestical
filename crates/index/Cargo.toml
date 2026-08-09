@@ -14,7 +14,6 @@ zstd = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
-ort = { workspace = true, features = ["coreml"] }
 tokenizers = { workspace = true }
 # Regular dependency, not dev-only: the HEIC/HEIF decode path shells out to
 # macOS's `sips` and needs a real output file on disk at runtime.
@@ -25,12 +24,22 @@ arrow-schema = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
-whisper-rs = { workspace = true }
+
+# The Apple-native seams: Vision OCR, PDFKit, the CoreML EP, and whisper's
+# Metal backend exist only on macOS. Everything else in this crate builds
+# and runs everywhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { workspace = true, features = ["coreml"] }
+whisper-rs = { workspace = true, features = ["metal"] }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-vision = { workspace = true }
 objc2-pdf-kit = { workspace = true }
 objc2-app-kit = { workspace = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { workspace = true }
+whisper-rs = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true

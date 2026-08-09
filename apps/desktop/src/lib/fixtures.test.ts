@@ -37,4 +37,17 @@ describe("wire fixtures", () => {
     expect(typedSavedSearches.saved.length).toBeGreaterThan(0);
     expect(typedSavedSearches.notices?.length).toBeGreaterThan(0);
   });
+
+  // An optional interface field can vanish from a regenerated fixture (a
+  // serde rename) without breaking the assignment above — a missing
+  // optional is still legal TS, so only a runtime assert here catches it.
+  it("carry the optional fields the compile-time assignment cannot enforce", () => {
+    expect(typedSearchOutcome.semantic_coverage).toBeDefined();
+    expect(typedSearchOutcome.text_coverage?.length).toBeGreaterThan(0);
+    const [hit] = typedSearchOutcome.results;
+    expect(hit?.timestamp_ms).toBeDefined();
+    expect(hit?.source).toBeDefined();
+    expect(hit?.locator).toBeDefined();
+    expect(hit?.snippet).toBeDefined();
+  });
 });

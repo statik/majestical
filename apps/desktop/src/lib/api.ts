@@ -2,6 +2,9 @@
 // and one interface per outcome struct, mirroring the Rust field-for-field
 // (snake_case included — these are serde's names, not ours to prettify).
 // Fields the Rust skips when empty (`skip_serializing_if`) are optional here.
+// Every interface here is pinned by `fixtures.test.ts` against a fixture in
+// `fixtures/*.json`; a new outcome interface needs a builder in
+// `src-tauri/tests/wire_fixtures.rs` too.
 import { invoke } from "@tauri-apps/api/core";
 
 /** `majestical_services::search::VolumeRef` */

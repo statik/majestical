@@ -1,6 +1,14 @@
 //! Sync location config, `maj sync push`/`pull`/`location add`/`location
 //! rm`, and `maj sync status`/`maj sync location list` compute. Moved from
 //! `crates/cli/src/sync_cmd.rs`.
+//!
+//! Two notices-sink conventions coexist here: `location_add`/`location_rm`
+//! take a caller-supplied `&Notices` — the CLI head drains it after the
+//! call returns, on both paths. `push`/`pull`/`status`/`locations_list`
+//! instead each own their sink internally and attach it to the error via
+//! `Notices::attach_on_err` on failure. New verbs should follow the
+//! wrapper-owns-sink pattern; it's the one that composes with
+//! `ServiceError::WithNotices`.
 use crate::app::FsApp;
 use crate::error::ServiceError;
 use anyhow::{Context, Result};
@@ -814,7 +822,8 @@ pub fn pull(
 
 /// Downcasts [`pull_impl`]'s early-return carrier back into the typed
 /// [`ServiceError::SyncPullApplyFailed`] so the completed transfer rows
-/// survive the conversion; any other error passes through unchanged.
+/// survive the conversion; any other error is converted via the usual
+/// `Other` fallback.
 fn pull_apply_error(err: anyhow::Error) -> ServiceError {
     match err.downcast::<PullApplyFailure>() {
         Ok(partial) => ServiceError::SyncPullApplyFailed {
@@ -1083,6 +1092,45 @@ mod push_pull_tests {
         (app, root)
     }
 
+    /// Shared setup for the push/pull round-trip tests below: a `source`
+    /// catalog with one emitted event, pushed to a `shuttle` location that a
+    /// freshly initialized `dest` catalog also points at. Returns
+    /// `(dest_root, location path)` — the two pieces every caller still
+    /// needs to drive its own scenario-specific pull. Push actually
+    /// succeeding (not merely not erroring — per-location failures land
+    /// inside the outcome, never as `Err`, see `push`'s doc) is asserted
+    /// here since it's the shared precondition every caller depends on.
+    fn pushed_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+        let (mut source, source_root) = init_catalog(dir, "source", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+
+        let loc = dir.join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
+        let push_outcome = push(
+            &source_root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+        assert!(!push_outcome.overall_failed(), "fixture push must succeed");
+
+        let dest_root = dir.join("dest");
+        std::fs::create_dir_all(&dest_root).expect("mkdir");
+        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
+        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
+
+        (dest_root, loc)
+    }
+
     #[test]
     fn overall_failed_is_true_when_every_location_is_skipped_or_failed() {
         let rows = vec![
@@ -1228,33 +1276,8 @@ mod push_pull_tests {
     #[test]
     fn push_then_pull_round_trips_an_event_through_a_location() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
-        source
-            .emit(vec![Op::ParaNodeCreate {
-                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            }])
-            .expect("emit");
+        let (dest_root, _loc) = pushed_fixture(dir.path());
 
-        let loc = dir.path().join("shuttle");
-        std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
-        let push_outcome = push(
-            &source_root,
-            &PushRequest {
-                location: None,
-                only: None,
-            },
-        )
-        .expect("push");
-        assert!(!push_outcome.overall_failed());
-        assert!(matches!(push_outcome.rows[0], LocationRow::Ran { .. }));
-
-        let dest_root = dir.path().join("dest");
-        std::fs::create_dir_all(&dest_root).expect("mkdir");
-        let dest_app = FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
         let pull_outcome = pull(
             &dest_root,
             "m2",
@@ -1269,6 +1292,7 @@ mod push_pull_tests {
         assert_eq!(pull_outcome.applied_events, 1);
         assert_eq!(pull_outcome.machines, vec!["m1".to_string()]);
 
+        let dest_app = FsApp::open(&dest_root, "m2", "m2").expect("open dest");
         let projection = dest_app.projection().expect("projection");
         assert!(
             projection.para_node("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_some(),
@@ -1287,31 +1311,7 @@ mod push_pull_tests {
     #[test]
     fn pull_carries_completed_rows_when_the_local_apply_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
-        source
-            .emit(vec![Op::ParaNodeCreate {
-                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            }])
-            .expect("emit");
-
-        let loc = dir.path().join("shuttle");
-        std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
-        push(
-            &source_root,
-            &PushRequest {
-                location: None,
-                only: None,
-            },
-        )
-        .expect("push");
-
-        let dest_root = dir.path().join("dest");
-        std::fs::create_dir_all(&dest_root).expect("mkdir");
-        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
+        let (dest_root, _loc) = pushed_fixture(dir.path());
 
         // Block the apply: put a directory where `open_synced` expects to
         // open a sqlite file.
@@ -1352,31 +1352,7 @@ mod push_pull_tests {
     #[test]
     fn a_failing_pull_carries_the_notices_its_sink_was_holding() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
-        source
-            .emit(vec![Op::ParaNodeCreate {
-                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            }])
-            .expect("emit");
-
-        let loc = dir.path().join("shuttle");
-        std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
-        push(
-            &source_root,
-            &PushRequest {
-                location: None,
-                only: None,
-            },
-        )
-        .expect("push");
-
-        let dest_root = dir.path().join("dest");
-        std::fs::create_dir_all(&dest_root).expect("mkdir");
-        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
+        let (dest_root, _loc) = pushed_fixture(dir.path());
 
         // Block the apply the same way as the test above: a directory sits
         // where `open_synced` expects to open a sqlite file. Resolved (and

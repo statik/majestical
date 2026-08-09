@@ -1611,6 +1611,71 @@ fn add_sync_location_dry_run_then_confirm_is_visible_via_list() {
     );
 }
 
+/// End-to-end coverage for `confirm_gate`'s `ServiceError` downcast arm —
+/// the only wire path a dry-run tool's carried notices take. Plants a
+/// legacy `catalog.db` in the catalog root (so `config_path`'s state-dir
+/// migration pushes its notice into the sink — the same trick as
+/// `sync::push_pull_tests::a_failing_pull_carries_the_notices_its_sink_was_holding`
+/// in `crates/services/src/sync.rs`) alongside a corrupted `sync.toml` (so
+/// the SUBSEQUENT `locations_list` call fails). `add_sync_location`'s dry
+/// run runs exactly that sequence (`locations_list` first, to report
+/// `already_configured`). The sink is non-empty when the failure happens,
+/// so `sync::locations_list` returns `ServiceError::WithNotices`, which `?`
+/// erases to `anyhow::Error` inside `add_sync_location_result`;
+/// `confirm_gate`'s `downcast::<ServiceError>()` must recover it and split
+/// it — reverting that arm to plain `tool_error(err)` renders the
+/// carrier's own label instead of the notice-then-error blocks this test
+/// pins (verified by hand: reverting the arm fails this test).
+#[test]
+fn add_sync_location_dry_run_with_a_broken_config_leads_with_its_notices() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let nas = dir.path().join("nas3");
+    std::fs::create_dir_all(&nas).expect("mkdir");
+    // `location add` creates a valid sync.toml first — same reason as
+    // `tool_error_preserves_the_full_context_chain_not_just_the_top_message`.
+    common::maj(&root, &state)
+        .args(["sync", "location", "add", "nas3"])
+        .arg(&nas)
+        .assert()
+        .success();
+    let sync_tomls = common::walkdir_find(&state, "sync.toml");
+    assert_eq!(sync_tomls.len(), 1, "{sync_tomls:?}");
+    std::fs::write(&sync_tomls[0], "not valid toml {{{\n").expect("corrupt sync.toml");
+    // Planted AFTER the location-add call above (which already resolved
+    // the state dir once with no legacy file present) so the dry-run call
+    // below is the FIRST `config_path` resolution to see it — same
+    // ordering constraint the services-crate sibling test documents.
+    std::fs::write(root.join("catalog.db"), b"legacy").expect("plant legacy db");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "add_sync_location",
+        &serde_json::json!({"name": "shuttle", "path": "/nonexistent-shuttle"}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let texts: Vec<String> = resp["result"]["content"]
+        .as_array()
+        .expect("content array")
+        .iter()
+        .map(|block| block["text"].as_str().expect("text block").to_string())
+        .collect();
+    assert!(
+        texts[0].contains("removed legacy catalog.db"),
+        "the carried notice must lead: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("TOML parse error")),
+        "the inner locations_list failure must still render: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("diagnostic(s) were collected")),
+        "the carrier's own label must never leak: {texts:?}"
+    );
+}
+
 /// Closes the cargo-mutants gap on `rm_sync_location_result`'s
 /// `Ok(Default::default())`/`delete !`/`==`->`!=` survivors and the
 /// `MajServer::rm_sync_location` wrapper survivor.

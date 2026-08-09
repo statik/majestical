@@ -261,8 +261,13 @@ mod tests {
         assert_eq!(texts[0], "warned first");
         assert_eq!(texts[1], "warned second");
         assert!(
-            texts[2].contains("no catalog"),
-            "the error text must be the INNER error's chain, not the carrier's"
+            texts[2].starts_with("no catalog"),
+            "must render the INNER error, got: {}",
+            texts[2]
+        );
+        assert!(
+            !texts[2].contains("diagnostic(s) were collected"),
+            "the carrier's own label must never render"
         );
     }
 }

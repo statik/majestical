@@ -18,6 +18,7 @@
 use crate::config::{self, GuiConfig};
 use majestical_services::app::FsApp;
 use majestical_services::catalog::AssetDetail;
+use majestical_services::error::ServiceError;
 use majestical_services::search::{SavedSearch, SearchOutcome, SearchRequest};
 use majestical_services::volumes::VolumesOutcome;
 use serde::Serialize;
@@ -42,17 +43,22 @@ pub struct CatalogCfg {
 pub struct AppState(pub RwLock<Option<CatalogCfg>>);
 
 /// The one error shape every command returns: the full anyhow/`ServiceError`
-/// Display chain, which is where the remedy text already lives (same rule
-/// as `maj mcp`'s `tool_error`).
+/// Display chain (where the remedy text already lives, same rule as
+/// `maj mcp`'s `tool_error`), plus any notices the failing call collected —
+/// the failure-path counterpart of the outcome structs' `notices` field,
+/// with the same absent-when-empty wire contract.
 #[derive(Debug, Serialize)]
 pub struct CommandError {
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 impl CommandError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            notices: Vec::new(),
         }
     }
 }
@@ -60,8 +66,16 @@ impl CommandError {
 impl<E: Into<anyhow::Error>> From<E> for CommandError {
     fn from(err: E) -> Self {
         let err: anyhow::Error = err.into();
+        let (notices, err) = match err.downcast::<ServiceError>() {
+            Ok(ServiceError::WithNotices { notices, source }) => {
+                (notices, anyhow::Error::from(*source))
+            }
+            Ok(other) => (Vec::new(), anyhow::Error::from(other)),
+            Err(err) => (Vec::new(), err),
+        };
         Self {
             message: format!("{err:#}"),
+            notices,
         }
     }
 }

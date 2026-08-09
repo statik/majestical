@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { api, errorMessage } from "./api";
+  import { api, errorMessage, errorNotices } from "./api";
   import type { SavedSearch, SearchOutcome } from "./api";
   import { timecode } from "./format";
   import Notices from "./Notices.svelte";
@@ -17,6 +17,7 @@
   let saved = $state<SavedSearch[]>([]);
   let savedNotices = $state<string[]>([]);
   let error = $state<string | null>(null);
+  let failureNotices = $state<string[]>([]);
   let debounce: ReturnType<typeof setTimeout> | undefined;
   /**
    * Every search takes the next number. A response whose number is no longer
@@ -40,6 +41,7 @@
       savedNotices = searches.notices ?? [];
     } catch (failure) {
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
     }
   }
 
@@ -53,6 +55,7 @@
       requestSeq += 1;
       outcome = null;
       error = null;
+      failureNotices = [];
       return;
     }
     debounce = setTimeout(
@@ -64,6 +67,7 @@
   async function runSearch(call: () => Promise<SearchOutcome>) {
     const seq = ++requestSeq;
     error = null;
+    failureNotices = [];
     try {
       const result = await call();
       if (seq !== requestSeq) return;
@@ -74,6 +78,7 @@
       // and grid under the error would attribute those results to this one.
       outcome = null;
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
     }
   }
 </script>
@@ -105,6 +110,7 @@
   <Notices notices={savedNotices} />
 
   {#if error}
+    <Notices notices={failureNotices} />
     <p class="error" role="alert">{error}</p>
   {/if}
 

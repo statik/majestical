@@ -154,6 +154,29 @@ export const api = {
 };
 
 /**
+ * The wire shape of a rejected command — `commands::CommandError`.
+ * `notices` is absent (not `[]`) when the failing call collected none.
+ */
+export interface CommandError {
+  message: string;
+  notices?: string[];
+}
+
+/** The notices a rejected command carried, `[]` when none. */
+export function errorNotices(error: unknown): string[] {
+  if (typeof error === "object" && error !== null && "notices" in error) {
+    const { notices } = error as { notices: unknown };
+    if (
+      Array.isArray(notices) &&
+      notices.every((n) => typeof n === "string")
+    ) {
+      return notices;
+    }
+  }
+  return [];
+}
+
+/**
  * A rejected command carries `commands::CommandError`, whose `message` is the
  * whole `{err:#}` chain — the remedy text is already in there, so surfaces
  * show it whole rather than summarizing it away.

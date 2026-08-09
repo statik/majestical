@@ -1,12 +1,14 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
-  import { api, errorMessage } from "./api";
+  import { api, errorMessage, errorNotices } from "./api";
   import type { AppStatus } from "./api";
+  import Notices from "./Notices.svelte";
 
   let { oninitialized }: { oninitialized: (status: AppStatus) => void } =
     $props();
 
   let error = $state<string | null>(null);
+  let failureNotices = $state<string[]>([]);
 
   /**
    * Picks a folder and hands it to `adopt`. Both commands return the new
@@ -14,12 +16,14 @@
    */
   async function choose(adopt: (path: string) => Promise<AppStatus>) {
     error = null;
+    failureNotices = [];
     try {
       const picked = await open({ directory: true });
       if (typeof picked !== "string") return;
       oninitialized(await adopt(picked));
     } catch (failure) {
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
     }
   }
 </script>
@@ -41,6 +45,7 @@
     </button>
   </div>
   {#if error}
+    <Notices notices={failureNotices} />
     <p class="error" role="alert">{error}</p>
   {/if}
 </section>

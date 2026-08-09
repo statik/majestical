@@ -31,6 +31,7 @@ pub fn decode_image(path: &Path) -> Result<image::RgbImage, IndexError> {
     Ok(image.to_rgb8())
 }
 
+#[cfg(target_os = "macos")]
 fn decode_via_sips(path: &Path) -> Result<image::DynamicImage, IndexError> {
     let tmp = tempfile::Builder::new()
         .suffix(".png")
@@ -67,6 +68,21 @@ fn decode_via_sips(path: &Path) -> Result<image::DynamicImage, IndexError> {
     image::open(tmp_path).map_err(|e| IndexError::Decode {
         path: path.to_path_buf(),
         message: e.to_string(),
+    })
+}
+
+/// Stub for builds without macOS's `sips` tool. Signature matches the
+/// macOS version exactly so `decode_image`'s HEIC branch compiles
+/// everywhere; surfaces as an ordinary per-item [`IndexError`], not a panic.
+///
+/// # Errors
+/// Always returns [`IndexError::PlatformUnavailable`] — HEIC decoding has
+/// no non-Apple backend.
+#[cfg(not(target_os = "macos"))]
+fn decode_via_sips(_path: &Path) -> Result<image::DynamicImage, IndexError> {
+    Err(IndexError::PlatformUnavailable {
+        capability: "HEIC decoding",
+        framework: "the macOS `sips` tool",
     })
 }
 
@@ -115,6 +131,17 @@ mod tests {
         assert_eq!(&bytes[8..12], b"WEBP");
         let back = image::load_from_memory(&bytes).expect("decode webp");
         assert_eq!((back.width(), back.height()), (320, 240));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_heic_decode_stub_names_the_gap_and_the_framework() {
+        let err = crate::thumbs::decode_image(std::path::Path::new("/nonexistent.heic"))
+            .expect_err("stub must refuse before touching the filesystem");
+        let rendered = err.to_string();
+        assert!(rendered.contains("HEIC decoding"));
+        assert!(rendered.contains("sips"));
+        assert!(rendered.contains("macOS"));
     }
 
     #[test]

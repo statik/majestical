@@ -5,8 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 use ort::ep::CoreML;
+#[cfg(target_os = "macos")]
 use ort::ep::coreml::{ComputeUnits, ModelFormat};
+use ort::session::builder::SessionBuilder;
 use ort::session::{Session, SessionOutputs};
 use ort::value::Tensor;
 use tokenizers::{
@@ -25,10 +28,14 @@ const TEXT_LEN_I64: i64 = 64;
 pub struct EncoderOptions {
     /// Run the vision tower on the `CoreML` execution provider (Apple Neural
     /// Engine) instead of CPU.
+    ///
+    /// macOS-only: ignored on builds without the `CoreML` EP.
     pub coreml: bool,
     /// Directory where `CoreML` caches its compiled model graph. Without this,
     /// `CoreML` recompiles the vision tower's graph on every session load,
     /// adding several seconds of startup latency.
+    ///
+    /// macOS-only: ignored on builds without the `CoreML` EP.
     pub coreml_cache: Option<PathBuf>,
 }
 
@@ -147,30 +154,59 @@ impl Encoder {
 fn build_vision_session(path: &Path, options: &EncoderOptions) -> Result<Session, IndexError> {
     let builder = Session::builder()
         .map_err(|e| IndexError::Encoder(format!("creating vision session builder: {e}")))?;
-    let mut builder = if options.coreml {
-        // `ModelFormat::MLProgram` fails to compile this model: ort's
-        // ONNX->ML Program converter can't translate the patch embedding
-        // Conv node ("Required param 'pad' is missing"). NeuralNetwork is
-        // CoreML's older format but still runs on the ANE via
-        // `ComputeUnits::CPUAndNeuralEngine`, and matches the reference
-        // encoder within 0.9999+ cosine (see the conformance gate).
-        let mut ep = CoreML::default()
-            .with_model_format(ModelFormat::NeuralNetwork)
-            .with_compute_units(ComputeUnits::CPUAndNeuralEngine);
-        if let Some(cache) = &options.coreml_cache {
-            std::fs::create_dir_all(cache)
-                .map_err(|e| IndexError::Encoder(format!("creating CoreML cache dir: {e}")))?;
-            ep = ep.with_model_cache_dir(cache.to_string_lossy().into_owned());
-        }
-        builder
-            .with_execution_providers([ep.build()])
-            .map_err(|e| IndexError::Encoder(format!("registering CoreML EP: {e}")))?
-    } else {
-        builder
-    };
+    let mut builder = apply_coreml_ep(builder, options)?;
     builder
         .commit_from_file(path)
         .map_err(|e| IndexError::Encoder(format!("loading vision model {}: {e}", path.display())))
+}
+
+/// Registers the `CoreML` execution provider on `builder` when
+/// `options.coreml` is set. The whole seam is isolated here so it gates
+/// behind a single `#[cfg]` rather than scattered expression-level ones.
+///
+/// # Errors
+/// Returns [`IndexError::Encoder`] if the cache directory can't be created
+/// or the EP fails to register.
+#[cfg(target_os = "macos")]
+fn apply_coreml_ep(
+    builder: SessionBuilder,
+    options: &EncoderOptions,
+) -> Result<SessionBuilder, IndexError> {
+    if !options.coreml {
+        return Ok(builder);
+    }
+    // `ModelFormat::MLProgram` fails to compile this model: ort's
+    // ONNX->ML Program converter can't translate the patch embedding
+    // Conv node ("Required param 'pad' is missing"). NeuralNetwork is
+    // CoreML's older format but still runs on the ANE via
+    // `ComputeUnits::CPUAndNeuralEngine`, and matches the reference
+    // encoder within 0.9999+ cosine (see the conformance gate).
+    let mut ep = CoreML::default()
+        .with_model_format(ModelFormat::NeuralNetwork)
+        .with_compute_units(ComputeUnits::CPUAndNeuralEngine);
+    if let Some(cache) = &options.coreml_cache {
+        std::fs::create_dir_all(cache)
+            .map_err(|e| IndexError::Encoder(format!("creating CoreML cache dir: {e}")))?;
+        ep = ep.with_model_cache_dir(cache.to_string_lossy().into_owned());
+    }
+    builder
+        .with_execution_providers([ep.build()])
+        .map_err(|e| IndexError::Encoder(format!("registering CoreML EP: {e}")))
+}
+
+/// No `CoreML` EP exists off macOS; the vision tower always runs on CPU
+/// regardless of `options.coreml` / `options.coreml_cache` (documented on
+/// the fields themselves).
+///
+/// # Errors
+/// Never fails — kept `Result`-returning to match the macOS signature.
+#[cfg(not(target_os = "macos"))]
+fn apply_coreml_ep(
+    builder: SessionBuilder,
+    options: &EncoderOptions,
+) -> Result<SessionBuilder, IndexError> {
+    let _ = (&options.coreml, &options.coreml_cache);
+    Ok(builder)
 }
 
 fn build_text_session(path: &Path) -> Result<Session, IndexError> {

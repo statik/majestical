@@ -72,6 +72,48 @@ fn structured_ok<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+/// Splits a carrier into its notices and inner error; non-carriers come
+/// back with no notices. The MCP analogue of the CLI's
+/// `surface_err_notices`, split out so tools that must MATCH on the inner
+/// error (`sync_pull`'s `SyncPullApplyFailed` arm) can do so after the split.
+fn split_notices(
+    err: majestical_services::error::ServiceError,
+) -> (Vec<String>, majestical_services::error::ServiceError) {
+    match err {
+        majestical_services::error::ServiceError::WithNotices { notices, source } => {
+            (notices, *source)
+        }
+        other => (Vec::new(), other),
+    }
+}
+
+/// Builds the error-result content blocks from already-split notices and an
+/// inner error: one text block per notice, in push order, followed by the
+/// inner error's full Display chain. Shared tail of [`tool_error_split`],
+/// reused directly by callers (`sync_pull`) that must match on the inner
+/// error before the blocks can be built.
+fn error_blocks_with_notices(
+    notices: Vec<String>,
+    err: majestical_services::error::ServiceError,
+) -> CallToolResult {
+    let mut blocks: Vec<ContentBlock> = notices.into_iter().map(ContentBlock::text).collect();
+    blocks.push(ContentBlock::text(format!(
+        "{:#}",
+        anyhow::Error::from(err)
+    )));
+    CallToolResult::error(blocks)
+}
+
+/// The failure-path analogue of [`with_notices`]: a tool error whose
+/// leading content blocks are the notices the failing call collected — one
+/// text block per line, in push order — followed by the inner error's full
+/// Display chain. MCP has no stderr; these blocks are the only channel a
+/// failure's warnings have.
+fn tool_error_split(err: majestical_services::error::ServiceError) -> CallToolResult {
+    let (notices, err) = split_notices(err);
+    error_blocks_with_notices(notices, err)
+}
+
 /// Folds any service-collected diagnostics into a hand-built tool response —
 /// the analogue of an outcome struct's own `notices` field for the read and
 /// write tools that assemble their response from `json!` rather than
@@ -194,4 +236,33 @@ async fn serve_async(catalog: &Path, machine_id: &str, author: &str) -> anyhow::
         .await
         .map_err(|err| anyhow::anyhow!("mcp server loop ended in an error: {err}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_error_split_leads_with_the_carried_notices() {
+        use majestical_services::error::ServiceError;
+        let err = ServiceError::WithNotices {
+            notices: vec!["warned first".to_string(), "warned second".to_string()],
+            source: Box::new(ServiceError::NoCatalog {
+                root: std::path::PathBuf::from("/nowhere"),
+            }),
+        };
+        let result = tool_error_split(err);
+        assert_eq!(result.is_error, Some(true));
+        let texts: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert_eq!(texts[0], "warned first");
+        assert_eq!(texts[1], "warned second");
+        assert!(
+            texts[2].contains("no catalog"),
+            "the error text must be the INNER error's chain, not the carrier's"
+        );
+    }
 }

@@ -65,13 +65,24 @@ use std::path::{Path, PathBuf};
 /// handed to this function at once would make the borrow checker see a
 /// live shared and exclusive borrow simultaneously, even though only one
 /// closure is ever called. Sequential code has no such problem.
+///
+/// A dry-run helper (e.g. `add_sync_location_result`) reaches its
+/// `ServiceError` through `?` on a call like `sync::locations_list`, which
+/// erases it to `anyhow::Error` on the way — `downcast` recovers the
+/// concrete type so a `WithNotices` carrier still gets split here rather
+/// than leaking its carrier label (`"N diagnostic(s) were collected..."`)
+/// as the tool's error text. An error that was never a `ServiceError` (most
+/// callers) downcasts back to itself unchanged.
 fn confirm_gate<T: Serialize>(confirm: bool, result: anyhow::Result<T>) -> CallToolResult {
     match result {
         Ok(value) => match inject_executed(&value, confirm) {
             Ok(json) => CallToolResult::structured(json),
             Err(result) => result,
         },
-        Err(err) => super::tool_error(err),
+        Err(err) => match err.downcast::<ServiceError>() {
+            Ok(err) => super::tool_error_split(err),
+            Err(err) => super::tool_error(err),
+        },
     }
 }
 
@@ -1213,14 +1224,22 @@ impl MajServer {
                     Err(result) => result,
                 }
             }
-            Err(ServiceError::SyncPullApplyFailed { rows, source }) => {
-                CallToolResult::structured_error(json!({
-                    "rows": rows,
-                    "executed": true,
-                    "error": format!("{source:#}"),
-                }))
+            Err(err) => {
+                let (notices, err) = super::split_notices(err);
+                match err {
+                    ServiceError::SyncPullApplyFailed { rows, source } => {
+                        CallToolResult::structured_error(super::with_notices(
+                            json!({
+                                "rows": rows,
+                                "executed": true,
+                                "error": format!("{source:#}"),
+                            }),
+                            notices,
+                        ))
+                    }
+                    other => super::error_blocks_with_notices(notices, other),
+                }
             }
-            Err(err) => super::tool_error(err),
         }
     }
 
@@ -1256,7 +1275,7 @@ impl MajServer {
                     Err(result) => result,
                 }
             }
-            Err(err) => super::tool_error(err),
+            Err(err) => super::tool_error_split(err),
         }
     }
 

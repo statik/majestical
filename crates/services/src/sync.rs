@@ -1095,12 +1095,12 @@ mod push_pull_tests {
     /// Shared setup for the push/pull round-trip tests below: a `source`
     /// catalog with one emitted event, pushed to a `shuttle` location that a
     /// freshly initialized `dest` catalog also points at. Returns
-    /// `(dest_root, location path)` — the two pieces every caller still
-    /// needs to drive its own scenario-specific pull. Push actually
-    /// succeeding (not merely not erroring — per-location failures land
-    /// inside the outcome, never as `Err`, see `push`'s doc) is asserted
-    /// here since it's the shared precondition every caller depends on.
-    fn pushed_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    /// `dest_root`, the piece every caller needs to drive its own
+    /// scenario-specific pull. Push actually succeeding (not merely not
+    /// erroring — per-location failures land inside the outcome, never as
+    /// `Err`, see `push`'s doc) is asserted here since it's the shared
+    /// precondition every caller depends on.
+    fn pushed_fixture(dir: &Path) -> PathBuf {
         let (mut source, source_root) = init_catalog(dir, "source", "m1");
         source
             .emit(vec![Op::ParaNodeCreate {
@@ -1128,7 +1128,7 @@ mod push_pull_tests {
         FsApp::init(&dest_root, "m2", "m2").expect("init dest");
         location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
 
-        (dest_root, loc)
+        dest_root
     }
 
     #[test]
@@ -1276,7 +1276,7 @@ mod push_pull_tests {
     #[test]
     fn push_then_pull_round_trips_an_event_through_a_location() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (dest_root, _loc) = pushed_fixture(dir.path());
+        let dest_root = pushed_fixture(dir.path());
 
         let pull_outcome = pull(
             &dest_root,
@@ -1311,7 +1311,7 @@ mod push_pull_tests {
     #[test]
     fn pull_carries_completed_rows_when_the_local_apply_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (dest_root, _loc) = pushed_fixture(dir.path());
+        let dest_root = pushed_fixture(dir.path());
 
         // Block the apply: put a directory where `open_synced` expects to
         // open a sqlite file.
@@ -1352,7 +1352,7 @@ mod push_pull_tests {
     #[test]
     fn a_failing_pull_carries_the_notices_its_sink_was_holding() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (dest_root, _loc) = pushed_fixture(dir.path());
+        let dest_root = pushed_fixture(dir.path());
 
         // Block the apply the same way as the test above: a directory sits
         // where `open_synced` expects to open a sqlite file. Resolved (and

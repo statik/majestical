@@ -187,7 +187,7 @@ impl MajServer {
     fn sync_status(&self) -> CallToolResult {
         match majestical_services::sync::status(&self.catalog) {
             Ok(outcome) => super::structured_ok(&outcome),
-            Err(err) => super::tool_error(err),
+            Err(err) => super::tool_error_split(err),
         }
     }
 
@@ -214,7 +214,7 @@ impl MajServer {
         }
         match majestical_services::sync::locations_list(&self.catalog) {
             Ok(outcome) => super::structured_ok(&outcome),
-            Err(err) => super::tool_error(err),
+            Err(err) => super::tool_error_split(err),
         }
     }
 

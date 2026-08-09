@@ -209,6 +209,23 @@ test("a failed search reports its whole message chain and drops stale results", 
   expect(screen.queryByText("1 results")).toBeNull();
 });
 
+test("a failed search's notices render above the error text", async () => {
+  const message = "no catalog selected yet — initialize or choose one first";
+  const notice = "warning: skipped 1 corrupt event log line(s) in /x/events";
+  mockCommands({
+    list_saved_searches: () => ({ saved: [] }),
+    search_assets: () => rejectCommand(message, [notice]),
+  });
+
+  render(SearchView, { onselect: () => {} });
+  await userEvent.type(screen.getByRole("searchbox"), "q");
+
+  await screen.findByText(notice);
+  expect(screen.getByRole("alert").textContent).toBe(message);
+  const order = screen.getByText(notice).compareDocumentPosition(screen.getByRole("alert"));
+  expect(order & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
 test("clearing the box drops a failed search's error", async () => {
   mockCommands({
     list_saved_searches: () => ({ saved: [] }),

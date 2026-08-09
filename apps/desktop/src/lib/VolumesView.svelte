@@ -3,7 +3,7 @@
   // card and archive it has ever been shown, whether or not one is plugged
   // in right now. Nothing here mounts, forgets or renames a volume — the
   // mutating verbs stay with the CLI and MCP this phase.
-  import { api, errorMessage } from "./api";
+  import { api, errorMessage, errorNotices } from "./api";
   import type { VolumesOutcome } from "./api";
   import { isoDay } from "./format";
   import Notices from "./Notices.svelte";
@@ -11,6 +11,7 @@
 
   let outcome = $state<VolumesOutcome | null>(null);
   let error = $state<string | null>(null);
+  let failureNotices = $state<string[]>([]);
 
   $effect(() => {
     void load();
@@ -21,6 +22,7 @@
       outcome = await api.listVolumes();
     } catch (failure) {
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
     }
   }
 </script>
@@ -31,6 +33,7 @@
   <Notices notices={outcome?.notices} />
 
   {#if error}
+    <Notices notices={failureNotices} />
     <p class="error" role="alert">{error}</p>
   {:else if outcome}
     {#if outcome.volumes.length === 0}

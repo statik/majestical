@@ -1,0 +1,15 @@
+{
+  "notices": [
+    "a warning the list_volumes call collected"
+  ],
+  "volumes": [
+    {
+      "asset_count": 1,
+      "clock_suspect": false,
+      "id": "vol1",
+      "label": "vol1",
+      "last_seen_ms": 1000,
+      "online": true
+    }
+  ]
+}

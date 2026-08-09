@@ -498,3 +498,28 @@ fn command_error_carries_the_full_display_chain() {
         .into();
     assert_eq!(err.message, "outer operation: inner cause");
 }
+
+#[test]
+fn command_error_splits_a_notices_carrier() {
+    let err = majestical_services::error::ServiceError::WithNotices {
+        notices: vec!["warned".to_string()],
+        source: Box::new(majestical_services::error::ServiceError::NoCatalog {
+            root: std::path::PathBuf::from("/nowhere"),
+        }),
+    };
+    let converted = CommandError::from(err);
+    assert_eq!(converted.notices, vec!["warned"]);
+    assert!(converted.message.contains("no catalog"));
+    assert!(
+        !converted.message.contains("diagnostic(s) were collected"),
+        "the carrier's own label must never reach a user"
+    );
+    // `CommandError::new` is private to `commands.rs`; this integration test
+    // crate reaches the same empty-notices shape through `From` instead.
+    let plain: CommandError = anyhow::anyhow!("plain").into();
+    let wire = serde_json::to_value(plain).expect("serialize");
+    assert!(
+        wire.get("notices").is_none(),
+        "empty notices must be absent from the wire, not []"
+    );
+}

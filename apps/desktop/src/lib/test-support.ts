@@ -27,11 +27,18 @@ export function mockCommands(handlers: Record<string, CommandHandler>): void {
 /**
  * The rejection a failing command produces: `commands::CommandError`
  * serialized, which is a plain object and never an `Error`. Returned rather
- * than installed, so it composes into a `mockCommands` handler.
+ * than installed, so it composes into a `mockCommands` handler. `notices`
+ * mirrors the Rust side's `skip_serializing_if`: omitted from the object
+ * entirely when empty, never present as `[]`.
  */
-export function rejectCommand(message: string): Promise<never> {
+export function rejectCommand(
+  message: string,
+  notices: string[] = [],
+): Promise<never> {
   // eslint-disable-next-line prefer-promise-reject-errors -- a rejected command carries the serialized `CommandError`, never an Error instance.
-  return Promise.reject({ message });
+  return Promise.reject(
+    notices.length > 0 ? { message, notices } : { message },
+  );
 }
 
 /**

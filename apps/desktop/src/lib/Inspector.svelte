@@ -2,7 +2,7 @@
   // Everything the catalog knows about one asset: identity, tags, PARA,
   // where its copies live, whether its bytes have been verified, and the
   // keyframes the index found in it.
-  import { api, errorMessage } from "./api";
+  import { api, errorMessage, errorNotices } from "./api";
   import type { AssetDetail, AssetVerification } from "./api";
   import { isoDay, timecode } from "./format";
   import Notices from "./Notices.svelte";
@@ -15,6 +15,10 @@
   let detail = $state<AssetDetail | null>(null);
   let missing = $state<string | null>(null);
   let error = $state<string | null>(null);
+  /** From `commands::CommandError.notices` — the lookup goes over `invoke`,
+   *  so a failure here (unlike `keyframeError` below, a `thumb://` fetch that
+   *  never carries a `CommandError`) can genuinely carry notices. */
+  let failureNotices = $state<string[]>([]);
   let keyframes = $state<KeyframeManifest | null>(null);
   /** Why the keyframe manifest could not be read. A plain absence (404) is
    *  not a failure and leaves this null: most assets are stills and have no
@@ -42,6 +46,7 @@
     detail = null;
     missing = null;
     error = null;
+    failureNotices = [];
     keyframes = null;
     keyframeError = null;
     if (id === null) return;
@@ -56,6 +61,7 @@
     } catch (failure) {
       if (seq !== requestSeq) return;
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
       return;
     }
     await loadKeyframes(id, seq);
@@ -104,6 +110,7 @@
 {#if assetId !== null}
   <aside class="inspector">
     {#if error}
+      <Notices notices={failureNotices} />
       <p class="error" role="alert">{error}</p>
     {:else if missing !== null}
       <p class="missing">

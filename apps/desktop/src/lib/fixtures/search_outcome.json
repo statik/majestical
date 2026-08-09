@@ -1,0 +1,43 @@
+{
+  "count": 1,
+  "notices": [
+    "a warning the search call collected"
+  ],
+  "results": [
+    {
+      "asset": "xxh3:0123456789abcdef0123456789abcdef",
+      "known": true,
+      "locator": 2,
+      "name": "clip.mov",
+      "para": "project/client-x",
+      "score": 0.987,
+      "snippet": "a matching snippet",
+      "source": "transcript",
+      "tags": [
+        "demo"
+      ],
+      "timestamp_ms": 1500,
+      "volumes": [
+        {
+          "id": "vol1",
+          "label": "vol1",
+          "online": true
+        }
+      ]
+    }
+  ],
+  "semantic_coverage": {
+    "eligible": 20,
+    "embedded": 10
+  },
+  "text_coverage": [
+    {
+      "covered": 5,
+      "eligible": 10,
+      "label": "transcripts",
+      "noun": "media assets",
+      "remedy": "run `maj index run --transcribe`",
+      "source": "transcript"
+    }
+  ]
+}

@@ -2,6 +2,9 @@
 // and one interface per outcome struct, mirroring the Rust field-for-field
 // (snake_case included — these are serde's names, not ours to prettify).
 // Fields the Rust skips when empty (`skip_serializing_if`) are optional here.
+// Every interface here is pinned by `fixtures.test.ts` against a fixture in
+// `fixtures/*.json`; a new outcome interface needs a builder in
+// `src-tauri/tests/wire_fixtures.rs` too.
 import { invoke } from "@tauri-apps/api/core";
 
 /** `majestical_services::search::VolumeRef` */
@@ -152,6 +155,29 @@ export const api = {
   useExistingCatalog: (path: string) =>
     invoke<AppStatus>("use_existing_catalog", { path }),
 };
+
+/**
+ * The wire shape of a rejected command — `commands::CommandError`.
+ * `notices` is absent (not `[]`) when the failing call collected none.
+ */
+export interface CommandError {
+  message: string;
+  notices?: string[];
+}
+
+/** The notices a rejected command carried, `[]` when none. */
+export function errorNotices(error: unknown): string[] {
+  if (typeof error === "object" && error !== null && "notices" in error) {
+    const { notices } = error as { notices: unknown };
+    if (
+      Array.isArray(notices) &&
+      notices.every((n) => typeof n === "string")
+    ) {
+      return notices;
+    }
+  }
+  return [];
+}
 
 /**
  * A rejected command carries `commands::CommandError`, whose `message` is the

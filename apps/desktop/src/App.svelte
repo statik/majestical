@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { api, errorMessage } from "./lib/api";
+  import { api, errorMessage, errorNotices } from "./lib/api";
   import type { AppStatus } from "./lib/api";
   import Inspector from "./lib/Inspector.svelte";
+  import Notices from "./lib/Notices.svelte";
   import SearchView from "./lib/SearchView.svelte";
   import UpdateBanner from "./lib/UpdateBanner.svelte";
   import VolumesView from "./lib/VolumesView.svelte";
@@ -11,6 +12,7 @@
 
   let status = $state<AppStatus | null>(null);
   let error = $state<string | null>(null);
+  let failureNotices = $state<string[]>([]);
   let selected = $state<string | null>(null);
   let surface = $state<Surface>("search");
 
@@ -23,6 +25,7 @@
       status = await api.appStatus();
     } catch (failure) {
       error = errorMessage(failure);
+      failureNotices = errorNotices(failure);
     }
   }
 
@@ -30,6 +33,7 @@
    *  retry that fails the same way is visibly a second attempt. */
   async function retry() {
     error = null;
+    failureNotices = [];
     await loadStatus();
   }
 
@@ -54,6 +58,7 @@
     <UpdateBanner />
   {/if}
   {#if error}
+    <Notices notices={failureNotices} />
     <p class="error" role="alert">{error}</p>
     <button class="retry" onclick={() => void retry()}>Retry</button>
   {:else if status === null}

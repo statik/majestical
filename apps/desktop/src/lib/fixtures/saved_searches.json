@@ -1,0 +1,11 @@
+{
+  "notices": [
+    "a warning the list_saved_searches call collected"
+  ],
+  "saved": [
+    {
+      "name": "clips",
+      "query": "clip"
+    }
+  ]
+}

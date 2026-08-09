@@ -222,6 +222,8 @@ test("a failed search's notices render above the error text", async () => {
 
   await screen.findByText(notice);
   expect(screen.getByRole("alert").textContent).toBe(message);
+  const order = screen.getByText(notice).compareDocumentPosition(screen.getByRole("alert"));
+  expect(order & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
 test("clearing the box drops a failed search's error", async () => {

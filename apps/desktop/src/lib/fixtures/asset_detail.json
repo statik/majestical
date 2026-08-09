@@ -1,0 +1,34 @@
+{
+  "asset": "xxh3:0123456789abcdef0123456789abcdef",
+  "fields": {
+    "shot": "sunset"
+  },
+  "has_thumb": true,
+  "instances": [
+    {
+      "mtime_ms": 1000,
+      "online": true,
+      "path": "clips/a.mov",
+      "size": 5,
+      "volume": "vol1",
+      "volume_label": "vol1"
+    }
+  ],
+  "notices": [
+    "a warning the get_asset call collected"
+  ],
+  "para": "project/client-x",
+  "tags": [
+    "demo"
+  ],
+  "verifications": [
+    {
+      "algo": "c4",
+      "hashdate_ms": 1000,
+      "outcome": "verified",
+      "path": "clips/a.mov",
+      "value": "abc123",
+      "volume": "vol1"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "message": "no catalog at /fixtures/catalog — run `maj catalog init` first",
+  "notices": [
+    "a warning the failing call collected"
+  ]
+}

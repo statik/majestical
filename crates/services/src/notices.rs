@@ -137,8 +137,14 @@ mod tests {
     #[test]
     fn attach_on_err_passes_ok_and_empty_sink_through_untouched() {
         let notices = Notices::default();
+        notices.push("still here");
         let ok: Result<u8, ServiceError> = Ok(7);
         assert_eq!(notices.attach_on_err(ok).expect("ok stays ok"), 7);
+        assert_eq!(
+            notices.drain(),
+            vec!["still here"],
+            "an Ok result must leave the sink's contents untouched, not drain them"
+        );
         let bare: Result<(), ServiceError> = Err(ServiceError::Other(anyhow::anyhow!("boom")));
         let err = notices.attach_on_err(bare).expect_err("must stay Err");
         assert!(

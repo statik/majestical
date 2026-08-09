@@ -12,6 +12,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
 use majestical_services::app::FsApp;
+use majestical_services::error::ServiceError;
 use majestical_services::notices::Notices;
 use std::path::{Path, PathBuf};
 
@@ -568,6 +569,20 @@ pub(crate) fn print_notices(lines: &[String]) {
     }
 }
 
+/// Splits a `WithNotices` carrier: prints its notices to stderr — the same
+/// lines, same stream, same position-before-the-error the Ok path gives
+/// them — and hands back the inner error, so downstream match arms see the
+/// same variants they always did. Errors that aren't carriers pass through.
+pub(crate) fn surface_err_notices<T>(result: Result<T, ServiceError>) -> Result<T, ServiceError> {
+    result.map_err(|err| match err {
+        ServiceError::WithNotices { notices, source } => {
+            print_notices(&notices);
+            *source
+        }
+        other => other,
+    })
+}
+
 /// Opens the catalog, runs one command against it, then drains the app's
 /// notices — on the error path too, so a warning collected before a failure
 /// still reaches the user.
@@ -694,4 +709,25 @@ fn main() -> Result<()> {
         Cmd::Mcp => mcp_cmd::serve(&cli.catalog, &cli.machine_id, &author)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_err_notices_unwraps_the_carrier_to_its_inner_error() {
+        use majestical_services::error::ServiceError;
+        let carried: Result<(), ServiceError> = Err(ServiceError::WithNotices {
+            notices: vec!["warned".to_string()],
+            source: Box::new(ServiceError::NoCatalog {
+                root: std::path::PathBuf::from("/nowhere"),
+            }),
+        });
+        let inner = surface_err_notices(carried).expect_err("stays Err");
+        assert!(
+            matches!(inner, ServiceError::NoCatalog { .. }),
+            "downstream match arms must see the pre-carrier variants"
+        );
+    }
 }

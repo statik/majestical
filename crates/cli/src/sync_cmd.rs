@@ -115,13 +115,13 @@ pub(crate) fn cmd_push(
     only: Option<OnlyArg>,
     json: bool,
 ) -> Result<()> {
-    let outcome = majestical_services::sync::push(
+    let outcome = crate::surface_err_notices(majestical_services::sync::push(
         catalog,
         &PushRequest {
             location,
             only: only.map(Into::into),
         },
-    )?;
+    ))?;
     crate::print_notices(&outcome.notices);
 
     // Text rows, then failure lines (always, to stderr), then the JSON
@@ -183,7 +183,7 @@ pub(crate) fn cmd_pull(
     author: &str,
     args: &PullArgs,
 ) -> Result<()> {
-    let pulled = majestical_services::sync::pull(
+    let pulled = crate::surface_err_notices(majestical_services::sync::pull(
         catalog,
         machine_id,
         author,
@@ -191,7 +191,7 @@ pub(crate) fn cmd_pull(
             location: args.location.as_deref(),
             only: args.only.map(Into::into),
         },
-    );
+    ));
     let outcome = match pulled {
         Ok(outcome) => outcome,
         Err(ServiceError::SyncPullApplyFailed { rows, source }) => {
@@ -339,7 +339,7 @@ fn json_rows(rows: &[LocationRow]) -> Vec<serde_json::Value> {
 /// Returns an error when there's no catalog at `catalog`, or no sync
 /// locations are configured.
 pub(crate) fn cmd_status(catalog: &Path, json: bool) -> Result<()> {
-    let outcome = majestical_services::sync::status(catalog)?;
+    let outcome = crate::surface_err_notices(majestical_services::sync::status(catalog))?;
     crate::print_notices(&outcome.notices);
     if json {
         println!(
@@ -459,7 +459,7 @@ fn print_direction(label: &str, counts: &majestical_services::sync::DirectionCou
 }
 
 pub(crate) fn cmd_location_list(catalog: &Path, json: bool) -> Result<()> {
-    let outcome = majestical_services::sync::locations_list(catalog)?;
+    let outcome = crate::surface_err_notices(majestical_services::sync::locations_list(catalog))?;
     crate::print_notices(&outcome.notices);
     if json {
         println!(

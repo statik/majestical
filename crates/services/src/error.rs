@@ -52,6 +52,20 @@ pub enum ServiceError {
         rows: Vec<crate::sync::LocationRow>,
         source: anyhow::Error,
     },
+    /// Wraps any error leaving a verb while that call's notices sink still
+    /// held diagnostics — the failure-path counterpart of an outcome
+    /// struct's `notices` field. Constructed only by
+    /// [`crate::notices::Notices::attach_on_err`], and never nested (attach
+    /// merges into an existing carrier instead). The Display text names the
+    /// carrier rather than repeating `source`'s message: heads are expected
+    /// to split this variant first (rendering `notices` through their usual
+    /// notices channel, then `source` as the error), so a message reaching
+    /// a user in carrier form means a head forgot to split.
+    #[error("{} diagnostic(s) were collected before this failure", .notices.len())]
+    WithNotices {
+        notices: Vec<String>,
+        source: Box<ServiceError>,
+    },
     /// Escape hatch while extraction is in flight: wraps the anyhow chains
     /// the cmd_* bodies already produce. Individual verbs migrate to typed
     /// variants only when a head needs to match on them (YAGNI).

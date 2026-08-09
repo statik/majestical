@@ -30,15 +30,28 @@
 //!   so there is no side-effect-free way to preview its `altered`/`missing`
 //!   sets ahead of running it for real.
 //!
-//! Every mutating call funnels a `ServiceError`/`anyhow::Error` through
-//! `super::tool_error` exactly like the read tools. Three operations carry
-//! partial progress even on failure and need it to reach the caller instead
-//! of being discarded by a plain tool-error text: `sync_push`/`sync_pull`/
-//! `inbox_process`'s per-row outcomes (`overall_failed() == true` still
-//! attaches the full structured outcome, `isError: true`), and
-//! `move_para`'s archive op / `sync_pull`'s local-apply step, whose
-//! `ServiceError::ParaArchivePartial`/`SyncPullApplyFailed` carry the
-//! moves/rows already completed before the failure.
+//! Most mutating calls funnel their `Err` through [`confirm_gate`], whose
+//! `Err` arm downcasts the `anyhow::Error` back to `ServiceError` and calls
+//! `super::tool_error_split` — so a `WithNotices` carrier (attached by the
+//! four sync verbs when their notices sink is non-empty on failure) renders
+//! its notices before the inner error instead of leaking the carrier's own
+//! label. The downcast exists because a helper like
+//! `add_sync_location_result` reaches its `ServiceError` through `?` on a
+//! `majestical_services::sync` call, which erases it to `anyhow::Error` on
+//! the way through an `anyhow::Result`-returning helper (see
+//! [`confirm_gate`]'s own doc). `sync_push` isn't `confirm_gate`-routed —
+//! it calls `super::tool_error_split` directly on its bespoke match — and
+//! three operations carry partial progress even on failure that needs to
+//! reach the caller instead of being discarded by a plain tool-error text:
+//! `sync_push`/`sync_pull`/`inbox_process`'s per-row outcomes
+//! (`overall_failed() == true` still attaches the full structured outcome,
+//! `isError: true`), and `move_para`'s archive op / `sync_pull`'s
+//! local-apply step, whose `ServiceError::ParaArchivePartial`/
+//! `SyncPullApplyFailed` carry the moves/rows already completed before the
+//! failure — `sync_pull` additionally splits any carried notices via
+//! `super::split_notices`/`super::error_blocks_with_notices` before
+//! matching on the inner error, since it must match `SyncPullApplyFailed`
+//! itself rather than delegate the whole thing to `tool_error_split`.
 use super::MajServer;
 use anyhow::Context as _;
 use majestical_core::event::AssetId;
@@ -65,13 +78,24 @@ use std::path::{Path, PathBuf};
 /// handed to this function at once would make the borrow checker see a
 /// live shared and exclusive borrow simultaneously, even though only one
 /// closure is ever called. Sequential code has no such problem.
+///
+/// A dry-run helper (e.g. `add_sync_location_result`) reaches its
+/// `ServiceError` through `?` on a call like `sync::locations_list`, which
+/// erases it to `anyhow::Error` on the way — `downcast` recovers the
+/// concrete type so a `WithNotices` carrier still gets split here rather
+/// than leaking its carrier label (`"N diagnostic(s) were collected..."`)
+/// as the tool's error text. An error that was never a `ServiceError` (most
+/// callers) downcasts back to itself unchanged.
 fn confirm_gate<T: Serialize>(confirm: bool, result: anyhow::Result<T>) -> CallToolResult {
     match result {
         Ok(value) => match inject_executed(&value, confirm) {
             Ok(json) => CallToolResult::structured(json),
             Err(result) => result,
         },
-        Err(err) => super::tool_error(err),
+        Err(err) => match err.downcast::<ServiceError>() {
+            Ok(err) => super::tool_error_split(err),
+            Err(err) => super::tool_error(err),
+        },
     }
 }
 
@@ -628,7 +652,8 @@ fn add_sync_location_result(
         ));
     }
     let notices = Notices::new();
-    majestical_services::sync::location_add(catalog, &args.name, &args.path, &notices)?;
+    let result = majestical_services::sync::location_add(catalog, &args.name, &args.path, &notices);
+    notices.attach_on_err(result)?;
     Ok(super::with_notices(
         json!({"name": args.name, "path": args.path}),
         notices.drain(),
@@ -665,7 +690,8 @@ fn rm_sync_location_result(
         ));
     }
     let notices = Notices::new();
-    majestical_services::sync::location_rm(catalog, &args.name, &notices)?;
+    let result = majestical_services::sync::location_rm(catalog, &args.name, &notices);
+    notices.attach_on_err(result)?;
     Ok(super::with_notices(
         json!({"name": args.name}),
         notices.drain(),
@@ -1213,14 +1239,22 @@ impl MajServer {
                     Err(result) => result,
                 }
             }
-            Err(ServiceError::SyncPullApplyFailed { rows, source }) => {
-                CallToolResult::structured_error(json!({
-                    "rows": rows,
-                    "executed": true,
-                    "error": format!("{source:#}"),
-                }))
+            Err(err) => {
+                let (notices, err) = super::split_notices(err);
+                match err {
+                    ServiceError::SyncPullApplyFailed { rows, source } => {
+                        CallToolResult::structured_error(super::with_notices(
+                            json!({
+                                "rows": rows,
+                                "executed": true,
+                                "error": format!("{source:#}"),
+                            }),
+                            notices,
+                        ))
+                    }
+                    other => super::error_blocks_with_notices(notices, other),
+                }
             }
-            Err(err) => super::tool_error(err),
         }
     }
 
@@ -1256,7 +1290,7 @@ impl MajServer {
                     Err(result) => result,
                 }
             }
-            Err(err) => super::tool_error(err),
+            Err(err) => super::tool_error_split(err),
         }
     }
 

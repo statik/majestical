@@ -1,6 +1,14 @@
 //! Sync location config, `maj sync push`/`pull`/`location add`/`location
 //! rm`, and `maj sync status`/`maj sync location list` compute. Moved from
 //! `crates/cli/src/sync_cmd.rs`.
+//!
+//! Two notices-sink conventions coexist here: `location_add`/`location_rm`
+//! take a caller-supplied `&Notices` — the CLI head drains it after the
+//! call returns, on both paths. `push`/`pull`/`status`/`locations_list`
+//! instead each own their sink internally and attach it to the error via
+//! `Notices::attach_on_err` on failure. New verbs should follow the
+//! wrapper-owns-sink pattern; it's the one that composes with
+//! `ServiceError::WithNotices`.
 use crate::app::FsApp;
 use crate::error::ServiceError;
 use anyhow::{Context, Result};
@@ -366,17 +374,14 @@ fn plan_both_directions(
 /// Returns an error when there's no catalog at `catalog_dir`, or no sync
 /// locations are configured.
 pub fn status(catalog_dir: &Path) -> Result<SyncStatusOutcome, ServiceError> {
-    status_impl(catalog_dir).map_err(ServiceError::from)
+    let notices = crate::notices::Notices::new();
+    let result = status_impl(catalog_dir, &notices).map_err(ServiceError::from);
+    notices.attach_on_err(result)
 }
 
-fn status_impl(catalog_dir: &Path) -> Result<SyncStatusOutcome> {
-    let notices = crate::notices::Notices::new();
-    // Accepted tradeoff: an `Err` from any step below drops this sink
-    // unread. Only the one-shot state-dir migration notes can precede the
-    // first fallible step, so nothing recurring is lost; carrying notices
-    // out of an error needs a payload on `ServiceError` — reserved for 7C.
+fn status_impl(catalog_dir: &Path, notices: &crate::notices::Notices) -> Result<SyncStatusOutcome> {
     ensure_catalog(catalog_dir)?;
-    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog_dir, notices)?)?;
     let targets = resolve_targets(&cfg, None)?;
     let rows = targets
         .into_iter()
@@ -409,16 +414,16 @@ pub struct LocationsOutcome {
 /// # Errors
 /// Returns an error if `sync.toml` exists but can't be read or parsed.
 pub fn locations_list(catalog_dir: &Path) -> Result<LocationsOutcome, ServiceError> {
-    locations_list_impl(catalog_dir).map_err(ServiceError::from)
+    let notices = crate::notices::Notices::new();
+    let result = locations_list_impl(catalog_dir, &notices).map_err(ServiceError::from);
+    notices.attach_on_err(result)
 }
 
-fn locations_list_impl(catalog_dir: &Path) -> Result<LocationsOutcome> {
-    let notices = crate::notices::Notices::new();
-    // Accepted tradeoff: an `Err` from any step below drops this sink
-    // unread. Only the one-shot state-dir migration notes can precede the
-    // first fallible step, so nothing recurring is lost; carrying notices
-    // out of an error needs a payload on `ServiceError` — reserved for 7C.
-    let cfg = SyncConfig::load(&config_path(catalog_dir, &notices)?)?;
+fn locations_list_impl(
+    catalog_dir: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<LocationsOutcome> {
+    let cfg = SyncConfig::load(&config_path(catalog_dir, notices)?)?;
     Ok(LocationsOutcome {
         readonly: cfg.readonly,
         locations: cfg.locations,
@@ -658,17 +663,18 @@ pub struct PushRequest<'a> {
 /// `req.location`). Per-location failures are reported inside the returned
 /// outcome, never as an `Err` — see [`PushOutcome::overall_failed`].
 pub fn push(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome, ServiceError> {
-    push_impl(catalog, req).map_err(ServiceError::from)
+    let notices = crate::notices::Notices::new();
+    let result = push_impl(catalog, req, &notices).map_err(ServiceError::from);
+    notices.attach_on_err(result)
 }
 
-fn push_impl(catalog: &Path, req: &PushRequest<'_>) -> Result<PushOutcome> {
-    let notices = crate::notices::Notices::new();
-    // Accepted tradeoff: an `Err` from any step below drops this sink
-    // unread. Only the one-shot state-dir migration notes can precede the
-    // first fallible step, so nothing recurring is lost; carrying notices
-    // out of an error needs a payload on `ServiceError` — reserved for 7C.
+fn push_impl(
+    catalog: &Path,
+    req: &PushRequest<'_>,
+    notices: &crate::notices::Notices,
+) -> Result<PushOutcome> {
     ensure_catalog(catalog)?;
-    let config = config_path(catalog, &notices)?;
+    let config = config_path(catalog, notices)?;
     let cfg = SyncConfig::load(&config)?;
     anyhow::ensure!(
         !cfg.readonly,
@@ -809,15 +815,23 @@ pub fn pull(
     author: &str,
     req: &PullRequest<'_>,
 ) -> Result<PullOutcome, ServiceError> {
-    pull_impl(catalog, machine_id, author, req).map_err(|err| {
-        match err.downcast::<PullApplyFailure>() {
-            Ok(partial) => ServiceError::SyncPullApplyFailed {
-                rows: partial.rows,
-                source: partial.source,
-            },
-            Err(err) => ServiceError::from(err),
-        }
-    })
+    let notices = crate::notices::Notices::new();
+    let result = pull_impl(catalog, machine_id, author, req, &notices).map_err(pull_apply_error);
+    notices.attach_on_err(result)
+}
+
+/// Downcasts [`pull_impl`]'s early-return carrier back into the typed
+/// [`ServiceError::SyncPullApplyFailed`] so the completed transfer rows
+/// survive the conversion; any other error is converted via the usual
+/// `Other` fallback.
+fn pull_apply_error(err: anyhow::Error) -> ServiceError {
+    match err.downcast::<PullApplyFailure>() {
+        Ok(partial) => ServiceError::SyncPullApplyFailed {
+            rows: partial.rows,
+            source: partial.source,
+        },
+        Err(err) => ServiceError::from(err),
+    }
 }
 
 fn pull_impl(
@@ -825,14 +839,10 @@ fn pull_impl(
     machine_id: &str,
     author: &str,
     req: &PullRequest<'_>,
+    notices: &crate::notices::Notices,
 ) -> Result<PullOutcome> {
-    let notices = crate::notices::Notices::new();
-    // Accepted tradeoff: an `Err` from any step below drops this sink
-    // unread. Only the one-shot state-dir migration notes can precede the
-    // first fallible step, so nothing recurring is lost; carrying notices
-    // out of an error needs a payload on `ServiceError` — reserved for 7C.
     ensure_catalog(catalog)?;
-    let cfg = SyncConfig::load(&config_path(catalog, &notices)?)?;
+    let cfg = SyncConfig::load(&config_path(catalog, notices)?)?;
     let targets = resolve_targets(&cfg, req.location)?;
     let rows: Vec<LocationRow> = targets
         .into_iter()
@@ -844,7 +854,7 @@ fn pull_impl(
     // landed segments become searchable rather than leaving them stranded
     // on disk unapplied. A failure here must not lose `rows` — every
     // location's transfer already genuinely completed by this point.
-    if let Err(source) = apply_pulled_events(catalog, machine_id, author, &notices) {
+    if let Err(source) = apply_pulled_events(catalog, machine_id, author, notices) {
         return Err(anyhow::Error::new(PullApplyFailure { rows, source }));
     }
 
@@ -1082,6 +1092,45 @@ mod push_pull_tests {
         (app, root)
     }
 
+    /// Shared setup for the push/pull round-trip tests below: a `source`
+    /// catalog with one emitted event, pushed to a `shuttle` location that a
+    /// freshly initialized `dest` catalog also points at. Returns
+    /// `dest_root`, the piece every caller needs to drive its own
+    /// scenario-specific pull. Push actually succeeding (not merely not
+    /// erroring — per-location failures land inside the outcome, never as
+    /// `Err`, see `push`'s doc) is asserted here since it's the shared
+    /// precondition every caller depends on.
+    fn pushed_fixture(dir: &Path) -> PathBuf {
+        let (mut source, source_root) = init_catalog(dir, "source", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+
+        let loc = dir.join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
+        let push_outcome = push(
+            &source_root,
+            &PushRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect("push");
+        assert!(!push_outcome.overall_failed(), "fixture push must succeed");
+
+        let dest_root = dir.join("dest");
+        std::fs::create_dir_all(&dest_root).expect("mkdir");
+        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
+        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
+
+        dest_root
+    }
+
     #[test]
     fn overall_failed_is_true_when_every_location_is_skipped_or_failed() {
         let rows = vec![
@@ -1227,33 +1276,8 @@ mod push_pull_tests {
     #[test]
     fn push_then_pull_round_trips_an_event_through_a_location() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
-        source
-            .emit(vec![Op::ParaNodeCreate {
-                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            }])
-            .expect("emit");
+        let dest_root = pushed_fixture(dir.path());
 
-        let loc = dir.path().join("shuttle");
-        std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
-        let push_outcome = push(
-            &source_root,
-            &PushRequest {
-                location: None,
-                only: None,
-            },
-        )
-        .expect("push");
-        assert!(!push_outcome.overall_failed());
-        assert!(matches!(push_outcome.rows[0], LocationRow::Ran { .. }));
-
-        let dest_root = dir.path().join("dest");
-        std::fs::create_dir_all(&dest_root).expect("mkdir");
-        let dest_app = FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
         let pull_outcome = pull(
             &dest_root,
             "m2",
@@ -1268,6 +1292,7 @@ mod push_pull_tests {
         assert_eq!(pull_outcome.applied_events, 1);
         assert_eq!(pull_outcome.machines, vec!["m1".to_string()]);
 
+        let dest_app = FsApp::open(&dest_root, "m2", "m2").expect("open dest");
         let projection = dest_app.projection().expect("projection");
         assert!(
             projection.para_node("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_some(),
@@ -1286,31 +1311,7 @@ mod push_pull_tests {
     #[test]
     fn pull_carries_completed_rows_when_the_local_apply_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut source, source_root) = init_catalog(dir.path(), "source", "m1");
-        source
-            .emit(vec![Op::ParaNodeCreate {
-                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                kind: ParaKind::Project,
-                name: "client-x".into(),
-            }])
-            .expect("emit");
-
-        let loc = dir.path().join("shuttle");
-        std::fs::create_dir_all(&loc).expect("mkdir");
-        location_add(&source_root, "shuttle", &loc, &Notices::new()).expect("add");
-        push(
-            &source_root,
-            &PushRequest {
-                location: None,
-                only: None,
-            },
-        )
-        .expect("push");
-
-        let dest_root = dir.path().join("dest");
-        std::fs::create_dir_all(&dest_root).expect("mkdir");
-        FsApp::init(&dest_root, "m2", "m2").expect("init dest");
-        location_add(&dest_root, "shuttle", &loc, &Notices::new()).expect("add on dest");
+        let dest_root = pushed_fixture(dir.path());
 
         // Block the apply: put a directory where `open_synced` expects to
         // open a sqlite file.
@@ -1338,5 +1339,59 @@ mod push_pull_tests {
         );
         assert!(matches!(rows[0], LocationRow::Ran { .. }));
         assert!(!source.to_string().is_empty());
+    }
+
+    /// Pins the carrier at the public `pull` boundary: a legacy `catalog.db`
+    /// sitting in the destination's sync root is exactly the notice the
+    /// deleted "Accepted tradeoff" comments named as droppable — it's pushed
+    /// by `config_path`'s state-dir migration inside `pull_impl`, well
+    /// before the local-apply step, so it's already sitting in the sink by
+    /// the time the same directory-blocked apply failure as the test above
+    /// fires. A failing `pull` must hand that notice back on the error
+    /// rather than losing it.
+    #[test]
+    fn a_failing_pull_carries_the_notices_its_sink_was_holding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest_root = pushed_fixture(dir.path());
+
+        // Block the apply the same way as the test above: a directory sits
+        // where `open_synced` expects to open a sqlite file. Resolved (and
+        // blocked) BEFORE planting the legacy db below — `catalog_paths`
+        // itself runs the same migration `config_path` does, so calling it
+        // afterward would consume the notice before `pull` ever sees it.
+        let paths =
+            crate::state_dir::catalog_paths(&dest_root, &Notices::new()).expect("catalog_paths");
+        std::fs::create_dir_all(&paths.db_path).expect("mkdir catalog.db");
+
+        // A pre-phase-4 `catalog.db` left in the sync root: `config_path`
+        // (called early in `pull_impl`, well before the location loop or the
+        // apply step) migrates it away and records the move as a notice —
+        // see `state_dir::migrate_legacy`.
+        std::fs::write(dest_root.join("catalog.db"), b"legacy").expect("plant legacy db");
+
+        let err = pull(
+            &dest_root,
+            "m2",
+            "m2",
+            &PullRequest {
+                location: None,
+                only: None,
+            },
+        )
+        .expect_err("apply failure must surface");
+        let ServiceError::WithNotices { notices, source } = err else {
+            panic!("a failing pull with a non-empty sink must carry its notices");
+        };
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("removed legacy catalog.db")),
+            "the state-dir migration note folded by config_path must ride the \
+             error, got: {notices:?}"
+        );
+        let ServiceError::SyncPullApplyFailed { rows, .. } = *source else {
+            panic!("the carrier must wrap the typed apply-failure, not hide it");
+        };
+        assert!(!rows.is_empty(), "completed transfer rows must survive");
     }
 }

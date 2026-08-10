@@ -4,18 +4,27 @@
 //! text-recognition request revision, pinned explicitly so results stay
 //! reproducible across OS updates and encoded in [`OCR_MODEL_TAG`].
 
+#[cfg(target_os = "macos")]
 use std::io::Cursor;
 
+#[cfg(target_os = "macos")]
 use objc2::AnyThread as _;
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSString};
+#[cfg(target_os = "macos")]
 use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRecognizeTextRequestRevision3, VNRequest,
     VNRequestTextRecognitionLevel,
 };
 
 use crate::error::IndexError;
+
+/// Whether this build can produce OCR derivations (Vision framework).
+pub const AVAILABLE: bool = cfg!(target_os = "macos");
 
 pub const OCR_MODEL_TAG: &str = "applevision-r3-v1";
 /// Pinned `VNRecognizeTextRequest` revision; must agree with the `r3` in
@@ -61,6 +70,7 @@ impl OcrResult {
 /// Returns [`IndexError::Encoder`] when Vision itself fails (not when it
 /// simply finds nothing), or when the image can't be re-encoded to PNG for
 /// handoff.
+#[cfg(target_os = "macos")]
 pub fn recognize_text(image: &image::RgbImage) -> Result<OcrResult, IndexError> {
     // Hand Vision an in-memory PNG via initWithData:options: — sidesteps
     // CGImage construction (and its pixel-format bookkeeping) entirely.
@@ -121,15 +131,32 @@ pub fn recognize_text(image: &image::RgbImage) -> Result<OcrResult, IndexError> 
     })
 }
 
+/// Stub for builds without the Vision framework. Signature matches the
+/// macOS version exactly so call sites compile everywhere.
+///
+/// # Errors
+/// Always returns [`IndexError::PlatformUnavailable`] — OCR has no
+/// non-Apple backend.
+#[cfg(not(target_os = "macos"))]
+pub fn recognize_text(_image: &image::RgbImage) -> Result<OcrResult, IndexError> {
+    Err(IndexError::PlatformUnavailable {
+        capability: "OCR",
+        framework: "the Vision framework",
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use objc2_vision::VNRecognizeTextRequestRevision3;
 
+    #[cfg(target_os = "macos")]
     use crate::ocr::{OCR_MODEL_TAG, OCR_REVISION};
 
     /// A Vision revision bump must not silently keep writing blobs under the
     /// old revision's model tag — the pinned revision, the binding's
     /// constant, and the tag must always agree.
+    #[cfg(target_os = "macos")]
     #[test]
     fn ocr_revision_matches_the_vision_binding_constant() {
         let pinned = usize::try_from(OCR_REVISION).expect("u32 fits in NSUInteger");
@@ -138,5 +165,16 @@ mod tests {
             OCR_MODEL_TAG.contains(&format!("r{OCR_REVISION}")),
             "OCR_MODEL_TAG ({OCR_MODEL_TAG}) must encode OCR_REVISION ({OCR_REVISION})"
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_ocr_stub_names_the_gap_and_the_framework() {
+        let image = image::RgbImage::new(2, 2);
+        let err = super::recognize_text(&image).expect_err("stub must refuse");
+        let rendered = err.to_string();
+        assert!(rendered.contains("OCR"));
+        assert!(rendered.contains("Vision"));
+        assert!(rendered.contains("macOS"));
     }
 }

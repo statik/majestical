@@ -589,6 +589,7 @@ fn generate_three_segment_clip(path: &std::path::Path) {
 
 /// Absolute path to a fixture shared with the index crate's own tests.
 #[cfg(test)]
+#[cfg(target_os = "macos")]
 fn index_fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../index/tests/fixtures")
@@ -659,6 +660,9 @@ fn index_run_kinds_accepts_new_names_and_rejects_unknown() {
 /// A real PDF flows end to end: `index run --kinds pdf` writes the `PdfText`
 /// blob, heals the `text_fts` table from that blob in the same pass, and a
 /// second run is a no-op with status reporting the pdf kind done.
+// Needs PDFKit: off-macOS the planner excludes the pdf kind (with a named
+// gap on stderr), so no blob is ever written and these assertions can't hold.
+#[cfg(target_os = "macos")]
 #[test]
 fn pdf_indexing_end_to_end_heals_text_fts() {
     let media = tempfile::tempdir().unwrap();
@@ -723,6 +727,8 @@ fn pdf_indexing_end_to_end_heals_text_fts() {
 
 /// A real still image flows through Vision OCR end to end: the `OcrImage`
 /// blob lands on disk and status reports the ocr kind done.
+// Needs the Vision framework: off-macOS the planner excludes the ocr kind.
+#[cfg(target_os = "macos")]
 #[test]
 fn ocr_indexing_still_image_end_to_end() {
     let media = tempfile::tempdir().unwrap();
@@ -770,6 +776,9 @@ fn ocr_indexing_still_image_end_to_end() {
 /// success: the run exits 0, records the failure in the per-run failure
 /// marker (surfaced by `index status`), writes no done-blob, and re-plans
 /// the same item on the next run instead of dropping it.
+// The failing item is a pdf, an Apple-only kind the planner excludes
+// off-macOS — nothing is ever attempted there, so no failure is recorded.
+#[cfg(target_os = "macos")]
 #[test]
 fn failed_derivations_are_reported_and_replanned() {
     let media = tempfile::tempdir().unwrap();
@@ -815,6 +824,9 @@ fn failed_derivations_are_reported_and_replanned() {
 /// the failure marker is merged per kind, so a later `--kinds thumbs` pass
 /// (which never retried the broken pdf item) leaves the pdf failure
 /// standing in `index status`.
+// Same pdf dependency as above: off-macOS the kind is excluded before any
+// failure record can exist to survive.
+#[cfg(target_os = "macos")]
 #[test]
 fn failure_records_survive_runs_of_other_kinds() {
     let media = tempfile::tempdir().unwrap();

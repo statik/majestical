@@ -2,6 +2,10 @@
 //! rendered with known text. Not `#[ignore]`d — Vision ships with macOS, so
 //! there is no model fetch to gate on.
 
+// Needs the Vision framework: off-macOS these fns compile against the
+// `PlatformUnavailable` stubs and would fail these assertions at runtime.
+#![cfg(target_os = "macos")]
+
 use majestical_index::ocr;
 
 #[test]

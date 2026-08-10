@@ -6,13 +6,21 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use objc2::AnyThread as _;
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::NSImage;
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSData, NSSize};
+#[cfg(target_os = "macos")]
 use objc2_pdf_kit::{PDFDisplayBox, PDFDocument};
 
 use crate::error::IndexError;
+
+/// Whether this build can produce PDF derivations (`PDFKit`).
+pub const AVAILABLE: bool = cfg!(target_os = "macos");
 
 pub const PDF_MODEL_TAG: &str = "pdfkit-v1";
 
@@ -42,6 +50,7 @@ impl PdfContent {
 /// Opens `path` as a `PDFDocument`, rejecting locked (password-protected)
 /// documents — their pages would silently extract as empty rather than
 /// failing, so the lock is surfaced as a decode error instead.
+#[cfg(target_os = "macos")]
 fn open_document(path: &Path) -> Result<Retained<PDFDocument>, IndexError> {
     let bytes = std::fs::read(path).map_err(|error| IndexError::Decode {
         path: path.to_path_buf(),
@@ -74,6 +83,7 @@ fn open_document(path: &Path) -> Result<Retained<PDFDocument>, IndexError> {
 /// # Errors
 /// Returns [`IndexError::Decode`] when the file cannot be opened as a PDF
 /// (missing, malformed, or password-protected).
+#[cfg(target_os = "macos")]
 pub fn extract_text(path: &Path) -> Result<PdfContent, IndexError> {
     let document = open_document(path)?;
     // SAFETY: -[PDFDocument pageCount] reads an NSUInteger property from a
@@ -99,6 +109,7 @@ pub fn extract_text(path: &Path) -> Result<PdfContent, IndexError> {
 /// # Errors
 /// Returns [`IndexError::Decode`] on open failure, an empty document,
 /// degenerate page bounds, or an unreadable rendering.
+#[cfg(target_os = "macos")]
 pub fn render_first_page(path: &Path, edge: u32) -> Result<image::RgbImage, IndexError> {
     let decode_error = |message: String| IndexError::Decode {
         path: path.to_path_buf(),
@@ -138,4 +149,56 @@ pub fn render_first_page(path: &Path, edge: u32) -> Result<image::RgbImage, Inde
     let rendered = image::load_from_memory(&tiff.to_vec())
         .map_err(|error| decode_error(format!("pdf render tiff decode: {error}")))?;
     Ok(rendered.to_rgb8())
+}
+
+/// Stub for builds without `PDFKit`. Signature matches the macOS version
+/// exactly so call sites compile everywhere.
+///
+/// # Errors
+/// Always returns [`IndexError::PlatformUnavailable`] — PDF text extraction
+/// has no non-Apple backend.
+#[cfg(not(target_os = "macos"))]
+pub fn extract_text(_path: &Path) -> Result<PdfContent, IndexError> {
+    Err(IndexError::PlatformUnavailable {
+        capability: "PDF text extraction",
+        framework: "PDFKit",
+    })
+}
+
+/// Stub for builds without `PDFKit`. Signature matches the macOS version
+/// exactly so call sites compile everywhere.
+///
+/// # Errors
+/// Always returns [`IndexError::PlatformUnavailable`] — PDF page rendering
+/// has no non-Apple backend.
+#[cfg(not(target_os = "macos"))]
+pub fn render_first_page(_path: &Path, _edge: u32) -> Result<image::RgbImage, IndexError> {
+    Err(IndexError::PlatformUnavailable {
+        capability: "PDF page rendering",
+        framework: "PDFKit",
+    })
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod platform_stub_tests {
+    use super::{extract_text, render_first_page};
+
+    #[test]
+    fn the_extract_text_stub_names_the_gap_and_the_framework() {
+        let err = extract_text(std::path::Path::new("/nonexistent.pdf")).expect_err("must refuse");
+        let rendered = err.to_string();
+        assert!(rendered.contains("PDF text extraction"));
+        assert!(rendered.contains("PDFKit"));
+        assert!(rendered.contains("macOS"));
+    }
+
+    #[test]
+    fn the_render_first_page_stub_names_the_gap_and_the_framework() {
+        let err = render_first_page(std::path::Path::new("/nonexistent.pdf"), 320)
+            .expect_err("must refuse");
+        let rendered = err.to_string();
+        assert!(rendered.contains("PDF page rendering"));
+        assert!(rendered.contains("PDFKit"));
+        assert!(rendered.contains("macOS"));
+    }
 }

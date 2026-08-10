@@ -21,4 +21,14 @@ pub enum IndexError {
     VectorStore(String),
     #[error("video {path}: {message}")]
     Video { path: PathBuf, message: String },
+    /// A derivation whose native backend exists only on macOS, requested
+    /// from a build without it. Names the capability and the framework so
+    /// degradation is never a silent zero (the never-lie rule).
+    #[error(
+        "{capability} is unavailable in this build: it requires {framework}, which exists only on macOS"
+    )]
+    PlatformUnavailable {
+        capability: &'static str,
+        framework: &'static str,
+    },
 }

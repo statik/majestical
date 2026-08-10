@@ -315,6 +315,39 @@ pub struct IndexStatusOutcome {
     pub notices: Vec<String>,
 }
 
+/// Names the platform gap for one Apple-only derivation kind excluded from
+/// `plan`, never a silent zero: `index status` must say why `n` assets that
+/// are otherwise eligible aren't queued, not just fail to mention them.
+fn platform_unavailable_notice(capability: &str, framework: &str, count: u64) -> String {
+    format!(
+        "{capability} is unavailable in this build (requires {framework}, macOS only) — \
+         {count} eligible asset(s) are not queued"
+    )
+}
+
+/// Pushes one notice per non-zero platform-exclusion count on `plan`
+/// (`ocr_unavailable`/`pdf_unavailable` — see `majestical_index::work`) onto
+/// `notices`, the same sink `status_impl` already drains into its outcome.
+/// On macOS both counts are always zero (Vision and `PDFKit` ship with the
+/// OS), so this pushes nothing there — see
+/// `macos_status_carries_no_platform_unavailable_notice`.
+fn push_platform_unavailable_notices(plan: &WorkPlan, notices: &crate::notices::Notices) {
+    if plan.ocr_unavailable > 0 {
+        notices.push(platform_unavailable_notice(
+            "OCR",
+            "the Vision framework",
+            plan.ocr_unavailable,
+        ));
+    }
+    if plan.pdf_unavailable > 0 {
+        notices.push(platform_unavailable_notice(
+            "PDF text extraction",
+            "PDFKit",
+            plan.pdf_unavailable,
+        ));
+    }
+}
+
 /// `maj index status`: the derivation queue's current state per kind
 /// without doing any work — a diff against the blob store, same as `run`,
 /// just not executed — plus the last run's per-item failures.
@@ -338,6 +371,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
         .then(|| transcript_model_remedy(caps.whisper, caps.text_model))
         .flatten();
     let captions_remedy = (plan.captions.needs_model > 0).then(|| DESCRIBER_REMEDY.to_string());
+    push_platform_unavailable_notices(&plan, app.notices());
     Ok(IndexStatusOutcome {
         thumbs: (&plan.thumbs).into(),
         embeddings: (&plan.embeddings).into(),
@@ -430,6 +464,124 @@ mod tests {
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty)
         );
+    }
+
+    /// The notice text itself, independent of any real platform: pins the
+    /// exact wording clause (c) requires (capability, framework, macOS
+    /// remedy, count) regardless of which OS runs this test.
+    #[test]
+    fn platform_unavailable_notice_names_capability_framework_and_count() {
+        let notice = platform_unavailable_notice("OCR", "the Vision framework", 3);
+        assert!(notice.contains("OCR"), "{notice}");
+        assert!(notice.contains("the Vision framework"), "{notice}");
+        assert!(notice.contains("macOS"), "{notice}");
+        assert!(notice.contains("3 eligible asset(s)"), "{notice}");
+    }
+
+    /// The sink-wiring itself, independent of any real platform: only
+    /// non-zero exclusion counts push a notice, and each pushes exactly one
+    /// — pins "never a silent zero" without depending on `ocr::AVAILABLE`/
+    /// `pdf::AVAILABLE` actually being false on the machine running this
+    /// test.
+    #[test]
+    fn push_platform_unavailable_notices_pushes_one_notice_per_nonzero_count() {
+        let plan = WorkPlan {
+            ocr_unavailable: 2,
+            ..WorkPlan::default()
+        };
+        let notices = crate::notices::Notices::new();
+        push_platform_unavailable_notices(&plan, &notices);
+        let drained = notices.drain();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(drained[0].contains("OCR"), "{drained:?}");
+
+        let plan_both = WorkPlan {
+            ocr_unavailable: 1,
+            pdf_unavailable: 1,
+            ..WorkPlan::default()
+        };
+        let notices = crate::notices::Notices::new();
+        push_platform_unavailable_notices(&plan_both, &notices);
+        assert_eq!(notices.drain().len(), 2);
+
+        let plan_none = WorkPlan::default();
+        let notices = crate::notices::Notices::new();
+        push_platform_unavailable_notices(&plan_none, &notices);
+        assert!(notices.drain().is_empty());
+    }
+
+    /// Phase 7C Task 9 clause (c), macOS shape: an online image and an
+    /// online PDF are both eligible-but-currently-unindexed sources, yet on
+    /// macOS (Vision + `PDFKit` both ship with the OS) `status` must carry
+    /// NO platform-unavailable notice — the notice is a genuine platform
+    /// gap, never decoration. Mirrored off-macOS in
+    /// `off_macos_status_names_the_ocr_and_pdf_platform_gap`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_status_carries_no_platform_unavailable_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("photo.jpg"), b"not really a jpeg").expect("write image");
+        std::fs::write(src.join("doc.pdf"), b"not really a pdf").expect("write pdf");
+        // Auto-detected volume identity (`None`) so `gather_sources` resolves
+        // these as online — a fixed `--volume` string wouldn't match
+        // `volume_identity::mounted_volumes()`'s real device ids.
+        crate::scan::scan(&mut app, &src, None).expect("scan");
+
+        let outcome = status(&app, &root).expect("status");
+        assert!(
+            outcome
+                .notices
+                .iter()
+                .all(|n| !n.contains("unavailable in this build")),
+            "{:?}",
+            outcome.notices
+        );
+    }
+
+    /// Phase 7C Task 9 clause (c), off-macOS mirror of
+    /// `macos_status_carries_no_platform_unavailable_notice`: the same
+    /// online image and PDF, but on a build where Vision/`PDFKit` don't
+    /// exist. `status` must carry one notice per capability naming it, the
+    /// missing framework, and the one eligible-but-unqueued asset. Can't run
+    /// on this (macOS) dev machine — CI-proven off-macOS in Task 10 — but
+    /// exercises only ordinary services-crate calls, no platform-gated
+    /// symbols, so it compiles cleanly if the `cfg` were ever flipped
+    /// locally.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_status_names_the_ocr_and_pdf_platform_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("photo.jpg"), b"not really a jpeg").expect("write image");
+        std::fs::write(src.join("doc.pdf"), b"not really a pdf").expect("write pdf");
+        crate::scan::scan(&mut app, &src, None).expect("scan");
+
+        let outcome = status(&app, &root).expect("status");
+
+        let ocr_notice = outcome
+            .notices
+            .iter()
+            .find(|n| n.contains("OCR"))
+            .expect("an OCR platform-unavailable notice");
+        assert!(ocr_notice.contains("the Vision framework"), "{ocr_notice}");
+        assert!(ocr_notice.contains("macOS"), "{ocr_notice}");
+        assert!(ocr_notice.contains("1 eligible asset(s)"), "{ocr_notice}");
+
+        let pdf_notice = outcome
+            .notices
+            .iter()
+            .find(|n| n.contains("PDF text extraction"))
+            .expect("a PDF platform-unavailable notice");
+        assert!(pdf_notice.contains("PDFKit"), "{pdf_notice}");
+        assert!(pdf_notice.contains("macOS"), "{pdf_notice}");
+        assert!(pdf_notice.contains("1 eligible asset(s)"), "{pdf_notice}");
     }
 
     #[test]

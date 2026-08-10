@@ -170,13 +170,13 @@ repository secret of the same name if the environment has none, so moving
 the values did not require a workflow change beyond adding that
 `environment:` line. `release.yml` passes them to `tauri-action`.
 
-The environment itself was created once with:
+Create the environment once with:
 
 ```bash
 gh api -X PUT repos/statik/majestical/environments/release
 ```
 
-and the secret values moved into it with:
+then move the secret values into it with:
 
 ```bash
 gh secret set TAURI_SIGNING_PRIVATE_KEY --env release

@@ -1405,10 +1405,22 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
   test asserting the field is absent — not null, not `[]` — from the
   serialized JSON when there is nothing to report. The rest rely on the
   attribute being copied correctly.
-- **A failing service call loses the notices its sink was holding** (Task 3,
-  narrow but real). Notices are drained on the `Ok` path; an `Err` returns
-  without draining, so a call that collected warnings and then failed
-  reports the failure alone. The 7C fix shape is a notices payload on
+- **CLOSED IN PHASE 7C (#91): A failing service call loses the notices its
+  sink was holding.** `ServiceError` now carries a `WithNotices { notices,
+  source }` variant (`crates/services/src/error.rs:65`), attached by
+  `Notices::attach_on_err` at the four sync verbs — the only verbs whose
+  local sink drops on `Err` (`crates/services/src/sync.rs:379,419,668,820`).
+  Each head splits the carrier once: the CLI's `surface_err_notices`
+  (`crates/cli/src/main.rs:576`) prints the notices to stderr before the
+  error, `maj mcp` renders them as leading text content blocks on the
+  `isError` result (`split_notices`/`error_blocks_with_notices`,
+  `crates/cli/src/mcp_cmd/mod.rs:87,103`), and the GUI folds them into
+  `CommandError.notices` (#92). The motivating `pull_impl` case is pinned by
+  a regression test. Original finding follows.
+
+  (Task 3, narrow but real.) Notices are drained on the `Ok` path; an `Err`
+  returns without draining, so a call that collected warnings and then
+  failed reports the failure alone. The 7C fix shape is a notices payload on
   `ServiceError` itself. `sync::pull_impl` gains the most from it: its sink
   holds the buffer `apply_pulled_events` folded, and that is exactly what is
   dropped at `PullApplyFailure` — the moment a user most wants to know what
@@ -1436,15 +1448,40 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
   (Task 4). They are the next two `schemars`-enum candidates, left out of
   #75 only because the four fields it did close were the ones with a
   hand-written `match`/`bail!` behind them.
-- **The services graph is macOS-only, so 3-OS Rust CI is impossible**
-  (discovered by PR #77's first matrix run). `crates/index` depends on
+- **CLOSED IN PHASE 7C (#93): The services graph is macOS-only, so 3-OS
+  Rust CI is impossible.** Reworded on close: a 2-OS Rust matrix is now
+  real. The objc2/Vision/PDFKit crates, the CoreML EP and whisper's Metal
+  feature moved under `[target.'cfg(target_os = "macos")'.dependencies]` in
+  `crates/index/Cargo.toml`; the Apple seams (`ocr.rs`, `pdf.rs`, the
+  `sips` HEIC decode in `thumbs.rs`, `apply_coreml_ep` in `encoder.rs`)
+  gained non-macOS siblings that return honest `PlatformUnavailable`
+  errors; the planner excludes the absent derivations with named
+  `ocr_unavailable`/`pdf_unavailable` counts; and CI's "Rust checks and
+  tests" job runs on `{macos-latest, ubuntu-latest}`. Windows stays out of
+  the Rust matrix and the actual non-Apple OCR/PDF fallback implementations
+  remain a phase of their own — both recorded under Phase 7C deferrals
+  below. Original finding follows.
+
+  (Discovered by PR #77's first matrix run.) `crates/index` depends on
   `objc2`, Vision and PDFKit unconditionally, and everything downstream of it
   inherits that — the Rust steps in the CI matrix therefore run on macOS
   alone. The frontend gates (`pnpm check`/`lint`/`test`/`build`) stay 3-OS
   and are genuinely cross-platform. Porting means target-gating those
   dependencies and supplying non-Apple OCR and PDF fallbacks; it is a phase
   of its own, not a cleanup.
-- **The TypeScript wire layer is unpinned against Rust** (Task 7). Nothing
+- **CLOSED IN PHASE 7C (#92): The TypeScript wire layer is unpinned against
+  Rust.** Exactly the named fix shape, pinned from both sides:
+  `apps/desktop/src-tauri/tests/wire_fixtures.rs` serializes one
+  fully-populated instance of each outcome struct the GUI consumes (plus
+  `CommandError`) and compares byte-for-byte against six committed fixtures
+  in `apps/desktop/src/lib/fixtures/` (`MAJ_UPDATE_FIXTURES=1`
+  regenerates); `apps/desktop/src/lib/fixtures.test.ts` assigns each JSON
+  to its `api.ts` interface, so a renamed or retyped serde field fails
+  `svelte-check`/`tsc`, and asserts the load-bearing runtime shapes at
+  vitest time. Drift now fails a build whichever side moved. Original
+  finding follows.
+
+  (Task 7.) Nothing
   cross-checks `api.ts`'s field names or its camelCase argument names against
   the Rust structs and `#[tauri::command]` signatures they mirror — a renamed
   serde field breaks the GUI at runtime and no test anywhere fails. Fix
@@ -1489,10 +1526,20 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
   race cannot fire as the workflow stands — this is dormant, not fixed.
   Restoring a second target brings it back, and the fix then is to create the
   release in a job of its own ahead of the matrix.
-- **`zizmor`'s auditor persona reports two informationals** (Task 10):
-  secrets-outside-env (the signing secrets should live in a GitHub
-  Environment) and the `rust-toolchain` pin. Neither is a finding at the
-  default persona. Both are 7C hardening.
+- **CLOSED IN PHASE 7C (this closing PR): `zizmor`'s auditor persona
+  reports two informationals.** The signing secrets now resolve from a
+  `release` GitHub Environment (`environment: release` on `release.yml`'s
+  desktop job; moving the secret VALUES is an operator step recorded in
+  `docs/RELEASING.md`), which clears `secrets-outside-environment`. The
+  `rust-toolchain` finding turned out to be `superfluous-actions` — the
+  action duplicated the runner's own rustup — cleared by replacing it with
+  a `rustup toolchain install` script step in both workflows, not by
+  SHA-pinning. The 9 auditor low findings that remain after this fix are
+  recorded under Phase 7C deferrals below. Original finding follows.
+
+  (Task 10.) secrets-outside-env (the signing secrets should live in a
+  GitHub Environment) and the `rust-toolchain` pin. Neither is a finding at
+  the default persona. Both are 7C hardening.
 - **Cross-binary `tauri_parity` loud-skips in CI** (Task 7, restated at
   closing). Without `MAJ_BIN` the test that compares the GUI's rows against
   `maj search --json` announces a skip and passes. Only `just gui-test`
@@ -1597,6 +1644,45 @@ which is the seam the tests drive and which is fully caught. Every route,
 status and body of the protocol is covered through `handle`.
 
 ## Phase 7C deferrals
+
+Recorded during the phase 7C PR chain (#90, #91, #92, #93) and this closing
+PR. Each item names where it came from.
+
+- **Non-Apple OCR and PDF fallback implementations** (spec's deferred list;
+  #93). The ubuntu leg runs honest `PlatformUnavailable` stubs — the
+  absence is named, with the exclusions counted, never a silent zero.
+  Actual OCR and PDF extraction off-macOS is a phase of its own, not a
+  cleanup.
+- **Windows in the Rust CI matrix** (spec's deferred list; #93). No release
+  artifact exists for it and its toolchain friction (protoc, ffmpeg, the
+  whisper build) buys nothing yet. The GUI build job already covers Windows
+  frontend-only.
+- **`api.ts` codegen from Rust** (spec's rejected alternatives; #92).
+  Revisit only if the wire fixtures prove noisy in practice — the outcome
+  structs' pairs-as-map `serialize_with` serializers are exactly what
+  derive-based codegen mishandles.
+- **The GUI `get_asset` `Ok(None)` arm still drops its notices** (carried
+  from the 7B deferrals; restated by #92's Task 5). `CommandError` now
+  carries a `notices` field, so the GUI's failure path is covered, but an
+  unknown asset id returns `Ok(None)` and discards whatever the sink held —
+  where MCP's `found: false` response folds them in.
+- **The four Apple-only CLI smoke tests are cfg-gated to macOS** (#93,
+  commit 66840ff): `pdf_indexing_end_to_end_heals_text_fts`,
+  `ocr_indexing_still_image_end_to_end`,
+  `failed_derivations_are_reported_and_replanned`, and
+  `failure_records_survive_runs_of_other_kinds`
+  (`crates/cli/tests/index_smoke.rs`). The last two mean the failure-record
+  machinery has no CLI-level coverage on the ubuntu leg; a cross-platform
+  failing-derivation fixture (e.g. a corrupt image for the thumbs pass)
+  would restore it.
+- **9 zizmor auditor low findings remain after the two-informational fix**
+  (this closing PR; recorded per Task 11's instruction that remaining
+  auditor findings are new information — record, don't chase): 7×
+  `undocumented-permissions` (`pages.yml:19,44`, `pr-title.yml:15`, and
+  the pre-existing `contents: write` grants in
+  `release.yml:89,115,183,244`) and 2× `concurrency-limits`
+  (`pr-title.yml`, `release-drafter.yml`). None is a finding at the
+  default persona.
 
 ### cargo-mutants triage (phase 7C)
 

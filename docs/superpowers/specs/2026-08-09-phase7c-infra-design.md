@@ -269,10 +269,10 @@ not a longer pin.
 First, `clippy::unnecessary_wraps` fires only where the non-macOS
 `apply_coreml_ep` stub compiles — the stub keeps `Result` to share the
 macOS signature, so the macOS leg never sees the lint; it carries an
-`#[expect]` with that reason (`crates/index/src/encoder.rs:203`, commit
-926b739). Second, four CLI smoke tests exercise Vision/PDFKit end to end
+`#[expect]` with that reason (`crates/index/src/encoder.rs:203`, PR #93).
+Second, four CLI smoke tests exercise Vision/PDFKit end to end
 and had to be cfg-gated to macOS
-(`crates/cli/tests/index_smoke.rs`, commit 66840ff) — the coverage cost is
+(`crates/cli/tests/index_smoke.rs`, PR #93) — the coverage cost is
 recorded on the watchlist under Phase 7C deferrals.
 
 **The parity-reference build step in ci.yml stays macOS-only** (PR #93; the

@@ -1666,8 +1666,8 @@ PR. Each item names where it came from.
   carries a `notices` field, so the GUI's failure path is covered, but an
   unknown asset id returns `Ok(None)` and discards whatever the sink held —
   where MCP's `found: false` response folds them in.
-- **The four Apple-only CLI smoke tests are cfg-gated to macOS** (#93,
-  commit 66840ff): `pdf_indexing_end_to_end_heals_text_fts`,
+- **The four Apple-only CLI smoke tests are cfg-gated to macOS** (PR #93):
+  `pdf_indexing_end_to_end_heals_text_fts`,
   `ocr_indexing_still_image_end_to_end`,
   `failed_derivations_are_reported_and_replanned`, and
   `failure_records_survive_runs_of_other_kinds`

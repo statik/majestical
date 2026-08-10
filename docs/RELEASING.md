@@ -161,9 +161,10 @@ already in place:
 
 ### The private key
 
-The private half lives in two secrets scoped to the `release` GitHub
-Environment, `TAURI_SIGNING_PRIVATE_KEY` and
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The `desktop` job in `release.yml`
+The private half lives in two secrets the desktop job resolves from the
+`release` GitHub Environment, `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (falling back to repository scope
+until the move below is done). The `desktop` job in `release.yml`
 declares `environment: release`, so `secrets.TAURI_SIGNING_PRIVATE_KEY` and
 its password resolve from the environment there; GitHub falls back to a
 repository secret of the same name if the environment has none, so moving

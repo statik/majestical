@@ -910,6 +910,111 @@ mod tests {
         assert!(err.to_string().contains("maj catalog init"));
     }
 
+    /// The `NotFound` guard in `SyncConfig::load` must fold ONLY a missing
+    /// file into the default config — any other read failure (here:
+    /// invalid-UTF-8 bytes, which `read_to_string` rejects with
+    /// `InvalidData` on every platform) must surface as an error, never as
+    /// a silently empty config.
+    #[test]
+    fn load_reports_a_non_missing_read_error_instead_of_defaulting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.toml");
+        std::fs::write(&path, [0xFF, 0xFE]).expect("write");
+        let err = SyncConfig::load(&path).expect_err("a present-but-unreadable file must error");
+        assert!(err.to_string().contains("reading"));
+    }
+
+    #[test]
+    fn resolve_targets_picks_exactly_the_named_location() {
+        let cfg = SyncConfig {
+            readonly: false,
+            locations: vec![
+                Location {
+                    name: "a".into(),
+                    path: "/tmp/a".into(),
+                    extra: toml::Table::new(),
+                },
+                Location {
+                    name: "b".into(),
+                    path: "/tmp/b".into(),
+                    extra: toml::Table::new(),
+                },
+            ],
+            extra: toml::Table::new(),
+        };
+        let targets = resolve_targets(&cfg, Some("b")).expect("named location resolves");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "b");
+    }
+
+    #[test]
+    fn filter_plan_keeps_only_the_requested_blob_class() {
+        let plan = transfer::TransferPlan {
+            segments: vec![transfer::SegmentCopy {
+                machine: "m1".into(),
+                segment: "events/m1/0000.jsonl".into(),
+                src_len: 10,
+                dst_len: 0,
+            }],
+            blobs: vec![
+                transfer::BlobCopy {
+                    rel: "t".into(),
+                    class: transfer::BlobClass::Thumbs,
+                    size: 1,
+                },
+                transfer::BlobCopy {
+                    rel: "v".into(),
+                    class: transfer::BlobClass::Vectors,
+                    size: 1,
+                },
+            ],
+        };
+        let narrowed = filter_plan(plan, Some(Only::Vectors));
+        assert!(
+            narrowed.segments.is_empty(),
+            "--only vectors drops segments"
+        );
+        assert_eq!(narrowed.blobs.len(), 1);
+        assert_eq!(narrowed.blobs[0].class, transfer::BlobClass::Vectors);
+    }
+
+    #[test]
+    fn location_row_name_reports_each_variants_name() {
+        let ran = LocationRow::Ran {
+            name: "r".into(),
+            segments_copied: 0,
+            segment_bytes: 0,
+            blobs_copied: 0,
+            blob_bytes: 0,
+            events_added: vec![],
+            failures: vec![],
+        };
+        let skipped = LocationRow::Skipped {
+            name: "s".into(),
+            reason: "x".into(),
+        };
+        let failed = LocationRow::Failed {
+            name: "f".into(),
+            error: "x".into(),
+        };
+        assert_eq!(ran.name(), "r");
+        assert_eq!(skipped.name(), "s");
+        assert_eq!(failed.name(), "f");
+    }
+
+    /// `PullApplyFailure` exists to ride an `anyhow` chain out of
+    /// `pull_impl` — its Display must forward the source error's text, or a
+    /// failing pull that ISN'T downcast (e.g. printed mid-chain) reports an
+    /// empty message.
+    #[test]
+    fn pull_apply_failure_displays_its_source_error() {
+        let failure = PullApplyFailure {
+            rows: vec![],
+            source: anyhow::anyhow!("boom"),
+        };
+        assert_eq!(failure.to_string(), "boom");
+    }
+
     #[test]
     fn locations_list_of_an_unconfigured_catalog_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -930,6 +1035,16 @@ mod tests {
     #[test]
     fn blob_counts_from_blobs_counts_each_class_independently() {
         let blobs = vec![
+            transfer::BlobCopy {
+                rel: "t1".into(),
+                class: transfer::BlobClass::Thumbs,
+                size: 1,
+            },
+            transfer::BlobCopy {
+                rel: "t2".into(),
+                class: transfer::BlobClass::Thumbs,
+                size: 1,
+            },
             transfer::BlobCopy {
                 rel: "a".into(),
                 class: transfer::BlobClass::Metadata,
@@ -955,7 +1070,7 @@ mod tests {
         assert_eq!(
             counts,
             BlobCounts {
-                thumbs: 0,
+                thumbs: 2,
                 metadata: 2,
                 vectors: 1,
                 transcripts: 1,
@@ -1203,6 +1318,134 @@ mod push_pull_tests {
         assert_eq!(applied, 8, "events must sum across locations");
         assert_eq!(blobs, 7, "blobs must sum across locations");
         assert_eq!(machines, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    /// Drives `status` against one mounted location holding nothing and one
+    /// unmounted location: the mounted one must report `Reachable` with the
+    /// real per-machine ahead counts from a genuine plan (not a defaulted
+    /// empty one), the unmounted one must report `Unreachable` — pinning
+    /// both `status_row`'s reachability branch and `plan_both_directions`
+    /// actually planning.
+    #[test]
+    fn status_reports_real_ahead_counts_and_unreachable_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut source, root) = init_catalog(dir.path(), "cat", "m1");
+        source
+            .emit(vec![Op::ParaNodeCreate {
+                node: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: ParaKind::Project,
+                name: "client-x".into(),
+            }])
+            .expect("emit");
+        let loc = dir.path().join("shuttle");
+        std::fs::create_dir_all(&loc).expect("mkdir");
+        location_add(&root, "shuttle", &loc, &Notices::new()).expect("add");
+        let cfg_path = config_path(&root, &Notices::new()).expect("config_path");
+        let mut cfg = SyncConfig::load(&cfg_path).expect("load");
+        cfg.locations.push(Location {
+            name: "gone".into(),
+            path: dir.path().join("does-not-exist"),
+            extra: toml::Table::new(),
+        });
+        cfg.store(&cfg_path).expect("store");
+
+        let outcome = status(&root).expect("status");
+        assert_eq!(outcome.rows.len(), 2);
+        let StatusRow::Reachable {
+            name,
+            ahead,
+            behind,
+        } = &outcome.rows[0]
+        else {
+            panic!(
+                "a mounted location must be Reachable, got {:?}",
+                outcome.rows[0]
+            );
+        };
+        assert_eq!(name, "shuttle");
+        let m1 = ahead
+            .segments
+            .get("m1")
+            .expect("the unpushed segment must count ahead");
+        assert_eq!(m1.files, 1);
+        assert!(m1.bytes > 0, "the pending segment's bytes must be counted");
+        assert!(behind.is_empty(), "the empty location has nothing we lack");
+        let StatusRow::Unreachable { name, .. } = &outcome.rows[1] else {
+            panic!(
+                "an unmounted location must be Unreachable, got {:?}",
+                outcome.rows[1]
+            );
+        };
+        assert_eq!(name, "gone");
+    }
+
+    #[test]
+    fn push_outcome_accessors_report_rows_exactly() {
+        let all_skipped = PushOutcome {
+            rows: vec![LocationRow::Skipped {
+                name: "a".into(),
+                reason: "unreachable".into(),
+            }],
+            notices: vec![],
+        };
+        assert!(all_skipped.no_location_ran());
+        assert!(all_skipped.failing_locations().is_empty());
+        let ran_with_failures = PushOutcome {
+            rows: vec![LocationRow::Ran {
+                name: "b".into(),
+                segments_copied: 1,
+                segment_bytes: 10,
+                blobs_copied: 0,
+                blob_bytes: 0,
+                events_added: vec![],
+                failures: vec![FileFailure {
+                    path: "x".into(),
+                    error: "boom".into(),
+                }],
+            }],
+            notices: vec![],
+        };
+        assert!(!ran_with_failures.no_location_ran());
+        assert_eq!(ran_with_failures.failing_locations(), vec!["b"]);
+        assert!(ran_with_failures.overall_failed());
+    }
+
+    #[test]
+    fn pull_outcome_accessors_report_rows_exactly() {
+        let all_skipped = PullOutcome {
+            rows: vec![LocationRow::Skipped {
+                name: "a".into(),
+                reason: "unreachable".into(),
+            }],
+            applied_events: 0,
+            machines: vec![],
+            blobs_fetched: 0,
+            notices: vec![],
+        };
+        assert!(all_skipped.no_location_ran());
+        assert!(all_skipped.failing_locations().is_empty());
+        assert!(all_skipped.overall_failed());
+        let ran_with_failures = PullOutcome {
+            rows: vec![LocationRow::Ran {
+                name: "b".into(),
+                segments_copied: 1,
+                segment_bytes: 10,
+                blobs_copied: 0,
+                blob_bytes: 0,
+                events_added: vec![],
+                failures: vec![FileFailure {
+                    path: "x".into(),
+                    error: "boom".into(),
+                }],
+            }],
+            applied_events: 0,
+            machines: vec![],
+            blobs_fetched: 0,
+            notices: vec![],
+        };
+        assert!(!ran_with_failures.no_location_ran());
+        assert_eq!(ran_with_failures.failing_locations(), vec!["b"]);
+        assert!(ran_with_failures.overall_failed());
     }
 
     #[test]

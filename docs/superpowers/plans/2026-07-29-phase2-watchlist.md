@@ -1596,6 +1596,103 @@ to pull the selected catalog out of the `AppHandle` and hand it to `handle`,
 which is the seam the tests drive and which is fully caught. Every route,
 status and body of the protocol is covered through `handle`.
 
+## Phase 7C deferrals
+
+### cargo-mutants triage (phase 7C)
+
+Three scoped runs, each `--in-place` (same rationale as 7B's GUI runs),
+foreground, one at a time; `git status` checked clean after each. The
+sync.rs run additionally scoped its test command to `--lib sync` — only
+majestical-services lib tests with "sync" in their path — so its missed
+list could overstate real gaps (a survivor there might be killed by tests
+outside that scope); every survivor was triaged against that caveat, and
+none needed it: all 21 were genuine gaps in the sync module's own tests.
+
+```bash
+cargo mutants --in-place -f crates/services/src/notices.rs -- --package majestical-services
+cargo mutants --in-place -f crates/services/src/sync.rs -- --package majestical-services --lib sync
+cargo mutants --in-place -f crates/index/src/work.rs -- --package majestical-index
+```
+
+**`crates/services/src/notices.rs`**: 5 mutants, **4 caught, 1 unviable, 0
+missed**. The unviable replaces `Notices::attach_on_err`'s body with
+`Ok(Default::default())`, which does not compile — its `T` carries no
+`Default` bound. The sink's own tests still cover it completely.
+
+**`crates/services/src/sync.rs`**: 98 mutants, **65 caught, 12 unviable,
+21 missed — all 21 closed with new lib tests** in `sync.rs`'s own test
+modules:
+
+- *`SyncConfig::load`'s `NotFound` match guard* (mutated to always match,
+  1): no test exercised a read failure that isn't "file doesn't exist
+  yet", so folding EVERY read error into a silently empty config passed
+  (`load_reports_a_non_missing_read_error_instead_of_defaulting` — plants
+  invalid-UTF-8 bytes, which `read_to_string` rejects on every platform).
+- *`resolve_targets`' name match* (`==` -> `!=`, 1): every existing caller
+  passed `None` (all locations); nothing pinned that naming a location
+  selects THAT location (`resolve_targets_picks_exactly_the_named_location`).
+- *`BlobCounts::from_blobs`' thumbs arm* (`+=` -> `-=`/`*=`, 2): the one
+  counting test's fixture had zero Thumbs blobs, so the arm never ran —
+  its fixture now carries two and asserts `thumbs: 2` exactly.
+- *`status_row`'s reachability test* (`!` deleted, 1) and
+  *`plan_both_directions`* (replaced with two defaulted-empty plans, 1):
+  no test ever drove `status` past its error paths, so a status that
+  called every mounted location unreachable — or reported every location
+  in sync regardless of reality — passed.
+  `status_reports_real_ahead_counts_and_unreachable_rows` plans a real
+  catalog against one mounted and one missing location and asserts the
+  mounted row's exact per-machine ahead counts.
+- *`filter_plan`'s class filter* (`==` -> `!=`, 1): the `--only` narrowing
+  had no direct test (`filter_plan_keeps_only_the_requested_blob_class`).
+- *`LocationRow::name`* (-> `""`/`"xyzzy"`, 2) and the
+  `PushOutcome`/`PullOutcome` accessors (`no_location_ran` ->
+  `true`/`false`, `failing_locations` -> `vec![]`/`vec![""]`/
+  `vec!["xyzzy"]`, `PullOutcome::overall_failed` -> `false`; 11): the free
+  functions underneath were tested directly, but the public methods heads
+  actually call never were, so a method lying about its own rows passed
+  (`location_row_name_reports_each_variants_name`,
+  `push_outcome_accessors_report_rows_exactly`,
+  `pull_outcome_accessors_report_rows_exactly`).
+- *`PullApplyFailure`'s Display* (-> writes nothing, 1): it exists to
+  forward the source error's text through the `anyhow` chain; empty output
+  would make a failing pull print nothing
+  (`pull_apply_failure_displays_its_source_error`).
+
+**`crates/index/src/work.rs`**: 124 mutants, **95 caught, 0 unviable, 29
+missed — 23 closed with new tests, 6 closed for the ubuntu leg by the same
+tests' `!AVAILABLE` branches** (unexecutable on macOS, see below). All 29
+are one defect family: `+=` on the planner's per-kind status counters
+mutated to `-=`/`*=`. Every existing test drove each surviving counter
+site zero or one times, where the operators coincide (`0 *= 1 == 0`
+survives any assertion looser than an exact nonzero count, and a
+never-executed site survives even `-=`, which would underflow-panic).
+Seven new tests drive every surviving site with TWO assets per bucket and
+exact `assert_eq!` counts, one test per planning pass:
+`keyframe_and_transcribe_counters_sum_per_asset_exactly`,
+`transcript_embed_needs_model_sums_per_asset_exactly`,
+`ocr_image_counters_sum_per_asset_exactly`,
+`ocr_keyframe_counters_sum_per_asset_exactly`,
+`pdf_text_counters_sum_per_asset_exactly`,
+`caption_offline_counters_sum_across_still_and_video_passes`, and
+`caption_video_needs_model_sums_per_asset_exactly`.
+
+The 6 remaining mutants sit at the three
+`ocr_unavailable`/`pdf_unavailable` increments, which are dead code on
+macOS — `ocr::AVAILABLE`/`pdf::AVAILABLE` are `cfg!(target_os = "macos")`
+consts, so no test on the machine that ran this run can ever execute
+them. The three new OCR/PDF counter tests assert those exclusion counters
+exactly (`== 2`) in their `!AVAILABLE` branches, which the ubuntu CI leg
+executes — including the `plan_ocr_keyframes` site that the existing
+`off_macos_excludes_ocr_and_pdf_work_and_counts_the_exclusions` test
+never reached (it has no video-with-manifest source).
+
+Verification was by hand, not assumption, for every macOS-reachable
+group: one representative mutant per new test (plus the keyframes-pending
+site and both caption-offline sites) was applied to the source, the named
+test run and watched fail, and the source reverted — 19 edit/run/revert
+cycles across the two files. The off-macOS branches are the one part
+taken on inspection; they run only on the ubuntu leg.
+
 ## Done in phase 6
 
 - **Segment rotation** (was Open, phase 2): landed with zero-padded `NNNN`

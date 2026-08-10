@@ -13,7 +13,11 @@ concurrency:
 jobs:
   rust:
     name: Rust checks and tests
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -23,11 +27,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-      - name: Install protoc (lance build dependency)
-        run: brew install protobuf
-      - run: brew install just
+      - name: Install protoc and just (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf just
+      - name: Install protoc and just (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler just
       - run: just check
+      # macOS-only: the reference is built at the merge-base with main, a
+      # commit that can predate the Linux port (main was macOS-only before
+      # phase 7C's target gating), so it may not compile here on Linux. The
+      # services_parity suite skips loudly when /tmp/maj-ref is absent.
       - name: Build pre-extraction reference binary for the parity harness
+        if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           orig_sha=$(git rev-parse HEAD)

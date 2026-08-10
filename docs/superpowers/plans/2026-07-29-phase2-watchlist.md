@@ -1648,8 +1648,9 @@ modules:
   `PushOutcome`/`PullOutcome` accessors (`no_location_ran` ->
   `true`/`false`, `failing_locations` -> `vec![]`/`vec![""]`/
   `vec!["xyzzy"]`, `PullOutcome::overall_failed` -> `false`; 11): the free
-  functions underneath were tested directly, but the public methods heads
-  actually call never were, so a method lying about its own rows passed
+  functions underneath were tested directly, but the public methods the
+  heads actually call were never tested, so a method lying about its own
+  rows passed
   (`location_row_name_reports_each_variants_name`,
   `push_outcome_accessors_report_rows_exactly`,
   `pull_outcome_accessors_report_rows_exactly`).

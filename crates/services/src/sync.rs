@@ -1351,18 +1351,19 @@ mod push_pull_tests {
 
         let outcome = status(&root).expect("status");
         assert_eq!(outcome.rows.len(), 2);
-        let StatusRow::Reachable {
-            name,
-            ahead,
-            behind,
-        } = &outcome.rows[0]
-        else {
-            panic!(
-                "a mounted location must be Reachable, got {:?}",
-                outcome.rows[0]
-            );
+        let row_name = |row: &StatusRow| match row {
+            StatusRow::Reachable { name, .. }
+            | StatusRow::Unreachable { name, .. }
+            | StatusRow::Failed { name, .. } => name.clone(),
         };
-        assert_eq!(name, "shuttle");
+        let shuttle = outcome
+            .rows
+            .iter()
+            .find(|r| row_name(r) == "shuttle")
+            .expect("a row for the mounted location");
+        let StatusRow::Reachable { ahead, behind, .. } = shuttle else {
+            panic!("a mounted location must be Reachable, got {shuttle:?}");
+        };
         let m1 = ahead
             .segments
             .get("m1")
@@ -1370,13 +1371,15 @@ mod push_pull_tests {
         assert_eq!(m1.files, 1);
         assert!(m1.bytes > 0, "the pending segment's bytes must be counted");
         assert!(behind.is_empty(), "the empty location has nothing we lack");
-        let StatusRow::Unreachable { name, .. } = &outcome.rows[1] else {
-            panic!(
-                "an unmounted location must be Unreachable, got {:?}",
-                outcome.rows[1]
-            );
-        };
-        assert_eq!(name, "gone");
+        let gone = outcome
+            .rows
+            .iter()
+            .find(|r| row_name(r) == "gone")
+            .expect("a row for the unmounted location");
+        assert!(
+            matches!(gone, StatusRow::Unreachable { .. }),
+            "an unmounted location must be Unreachable, got {gone:?}"
+        );
     }
 
     #[test]

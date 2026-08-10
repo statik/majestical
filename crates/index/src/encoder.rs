@@ -201,6 +201,10 @@ fn apply_coreml_ep(
 /// # Errors
 /// Never fails — kept `Result`-returning to match the macOS signature.
 #[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature must match the macOS variant so call sites stay cfg-free"
+)]
 fn apply_coreml_ep(
     builder: SessionBuilder,
     options: &EncoderOptions,

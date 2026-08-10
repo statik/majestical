@@ -2,6 +2,7 @@
 //! through macOS's `sips` (the `image` crate has no HEIC support).
 
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use crate::error::IndexError;
@@ -82,7 +83,7 @@ fn decode_via_sips(path: &Path) -> Result<image::DynamicImage, IndexError> {
 fn decode_via_sips(_path: &Path) -> Result<image::DynamicImage, IndexError> {
     Err(IndexError::PlatformUnavailable {
         capability: "HEIC decoding",
-        framework: "the macOS `sips` tool",
+        framework: "the `sips` tool",
     })
 }
 

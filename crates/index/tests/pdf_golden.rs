@@ -1,5 +1,9 @@
 //! Golden tests against real `PDFKit` (ships with macOS — not ignored).
 
+// Needs PDFKit: off-macOS these fns compile against the
+// `PlatformUnavailable` stubs and would fail these assertions at runtime.
+#![cfg(target_os = "macos")]
+
 use majestical_index::pdf;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixture.pdf");

@@ -724,6 +724,7 @@ mod tests {
     use crate::blob::{BlobStore, Derivation};
     use crate::model::MINILM;
     use crate::ocr::OCR_MODEL_TAG;
+    use crate::pdf::PDF_MODEL_TAG;
     use crate::transcribe::WHISPER_MODEL_TAG;
     use majestical_core::media_kind::MediaKind;
 
@@ -1862,6 +1863,312 @@ mod tests {
         }
         assert_eq!(plan.ocr_unavailable, 0, "Vision is available on macOS");
         assert_eq!(plan.pdf_unavailable, 0, "PDFKit is available on macOS");
+    }
+
+    /// Counter-summation family (cargo-mutants triage, phase 7C): the tests
+    /// below all drive each status counter with TWO assets and assert the
+    /// exact count. Every earlier test left these counters at 0 or 1, where
+    /// `+=` and `*=` coincide (`0 *= 1 == 0` survives any looser assertion,
+    /// and a never-executed site survives even `-=`); two increments plus
+    /// `assert_eq!` discriminate the operator at every site.
+    #[test]
+    fn keyframe_and_transcribe_counters_sum_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let sources = vec![
+            source(
+                "xxh3:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                MediaKind::Video,
+                Some("/tmp/v1.mov"),
+            ),
+            source(
+                "xxh3:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+                MediaKind::Video,
+                Some("/tmp/v2.mov"),
+            ),
+            source(
+                "xxh3:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+                MediaKind::Audio,
+                None,
+            ),
+            source(
+                "xxh3:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+                MediaKind::Audio,
+                None,
+            ),
+        ];
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert_eq!(
+            plan.keyframes.pending, 2,
+            "both online videos queue keyframes"
+        );
+        assert_eq!(
+            plan.transcripts.pending, 2,
+            "both online videos queue transcribe"
+        );
+        assert_eq!(
+            plan.transcripts.offline, 2,
+            "both pathless audios count offline"
+        );
+    }
+
+    #[test]
+    fn transcript_embed_needs_model_sums_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hexes = [
+            "aa31aa31aa31aa31aa31aa31aa31aa31",
+            "bb42bb42bb42bb42bb42bb42bb42bb42",
+        ];
+        for hex in hexes {
+            let transcript = store.path_for(
+                hex,
+                &Derivation::Transcript {
+                    model_tag: WHISPER_MODEL_TAG,
+                },
+            );
+            store
+                .write_atomic(&transcript, b"{}")
+                .expect("seed transcript");
+        }
+        let sources: Vec<AssetSource> = hexes
+            .iter()
+            .map(|hex| source(&format!("xxh3:{hex}"), MediaKind::Audio, None))
+            .collect();
+        let plan = plan_work(&sources, &store, &base_caps());
+
+        assert_eq!(
+            plan.transcripts.done, 2,
+            "the transcribe pass counts each synced transcript blob done"
+        );
+        assert_eq!(
+            plan.transcripts.needs_model, 2,
+            "the embed pass counts each blocked asset against the missing text model"
+        );
+    }
+
+    #[test]
+    fn ocr_image_counters_sum_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let sources = vec![
+            source(
+                "xxh3:0ff10ff10ff10ff10ff10ff10ff10ff1",
+                MediaKind::Image,
+                None,
+            ),
+            source(
+                "xxh3:0ff20ff20ff20ff20ff20ff20ff20ff2",
+                MediaKind::Image,
+                None,
+            ),
+            source(
+                "xxh3:0aa10aa10aa10aa10aa10aa10aa10aa1",
+                MediaKind::Image,
+                Some("/tmp/on1.png"),
+            ),
+            source(
+                "xxh3:0aa20aa20aa20aa20aa20aa20aa20aa2",
+                MediaKind::Image,
+                Some("/tmp/on2.png"),
+            ),
+        ];
+        let plan = plan_work(&sources, &store, &base_caps());
+
+        assert_eq!(plan.ocr.offline, 2, "both pathless images count offline");
+        if crate::ocr::AVAILABLE {
+            assert_eq!(plan.ocr.pending, 2, "both online images queue OCR");
+            assert_eq!(plan.ocr_unavailable, 0);
+        } else {
+            assert_eq!(plan.ocr.pending, 0);
+            assert_eq!(
+                plan.ocr_unavailable, 2,
+                "off-macOS both online images count platform-unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn ocr_keyframe_counters_sum_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let done_hexes = [
+            "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+            "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+        ];
+        let offline_hexes = [
+            "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+            "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+        ];
+        let online_hexes = [
+            "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+            "6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+        ];
+        for hex in done_hexes.iter().chain(&offline_hexes).chain(&online_hexes) {
+            let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+            store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        }
+        for hex in done_hexes {
+            let marker = store.path_for(
+                hex,
+                &Derivation::OcrComplete {
+                    model_tag: OCR_MODEL_TAG,
+                },
+            );
+            store.write_atomic(&marker, b"{}").expect("seed marker");
+        }
+        let mut sources = Vec::new();
+        for hex in done_hexes.iter().chain(&offline_hexes) {
+            sources.push(source(&format!("xxh3:{hex}"), MediaKind::Video, None));
+        }
+        for hex in online_hexes {
+            sources.push(source(
+                &format!("xxh3:{hex}"),
+                MediaKind::Video,
+                Some("/tmp/v.mov"),
+            ));
+        }
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert_eq!(plan.ocr.done, 2, "both completion markers count done");
+        assert_eq!(plan.ocr.offline, 2, "both pathless videos count offline");
+        if crate::ocr::AVAILABLE {
+            assert_eq!(plan.ocr.pending, 2, "both online videos queue keyframe OCR");
+            assert_eq!(plan.ocr_unavailable, 0);
+        } else {
+            assert_eq!(plan.ocr.pending, 0);
+            assert_eq!(
+                plan.ocr_unavailable, 2,
+                "off-macOS both online videos count platform-unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_text_counters_sum_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let done_hexes = [
+            "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+            "8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b",
+        ];
+        for hex in done_hexes {
+            let blob = store.path_for(
+                hex,
+                &Derivation::PdfText {
+                    model_tag: PDF_MODEL_TAG,
+                },
+            );
+            store.write_atomic(&blob, b"{}").expect("seed pdf text");
+        }
+        let mut sources = Vec::new();
+        for hex in done_hexes {
+            sources.push(source(&format!("xxh3:{hex}"), MediaKind::Pdf, None));
+        }
+        sources.push(source(
+            "xxh3:9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",
+            MediaKind::Pdf,
+            None,
+        ));
+        sources.push(source(
+            "xxh3:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+            MediaKind::Pdf,
+            None,
+        ));
+        sources.push(source(
+            "xxh3:1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e",
+            MediaKind::Pdf,
+            Some("/tmp/on1.pdf"),
+        ));
+        sources.push(source(
+            "xxh3:2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f",
+            MediaKind::Pdf,
+            Some("/tmp/on2.pdf"),
+        ));
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert_eq!(plan.pdf.done, 2, "both extracted-text blobs count done");
+        assert_eq!(plan.pdf.offline, 2, "both pathless PDFs count offline");
+        if crate::pdf::AVAILABLE {
+            assert_eq!(
+                plan.pdf.pending, 2,
+                "both online PDFs queue text extraction"
+            );
+            assert_eq!(plan.pdf_unavailable, 0);
+        } else {
+            assert_eq!(plan.pdf.pending, 0);
+            assert_eq!(
+                plan.pdf_unavailable, 2,
+                "off-macOS both online PDFs count platform-unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn caption_offline_counters_sum_across_still_and_video_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let video_hexes = [
+            "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+            "4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b",
+        ];
+        for hex in video_hexes {
+            let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+            store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        }
+        let mut sources = vec![
+            source(
+                "xxh3:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+                MediaKind::Image,
+                None,
+            ),
+            source(
+                "xxh3:6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d",
+                MediaKind::Image,
+                None,
+            ),
+        ];
+        for hex in video_hexes {
+            sources.push(source(&format!("xxh3:{hex}"), MediaKind::Video, None));
+        }
+        let plan = plan_work(&sources, &store, &full_caps());
+
+        assert_eq!(
+            plan.captions.offline, 4,
+            "two stills via plan_caption_still plus two manifest-ready videos \
+             via plan_caption_video"
+        );
+    }
+
+    #[test]
+    fn caption_video_needs_model_sums_per_asset_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hexes = [
+            "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+            "8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f",
+        ];
+        let mut sources = Vec::new();
+        for hex in hexes {
+            let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+            store.write_atomic(&manifest, b"[]").expect("seed manifest");
+            sources.push(source(
+                &format!("xxh3:{hex}"),
+                MediaKind::Video,
+                Some("/tmp/v.mov"),
+            ));
+        }
+        let caps = Capabilities {
+            describer_tag: None,
+            ..full_caps()
+        };
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(
+            plan.captions.needs_model, 2,
+            "each manifest-ready video counts against the missing describer"
+        );
     }
 
     /// Phase 7C Task 9 behavior contract, clauses (a)+(b), off-macOS mirror

@@ -233,3 +233,61 @@ deleted.
   filmstrip — phase 7D.
 - Codegen of `api.ts` from Rust (revisit only if the fixture set proves
   noisy to maintain).
+
+## As-built (phase 7C)
+
+What shipped, where it differs from the design above. Written as what IS,
+not as a change log.
+
+**The attach seam is four verbs, not ~30** (PR #91). The pre-implementation
+survey showed every verb except the four sync ones (`status`,
+`locations_list`, `push`, `pull`) keeps its sink on `App`/head-side, where
+`with_app` in `crates/cli/src/main.rs` already drains on the error path —
+only the sync verbs' local sinks drop on `Err`. So `attach_notices` on
+`App` never existed; the helper is `Notices::attach_on_err`
+(`crates/services/src/notices.rs:55`), applied at exactly those four
+boundaries (`crates/services/src/sync.rs:379,419,668,820`) rather than
+mechanically at ~30.
+
+**MCP failure notices are leading text content blocks, not a `notices`
+field** (PR #91). `rmcp`'s error constructor is
+`CallToolResult::error(Vec<ContentBlock>)`; structured content is the
+success-path shape, so the `isError: true` result cannot carry the field
+the design named. Instead `split_notices` takes the carrier apart and
+`error_blocks_with_notices` emits one text block per notice, in push
+order, ahead of the inner error's Display chain
+(`crates/cli/src/mcp_cmd/mod.rs:87,103`).
+
+**The rust-toolchain finding was `superfluous-actions`, and the fix was
+removing the action** (this closing PR). The design read the 7B watchlist
+item as a missing SHA pin. zizmor's actual auditor finding was that
+`dtolnay/rust-toolchain` duplicates the rustup already on the runner; the
+fix is a `rustup toolchain install stable` script step in both workflows,
+not a longer pin.
+
+**The ubuntu leg needed two rounds the plan did not anticipate** (PR #93).
+First, `clippy::unnecessary_wraps` fires only where the non-macOS
+`apply_coreml_ep` stub compiles — the stub keeps `Result` to share the
+macOS signature, so the macOS leg never sees the lint; it carries an
+`#[expect]` with that reason (`crates/index/src/encoder.rs:203`, PR #93).
+Second, four CLI smoke tests exercise Vision/PDFKit end to end
+and had to be cfg-gated to macOS
+(`crates/cli/tests/index_smoke.rs`, PR #93) — the coverage cost is
+recorded on the watchlist under Phase 7C deferrals.
+
+**The parity-reference build step in ci.yml stays macOS-only** (PR #93; the
+plan's Task 10 did not call this out). The reference `maj` binary is built
+at the merge-base with main, a commit that can predate this phase's Linux
+port and so may not compile on the ubuntu leg. The step carries an
+`if: runner.os == 'macOS'` guard and a comment saying exactly this; the
+`services_parity` suite skips loudly when `/tmp/maj-ref` is absent.
+
+**The environment move is half done, and the outstanding half is operator
+work** (this closing PR). The `release` GitHub Environment exists and
+`release.yml`'s desktop job declares `environment: release`; that is safe
+before the environment holds any secrets because GitHub falls back to the
+repository secret of the same name. The two secret VALUES still have to be
+moved by the operator (`gh secret set TAURI_SIGNING_PRIVATE_KEY --env
+release`, and likewise the password), and the repository-level secrets
+stay until a release dry run proves the environment-scoped ones end to
+end. `docs/RELEASING.md`'s secrets section is the instruction of record.

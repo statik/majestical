@@ -161,9 +161,33 @@ already in place:
 
 ### The private key
 
-The private half lives in two repository secrets, `TAURI_SIGNING_PRIVATE_KEY`
-and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Both are set (`gh secret list`).
-`release.yml` passes them to `tauri-action`; no workflow change is needed.
+The private half lives in two secrets the desktop job resolves from the
+`release` GitHub Environment, `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (falling back to repository scope
+until the move below is done). The `desktop` job in `release.yml`
+declares `environment: release`, so `secrets.TAURI_SIGNING_PRIVATE_KEY` and
+its password resolve from the environment there; GitHub falls back to a
+repository secret of the same name if the environment has none, so moving
+the values did not require a workflow change beyond adding that
+`environment:` line. `release.yml` passes them to `tauri-action`.
+
+Create the environment once with:
+
+```bash
+gh api -X PUT repos/statik/majestical/environments/release
+```
+
+then move the secret values into it with:
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env release
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release
+```
+
+The old repository-level secrets stay in place until a release dry run
+proves the environment-scoped ones work end to end; only then should they be
+deleted (`gh secret delete TAURI_SIGNING_PRIVATE_KEY`, and likewise for the
+password).
 
 **Nothing has yet proved that those secrets hold the private half of the
 public key above**, and the artifacts cannot tell you. `tauri-cli` signs with
@@ -207,8 +231,8 @@ To regenerate the keypair from scratch:
 
 ```bash
 cd apps/desktop && pnpm tauri signer generate -w /tmp/majestical-updater.key
-gh secret set TAURI_SIGNING_PRIVATE_KEY < /tmp/majestical-updater.key
-gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD   # the password chosen above
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env release < /tmp/majestical-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release  # the password chosen above
 trash /tmp/majestical-updater.key
 ```
 

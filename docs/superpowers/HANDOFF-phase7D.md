@@ -59,7 +59,9 @@ run on Linux, with the Apple-only derivations honestly absent there.
     derivations with named counts and `index status` names the gap;
     transcription stays functional (whisper CPU) off-macOS. The ubuntu leg
     runs the full non-Apple suite — currently 209 `majestical-services`
-    and 129 `majestical-index` lib tests among it.
+    and 127 `majestical-index` lib tests among it (the services count is
+    the same on both legs; the index count is 129 on macOS, where seven
+    Apple-only tests compile in place of the five stub-path ones).
   - **CI hardening + phase close** (this closing PR). The zizmor rider
     (signing secrets scoped to a `release` environment, the redundant
     toolchain action replaced with a rustup step), the phase 7C
@@ -122,8 +124,8 @@ instructions: `docs/RELEASING.md`, "The private key".
   (`crates/index/src/ocr.rs:27`) and `pdf::AVAILABLE`
   (`crates/index/src/pdf.rs:23`), both `cfg!(target_os = "macos")`. The
   planner's exclusion sites in `crates/index/src/work.rs` (the
-  `ocr_unavailable` increments at `:505` and `:562`, the `pdf_unavailable`
-  increment at `:600`, plus the pass gates around `:191-255`) count what a
+  `ocr_unavailable` increments at `:506` and `:563`, the `pdf_unavailable`
+  increment at `:601`, plus the pass gates around `:191-255`) count what a
   build cannot derive so status can name the gap. The non-macOS siblings
   of `ocr.rs`/`pdf.rs`, the `sips` path in `thumbs.rs:82`, and
   `apply_coreml_ep` in `encoder.rs:203` return

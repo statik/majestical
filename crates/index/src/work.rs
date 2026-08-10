@@ -158,12 +158,16 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 /// rejects both shapes the same way). [`MediaKind::Other`] has no derivation at
 /// all; [`MediaKind::Audio`] is skipped by the thumbnail/image-embed/keyframe
 /// passes (no visual thumbnail for audio) and covered by transcribe instead.
-/// [`MediaKind::Pdf`] joins the thumbnail and image-embed passes (page 1
-/// renders like a still — see `pdf::render_first_page`) on top of its own
-/// PDF-text/caption passes — but only when `pdf::AVAILABLE` (macOS,
-/// `PDFKit`); off that platform a `Pdf` source leaves both passes rather
-/// than piling up as unresolvable `offline`/`pending` work, and OCR/PDF-text
-/// emission is gated the same way on `ocr::AVAILABLE`/`pdf::AVAILABLE` (see
+/// [`MediaKind::Pdf`] joins the thumbnail, image-embed, and caption-still
+/// passes (page 1 renders like a still — see `pdf::render_first_page` —
+/// and `caption_still` reads that same rendered Thumb blob) on top of its
+/// own PDF-text pass — but only when `pdf::AVAILABLE` (macOS, `PDFKit`); off
+/// that platform a `Pdf` source leaves all three passes rather than piling
+/// up as unresolvable `offline`/`pending` work (or, for captions, a
+/// `Caption` item whose Thumb blob can never arrive). OCR/PDF-text emission
+/// is gated the same way on `ocr::AVAILABLE`/`pdf::AVAILABLE`, and the PDF
+/// pass alone counts every excluded asset — once — since it's the one pass
+/// every `Pdf` source still runs through regardless of platform (see
 /// [`WorkPlan::ocr_unavailable`]/[`WorkPlan::pdf_unavailable`]).
 ///
 /// Ten passes over `sources` (rather than one) so `items` comes out
@@ -235,7 +239,16 @@ pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities
         }
     }
     for source in sources.iter().filter(|s| match s.kind {
-        MediaKind::Image | MediaKind::Pdf => true,
+        MediaKind::Image => true,
+        // `caption_still` reads the Thumb blob rather than re-decoding the
+        // source (`crates/services/src/index/run.rs::caption_still`), and
+        // that blob's only producer for a PDF is `pdf::render_first_page` —
+        // same dependency as the thumbnail/image-embed passes above, so a
+        // `Pdf` source must leave this pass too when `!pdf::AVAILABLE`, or
+        // the item would queue for a thumbnail that can never arrive. The
+        // exclusion is still counted exactly once, via `plan_pdf_text` — no
+        // separate counter here.
+        MediaKind::Pdf => pdf::AVAILABLE,
         MediaKind::Video | MediaKind::Audio | MediaKind::Other => false,
     }) {
         if let Some(hex) = asset_hex(&source.asset) {
@@ -592,15 +605,17 @@ fn plan_pdf_text(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut 
     });
 }
 
-/// CAPTIONS, STILLS (`MediaKind::Image | MediaKind::Pdf` — a PDF page
-/// renders like a still): no describer configured -> `needs_model` (checked
-/// first: the [`Derivation::Caption`] blob path depends on the describer's
-/// tag, so done can't be checked without it, same reasoning as
-/// `plan_image_embed`'s model gate). BOTH the caption and
-/// [`Derivation::Tags`] blobs exist -> done — a caption blob alone means a
-/// run died (or hit a backend failure) between the two writes, and counting
-/// it done would leave the tags blob missing forever; the runner skips the
-/// completed caption half on retry. Else offline (no path) / pending+item.
+/// CAPTIONS, STILLS (`MediaKind::Image`, plus `MediaKind::Pdf` when
+/// `pdf::AVAILABLE` — a PDF page renders like a still, but only on a
+/// `PDFKit` build; see `plan_work`'s source filter for this pass): no
+/// describer configured -> `needs_model` (checked first: the
+/// [`Derivation::Caption`] blob path depends on the describer's tag, so done
+/// can't be checked without it, same reasoning as `plan_image_embed`'s model
+/// gate). BOTH the caption and [`Derivation::Tags`] blobs exist -> done — a
+/// caption blob alone means a run died (or hit a backend failure) between
+/// the two writes, and counting it done would leave the tags blob missing
+/// forever; the runner skips the completed caption half on retry. Else
+/// offline (no path) / pending+item.
 fn plan_caption_still(
     source: &AssetSource,
     hex: &str,
@@ -1773,12 +1788,14 @@ mod tests {
     }
 
     /// Phase 7C Task 9 behavior contract, clauses (a)+(b), macOS shape: an
-    /// online image and an online PDF, every capability on. Today's
-    /// behavior — Vision and `PDFKit` are both available — must not
-    /// regress: OCR is queued, the PDF joins the thumbnail/image-embed
-    /// passes on top of its own `PdfText`, and neither exclusion counter
-    /// moves. A regression that flips `ocr::AVAILABLE`/`pdf::AVAILABLE`
-    /// (e.g. a botched `cfg!` edit) fails this test.
+    /// online image and an online PDF, every capability on (including a
+    /// configured describer, so the caption-still pass has something to
+    /// react to). Today's behavior — Vision and `PDFKit` are both available
+    /// — must not regress: OCR is queued, the PDF joins the
+    /// thumbnail/image-embed/caption-still passes on top of its own
+    /// `PdfText`, and neither exclusion counter moves. A regression that
+    /// flips `ocr::AVAILABLE`/`pdf::AVAILABLE` (e.g. a botched `cfg!` edit)
+    /// fails this test.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_includes_ocr_and_pdf_work_with_zero_exclusion_counts() {
@@ -1806,7 +1823,7 @@ mod tests {
             "{:?}",
             plan.items
         );
-        for kind in [WorkKind::Thumb, WorkKind::ImageEmbed] {
+        for kind in [WorkKind::Thumb, WorkKind::ImageEmbed, WorkKind::Caption] {
             assert!(
                 plan.items
                     .iter()
@@ -1821,14 +1838,22 @@ mod tests {
 
     /// Phase 7C Task 9 behavior contract, clauses (a)+(b), off-macOS mirror
     /// of `macos_includes_ocr_and_pdf_work_with_zero_exclusion_counts`: the
-    /// same sources and capabilities, but on a build where Vision/`PDFKit`
-    /// don't exist. No `OcrImage`/`OcrKeyframes`/`PdfText` work is queued
-    /// (a); the PDF leaves the thumbnail/image-embed passes entirely rather
-    /// than piling up as `offline`/`pending` (b); both exclusion counters
-    /// name exactly the one eligible asset each. Can't run on this (macOS)
-    /// dev machine — CI-proven off-macOS in Task 10 — but is written to
-    /// compile cleanly if the `cfg` were ever flipped locally: it only
-    /// touches plain planner types, no platform-gated symbols.
+    /// same sources and capabilities (including a configured describer), but
+    /// on a build where Vision/`PDFKit` don't exist. No
+    /// `OcrImage`/`OcrKeyframes`/`PdfText` work is queued (a); the PDF
+    /// leaves the thumbnail/image-embed/caption-still passes entirely rather
+    /// than piling up as `offline`/`pending` — or, for the caption-still
+    /// pass, queuing a `Caption` item whose only pixel source
+    /// (`caption_still` reads the Thumb blob) can never arrive, which would
+    /// otherwise surface as a confusing runtime failure instead of an
+    /// honest plan-time exclusion (b); both exclusion counters name exactly
+    /// the one eligible asset each. The image asset is unaffected — its
+    /// `Caption` item still plans, since `caption_still`'s pixel source for
+    /// a still image is the Thumb blob produced by the cross-platform
+    /// `image` crate, not `PDFKit`. Can't run on this (macOS) dev machine —
+    /// CI-proven off-macOS in Task 10 — but is written to compile cleanly if
+    /// the `cfg` were ever flipped locally: it only touches plain planner
+    /// types, no platform-gated symbols.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn off_macos_excludes_ocr_and_pdf_work_and_counts_the_exclusions() {
@@ -1853,7 +1878,7 @@ mod tests {
                 plan.items
             );
         }
-        for kind in [WorkKind::Thumb, WorkKind::ImageEmbed] {
+        for kind in [WorkKind::Thumb, WorkKind::ImageEmbed, WorkKind::Caption] {
             assert!(
                 !plan
                     .items
@@ -1863,6 +1888,13 @@ mod tests {
                 plan.items
             );
         }
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.asset == image_asset && i.kind == WorkKind::Caption),
+            "an image's Caption item is unaffected off-macOS: {:?}",
+            plan.items
+        );
         assert_eq!(
             plan.ocr_unavailable, 1,
             "the online, decodable image is eligible for OCR but unqueued"

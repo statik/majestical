@@ -140,8 +140,11 @@ pub struct WorkPlan {
     /// Same accounting as [`Self::ocr_unavailable`], for
     /// [`WorkKind::PdfText`] and `pdf::AVAILABLE` (no `PDFKit`). A `Pdf`
     /// asset excluded from the thumbnail/image-embed passes (see
-    /// `plan_work`'s source filters) is the same asset already counted here
-    /// via `plan_pdf_text` — never double-counted across passes.
+    /// `plan_work`'s source filters) is counted here (via `plan_pdf_text`)
+    /// once when `PdfText` is its blocked pass — one whose `PdfText` blob is
+    /// already done, or that counts offline, lands in [`Self::pdf`] instead
+    /// even though it still leaves those other passes. Never double-counted
+    /// across passes.
     pub pdf_unavailable: u64,
 }
 
@@ -166,8 +169,9 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 /// up as unresolvable `offline`/`pending` work (or, for captions, a
 /// `Caption` item whose Thumb blob can never arrive). OCR/PDF-text emission
 /// is gated the same way on `ocr::AVAILABLE`/`pdf::AVAILABLE`, and the PDF
-/// pass alone counts every excluded asset — once — since it's the one pass
-/// every `Pdf` source still runs through regardless of platform (see
+/// pass alone counts each excluded asset — at most once, when `PdfText` is
+/// its blocked pass — since it's the one pass every `Pdf` source still runs
+/// through regardless of platform (see
 /// [`WorkPlan::ocr_unavailable`]/[`WorkPlan::pdf_unavailable`]).
 ///
 /// Ten passes over `sources` (rather than one) so `items` comes out
@@ -574,9 +578,10 @@ fn plan_ocr_keyframes(
 /// platform-unavailable / pending+item. This is also the single place that
 /// counts [`WorkPlan::pdf_unavailable`]: every `Pdf` source runs through
 /// this pass regardless of platform (unlike the thumbnail/image-embed
-/// passes, which drop `Pdf` sources entirely off `pdf::AVAILABLE`), so one
-/// asset is counted here exactly once even though it was also excluded from
-/// those other two passes.
+/// passes, which drop `Pdf` sources entirely off `pdf::AVAILABLE`), so an
+/// asset excluded from those other two passes is counted here once when
+/// `PdfText` is its blocked pass — a done/offline `PdfText` counts in
+/// [`WorkPlan::pdf`] instead, though the asset still leaves those passes.
 fn plan_pdf_text(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut WorkPlan) {
     let path = blobs.path_for(
         hex,
@@ -754,10 +759,10 @@ mod tests {
         }
     }
 
-    // Asserts an OcrImage item is queued unconditionally — true only when
-    // `ocr::AVAILABLE` (macOS). See `off_macos_excludes_ocr_and_pdf_work`
-    // below for the mirrored off-macOS shape.
-    #[cfg(target_os = "macos")]
+    // The status counts hold on every platform; only the item assertions
+    // branch on `ocr::AVAILABLE` (an OcrImage item is queued only on macOS —
+    // see `off_macos_excludes_ocr_and_pdf_work` below for the fuller
+    // off-macOS shape).
     #[test]
     fn plans_missing_thumbs_and_counts_statuses() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -794,19 +799,29 @@ mod tests {
             "both Image assets (aa11, bb22) are embedding-eligible with no model installed"
         );
         assert_eq!(plan.keyframes.needs_model, 1, "cc33 needs a model too");
-        assert_eq!(
-            plan.items.len(),
-            2,
-            "aa11 is the only online image: its thumb, and its ungated OCR item \
-             (OCR has no capability gate — see plan_ocr_image)"
-        );
         assert!(matches!(plan.items[0].kind, WorkKind::Thumb));
-        assert!(matches!(plan.items[1].kind, WorkKind::OcrImage));
+        if crate::ocr::AVAILABLE {
+            assert_eq!(
+                plan.items.len(),
+                2,
+                "aa11 is the only online image: its thumb, and its ungated OCR item \
+                 (OCR has no capability gate — see plan_ocr_image)"
+            );
+            assert!(matches!(plan.items[1].kind, WorkKind::OcrImage));
+        } else {
+            assert_eq!(
+                plan.items.len(),
+                1,
+                "off-macOS aa11's OCR item is not queued — it counts platform-unavailable"
+            );
+            assert_eq!(plan.ocr_unavailable, 1);
+        }
     }
 
-    // Asserts an OcrImage item is queued for the decodable image — true only
-    // when `ocr::AVAILABLE` (macOS).
-    #[cfg(target_os = "macos")]
+    // The status counts hold on every platform (the undecodable check in
+    // plan_ocr_image precedes its `ocr::AVAILABLE` gate, so `ocr.unsupported`
+    // is cross-platform); only the item assertions branch on
+    // `ocr::AVAILABLE` (an OcrImage item is queued only on macOS).
     #[test]
     fn existing_blobs_count_done_and_raw_images_are_unsupported() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -848,28 +863,41 @@ mod tests {
             "RAW and AVIF are unsupported for OCR too"
         );
         assert_eq!(
-            plan.items.len(),
-            2,
-            "aa11's ImageEmbed and OcrImage — ee55/ff66 are undecodable for both \
-             (recognize_text takes an already-decoded image::RgbImage, same as \
-             embeddings): {:?}",
-            plan.items
-        );
-        assert_eq!(
             plan.items
                 .iter()
                 .filter(|i| i.kind == WorkKind::ImageEmbed)
                 .count(),
             1
         );
-        assert_eq!(
-            plan.items
-                .iter()
-                .filter(|i| i.kind == WorkKind::OcrImage)
-                .count(),
-            1,
-            "only aa11 (the decodable PNG) gets an OcrImage item"
-        );
+        if crate::ocr::AVAILABLE {
+            assert_eq!(
+                plan.items.len(),
+                2,
+                "aa11's ImageEmbed and OcrImage — ee55/ff66 are undecodable for both \
+                 (recognize_text takes an already-decoded image::RgbImage, same as \
+                 embeddings): {:?}",
+                plan.items
+            );
+            assert_eq!(
+                plan.items
+                    .iter()
+                    .filter(|i| i.kind == WorkKind::OcrImage)
+                    .count(),
+                1,
+                "only aa11 (the decodable PNG) gets an OcrImage item"
+            );
+        } else {
+            assert_eq!(
+                plan.items.len(),
+                1,
+                "off-macOS only aa11's ImageEmbed — its OCR counts platform-unavailable: {:?}",
+                plan.items
+            );
+            assert_eq!(
+                plan.ocr_unavailable, 1,
+                "aa11 (decodable) counts platform-unavailable; ee55/ff66 stay unsupported"
+            );
+        }
     }
 
     /// The RAW/JXL extensions this PR added to `media_kind`'s table (pef,

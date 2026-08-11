@@ -73,22 +73,14 @@ close) — nothing in 7C touched app startup, but the standing rule holds:
 repeat the smoke by hand whenever `lib.rs`'s plugin registration or
 `tauri.conf.json` changes; no automated test covers app launch end to end.
 
-## Operator TODO (outstanding — before the next release)
+## Secrets migration (COMPLETE 2026-08-11)
 
-The `release` GitHub Environment exists and `release.yml`'s desktop job
-references it, but the two secret VALUES are still repository-scoped. Only
-the user can move them:
-
-```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY --env release
-gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release
-```
-
-Then a release dry run proves the environment-scoped secrets end to end;
-only after that should the repository-level secrets be deleted. This is safe
-to leave pending — GitHub falls back to the repository secret of the same
-name — but the move is not done until the dry run says so. Full
-instructions: `docs/RELEASING.md`, "The private key".
+The two signing secrets live ONLY in the `release` GitHub Environment; the
+repository-level copies are deleted. The v0.2.0-rc1 dry run proved the
+environment-scoped values end to end (no `does not match the public key` in
+the desktop job's log, `.sig` + `latest.json` uploaded; draft then deleted,
+no tag created). Key rotation instructions: `docs/RELEASING.md`, "The
+private key".
 
 ## Architecture pointers
 

@@ -1,0 +1,345 @@
+<title>Majestical 7D — Browse mockups</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: light-dark(#fafaf9, #1e1e20);
+    --ink: light-dark(#1d1d1f, #ececee);
+    --muted: color-mix(in srgb, currentcolor 55%, transparent);
+    --edge: color-mix(in srgb, currentcolor 16%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --accent: light-dark(#b45309, #e8a33d);
+    --canvas: light-dark(#ffffff, #262629);
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"] { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  .eyebrow {
+    margin: 0 0 .4rem;
+    color: var(--accent);
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+  h1 { margin: 0 0 .5rem; font-size: 1.6rem; letter-spacing: -.01em; text-wrap: balance; }
+  h2 { margin: 3.5rem 0 .35rem; font-size: 1.15rem; }
+  .lede, p { max-width: 70ch; }
+  .lede { color: var(--muted); margin: 0 0 2.5rem; }
+  .qnote { color: var(--muted); margin: .1rem 0 1.1rem; font-size: .85rem; }
+
+  /* ---- window frame around each mockup ---- */
+  .frame {
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    background: var(--canvas);
+    box-shadow: 0 8px 28px rgb(0 0 0 / 10%);
+    overflow: hidden;
+    margin: 1rem 0 .75rem;
+  }
+  .titlebar {
+    display: flex; align-items: center; gap: .45rem;
+    padding: .5rem .75rem;
+    border-bottom: 1px solid var(--edge);
+    background: var(--sunken);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--edge); }
+  .titlebar span { margin-left: .5rem; color: var(--muted); font-size: .72rem; }
+
+  /* ---- mockup internals: the app's own visual language at 11px ---- */
+  .mk { font-size: 11px; line-height: 1.45; }
+  .mk-shell { display: grid; height: 430px; }
+  .shell-a { grid-template-columns: 128px 168px 1fr 208px; }
+  .shell-b { grid-template-columns: 128px 1fr 208px; }
+  .mk-side {
+    display: flex; flex-direction: column; gap: .8rem;
+    padding: .7rem .6rem;
+    border-right: 1px solid var(--edge);
+    background: var(--sunken);
+  }
+  .mk-brand { margin: 0; font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; font-weight: 700; }
+  .mk-nav { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; flex: 1; }
+  .mk-nav li { padding: .28rem .45rem; border-radius: 4px; }
+  .mk-nav li.cur { background: color-mix(in srgb, currentcolor 9%, transparent); font-weight: 600; }
+  .mk-path { margin: 0; color: var(--muted); font-size: .6rem; overflow-wrap: anywhere; }
+
+  .mk-tree { padding: .7rem .5rem; border-right: 1px solid var(--edge); overflow: hidden; }
+  .mk-tree ul { margin: 0; padding: 0 0 0 .75rem; list-style: none; }
+  .mk-tree > ul { padding-left: 0; }
+  .mk-tree li { padding: .14rem .3rem; border-radius: 4px; white-space: nowrap; }
+  .mk-tree .vol { font-weight: 600; }
+  .mk-tree .sel { background: color-mix(in srgb, currentcolor 10%, transparent); }
+  .mk-tree .off { color: var(--muted); }
+  .caret { display: inline-block; width: .8em; color: var(--muted); }
+  .mk-badge {
+    display: inline-block; margin-left: .3rem; padding: 0 .32rem;
+    border: 1px solid var(--edge); border-radius: 999px;
+    color: var(--muted); font-size: .58rem; vertical-align: 1px;
+  }
+
+  .mk-main { display: flex; flex-direction: column; gap: .5rem; padding: .7rem .8rem; overflow: hidden; }
+  .mk-crumbs { display: flex; align-items: center; gap: .3rem; flex-wrap: wrap; }
+  .mk-crumbs b { font-weight: 600; }
+  .mk-crumbs i { color: var(--muted); font-style: normal; }
+  .mk-toolrow { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+  .mk-chip {
+    padding: .12rem .5rem;
+    border: 1px solid var(--edge); border-radius: 999px;
+    color: inherit; font-size: .66rem;
+  }
+  .mk-chip.on { background: color-mix(in srgb, currentcolor 10%, transparent); font-weight: 600; }
+  .mk-chip.dim { color: var(--muted); }
+  .mk-count { margin: 0; color: var(--muted); }
+  .mk-notice { margin: 0; color: var(--muted); font-size: .66rem; }
+
+  .mk-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+    gap: .5rem; margin: 0; padding: 0; list-style: none; overflow: hidden;
+  }
+  .mk-card { display: flex; flex-direction: column; gap: .18rem; padding: .3rem; border: 1px solid var(--edge); border-radius: 6px; }
+  .mk-card.sel { outline: 2px solid color-mix(in srgb, currentcolor 45%, transparent); outline-offset: -1px; }
+  .mk-thumb { position: relative; width: 100%; aspect-ratio: 16/9; border-radius: 4px; background: var(--sunken); overflow: hidden; }
+  .mk-thumb::after { content: ""; position: absolute; inset: 0; background: var(--tint, none); opacity: .75; }
+  .t1 { --tint: linear-gradient(120deg, #7c9aa6, #40525c); }
+  .t2 { --tint: linear-gradient(120deg, #a68a6d, #5c4a38); }
+  .t3 { --tint: linear-gradient(120deg, #6da679, #37543f); }
+  .t4 { --tint: linear-gradient(120deg, #9a7ca6, #4c3d54); }
+  .t5 { --tint: linear-gradient(120deg, #a6a06d, #545038); }
+  .t6 { --tint: linear-gradient(120deg, #6d84a6, #384254); }
+  .dur {
+    position: absolute; right: .2rem; bottom: .2rem; z-index: 1;
+    padding: 0 .28rem; border-radius: 3px;
+    background: rgb(0 0 0 / 62%); color: #fff; font-size: .56rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .offthumb { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; color: var(--muted); font-size: .6rem; }
+  .mk-name { overflow-wrap: anywhere; font-size: .64rem; }
+  .mk-sub { color: var(--muted); font-size: .58rem; }
+
+  /* hover-scrub state on one card */
+  .scrub { position: absolute; inset: auto 0 0 0; z-index: 2; height: 34%; display: flex; }
+  .scrub i { flex: 1; border-right: 1px solid rgb(255 255 255 / 35%); background: rgb(0 0 0 / 40%); }
+  .scrub i.pos { background: rgb(255 255 255 / 30%); }
+  .tc {
+    position: absolute; top: .2rem; left: .2rem; z-index: 2;
+    padding: 0 .28rem; border-radius: 3px;
+    background: rgb(0 0 0 / 62%); color: #fff; font-size: .56rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mk-insp { padding: .7rem .6rem; border-left: 1px solid var(--edge); overflow: hidden; }
+  .mk-insp .big { width: 100%; aspect-ratio: 16/9; border-radius: 4px; background: var(--sunken); position: relative; overflow: hidden; }
+  .mk-insp .big::after { content: ""; position: absolute; inset: 0; background: var(--tint); opacity: .75; }
+  .mk-insp h4 { margin: .4rem 0 0; font-size: .7rem; overflow-wrap: anywhere; }
+  .mk-insp dl { display: grid; grid-template-columns: auto 1fr; gap: .08rem .4rem; margin: .45rem 0 0; font-size: .6rem; }
+  .mk-insp dt { color: var(--muted); }
+  .mk-insp dd { margin: 0; overflow-wrap: anywhere; }
+  .mk-tags { display: flex; flex-wrap: wrap; gap: .25rem; margin: .45rem 0 0; padding: 0; list-style: none; }
+  .mk-tags li { padding: .05rem .4rem; border: 1px solid var(--edge); border-radius: 999px; font-size: .6rem; }
+
+  /* folder pills row (variant B) */
+  .mk-folders { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .mk-folder {
+    display: flex; align-items: center; gap: .3rem;
+    padding: .18rem .55rem;
+    border: 1px solid var(--edge); border-radius: 6px;
+  }
+  .mk-folder small { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* annotation notes */
+  .notes { display: grid; gap: .35rem; margin: 0 0 1rem; padding: 0; list-style: none; max-width: 74ch; }
+  .notes li { display: flex; gap: .6rem; }
+  .notes b {
+    flex: none; width: 1.35rem; height: 1.35rem;
+    display: grid; place-items: center;
+    border: 1px solid var(--accent); border-radius: 50%;
+    color: var(--accent); font-size: .7rem;
+  }
+  .pin {
+    position: absolute; z-index: 3;
+    width: 15px; height: 15px;
+    display: grid; place-items: center;
+    border: 1px solid var(--accent); border-radius: 50%;
+    background: var(--paper);
+    color: var(--accent); font-size: .58rem; font-weight: 600;
+  }
+  .rel { position: relative; }
+
+  .verdict { border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; max-width: 70ch; }
+  .verdict p { margin: .35rem 0; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Majestical · Phase 7D design session · Round 1 of 3</p>
+  <h1>Browse — two layout candidates</h1>
+  <p class="lede">
+    Both mockups use the app's real visual language (Layout C shell, existing tokens and
+    card grid). Browse navigates <strong>cataloged assets only</strong>, works identically for
+    offline drives, and any folder shows its <strong>entire subtree flattened</strong> into one
+    grid — the Kyno drilldown. The sidebar change shown here is shared by every variant:
+    Browse, Ingest, and Organize join Search and Volumes, in workflow order
+    (find → browse → bring in → file away → hardware).
+  </p>
+
+  <h2>Variant A — folder tree pane</h2>
+  <p class="qnote">A persistent tree keeps you oriented across volumes; the grid always shows the selected node's subtree.</p>
+  <div class="frame rel">
+    <div class="pin" style="top: 122px; left: 22px;">1</div>
+    <div class="pin" style="top: 66px; left: 152px;">2</div>
+    <div class="pin" style="top: 210px; left: 152px;">3</div>
+    <div class="pin" style="top: 60px; right: 232px;">4</div>
+    <div class="pin" style="top: 245px; left: 322px;">5</div>
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Browse (variant A)</span></div>
+    <div class="mk">
+      <div class="mk-shell shell-a">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li class="cur">Browse</li>
+            <li>Ingest</li>
+            <li>Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-tree">
+          <ul>
+            <li class="vol"><span class="caret">▾</span>SSD-A</li>
+            <ul>
+              <li><span class="caret">▸</span>Campaigns</li>
+              <li><span class="caret">▾</span>ProjectX</li>
+              <ul>
+                <li class="sel">B-Roll</li>
+                <li>Interviews</li>
+                <li>Stills</li>
+              </ul>
+            </ul>
+            <li class="vol"><span class="caret">▸</span>Archive-9</li>
+            <li class="vol off"><span class="caret">▸</span>Talon-2024<span class="mk-badge">offline</span></li>
+          </ul>
+        </div>
+        <div class="mk-main">
+          <div class="mk-crumbs"><i>SSD-A</i><i>›</i><i>ProjectX</i><i>›</i><b>B-Roll</b></div>
+          <div class="mk-toolrow">
+            <span class="mk-chip on">Flatten subfolders</span>
+            <span class="mk-chip dim">Sort: Captured ↓</span>
+            <span class="mk-chip dim">Kind: All</span>
+          </div>
+          <p class="mk-count">142 items across 11 folders · 9 on an offline volume</p>
+          <ul class="mk-grid">
+            <li class="mk-card"><div class="mk-thumb t1"><span class="tc">00:42</span><span class="dur">02:13</span><span class="scrub"><i></i><i></i><i class="pos"></i><i></i><i></i><i></i></span></div><span class="mk-name">A012_C004.braw</span><span class="mk-sub">video · 4.1 GB</span></li>
+            <li class="mk-card sel"><div class="mk-thumb t2"><span class="dur">00:57</span></div><span class="mk-name">A012_C005.braw</span><span class="mk-sub">video · 1.9 GB</span></li>
+            <li class="mk-card"><div class="mk-thumb t3"></div><span class="mk-name">rooftop_072.arw</span><span class="mk-sub">image · 48 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb t4"></div><span class="mk-name">rooftop_073.arw</span><span class="mk-sub">image · 47 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb"><span class="offthumb">offline</span></div><span class="mk-name">drone_pass_04.mov</span><span class="mk-sub">video · Talon-2024</span></li>
+            <li class="mk-card"><div class="mk-thumb t5"><span class="dur">14:02</span></div><span class="mk-name">interview_sarah_take2.mov</span><span class="mk-sub">video · 22 GB</span></li>
+            <li class="mk-card"><div class="mk-thumb t6"></div><span class="mk-name">slate_notes.pdf</span><span class="mk-sub">pdf · 2 pages</span></li>
+            <li class="mk-card"><div class="mk-thumb t3"></div><span class="mk-name">bts_0114.heic</span><span class="mk-sub">image · 8 MB</span></li>
+          </ul>
+        </div>
+        <aside class="mk-insp">
+          <div class="big t2"></div>
+          <h4>A012_C005.braw</h4>
+          <dl>
+            <dt>Size</dt><dd>1.9 GB</dd>
+            <dt>Captured</dt><dd>2026-07-19</dd>
+            <dt>Volume</dt><dd>SSD-A · online</dd>
+            <dt>PARA</dt><dd>project/client-x</dd>
+            <dt>Verified</dt><dd>2026-08-02 ✓</dd>
+          </dl>
+          <ul class="mk-tags"><li>b-roll</li><li>rooftop</li><li>golden-hour</li></ul>
+        </aside>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>1</b><span>Sidebar order for the whole phase: Search, Browse, Ingest, Organize, Volumes. Say if you want a different order.</span></li>
+    <li><b>2</b><span>Tree pane: volumes at the root, folders beneath; offline volumes browse identically, just badged. Selecting any node scopes the grid to its whole subtree.</span></li>
+    <li><b>3</b><span>The tree is a fourth column — at a 13″ window with the inspector open, the grid drops to roughly three thumbnails per row.</span></li>
+    <li><b>4</b><span>“Flatten subfolders” is on by default (the Drilldown). Toggled off, the grid shows only the folder's direct children.</span></li>
+    <li><b>5</b><span>Hover-scrub on video cards: the filmstrip strip appears on hover, mouse-x picks the keyframe, timecode chip top-left. Click pins that frame in the inspector.</span></li>
+  </ul>
+
+  <h2>Variant B — breadcrumb drilldown, no tree</h2>
+  <p class="qnote">Same three-pane shell as Search. Child folders render as a pill row you click into; the breadcrumb is the way back up.</p>
+  <div class="frame rel">
+    <div class="pin" style="top: 96px; left: 322px;">1</div>
+    <div class="pin" style="top: 96px; right: 380px;">2</div>
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Browse (variant B)</span></div>
+    <div class="mk">
+      <div class="mk-shell shell-b">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li class="cur">Browse</li>
+            <li>Ingest</li>
+            <li>Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-main">
+          <div class="mk-crumbs"><i>All volumes</i><i>›</i><i>SSD-A</i><i>›</i><b>ProjectX</b></div>
+          <div class="mk-folders">
+            <span class="mk-folder">📁 B-Roll <small>142</small></span>
+            <span class="mk-folder">📁 Interviews <small>36</small></span>
+            <span class="mk-folder">📁 Stills <small>410</small></span>
+          </div>
+          <div class="mk-toolrow">
+            <span class="mk-chip on">Flatten subfolders</span>
+            <span class="mk-chip dim">Sort: Captured ↓</span>
+            <span class="mk-chip dim">Kind: All</span>
+          </div>
+          <p class="mk-count">588 items across 14 folders · 9 on an offline volume</p>
+          <ul class="mk-grid">
+            <li class="mk-card"><div class="mk-thumb t1"><span class="dur">02:13</span></div><span class="mk-name">A012_C004.braw</span><span class="mk-sub">video · 4.1 GB</span></li>
+            <li class="mk-card sel"><div class="mk-thumb t2"><span class="dur">00:57</span></div><span class="mk-name">A012_C005.braw</span><span class="mk-sub">video · 1.9 GB</span></li>
+            <li class="mk-card"><div class="mk-thumb t3"></div><span class="mk-name">rooftop_072.arw</span><span class="mk-sub">image · 48 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb t4"></div><span class="mk-name">rooftop_073.arw</span><span class="mk-sub">image · 47 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb"><span class="offthumb">offline</span></div><span class="mk-name">drone_pass_04.mov</span><span class="mk-sub">video · Talon-2024</span></li>
+            <li class="mk-card"><div class="mk-thumb t5"><span class="dur">14:02</span></div><span class="mk-name">interview_sarah_take2.mov</span><span class="mk-sub">video · 22 GB</span></li>
+            <li class="mk-card"><div class="mk-thumb t6"></div><span class="mk-name">slate_notes.pdf</span><span class="mk-sub">pdf · 2 pages</span></li>
+            <li class="mk-card"><div class="mk-thumb t3"></div><span class="mk-name">bts_0114.heic</span><span class="mk-sub">image · 8 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb t4"></div><span class="mk-name">bts_0115.heic</span><span class="mk-sub">image · 8 MB</span></li>
+            <li class="mk-card"><div class="mk-thumb t1"><span class="dur">00:31</span></div><span class="mk-name">A013_C001.braw</span><span class="mk-sub">video · 1.1 GB</span></li>
+          </ul>
+        </div>
+        <aside class="mk-insp">
+          <div class="big t2"></div>
+          <h4>A012_C005.braw</h4>
+          <dl>
+            <dt>Size</dt><dd>1.9 GB</dd>
+            <dt>Captured</dt><dd>2026-07-19</dd>
+            <dt>Volume</dt><dd>SSD-A · online</dd>
+            <dt>PARA</dt><dd>project/client-x</dd>
+            <dt>Verified</dt><dd>2026-08-02 ✓</dd>
+          </dl>
+          <ul class="mk-tags"><li>b-roll</li><li>rooftop</li><li>golden-hour</li></ul>
+        </aside>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>1</b><span>Child folders as a pill row with item counts — the drill-down affordance. The root level shows one pill per volume.</span></li>
+    <li><b>2</b><span>No fourth column: the grid keeps Search's width, and the surface reuses Search's exact grid/inspector machinery — least new layout code of the two.</span></li>
+  </ul>
+
+  <div class="verdict">
+    <p><strong>My read:</strong> A is the stronger Browse for a media catalog — folder trees are the
+    mental model every DIT already has, offline volumes stay visible in the tree instead of
+    being something you have to remember to drill into, and the orientation cost of B's
+    pill-row (where am I? what's beside me?) grows with catalog depth. The fourth column is
+    real but tolerable: the tree can collapse to a strip once a selection is made.</p>
+    <p><strong>Both variants share:</strong> flatten-on-by-default, degradation notices verbatim under
+    the count line, the existing inspector unchanged, and hover-scrub as drawn in A's note 5.</p>
+  </div>
+</div>

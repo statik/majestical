@@ -1,0 +1,252 @@
+<title>Majestical 7D — Organize mockups</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: light-dark(#fafaf9, #1e1e20);
+    --ink: light-dark(#1d1d1f, #ececee);
+    --muted: color-mix(in srgb, currentcolor 55%, transparent);
+    --edge: color-mix(in srgb, currentcolor 16%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --accent: light-dark(#b45309, #e8a33d);
+    --canvas: light-dark(#ffffff, #262629);
+    --alert: light-dark(#b3261e, #f2b8b5);
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"] { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  .eyebrow { margin: 0 0 .4rem; color: var(--accent); font-size: .72rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+  h1 { margin: 0 0 .5rem; font-size: 1.6rem; letter-spacing: -.01em; text-wrap: balance; }
+  h2 { margin: 3.5rem 0 .35rem; font-size: 1.15rem; }
+  .lede, p { max-width: 70ch; }
+  .lede { color: var(--muted); margin: 0 0 2.5rem; }
+  .qnote { color: var(--muted); margin: .1rem 0 1.1rem; font-size: .85rem; }
+
+  .frame {
+    border: 1px solid var(--edge); border-radius: 10px;
+    background: var(--canvas);
+    box-shadow: 0 8px 28px rgb(0 0 0 / 10%);
+    overflow: hidden; margin: 1rem 0 .75rem;
+  }
+  .titlebar { display: flex; align-items: center; gap: .45rem; padding: .5rem .75rem; border-bottom: 1px solid var(--edge); background: var(--sunken); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--edge); }
+  .titlebar span { margin-left: .5rem; color: var(--muted); font-size: .72rem; }
+
+  .mk { font-size: 11px; line-height: 1.45; }
+  .mk-shell { display: grid; height: 430px; grid-template-columns: 128px 1fr; }
+  .mk-side { display: flex; flex-direction: column; gap: .8rem; padding: .7rem .6rem; border-right: 1px solid var(--edge); background: var(--sunken); }
+  .mk-brand { margin: 0; font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; font-weight: 700; }
+  .mk-nav { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; flex: 1; }
+  .mk-nav li { padding: .28rem .45rem; border-radius: 4px; }
+  .mk-nav li.cur { background: color-mix(in srgb, currentcolor 9%, transparent); font-weight: 600; }
+  .mk-path { margin: 0; color: var(--muted); font-size: .6rem; overflow-wrap: anywhere; }
+
+  .mk-main { display: flex; flex-direction: column; gap: .5rem; padding: .7rem .8rem; overflow: hidden; }
+  .mk-h { margin: 0; font-size: .8rem; font-weight: 600; }
+  .mk-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; flex: 1; min-height: 0; }
+  .mk-col { display: flex; flex-direction: column; gap: .45rem; min-height: 0; }
+  .mk-label { margin: 0; color: var(--muted); font-size: .62rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+
+  .mk-tree { margin: 0; padding: 0; list-style: none; overflow: hidden; }
+  .mk-tree > li { padding: .1rem 0; }
+  .kind { color: var(--muted); font-size: .62rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; margin: .35rem 0 .1rem; }
+  .node { display: flex; align-items: center; gap: .35rem; padding: .16rem .4rem; border-radius: 4px; }
+  .node.sel { background: color-mix(in srgb, currentcolor 10%, transparent); font-weight: 600; }
+  .node small { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+  .node .arch { color: var(--muted); font-size: .58rem; border: 1px solid var(--edge); border-radius: 999px; padding: 0 .3rem; }
+
+  .mk-detail { border: 1px solid var(--edge); border-radius: 6px; padding: .55rem .65rem; display: flex; flex-direction: column; gap: .3rem; }
+  .mk-detail h4 { margin: 0; font-size: .72rem; }
+  .mk-detail p { margin: 0; color: var(--muted); font-size: .62rem; }
+  .mk-actions { display: flex; gap: .35rem; margin-top: .2rem; }
+  .mk-btn { padding: .16rem .55rem; border: 1px solid var(--edge); border-radius: 5px; font-size: .64rem; }
+  .mk-btn.warn { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, transparent); }
+
+  .taglist { margin: 0; padding: 0; list-style: none; overflow: hidden; }
+  .tagrow { display: flex; align-items: center; gap: .4rem; padding: .18rem .4rem; border-radius: 4px; }
+  .tagrow.sel { background: color-mix(in srgb, currentcolor 10%, transparent); }
+  .tagpill { padding: .05rem .45rem; border: 1px solid var(--edge); border-radius: 999px; font-size: .62rem; }
+  .tagrow small { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+  .tagrow .dupe { color: var(--accent); font-size: .58rem; }
+  .mk-input { padding: .2rem .45rem; border: 1px solid var(--edge); border-radius: 5px; color: var(--muted); font-size: .64rem; }
+
+  /* modal overlay mockups */
+  .overlay { position: relative; }
+  .overlay::after { content: ""; position: absolute; inset: 0; background: rgb(0 0 0 / 30%); }
+  .modal {
+    position: absolute; z-index: 2; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 330px; padding: .8rem .9rem;
+    border: 1px solid var(--edge); border-radius: 8px;
+    background: var(--canvas);
+    box-shadow: 0 12px 40px rgb(0 0 0 / 30%);
+    font-size: 11px;
+  }
+  .modal h4 { margin: 0 0 .3rem; font-size: .78rem; }
+  .modal p { margin: 0 0 .4rem; color: var(--muted); font-size: .64rem; max-width: none; }
+  .modal ul { margin: 0 0 .5rem; padding: 0; list-style: none; border: 1px solid var(--edge); border-radius: 5px; }
+  .modal li { display: flex; gap: .4rem; padding: .22rem .45rem; border-bottom: 1px solid var(--edge); font-size: .62rem; }
+  .modal li:last-child { border-bottom: 0; }
+  .modal li i { color: var(--muted); font-style: normal; }
+  .modal .row { display: flex; justify-content: flex-end; gap: .4rem; }
+
+  /* selection toolbar */
+  .selbar {
+    display: flex; align-items: center; gap: .5rem;
+    width: max-content; margin: .3rem auto 0;
+    padding: .3rem .6rem;
+    border: 1px solid var(--edge); border-radius: 8px;
+    background: var(--canvas);
+    box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+    font-size: .68rem;
+  }
+  .selbar b { font-variant-numeric: tabular-nums; }
+
+  .notes { display: grid; gap: .35rem; margin: 0 0 1rem; padding: 0; list-style: none; max-width: 74ch; }
+  .notes li { display: flex; gap: .6rem; }
+  .notes b { flex: none; width: 1.35rem; height: 1.35rem; display: grid; place-items: center; border: 1px solid var(--accent); border-radius: 50%; color: var(--accent); font-size: .7rem; }
+  .pin { position: absolute; z-index: 3; width: 15px; height: 15px; display: grid; place-items: center; border: 1px solid var(--accent); border-radius: 50%; background: var(--paper); color: var(--accent); font-size: .58rem; font-weight: 600; }
+  .rel { position: relative; }
+  .verdict { border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; max-width: 70ch; }
+  .verdict p { margin: .35rem 0; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Majestical · Phase 7D design session · Round 2 of 3</p>
+  <h1>Organize — structure on the left, vocabulary on the right</h1>
+  <p class="lede">
+    Organize manages the PARA structure and the tag vocabulary; putting assets <em>into</em>
+    them happens where the assets are (a selection toolbar in Browse and Search, shown at the
+    bottom). One layout candidate this round plus two interaction details — the layout
+    question is smaller here, so I've drawn my recommendation and one alternative as a note
+    rather than two full frames.
+  </p>
+
+  <h2>The surface — two columns: PARA tree · tag manager</h2>
+  <p class="qnote">Both halves visible at once; no tabs. The alternative — PARA and Tags as separate sidebar surfaces — is note 5.</p>
+  <div class="frame rel">
+    <div class="pin" style="top: 108px; left: 200px;">1</div>
+    <div class="pin" style="top: 285px; left: 200px;">2</div>
+    <div class="pin" style="top: 108px; right: 428px;">3</div>
+    <div class="pin" style="top: 212px; right: 428px;">4</div>
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Organize</span></div>
+    <div class="mk">
+      <div class="mk-shell">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li>Browse</li>
+            <li>Ingest</li>
+            <li class="cur">Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-main">
+          <div class="mk-cols">
+            <div class="mk-col">
+              <p class="mk-label">PARA structure</p>
+              <ul class="mk-tree">
+                <li class="kind">Projects</li>
+                <li><span class="node sel">client-x <small>1,204</small></span></li>
+                <li><span class="node">spring-campaign <small>388</small></span></li>
+                <li class="kind">Areas</li>
+                <li><span class="node">studio-ops <small>92</small></span></li>
+                <li class="kind">Resources</li>
+                <li><span class="node">stock-library <small>3,551</small></span></li>
+                <li class="kind">Archive</li>
+                <li><span class="node">talon-2024 <span class="arch">archived</span> <small>7,712</small></span></li>
+              </ul>
+              <div class="mk-detail">
+                <h4>project/client-x</h4>
+                <p>1,204 assets · materialized at SSD-A/Projects/client-x</p>
+                <div class="mk-actions">
+                  <span class="mk-btn">Rename</span>
+                  <span class="mk-btn warn">Archive…</span>
+                </div>
+              </div>
+              <span class="mk-btn" style="width: max-content;">+ New node</span>
+            </div>
+            <div class="mk-col">
+              <p class="mk-label">Tags · 48</p>
+              <span class="mk-input">Filter tags…</span>
+              <ul class="taglist">
+                <li class="tagrow"><span class="tagpill">b-roll</span><small>412</small></li>
+                <li class="tagrow sel"><span class="tagpill">golden-hour</span><span class="dupe">≈ goldenhour</span><small>67</small></li>
+                <li class="tagrow"><span class="tagpill">goldenhour</span><span class="dupe">≈ golden-hour</span><small>9</small></li>
+                <li class="tagrow"><span class="tagpill">interview</span><small>140</small></li>
+                <li class="tagrow"><span class="tagpill">rooftop</span><small>52</small></li>
+                <li class="tagrow"><span class="tagpill">drone</span><small>203</small></li>
+              </ul>
+              <div class="mk-detail">
+                <h4>golden-hour</h4>
+                <p>67 assets · last used 2026-08-06</p>
+                <div class="mk-actions">
+                  <span class="mk-btn">Rename</span>
+                  <span class="mk-btn">Merge into…</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>1</b><span>PARA nodes grouped under their four kinds, asset counts from the projection. Selecting a node fills the detail card; “1,204” click-throughs to Search filtered by <code>para:</code> land in a later phase, not this one.</span></li>
+    <li><b>2</b><span>Archive… opens the dry-run preview modal below — archive can move real directories, so the GUI never runs it blind.</span></li>
+    <li><b>3</b><span>Tag list with usage counts. Near-duplicates (case/hyphen variants) get a ≈ hint so merge targets are findable — computed client-side, no new service verb.</span></li>
+    <li><b>4</b><span>Rename and Merge into… are the two new CRDT verbs. Merge rewrites every tagged asset to the target tag and retires the source.</span></li>
+    <li><b>5</b><span>The alternative layout: “PARA” and “Tags” as two separate sidebar entries instead of one Organize surface. More sidebar rows for less density — I don't recommend it, but say so if you prefer it.</span></li>
+  </ul>
+
+  <h2>Detail — archive dry-run preview</h2>
+  <p class="qnote">The GUI equivalent of the MCP dry-run default: preview describes real state read from disk, then one explicit confirm.</p>
+  <div class="frame rel">
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Organize (archive confirm)</span></div>
+    <div class="mk overlay" style="height: 300px;">
+      <div class="modal">
+        <h4>Archive project/client-x?</h4>
+        <p>Dry run against the two materialized roots found for this node:</p>
+        <ul>
+          <li><i>move</i> SSD-A/Projects/client-x → SSD-A/Archive/2026/client-x</li>
+          <li><i>move</i> NAS-1/Projects/client-x → NAS-1/Archive/2026/client-x</li>
+          <li><i>event</i> para_node_archive · 1,204 assets keep their history</li>
+        </ul>
+        <div class="row"><span class="mk-btn">Cancel</span><span class="mk-btn warn">Archive node</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Detail — the selection toolbar (lives in Browse and Search, not Organize)</h2>
+  <p class="qnote">Multi-select in any grid raises this bar; this is how assets get tagged and filed in bulk.</p>
+  <div class="frame rel">
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Browse (3 selected)</span></div>
+    <div class="mk" style="padding: 1.2rem 0 1.4rem;">
+      <div class="selbar">
+        <b>3 selected</b>
+        <span class="mk-btn">Tag…</span>
+        <span class="mk-btn">File to node…</span>
+        <span class="mk-btn" style="border: 0; color: var(--muted);">Clear</span>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>·</b><span>“Tag…” opens a tag picker (existing tags + create new); “File to node…” a PARA node picker emitting one <code>asset_para_set</code> per asset — catalog metadata only, no files move. Both act on N assets and report “Tagged 3 assets” with any per-asset failures listed, never silently dropped.</span></li>
+  </ul>
+
+  <div class="verdict">
+    <p><strong>My read:</strong> the two-column Organize keeps structure and vocabulary in one glance —
+    they're both "the taxonomy," and merge/rename decisions often reference what's on the other
+    side (a tag that should become a node, a node name colliding with a tag). The selection
+    toolbar belongs to the grids because bulk curation starts from looking at assets, not from
+    the taxonomy.</p>
+  </div>
+</div>

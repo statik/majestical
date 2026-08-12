@@ -1,0 +1,258 @@
+<title>Majestical 7D — Ingest mockups</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: light-dark(#fafaf9, #1e1e20);
+    --ink: light-dark(#1d1d1f, #ececee);
+    --muted: color-mix(in srgb, currentcolor 55%, transparent);
+    --edge: color-mix(in srgb, currentcolor 16%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --accent: light-dark(#b45309, #e8a33d);
+    --canvas: light-dark(#ffffff, #262629);
+    --alert: light-dark(#b3261e, #f2b8b5);
+    --ok: light-dark(#1a7f37, #6fce8a);
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"] { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  .eyebrow { margin: 0 0 .4rem; color: var(--accent); font-size: .72rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+  h1 { margin: 0 0 .5rem; font-size: 1.6rem; letter-spacing: -.01em; text-wrap: balance; }
+  h2 { margin: 3.5rem 0 .35rem; font-size: 1.15rem; }
+  .lede, p { max-width: 70ch; }
+  .lede { color: var(--muted); margin: 0 0 2.5rem; }
+  .qnote { color: var(--muted); margin: .1rem 0 1.1rem; font-size: .85rem; }
+
+  .frame { border: 1px solid var(--edge); border-radius: 10px; background: var(--canvas); box-shadow: 0 8px 28px rgb(0 0 0 / 10%); overflow: hidden; margin: 1rem 0 .75rem; }
+  .titlebar { display: flex; align-items: center; gap: .45rem; padding: .5rem .75rem; border-bottom: 1px solid var(--edge); background: var(--sunken); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--edge); }
+  .titlebar span { margin-left: .5rem; color: var(--muted); font-size: .72rem; }
+
+  .mk { font-size: 11px; line-height: 1.45; }
+  .mk-shell { display: grid; grid-template-columns: 128px 1fr; }
+  .mk-side { display: flex; flex-direction: column; gap: .8rem; padding: .7rem .6rem; border-right: 1px solid var(--edge); background: var(--sunken); }
+  .mk-brand { margin: 0; font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; font-weight: 700; }
+  .mk-nav { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; flex: 1; }
+  .mk-nav li { padding: .28rem .45rem; border-radius: 4px; }
+  .mk-nav li.cur { background: color-mix(in srgb, currentcolor 9%, transparent); font-weight: 600; }
+  .mk-path { margin: 0; color: var(--muted); font-size: .6rem; overflow-wrap: anywhere; }
+
+  .mk-main { display: flex; flex-direction: column; gap: .55rem; padding: .8rem .9rem; }
+  .mk-label { margin: 0; color: var(--muted); font-size: .62rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+  .board { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+  .panel { border: 1px solid var(--edge); border-radius: 6px; padding: .55rem .65rem; display: flex; flex-direction: column; gap: .35rem; }
+  .panel h4 { margin: 0; font-size: .72rem; }
+  .panel p { margin: 0; color: var(--muted); font-size: .62rem; max-width: none; }
+  .mk-btn { width: max-content; padding: .18rem .6rem; border: 1px solid var(--edge); border-radius: 5px; font-size: .66rem; }
+  .mk-btn.primary { border-color: color-mix(in srgb, currentcolor 45%, transparent); font-weight: 600; }
+  .mk-btn.ghost { border: 0; color: var(--muted); }
+  .destrow { display: flex; align-items: center; gap: .4rem; padding: .22rem .4rem; border: 1px solid var(--edge); border-radius: 5px; font-size: .62rem; }
+  .destrow i { font-style: normal; color: var(--muted); margin-left: auto; }
+  .planline { display: flex; gap: .9rem; font-size: .64rem; font-variant-numeric: tabular-nums; }
+  .planline b { font-weight: 600; }
+  .planline .rej { color: var(--muted); }
+  .mk-notice { margin: 0; color: var(--muted); font-size: .62rem; }
+  .startrow { display: flex; align-items: center; gap: .6rem; margin-top: .15rem; }
+
+  .bar { position: relative; height: 8px; border: 1px solid var(--edge); border-radius: 999px; overflow: hidden; }
+  .bar i { position: absolute; inset: 0; width: var(--w, 40%); background: color-mix(in srgb, currentcolor 55%, transparent); }
+  .filerow { display: flex; gap: .5rem; font-size: .62rem; font-variant-numeric: tabular-nums; }
+  .filerow .name { overflow-wrap: anywhere; }
+  .filerow i { font-style: normal; color: var(--muted); margin-left: auto; white-space: nowrap; }
+  .stat { font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--alert); }
+
+  .resume {
+    display: flex; align-items: center; gap: .6rem;
+    padding: .4rem .6rem;
+    border: 1px solid var(--edge); border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    font-size: .66rem;
+  }
+  .resume p { margin: 0; max-width: none; }
+
+  .notes { display: grid; gap: .35rem; margin: 0 0 1rem; padding: 0; list-style: none; max-width: 74ch; }
+  .notes li { display: flex; gap: .6rem; }
+  .notes b { flex: none; width: 1.35rem; height: 1.35rem; display: grid; place-items: center; border: 1px solid var(--accent); border-radius: 50%; color: var(--accent); font-size: .7rem; }
+  .pin { position: absolute; z-index: 3; width: 15px; height: 15px; display: grid; place-items: center; border: 1px solid var(--accent); border-radius: 50%; background: var(--paper); color: var(--accent); font-size: .58rem; font-weight: 600; }
+  .rel { position: relative; }
+  .verdict { border-left: 3px solid var(--accent); padding: .1rem 0 .1rem 1rem; max-width: 70ch; }
+  .verdict p { margin: .35rem 0; }
+  code { font-size: .85em; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Majestical · Phase 7D design session · Round 3 of 3</p>
+  <h1>Ingest — one verified job, three honest states</h1>
+  <p class="lede">
+    Single job with live progress, per your scope call. The surface is a board that walks
+    left-to-right: source → destinations → plan → run. Nothing copies before the plan is on
+    screen, progress is per-file and per-byte off the new engine seam, and a crash turns into
+    a resume banner, not a lost run. The queue waits for a later phase.
+  </p>
+
+  <h2>State 1 — setup, plan visible before anything runs</h2>
+  <div class="frame rel">
+    <div class="pin" style="top: 84px; left: 200px;">1</div>
+    <div class="pin" style="top: 84px; right: 350px;">2</div>
+    <div class="pin" style="top: 236px; left: 200px;">3</div>
+    <div class="pin" style="top: 320px; left: 200px;">4</div>
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Ingest (planning)</span></div>
+    <div class="mk">
+      <div class="mk-shell">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li>Browse</li>
+            <li class="cur">Ingest</li>
+            <li>Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-main">
+          <div class="board">
+            <div class="panel">
+              <h4>Source</h4>
+              <div class="destrow">/Volumes/A7IV-CARD <i>card · 214 files · 96.4 GB</i></div>
+              <span class="mk-btn">Choose source…</span>
+            </div>
+            <div class="panel">
+              <h4>Destinations</h4>
+              <div class="destrow">SSD-A/Projects/client-x <i>1.2 TB free</i></div>
+              <div class="destrow">NAS-1/Projects/client-x <i>18 TB free</i></div>
+              <span class="mk-btn">+ Add destination</span>
+            </div>
+          </div>
+          <div class="panel">
+            <h4>File as</h4>
+            <div class="board" style="gap: .5rem;">
+              <div class="destrow">PARA node: project/client-x <i>change…</i></div>
+              <div class="destrow">Subfolder: 2026-08-12_card-a <i>from template</i></div>
+            </div>
+          </div>
+          <div class="panel">
+            <h4>Plan</h4>
+            <div class="planline"><b>207 to copy</b> <span>94.1 GB</span> <span class="rej">5 duplicates skipped</span> <span class="rej">2 rejected (unreadable)</span></div>
+            <p class="mk-notice">notice: 2 files could not be hashed on the card — listed below the run when it completes</p>
+          </div>
+          <div class="startrow">
+            <span class="mk-btn primary">Start verified copy</span>
+            <span class="mk-btn ghost">Plan again</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>1</b><span>Source via the native folder picker; the summary line comes from the same plan verb the CLI uses. Card detection is just “it's a mounted volume” — no special casing this phase.</span></li>
+    <li><b>2</b><span>Multiple destinations, each verified independently — the OffShoot-style multi-destination copy the engine already does.</span></li>
+    <li><b>3</b><span>The plan is the dry run: counts, bytes, duplicates, rejects, and service notices verbatim, on screen before the Start button does anything. Same polarity doctrine as everywhere: rejects are rows, not errors.</span></li>
+    <li><b>4</b><span>Start is disabled until a source, at least one destination, and a PARA node are set and the plan is current (any edit stales it back to “Plan again”).</span></li>
+  </ul>
+
+  <h2>State 2 — running, the progress seam on screen</h2>
+  <div class="frame rel">
+    <div class="pin" style="top: 96px; left: 200px;">5</div>
+    <div class="pin" style="top: 190px; left: 200px;">6</div>
+    <div class="pin" style="top: 288px; left: 200px;">7</div>
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Ingest (running)</span></div>
+    <div class="mk">
+      <div class="mk-shell">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li>Browse</li>
+            <li class="cur">Ingest</li>
+            <li>Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-main">
+          <div class="panel">
+            <h4>Copying — run 01J5PXH3 · resumable</h4>
+            <div class="bar"><i style="--w: 43%;"></i></div>
+            <div class="planline"><b>89 / 207 files</b> <span>40.5 / 94.1 GB</span> <span>elapsed 06:12 · about 08:40 left</span></div>
+          </div>
+          <div class="panel">
+            <h4>Now</h4>
+            <div class="filerow"><span class="name">A012_C089.braw</span> <i>copy → SSD-A · 61%</i></div>
+            <div class="filerow"><span class="name">A012_C088.braw</span> <i>verify → NAS-1 · xxh3</i></div>
+          </div>
+          <div class="panel">
+            <h4>Destinations</h4>
+            <div class="filerow"><span class="name">SSD-A/Projects/client-x</span> <i class="stat">88 placed · 0 failed</i></div>
+            <div class="filerow"><span class="name">NAS-1/Projects/client-x</span> <i class="stat">86 placed · <span class="bad">1 failed</span></i></div>
+          </div>
+          <div class="startrow">
+            <span class="mk-btn">Stop after current file</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>5</b><span>The run id is on screen from the first second — the same id <code>maj ingest --resume</code> takes, so a GUI run can be picked up from the CLI and vice versa.</span></li>
+    <li><b>6</b><span>Progress events off the new engine seam: per-file start/bytes/done over a Tauri event channel. Leaving the surface doesn't cancel the run; the sidebar shows a small “Ingest ●” running marker.</span></li>
+    <li><b>7</b><span>Per-destination tallies update live; a failure turns its row's counter red but the run continues — per-item failures are rows, only total/operator-fixable failures abort.</span></li>
+  </ul>
+
+  <h2>State 3 — done, and the crash-recovery banner</h2>
+  <div class="frame rel">
+    <div class="titlebar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>Majestical — Ingest (complete · and a resume banner)</span></div>
+    <div class="mk">
+      <div class="mk-shell">
+        <nav class="mk-side">
+          <h3 class="mk-brand">Majestical</h3>
+          <ul class="mk-nav">
+            <li>Search</li>
+            <li>Browse</li>
+            <li class="cur">Ingest</li>
+            <li>Organize</li>
+            <li>Volumes</li>
+          </ul>
+          <p class="mk-path">~/Catalogs/studio.maj</p>
+        </nav>
+        <div class="mk-main">
+          <div class="resume">
+            <p><b>Unfinished run 01J5PXH3</b> — 118 of 207 files placed before the app closed.</p>
+            <span class="mk-btn primary">Resume</span>
+            <span class="mk-btn ghost">Dismiss</span>
+          </div>
+          <div class="panel">
+            <h4>Run 01J5PW2A — complete</h4>
+            <div class="planline"><b class="ok">205 placed ✓</b> <span class="bad">2 failed</span> <span>94.0 GB · 14:52</span></div>
+            <p class="mk-notice">MHL generation written per destination · events emitted · assets queued for indexing</p>
+          </div>
+          <div class="panel">
+            <h4>Failures — kept, named, actionable</h4>
+            <div class="filerow"><span class="name">A012_C101.braw</span> <i class="bad">verify mismatch at NAS-1 — marked failed, quarantined</i></div>
+            <div class="filerow"><span class="name">A012_C102.braw</span> <i class="bad">source read error — not placed</i></div>
+            <div class="startrow"><span class="mk-btn">Re-copy failed…</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>·</b><span>On surface load the GUI checks the transfer journal; an incomplete run becomes the amber resume banner. The completion card states exactly what exists: placed counts from real rows, per-destination MHL generations, failures quarantined with reasons — never a green checkmark over a partial truth.</span></li>
+  </ul>
+
+  <div class="verdict">
+    <p><strong>My read:</strong> this is the OffShoot claim made honest in Majestical's idiom — plan
+    first, verify always, resume anything, and the GUI shows the same run ids and outcome rows
+    the CLI and MCP see. The only new machinery is the progress seam; everything else rides
+    the existing engine, journal, and outcome structs.</p>
+  </div>
+</div>

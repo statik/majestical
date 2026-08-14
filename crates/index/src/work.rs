@@ -33,6 +33,8 @@ pub enum WorkKind {
     Thumb,
     ImageEmbed,
     Keyframes,
+    /// A video whose keyframe manifest is ready -> per-timestamp image blobs.
+    KeyframeImages,
     /// Video or audio bytes -> a whisper transcript blob.
     Transcribe,
     /// A transcript blob -> chunk vector blobs (text embeddings).
@@ -116,12 +118,14 @@ pub struct KindStatus {
 /// already has.
 #[derive(Debug, Default)]
 pub struct WorkPlan {
-    /// Priority-ordered: thumbnails, image embeddings, keyframes,
-    /// transcripts, transcript embeddings, OCR, PDF text, then captions.
+    /// Priority-ordered: thumbnails, image embeddings, keyframes, keyframe
+    /// images, transcripts, transcript embeddings, OCR, PDF text, then
+    /// captions.
     pub items: Vec<WorkItem>,
     pub thumbs: KindStatus,
     pub embeddings: KindStatus,
     pub keyframes: KindStatus,
+    pub keyframe_images: KindStatus,
     /// Covers both [`WorkKind::Transcribe`] and [`WorkKind::TranscriptEmbed`]
     /// — totals are derivation counts, not asset counts: one audio asset with
     /// a transcript blob and its chunk vectors counts `done` twice here.
@@ -174,11 +178,11 @@ fn is_undecodable(path: &std::path::Path) -> bool {
 /// through regardless of platform (see
 /// [`WorkPlan::ocr_unavailable`]/[`WorkPlan::pdf_unavailable`]).
 ///
-/// Ten passes over `sources` (rather than one) so `items` comes out
+/// Eleven passes over `sources` (rather than one) so `items` comes out
 /// globally priority-ordered — every thumbnail before every image embedding
-/// before every keyframe set before every transcript before every transcript
-/// embedding before every OCR item before every PDF text item before every
-/// caption — instead of grouped per asset.
+/// before every keyframe set before every keyframe-image set before every
+/// transcript before every transcript embedding before every OCR item before
+/// every PDF text item before every caption — instead of grouped per asset.
 #[must_use]
 pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities) -> WorkPlan {
     let mut plan = WorkPlan::default();
@@ -208,6 +212,11 @@ pub fn plan_work(sources: &[AssetSource], blobs: &BlobStore, caps: &Capabilities
     for source in sources.iter().filter(|s| s.kind == MediaKind::Video) {
         if let Some(hex) = asset_hex(&source.asset) {
             plan_keyframes(source, hex, blobs, caps, &mut plan);
+        }
+    }
+    for source in sources.iter().filter(|s| s.kind == MediaKind::Video) {
+        if let Some(hex) = asset_hex(&source.asset) {
+            plan_keyframe_images(source, hex, blobs, caps, &mut plan);
         }
     }
     for source in sources.iter().filter(|s| match s.kind {
@@ -515,6 +524,72 @@ fn plan_ocr_image(source: &AssetSource, hex: &str, blobs: &BlobStore, plan: &mut
     });
 }
 
+/// The vision `model_tag`, iff `hex` already has a keyframe manifest under
+/// it. `None` means this pass has nothing to say yet — no model, or the
+/// keyframes pass hasn't produced a manifest — and the caller must return
+/// without counting anything: the keyframes pass owns that signal, and
+/// re-planning before the manifest exists is noise on every pass. Shared by
+/// [`plan_keyframe_images`], [`plan_ocr_keyframes`], and
+/// [`plan_caption_video`] — the three passes that only have something to say
+/// once the keyframes pass has produced a manifest.
+fn keyframe_manifest_tag<'a>(
+    hex: &str,
+    blobs: &BlobStore,
+    caps: &'a Capabilities,
+) -> Option<&'a str> {
+    let model_tag = caps.model_tag.as_deref()?;
+    let manifest_path = blobs.path_for(hex, &Derivation::KeyframeManifest { model_tag });
+    manifest_path.is_file().then_some(model_tag)
+}
+
+/// KEYFRAME IMAGES (`MediaKind::Video` only): no keyframe manifest under
+/// `caps.model_tag` (including when that capability is itself missing) ->
+/// skip entirely via [`keyframe_manifest_tag`] — not pending, not counted,
+/// same precedent as `plan_ocr_keyframes` below: the keyframes pass owns
+/// that signal, and re-planning here before a manifest exists would just be
+/// noise every pass, unlike `plan_keyframes`'s own `needs_model` bucket
+/// (there is no `keyframe_images.needs_model` counter for this reason).
+/// Manifest present -> check the [`Derivation::KeyframeImagesComplete`]
+/// marker (the runner writes it once every manifest timestamp has an image
+/// blob — far cheaper than diffing every timestamp here on every status
+/// call) -> done; else offline (no path) / `needs_ffmpeg` / pending+item, in
+/// that order — the same offline-before-ffmpeg precedence every gated kind
+/// in this file uses, so one offline video classifies consistently across
+/// every kind. Unlike `plan_ocr_keyframes`, there is no platform-`AVAILABLE`
+/// gate after the ffmpeg check: ffmpeg is the only capability this pass
+/// depends on.
+fn plan_keyframe_images(
+    source: &AssetSource,
+    hex: &str,
+    blobs: &BlobStore,
+    caps: &Capabilities,
+    plan: &mut WorkPlan,
+) {
+    let Some(model_tag) = keyframe_manifest_tag(hex, blobs, caps) else {
+        return;
+    };
+    let done_path = blobs.path_for(hex, &Derivation::KeyframeImagesComplete { model_tag });
+    if done_path.is_file() {
+        plan.keyframe_images.done += 1;
+        return;
+    }
+    let Some(abs_path) = &source.abs_path else {
+        plan.keyframe_images.offline += 1;
+        return;
+    };
+    if !caps.ffmpeg {
+        plan.keyframe_images.needs_ffmpeg += 1;
+        return;
+    }
+    plan.keyframe_images.pending += 1;
+    plan.items.push(WorkItem {
+        asset: source.asset.clone(),
+        asset_hex: hex.to_string(),
+        abs_path: abs_path.clone(),
+        kind: WorkKind::KeyframeImages,
+    });
+}
+
 /// OCR, VIDEO KEYFRAMES (`MediaKind::Video` only): no keyframe manifest blob
 /// (under the vision `caps.model_tag`, including when that capability is
 /// itself missing) -> skip entirely, not pending, not counted — the
@@ -534,11 +609,7 @@ fn plan_ocr_keyframes(
     caps: &Capabilities,
     plan: &mut WorkPlan,
 ) {
-    let Some(model_tag) = &caps.model_tag else {
-        return;
-    };
-    let manifest_path = blobs.path_for(hex, &Derivation::KeyframeManifest { model_tag });
-    if !manifest_path.is_file() {
+    if keyframe_manifest_tag(hex, blobs, caps).is_none() {
         return;
     }
     let done_path = blobs.path_for(
@@ -676,11 +747,7 @@ fn plan_caption_video(
     caps: &Capabilities,
     plan: &mut WorkPlan,
 ) {
-    let Some(model_tag) = &caps.model_tag else {
-        return;
-    };
-    let manifest_path = blobs.path_for(hex, &Derivation::KeyframeManifest { model_tag });
-    if !manifest_path.is_file() {
+    if keyframe_manifest_tag(hex, blobs, caps).is_none() {
         return;
     }
     let Some(describer_tag) = caps.describer_tag.as_deref() else {
@@ -800,6 +867,10 @@ mod tests {
             "both Image assets (aa11, bb22) are embedding-eligible with no model installed"
         );
         assert_eq!(plan.keyframes.needs_model, 1, "cc33 needs a model too");
+        assert_eq!(
+            plan.keyframe_images.needs_model, 0,
+            "keyframe-images stays silent without a model — the keyframes pass owns that signal"
+        );
         assert!(matches!(plan.items[0].kind, WorkKind::Thumb));
         if crate::ocr::AVAILABLE {
             assert_eq!(
@@ -999,6 +1070,228 @@ mod tests {
             "both thumbs must precede the embedding, which must precede the keyframes, \
              which must precede aa11's ungated OCR item"
         );
+    }
+
+    /// Every `KeyframeImages` bucket driven by two assets each — the same
+    /// counter-summation discipline as the `_counters_sum_per_asset_exactly`
+    /// family below. `needs_ffmpeg` is a mutually exclusive outcome of the
+    /// same `caps.ffmpeg` flag as `pending`, so it gets its own test
+    /// (`plan_keyframe_images_needs_ffmpeg_sums_per_asset_exactly`) with its
+    /// own `plan_work` call rather than appearing here.
+    #[test]
+    fn plan_keyframe_images_counts_every_bucket_with_two_assets_each() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let model_tag = "m1";
+
+        let done_hexes = [
+            "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+        ];
+        let offline_hexes = [
+            "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+            "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+        ];
+        let pending_hexes = [
+            "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a",
+            "9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b",
+        ];
+        let no_manifest_hexes = [
+            "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+            "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+        ];
+
+        for hex in done_hexes
+            .iter()
+            .chain(&offline_hexes)
+            .chain(&pending_hexes)
+        {
+            let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag });
+            store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        }
+        for hex in done_hexes {
+            let marker = store.path_for(hex, &Derivation::KeyframeImagesComplete { model_tag });
+            store.write_atomic(&marker, b"{}").expect("seed marker");
+        }
+
+        let mut sources = Vec::new();
+        for hex in done_hexes.iter().chain(&offline_hexes) {
+            sources.push(source(&format!("xxh3:{hex}"), MediaKind::Video, None));
+        }
+        for hex in pending_hexes.iter().chain(&no_manifest_hexes) {
+            sources.push(source(
+                &format!("xxh3:{hex}"),
+                MediaKind::Video,
+                Some("/tmp/v.mov"),
+            ));
+        }
+        let caps = Capabilities {
+            model_tag: Some(model_tag.into()),
+            ffmpeg: true,
+            ..base_caps()
+        };
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(plan.keyframe_images.done, 2, "both markers exist");
+        assert_eq!(
+            plan.keyframe_images.offline, 2,
+            "both have no readable path"
+        );
+        assert_eq!(
+            plan.keyframe_images.pending, 2,
+            "both are online with ffmpeg"
+        );
+        let kf_image_items: Vec<_> = plan
+            .items
+            .iter()
+            .filter(|i| i.kind == WorkKind::KeyframeImages)
+            .collect();
+        assert_eq!(
+            kf_image_items.len(),
+            2,
+            "exactly the pending pair queues an item, not the no-manifest pair: {:?}",
+            plan.items
+        );
+        for hex in pending_hexes {
+            let asset = format!("xxh3:{hex}");
+            assert!(
+                kf_image_items.iter().any(|i| i.asset == asset),
+                "expected a KeyframeImages item for {asset}: {:?}",
+                plan.items
+            );
+        }
+    }
+
+    /// The `needs_ffmpeg` half of the bucket family above: `pending` and
+    /// `needs_ffmpeg` are mutually exclusive outcomes of `caps.ffmpeg` on the
+    /// same asset shape (manifest present, online, no completion marker), so
+    /// this needs its own `plan_work` call with `ffmpeg: false`.
+    #[test]
+    fn plan_keyframe_images_counts_needs_ffmpeg_without_ffmpeg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hexes = [
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e",
+            "6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+        ];
+        for hex in hexes {
+            let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+            store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        }
+        let sources: Vec<AssetSource> = hexes
+            .iter()
+            .map(|hex| source(&format!("xxh3:{hex}"), MediaKind::Video, Some("/tmp/v.mov")))
+            .collect();
+        let caps = Capabilities {
+            model_tag: Some("m1".into()),
+            ffmpeg: false,
+            ..base_caps()
+        };
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(plan.keyframe_images.needs_ffmpeg, 2);
+        assert_eq!(plan.keyframe_images.pending, 0);
+        assert!(
+            !plan
+                .items
+                .iter()
+                .any(|i| i.kind == WorkKind::KeyframeImages),
+            "no item may be queued without ffmpeg: {:?}",
+            plan.items
+        );
+    }
+
+    /// No other capability gates this pass — only `model_tag` (to locate the
+    /// manifest) and `ffmpeg` (checked inside `plan_keyframe_images`) matter.
+    /// Unlike OCR there is no platform-`AVAILABLE` gate either. The
+    /// `Capabilities` literal is spelled out field-by-field, rather than
+    /// `..base_caps()`, deliberately: every unrelated capability is visibly
+    /// off (`whisper`/`text_model`/`describer_tag`), which is the point of
+    /// the test — an item still plans.
+    #[test]
+    fn plan_keyframe_images_ignores_unrelated_capabilities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hex = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
+        let manifest = store.path_for(hex, &Derivation::KeyframeManifest { model_tag: "m1" });
+        store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        let caps = Capabilities {
+            model_tag: Some("m1".into()),
+            ffmpeg: true,
+            whisper: false,
+            text_model: false,
+            describer_tag: None,
+        };
+        let asset = format!("xxh3:{hex}");
+        let sources = vec![source(&asset, MediaKind::Video, Some("/tmp/v.mov"))];
+        let plan = plan_work(&sources, &store, &caps);
+
+        assert_eq!(plan.keyframe_images.pending, 1);
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.asset == asset && i.kind == WorkKind::KeyframeImages),
+            "{:?}",
+            plan.items
+        );
+    }
+
+    /// Global ordering: the keyframe-images pass runs directly after the
+    /// keyframes pass and before transcribe, so every `KeyframeImages` item
+    /// lands after every `Keyframes` item and before every `Transcribe`
+    /// item — structurally, from pass order, regardless of which specific
+    /// assets trigger which items.
+    #[test]
+    fn keyframe_images_items_ordered_after_keyframes_and_before_transcribe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let caps = full_caps();
+
+        // video1 has no manifest yet -> queues a Keyframes item this pass.
+        let video1 = source(
+            "xxh3:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+            MediaKind::Video,
+            Some("/tmp/v1.mov"),
+        );
+        // video2 already has a manifest -> queues a KeyframeImages item
+        // instead (its Keyframes pass counts done, not pending).
+        let video2_hex = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b";
+        let manifest = store.path_for(
+            video2_hex,
+            &Derivation::KeyframeManifest { model_tag: "m1" },
+        );
+        store.write_atomic(&manifest, b"[]").expect("seed manifest");
+        let video2 = source(
+            &format!("xxh3:{video2_hex}"),
+            MediaKind::Video,
+            Some("/tmp/v2.mov"),
+        );
+        let sources = vec![video1, video2];
+        let plan = plan_work(&sources, &store, &caps);
+
+        let last_keyframes = plan
+            .items
+            .iter()
+            .rposition(|i| i.kind == WorkKind::Keyframes)
+            .expect("a Keyframes item");
+        let first_keyframe_images = plan
+            .items
+            .iter()
+            .position(|i| i.kind == WorkKind::KeyframeImages)
+            .expect("a KeyframeImages item");
+        let last_keyframe_images = plan
+            .items
+            .iter()
+            .rposition(|i| i.kind == WorkKind::KeyframeImages)
+            .expect("a KeyframeImages item");
+        let first_transcribe = plan
+            .items
+            .iter()
+            .position(|i| i.kind == WorkKind::Transcribe)
+            .expect("a Transcribe item");
+
+        assert!(last_keyframes < first_keyframe_images, "{:?}", plan.items);
+        assert!(last_keyframe_images < first_transcribe, "{:?}", plan.items);
     }
 
     /// The `MediaKind::Video` check in `plan_thumb`'s ffmpeg gate must gate

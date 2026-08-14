@@ -348,6 +348,12 @@ fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> Kind
             WorkKind::Thumb => split.thumbs.push(item),
             WorkKind::ImageEmbed => split.embeds.push(item),
             WorkKind::Keyframes => split.keyframes.push(item),
+            // No executor yet (phase 7D Task 4 wires one); unreachable today
+            // regardless — `VALID_KINDS` doesn't list "keyframe-images", so
+            // `build_plan`'s `kinds` filter has already dropped every item of
+            // this kind before `split_and_cap_items` ever sees it. This arm
+            // exists purely to keep the match exhaustive.
+            WorkKind::KeyframeImages => {}
             WorkKind::Transcribe => split.transcribes.push(item),
             WorkKind::TranscriptEmbed => split.transcript_embeds.push(item),
             WorkKind::OcrImage => split.ocr_images.push(item),

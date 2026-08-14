@@ -38,7 +38,13 @@ use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKi
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The `--kinds` values `index run`/`index status` understand.
+/// The `--kinds` values `index run`/`index status` understand. Adding
+/// "keyframe-images" here (wiring up `WorkKind::KeyframeImages`) requires
+/// replacing the no-op arm in `run.rs`'s `split_and_cap_items` with a real
+/// executor first — today that arm is unreachable because `build_plan`'s
+/// `kinds` filter drops every `KeyframeImages` item before it gets there;
+/// the moment this list names it, that arm silently drops real work instead,
+/// with no compile error and no test to catch it.
 pub const VALID_KINDS: &[&str] = &[
     "thumbs",
     "embeddings",
@@ -127,6 +133,7 @@ fn workkind_name(kind: WorkKind) -> &'static str {
         WorkKind::Thumb => "thumbs",
         WorkKind::ImageEmbed => "embeddings",
         WorkKind::Keyframes => "keyframes",
+        WorkKind::KeyframeImages => "keyframe-images",
         WorkKind::Transcribe | WorkKind::TranscriptEmbed => "transcripts",
         WorkKind::OcrImage | WorkKind::OcrKeyframes => "ocr",
         WorkKind::PdfText => "pdf",
@@ -589,6 +596,7 @@ mod tests {
         assert_eq!(workkind_name(WorkKind::Thumb), "thumbs");
         assert_eq!(workkind_name(WorkKind::ImageEmbed), "embeddings");
         assert_eq!(workkind_name(WorkKind::Keyframes), "keyframes");
+        assert_eq!(workkind_name(WorkKind::KeyframeImages), "keyframe-images");
         assert_eq!(workkind_name(WorkKind::Transcribe), "transcripts");
         assert_eq!(workkind_name(WorkKind::TranscriptEmbed), "transcripts");
         assert_eq!(workkind_name(WorkKind::OcrImage), "ocr");

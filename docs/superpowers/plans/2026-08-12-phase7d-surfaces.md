@@ -74,9 +74,9 @@ fn keyframe_image_paths_are_model_scoped_and_per_timestamp() {
     let a = store.path_for(hex, &Derivation::KeyframeImage { model_tag: "m1", timestamp_ms: 1500 });
     let b = store.path_for(hex, &Derivation::KeyframeImage { model_tag: "m1", timestamp_ms: 2500 });
     assert_ne!(a, b, "one image per timestamp");
-    assert!(a.ends_with("m1/kf-img-1500.webp"), "got {}", a.display());
+    assert!(a.ends_with(format!("m1/kf-img-{THUMB_EDGE}-1500.webp")), "got {}", a.display());
     let done = store.path_for(hex, &Derivation::KeyframeImagesComplete { model_tag: "m1" });
-    assert!(done.ends_with("m1/kf-images-complete.json"), "got {}", done.display());
+    assert!(done.ends_with("m1/keyframe-images-complete.json"), "got {}", done.display());
 }
 ```
 
@@ -112,10 +112,10 @@ In `path_for`, after the `KeyframeManifest` arm:
 
 ```rust
     Derivation::KeyframeImage { model_tag, timestamp_ms } => {
-        dir.join(model_tag).join(format!("kf-img-{timestamp_ms}.webp"))
+        dir.join(model_tag).join(format!("kf-img-{THUMB_EDGE}-{timestamp_ms}.webp"))
     }
     Derivation::KeyframeImagesComplete { model_tag } => {
-        dir.join(model_tag).join("kf-images-complete.json")
+        dir.join(model_tag).join("keyframe-images-complete.json")
     }
 ```
 
@@ -303,7 +303,7 @@ git commit -m "feat: planner pass for keyframe-image extraction"
 - Modify: `crates/services/src/index/mod.rs` (kind name map at :129, status rendering)
 - Test: extend the existing `index run`/`index status` service tests (find them: `rg -n "keyframes" crates/services/src/index/run.rs | head`) — they build real manifests against temp catalogs.
 
-- [ ] **Step 1: Write the failing service test**: an asset with a keyframe manifest of two timestamps; `index run` produces two `kf-img-*.webp` blobs + the completion marker; a second `plan_work` counts it done. A manifest with one extractable and one unreadable timestamp (point the asset at a truncated video after manifest creation, the trick the failure-record tests use) records a per-item failure row, writes NO completion marker, and the item re-plans.
+- [ ] **Step 1: Write the failing service test**: an asset with a keyframe manifest of two timestamps; `index run` produces two `kf-img-*-*.webp` blobs + the completion marker; a second `plan_work` counts it done. A manifest with one extractable and one unreadable timestamp (point the asset at a truncated video after manifest creation, the trick the failure-record tests use) records a per-item failure row, writes NO completion marker, and the item re-plans.
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p majestical-services --lib keyframe_image` — fails: no runner arm.
 

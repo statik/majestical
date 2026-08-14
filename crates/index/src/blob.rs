@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::IndexError;
+use crate::thumbs::THUMB_EDGE;
 
 pub const THUMB_NAME: &str = "thumb-320.webp";
 const ZSTD_LEVEL: i32 = 3;
@@ -27,6 +28,20 @@ pub enum Derivation<'a> {
     /// JSON list of keyframe timestamps; doubles as the "video fully
     /// keyframed" completion marker.
     KeyframeManifest {
+        model_tag: &'a str,
+    },
+    /// One extracted keyframe image (thumb-scale WebP) at a manifest
+    /// timestamp. Scoped to the manifest's model tag: the timestamps are
+    /// the manifest's, so the images live and die with it.
+    KeyframeImage {
+        model_tag: &'a str,
+        timestamp_ms: u64,
+    },
+    /// Marker written once EVERY timestamp in the manifest has its
+    /// `KeyframeImage` blob (mirrors [`Derivation::OcrComplete`]). Images
+    /// without this marker mean an interrupted run: the item re-plans and
+    /// existing images make the retry cheap.
+    KeyframeImagesComplete {
         model_tag: &'a str,
     },
     /// Whisper transcript (JSON, zstd-compressed) for a video/audio asset.
@@ -125,7 +140,9 @@ pub struct VectorBlobRef {
 
 /// Classifies one filename under a `<hex>/<model_tag>/` dir as a vector, or
 /// `None` for anything else (notably `keyframes.json`, the manifest that
-/// lives alongside real vectors under the same dir).
+/// lives alongside real vectors under the same dir, and
+/// `kf-img-<edge>-<ts>.webp`, a keyframe image that shares the `kf-` prefix
+/// this function splits on but fails the `.f32le.zst` suffix check).
 fn classify_vector_file(name: &str) -> Option<(&'static str, i64)> {
     if name == "image.f32le.zst" {
         return Some(("image", -1));
@@ -161,6 +178,15 @@ impl BlobStore {
                 .join(format!("kf-{timestamp_ms}.f32le.zst")),
             Derivation::KeyframeManifest { model_tag } => {
                 dir.join(model_tag).join("keyframes.json")
+            }
+            Derivation::KeyframeImage {
+                model_tag,
+                timestamp_ms,
+            } => dir
+                .join(model_tag)
+                .join(format!("kf-img-{THUMB_EDGE}-{timestamp_ms}.webp")),
+            Derivation::KeyframeImagesComplete { model_tag } => {
+                dir.join(model_tag).join("keyframe-images-complete.json")
             }
             Derivation::Transcript { model_tag } => dir.join(model_tag).join("transcript.json.zst"),
             Derivation::TranscriptChunk {
@@ -490,6 +516,80 @@ mod tests {
                 .join("blobs/01")
                 .join(hex)
                 .join("siglip2-b16-v1/keyframes.json"),
+        );
+    }
+
+    #[test]
+    fn keyframe_image_paths_are_model_scoped_and_per_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let a = store.path_for(
+            hex,
+            &Derivation::KeyframeImage {
+                model_tag: "m1",
+                timestamp_ms: 1500,
+            },
+        );
+        let b = store.path_for(
+            hex,
+            &Derivation::KeyframeImage {
+                model_tag: "m1",
+                timestamp_ms: 2500,
+            },
+        );
+        assert!(
+            a.ends_with(format!("m1/kf-img-{THUMB_EDGE}-1500.webp")),
+            "got {}",
+            a.display()
+        );
+        assert!(
+            b.ends_with(format!("m1/kf-img-{THUMB_EDGE}-2500.webp")),
+            "got {}",
+            b.display()
+        );
+
+        // A different model tag must land in its own directory, not collide
+        // with `m1` — this is what earns "model_scoped" in the test name.
+        let m2 = store.path_for(
+            hex,
+            &Derivation::KeyframeImage {
+                model_tag: "m2",
+                timestamp_ms: 1500,
+            },
+        );
+        assert_ne!(a, m2, "different model tags must not share a path");
+
+        let done = store.path_for(hex, &Derivation::KeyframeImagesComplete { model_tag: "m1" });
+        assert!(
+            done.ends_with("m1/keyframe-images-complete.json"),
+            "got {}",
+            done.display()
+        );
+    }
+
+    /// A thumbnail size bump (`THUMB_EDGE`) must not silently keep writing
+    /// keyframe image blobs under the old size's filename — the two must
+    /// always agree, or two different sizes would collide at the same
+    /// content-addressed path (mirrors `thumb_name_encodes_the_current_thumb_edge`).
+    #[test]
+    fn keyframe_image_name_encodes_the_current_thumb_edge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let path = store.path_for(
+            "aabb",
+            &Derivation::KeyframeImage {
+                model_tag: "m1",
+                timestamp_ms: 1500,
+            },
+        );
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("keyframe image path has a filename");
+        assert!(
+            name.contains(&THUMB_EDGE.to_string()),
+            "keyframe image filename ({name}) must encode THUMB_EDGE ({THUMB_EDGE})"
         );
     }
 
@@ -851,6 +951,21 @@ mod tests {
         store
             .write_atomic(&ocr_kf_path, b"{}")
             .expect("write ocr keyframe blob");
+
+        // A keyframe image (`kf-img-<edge>-<ts>.webp`) also shares the `kf-`
+        // prefix — the `.f32le.zst` suffix check and the integer parse of the
+        // remainder both keep it out (the parse is what rejects it even if
+        // the suffix check were loosened: `img-<edge>-<ts>` is not an i64).
+        let kf_img_path = store.path_for(
+            "bb22bb22bb22bb22bb22bb22bb22bb22",
+            &Derivation::KeyframeImage {
+                model_tag: "m1",
+                timestamp_ms: 7_000,
+            },
+        );
+        store
+            .write_atomic(&kf_img_path, b"webp-bytes")
+            .expect("write keyframe image blob");
 
         let mut refs = store.iter_vectors("m1").expect("iter_vectors");
         refs.sort_by(|a, b| (&a.asset_hex, &a.kind).cmp(&(&b.asset_hex, &b.kind)));

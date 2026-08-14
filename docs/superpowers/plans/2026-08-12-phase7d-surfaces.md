@@ -143,23 +143,46 @@ git commit -m "feat: KeyframeImage + KeyframeImagesComplete derivations"
 // in keyframe_images.rs
 #[cfg(test)]
 mod tests {
+    // generate_test_clip: same synthesis as
+    // crates/index/tests/video_e2e.rs::generate_test_clip, but at 640x360
+    // (double THUMB_EDGE) so thumbnail_webp's resize branch is actually
+    // exercised instead of a same-size pass-through — three 3s lavfi color
+    // segments (red, green, blue) concatenated, at 25fps.
+
     #[test]
     fn extracted_frame_is_webp_at_thumb_scale() {
         if !crate::video::ffmpeg_available() {
-            eprintln!("SKIP: ffmpeg not on PATH");
             return;
         }
-        let video = crate::video::tests_fixture_video(); // reuse the real helper name
-        let bytes = super::extract_keyframe_webp(&video, 0).expect("frame 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video_path = dir.path().join("clip.mp4");
+        generate_test_clip(&video_path); // 640x360, red/green/blue, 3s each
+
+        // 4500ms lands mid-way through the green segment (video_e2e.rs
+        // extracts at the same timestamp for the same reason) — a `ts_ms`
+        // silently swapped for a constant would decode the red segment
+        // instead, which the color-dominance assertion below catches.
+        let bytes = super::extract_keyframe_webp(&video_path, 4500).expect("frame at 4500ms");
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
         let img = image::load_from_memory(&bytes).expect("decode");
-        assert!(img.width().max(img.height()) <= crate::thumbs::THUMB_EDGE);
+        // Exact dims, not just "under the cap" (the convention thumbs.rs's
+        // own test uses) — 640x360 source at THUMB_EDGE (320) longest-edge
+        // scale must land on exactly (320, 180).
+        assert_eq!((img.width(), img.height()), (320, 180));
+
+        let rgb = img.to_rgb8();
+        let center = rgb.get_pixel(rgb.width() / 2, rgb.height() / 2);
+        let (r, g, b) = (u16::from(center[0]), u16::from(center[1]), u16::from(center[2]));
+        assert!(
+            g > r + 50 && g > b + 50,
+            "expected the 4500ms frame's center pixel to be green-dominant, got {center:?}"
+        );
     }
 }
 ```
 
-(The fixture-helper name above is a stand-in for whatever `video.rs`'s own tests call — mirror them exactly; if they synthesize a video with an ffmpeg command, copy that synthesis.)
+(`generate_test_clip` mirrors `video_e2e.rs`'s synthesis exactly, scaled to 640x360 — copy that synthesis rather than reusing a smaller fixture, since the resize-branch and color-dominance assertions above both depend on it.)
 
 - [ ] **Step 2: Run to verify failure**
 

@@ -470,6 +470,14 @@ fn index_status_matches() {
         serde_json::json!(0),
         "{structured}"
     );
+    // The keyframe-images row rides the wire under its `--kinds` name, not
+    // the Rust field name (`IndexStatusOutcome`'s serde rename) — pinned
+    // here because an agent reading this tool's output keys on it.
+    assert_eq!(
+        structured["keyframe-images"]["done"],
+        serde_json::json!(0),
+        "{structured}"
+    );
     assert!(structured["failed_last_run"].is_object(), "{structured}");
 }
 

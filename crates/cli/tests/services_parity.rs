@@ -10,6 +10,19 @@ use std::path::Path;
 
 #[cfg(test)]
 fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
+    diff_against_ref_normalized(root, state, args, ToString::to_string);
+}
+
+/// Everything [`diff_against_ref`] does, with `normalize` applied to BOTH
+/// binaries' stdout AND stderr before comparing — for a verb whose output
+/// this branch intentionally changed (see [`without_keyframe_images`]).
+#[cfg(test)]
+fn diff_against_ref_normalized(
+    root: &Path,
+    state: &Path,
+    args: &[&str],
+    normalize: fn(&str) -> String,
+) {
     let reference = Path::new("/tmp/maj-ref");
     if !reference.is_file() {
         eprintln!("SKIP parity({args:?}): /tmp/maj-ref missing — build it first");
@@ -30,17 +43,80 @@ fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
     let (new, old) = (run("new"), run("ref"));
     assert_eq!(
         (
-            String::from_utf8_lossy(&new.stdout),
-            String::from_utf8_lossy(&new.stderr),
+            normalize(&String::from_utf8_lossy(&new.stdout)),
+            normalize(&String::from_utf8_lossy(&new.stderr)),
             new.status.code()
         ),
         (
-            String::from_utf8_lossy(&old.stdout),
-            String::from_utf8_lossy(&old.stderr),
+            normalize(&String::from_utf8_lossy(&old.stdout)),
+            normalize(&String::from_utf8_lossy(&old.stderr)),
             old.status.code()
         ),
         "stdout/stderr/exit diverged for {args:?}"
     );
+}
+
+/// Renders `text` as the reference binary would: without the
+/// `keyframe-images` derivation. The reference is built at the merge-base
+/// with `main`, which predates that kind, so the index verbs compare modulo
+/// it rather than losing their parity coverage outright. Three shapes carry
+/// it, all stripped here: the `keyframe-images: ...` line `index run`/`index
+/// status` print, the `"keyframe-images":{…}` member of their `--json`
+/// objects, and the kind's place in the `--kinds` list the unknown-kind
+/// error names.
+///
+/// Every strip is an exact-substring removal from the original bytes, so a
+/// formatting change anywhere (compact vs pretty, key order, spacing) still
+/// fails the comparison. Applied to BOTH binaries' output, so nothing
+/// outside the removed spans can hide behind it.
+///
+/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: it strips the
+/// kind from both binaries forever, so for as long as it exists the four
+/// index parity rows are blind to `keyframe-images`. Once the reference
+/// binary includes the kind (i.e. once this branch is on `main`), delete
+/// this function, [`strip_keyframe_images_member`], and
+/// [`diff_against_ref_normalized`], and point the four index rows back at
+/// [`diff_against_ref`]. Scheduled as a step of phase 7D Task 21 in
+/// `docs/superpowers/plans/2026-08-12-phase7d-surfaces.md`.
+#[cfg(test)]
+fn without_keyframe_images(text: &str) -> String {
+    // `split_inclusive` keeps each line's own newline (and the last line's
+    // absence of one), so a text that never mentions the kind normalizes to
+    // itself byte for byte.
+    let mut kept = String::with_capacity(text.len());
+    for line in text
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with("keyframe-images:"))
+    {
+        let line = strip_keyframe_images_member(line).unwrap_or_else(|| line.to_string());
+        kept.push_str(&line.replace("keyframes, keyframe-images,", "keyframes,"));
+    }
+    kept
+}
+
+/// Cuts the `"keyframe-images":{…}` member — and the comma separating it
+/// from its neighbour — out of a JSON line. `serde_json` is used ONLY to
+/// build the needle (re-serializing that one member's value); the removal
+/// itself is an exact-substring cut from the original bytes, so the line is
+/// never reformatted. `None` when the line isn't a JSON object, carries no
+/// such member, or doesn't contain the needle verbatim — a
+/// differently-formatted document therefore passes through unstripped and
+/// diverges loudly instead of being normalized into agreement.
+#[cfg(test)]
+fn strip_keyframe_images_member(line: &str) -> Option<String> {
+    let document: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let needle = format!(
+        "\"keyframe-images\":{}",
+        serde_json::to_string(document.get("keyframe-images")?).ok()?
+    );
+    let mut start = line.find(&needle)?;
+    let mut end = start + needle.len();
+    if line[end..].starts_with(',') {
+        end += 1;
+    } else if line[..start].ends_with(',') {
+        start -= 1;
+    }
+    Some(format!("{}{}", &line[..start], &line[end..]))
 }
 
 /// Runs `args` once per binary, each against its OWN catalog root/state —
@@ -279,7 +355,7 @@ fn index_status_output_is_byte_identical() {
         ["index", "status", "--json"].as_slice(),
         ["index", "status"].as_slice(),
     ] {
-        diff_against_ref(&root, &state, args);
+        diff_against_ref_normalized(&root, &state, args, without_keyframe_images);
     }
 }
 
@@ -296,7 +372,7 @@ fn index_run_empty_pass_output_is_byte_identical() {
         ["index", "run", "--limit", "0", "--json"].as_slice(),
         ["index", "run", "--limit", "0"].as_slice(),
     ] {
-        diff_against_ref(&root, &state, args);
+        diff_against_ref_normalized(&root, &state, args, without_keyframe_images);
     }
 }
 
@@ -308,10 +384,11 @@ fn index_run_empty_pass_output_is_byte_identical() {
 fn index_run_kinds_thumbs_on_a_text_only_catalog_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
-    diff_against_ref(
+    diff_against_ref_normalized(
         &root,
         &state,
         &["index", "run", "--kinds", "thumbs", "--limit", "1"],
+        without_keyframe_images,
     );
 }
 
@@ -322,7 +399,12 @@ fn index_run_kinds_thumbs_on_a_text_only_catalog_is_byte_identical() {
 fn index_run_invalid_kinds_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
-    diff_against_ref(&root, &state, &["index", "run", "--kinds", "bogus"]);
+    diff_against_ref_normalized(
+        &root,
+        &state,
+        &["index", "run", "--kinds", "bogus"],
+        without_keyframe_images,
+    );
 }
 
 #[test]

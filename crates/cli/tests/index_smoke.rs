@@ -555,6 +555,36 @@ fn index_run_explicit_keyframes_without_ffmpeg_hard_errors() {
         .stderr(contains("install ffmpeg"));
 }
 
+/// `keyframe-images` is ffmpeg-only too, so it answers to the same hard-ask
+/// policy as `keyframes` above: named explicitly with no ffmpeg on `PATH`,
+/// the run fails loudly and by name rather than reporting a silent zero.
+#[test]
+fn index_run_explicit_keyframe_images_without_ffmpeg_hard_errors() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("clip.mov"), b"not a real mov").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["index", "run", "--kinds", "keyframe-images"])
+        .assert()
+        .failure()
+        .stderr(contains("--kinds keyframe-images requires ffmpeg"))
+        .stderr(contains("install ffmpeg"));
+}
+
 /// Builds the same 9s, 320x180 three-segment (red/green/blue) clip
 /// `video_e2e.rs` uses, at `path`.
 #[cfg(test)]
@@ -1058,4 +1088,133 @@ fn keyframe_search_resolves_the_correct_segment_and_timestamp() {
         .success()
         .stdout(contains("clip.mp4"))
         .stdout(contains("@0m07s"));
+}
+
+/// A solid-color clip of `seconds` at 320x180 — distinct bytes (and so a
+/// distinct asset hash) from `generate_three_segment_clip`'s output, which
+/// the two-video keyframe-image test below needs.
+#[cfg(test)]
+fn generate_solid_clip(path: &std::path::Path, color: &str, seconds: u32) {
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+        .arg(format!(
+            "color=c={color}:s=320x180:d={seconds}:r=25,format=yuv420p"
+        ))
+        .arg(path)
+        .status()
+        .expect("running ffmpeg to generate the test clip");
+    assert!(status.success(), "ffmpeg clip generation failed");
+}
+
+/// Writes the keyframe manifest an earlier `--kinds keyframes` pass would
+/// have left for `path`'s asset, and returns the asset's blob hex.
+#[cfg(test)]
+fn seed_keyframe_manifest(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    timestamps: &[u64],
+) -> String {
+    let bytes = std::fs::read(path).unwrap();
+    let hex = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&bytes));
+    let model_tag = majestical_index::model::MODEL_TAG;
+    let blobs = majestical_index::blob::BlobStore::new(root);
+    let manifest = serde_json::json!({
+        "model_tag": model_tag,
+        "detected": timestamps.len(),
+        "timestamps": timestamps,
+    });
+    blobs
+        .write_atomic(
+            &blobs.path_for(
+                &hex,
+                &majestical_index::blob::Derivation::KeyframeManifest { model_tag },
+            ),
+            manifest.to_string().as_bytes(),
+        )
+        .unwrap();
+    hex
+}
+
+/// `index run --kinds keyframe-images` end to end through the real CLI: two
+/// scanned clips, each handed the keyframe manifest an earlier keyframes
+/// pass would have written, get one thumb-scale WebP per manifest timestamp
+/// plus a completion marker — and `index status` then names the kind with
+/// both videos done (two assets, exact counts). Real ffmpeg required (skips
+/// without it); the model files are fake-size placeholders that only open
+/// the planner's gate, since nothing here loads an encoder.
+#[test]
+fn index_run_keyframe_images_writes_images_and_status_counts_them() {
+    if !majestical_index::video::ffmpeg_available() {
+        // Loud like the parity harness's own skip: a silent pass here would
+        // look identical to a real one on a machine without ffmpeg.
+        eprintln!("SKIP index_run_keyframe_images: ffmpeg not on PATH");
+        return;
+    }
+    let media = tempfile::tempdir().unwrap();
+    let three_segment = media.path().join("clip.mp4");
+    let solid = media.path().join("solid.mp4");
+    generate_three_segment_clip(&three_segment);
+    generate_solid_clip(&solid, "white", 4);
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_root = tempfile::tempdir().unwrap();
+    seed_fake_model_files(model_root.path());
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    seed_keyframe_manifest(&root, &three_segment, &[1500, 4500]);
+    seed_keyframe_manifest(&root, &solid, &[1000]);
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "run", "--kinds", "keyframe-images"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "keyframe-images: 2 videos, 3 images written, 0 already present, 0 videos failed",
+        ));
+
+    let edge = majestical_index::thumbs::THUMB_EDGE;
+    for name in [
+        format!("kf-img-{edge}-1500.webp"),
+        format!("kf-img-{edge}-4500.webp"),
+        format!("kf-img-{edge}-1000.webp"),
+    ] {
+        let found = walkdir_find(&root, &name);
+        assert_eq!(found.len(), 1, "expected exactly one {name}: {found:?}");
+        let bytes = std::fs::read(&found[0]).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF", "{name} is not WebP");
+        assert_eq!(&bytes[8..12], b"WEBP", "{name} is not WebP");
+    }
+    assert_eq!(
+        walkdir_find(&root, "keyframe-images-complete.json").len(),
+        2
+    );
+
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "keyframe-images: 2 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+             0 need model",
+        ));
+
+    // A second pass has nothing left to extract: every image blob is
+    // already there, so the resume path counts them and rewrites nothing.
+    maj(&root, &state)
+        .env("MAJ_MODEL_DIR", model_root.path())
+        .args(["index", "run", "--kinds", "keyframe-images"])
+        .assert()
+        .success()
+        .stdout(contains("keyframe-images: 0 videos, 0 images written"));
 }

@@ -16,8 +16,9 @@ mod heal;
 mod run;
 
 pub use run::{
-    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeOutcome, OcrOutcome,
-    PdfOutcome, ThumbOutcome, TranscribeOutcome, TranscriptEmbedOutcome, run,
+    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeImageOutcome,
+    KeyframeOutcome, OcrOutcome, PdfOutcome, ThumbOutcome, TranscribeOutcome,
+    TranscriptEmbedOutcome, run,
 };
 
 use crate::app::FsApp;
@@ -38,17 +39,20 @@ use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKi
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The `--kinds` values `index run`/`index status` understand. Adding
-/// "keyframe-images" here (wiring up `WorkKind::KeyframeImages`) requires
-/// replacing the no-op arm in `run.rs`'s `split_and_cap_items` with a real
-/// executor first — today that arm is unreachable because `build_plan`'s
-/// `kinds` filter drops every `KeyframeImages` item before it gets there;
-/// the moment this list names it, that arm silently drops real work instead,
-/// with no compile error and no test to catch it.
+/// The `--kinds` values `index run`/`index status` understand. Every name
+/// here must have a real executor behind it: [`build_plan`]'s `kinds` filter
+/// keeps only items whose [`workkind_name`] this list contains, and
+/// `run.rs`'s `split_and_cap_items` then routes each one to its kind's
+/// runner. A name listed here whose split arm is a no-op would silently
+/// drop real work — no compile error, no failure row, just items that
+/// re-plan forever. "keyframe-images" is wired end to end:
+/// `run::run_keyframe_image_items` executes it and `status`'s
+/// `keyframe_images` row reports it.
 pub const VALID_KINDS: &[&str] = &[
     "thumbs",
     "embeddings",
     "keyframes",
+    "keyframe-images",
     "transcripts",
     "ocr",
     "pdf",
@@ -196,10 +200,11 @@ fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
 /// first folds it over the previous report so a `--kinds`-filtered run only
 /// speaks for the kinds it actually worked.
 fn failure_report_json(o: &IndexRunOutcome) -> serde_json::Value {
-    let kinds: [(&str, Vec<(PathBuf, String)>); 7] = [
+    let kinds: [(&str, Vec<(PathBuf, String)>); 8] = [
         ("thumbs", o.thumbs.failed.clone()),
         ("embeddings", o.embed.failed.clone()),
         ("keyframes", o.keyframes.failed.clone()),
+        ("keyframe-images", o.keyframe_images.failed.clone()),
         ("transcripts", o.transcript_failures()),
         ("ocr", o.ocr.failed.clone()),
         ("pdf", o.pdf.failed.clone()),
@@ -309,6 +314,10 @@ pub struct IndexStatusOutcome {
     pub thumbs: KindStatusRow,
     pub embeddings: KindStatusRow,
     pub keyframes: KindStatusRow,
+    /// Serialized under the `--kinds` name — see [`IndexRunOutcome`]'s own
+    /// `keyframe-images` field for why.
+    #[serde(rename = "keyframe-images")]
+    pub keyframe_images: KindStatusRow,
     pub transcripts: KindStatusRow,
     pub ocr: KindStatusRow,
     pub pdf: KindStatusRow,
@@ -383,6 +392,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
         thumbs: (&plan.thumbs).into(),
         embeddings: (&plan.embeddings).into(),
         keyframes: (&plan.keyframes).into(),
+        keyframe_images: (&plan.keyframe_images).into(),
         transcripts: (&plan.transcripts).into(),
         ocr: (&plan.ocr).into(),
         pdf: (&plan.pdf).into(),
@@ -591,6 +601,95 @@ mod tests {
         assert!(pdf_notice.contains("1 eligible asset(s)"), "{pdf_notice}");
     }
 
+    /// The `keyframe-images` row `index status` renders, driven by two
+    /// assets per bucket so a counter that increments once for two assets
+    /// (or once per pass) can't pass: two videos with a completion marker
+    /// count `done`, two with only a manifest count `pending` and keep their
+    /// work items — which they only do because `VALID_KINDS` names the kind
+    /// (`build_plan` drops every item whose kind the caller didn't request).
+    /// Nothing here decodes: planning only diffs blob paths.
+    #[test]
+    fn keyframe_image_status_counts_two_assets_per_bucket_and_keeps_their_items() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        for name in ["a.mov", "b.mov", "c.mov", "d.mov"] {
+            std::fs::write(src.join(name), format!("not a real mov: {name}")).expect("write");
+        }
+        // Auto-detected volume identity (`None`) so these resolve as online.
+        crate::scan::scan(&mut app, &src, None).expect("scan");
+
+        let (_, projection) = open_catalog(&app, &root).expect("open catalog");
+        let blobs = BlobStore::new(&root);
+        let model_tag = majestical_index::model::MODEL_TAG;
+        let mut hexes: Vec<String> = gather_sources(&projection)
+            .iter()
+            .filter_map(|source| Some(source.asset.strip_prefix("xxh3:")?.to_string()))
+            .collect();
+        hexes.sort();
+        assert_eq!(hexes.len(), 4, "four scanned videos");
+        for hex in &hexes {
+            let manifest = blobs.path_for(
+                hex,
+                &majestical_index::blob::Derivation::KeyframeManifest { model_tag },
+            );
+            blobs
+                .write_atomic(
+                    &manifest,
+                    br#"{"model_tag":"m","detected":0,"timestamps":[]}"#,
+                )
+                .expect("seed manifest");
+        }
+        for hex in &hexes[..2] {
+            let marker = blobs.path_for(
+                hex,
+                &majestical_index::blob::Derivation::KeyframeImagesComplete { model_tag },
+            );
+            blobs
+                .write_atomic(&marker, br#"{"timestamps":[]}"#)
+                .expect("seed");
+        }
+
+        let caps = Capabilities {
+            model_tag: Some(model_tag.to_string()),
+            ffmpeg: true,
+            whisper: false,
+            text_model: false,
+            describer_tag: None,
+        };
+        let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
+        let plan = build_plan(&projection, &blobs, &kinds, &caps);
+
+        let row = KindStatusRow::from(&plan.keyframe_images);
+        assert_eq!(row.done, 2, "two videos carry the completion marker");
+        assert_eq!(row.pending, 2, "two have a manifest but no marker");
+        assert_eq!(row.offline, 0);
+        assert_eq!(row.needs_ffmpeg, 0);
+        assert_eq!(row.needs_model, 0);
+        assert_eq!(
+            plan.items
+                .iter()
+                .filter(|item| item.kind == WorkKind::KeyframeImages)
+                .count(),
+            2,
+            "the two pending videos keep their work items"
+        );
+
+        // The same plan under a `--kinds thumbs` request keeps the counts
+        // (status always reports every kind) but drops the items.
+        let thumbs_only: BTreeSet<String> = ["thumbs".to_string()].into();
+        let narrowed = build_plan(&projection, &blobs, &thumbs_only, &caps);
+        assert_eq!(narrowed.keyframe_images.pending, 2);
+        assert!(
+            !narrowed
+                .items
+                .iter()
+                .any(|item| item.kind == WorkKind::KeyframeImages)
+        );
+    }
+
     #[test]
     fn workkind_name_covers_every_kind() {
         assert_eq!(workkind_name(WorkKind::Thumb), "thumbs");
@@ -618,6 +717,7 @@ mod tests {
                 failed: Vec::new(),
             },
             keyframes: KeyframeOutcome::default(),
+            keyframe_images: KeyframeImageOutcome::default(),
             transcribe: TranscribeOutcome::default(),
             transcript_embed: TranscriptEmbedOutcome::default(),
             ocr: OcrOutcome::default(),
@@ -688,6 +788,7 @@ mod tests {
                 failed: Vec::new(),
             },
             keyframes: KeyframeOutcome::default(),
+            keyframe_images: KeyframeImageOutcome::default(),
             transcribe: TranscribeOutcome::default(),
             transcript_embed: TranscriptEmbedOutcome::default(),
             ocr: OcrOutcome::default(),

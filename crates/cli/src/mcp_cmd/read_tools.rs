@@ -192,8 +192,9 @@ impl MajServer {
     }
 
     /// Reports the derivation queue's current state per kind (thumbnails,
-    /// embeddings, keyframes, transcripts, OCR, PDF text, captions) without
-    /// doing any work, plus the last `index_run`'s per-item failures.
+    /// embeddings, keyframes, keyframe images, transcripts, OCR, PDF text,
+    /// captions) without doing any work, plus the last `index_run`'s
+    /// per-item failures.
     #[tool]
     fn index_status(&self) -> CallToolResult {
         let app = match self.open_app() {

@@ -1,0 +1,33 @@
+{
+  "count": 3,
+  "folder_count": 2,
+  "notices": [
+    "a warning the browse_list call collected"
+  ],
+  "results": [
+    {
+      "asset": "xxh3:0123456789abcdef0123456789abcdef",
+      "kind": "video",
+      "known": true,
+      "locator": 2,
+      "mtime_ms": 1700000000000,
+      "name": "clip.mov",
+      "para": "project/client-x",
+      "score": 0.0,
+      "size": 1024,
+      "snippet": "a matching snippet",
+      "source": "transcript",
+      "tags": [
+        "demo"
+      ],
+      "timestamp_ms": 1500,
+      "volumes": [
+        {
+          "id": "vol1",
+          "label": "vol1",
+          "online": true
+        }
+      ]
+    }
+  ]
+}

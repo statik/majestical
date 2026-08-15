@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type {
   AppStatus,
   AssetDetail,
+  BrowseListOutcome,
+  BrowseTreeOutcome,
   CommandError,
   SavedSearches,
   SearchOutcome,
@@ -9,6 +11,8 @@ import type {
 } from "./api";
 import appStatus from "./fixtures/app_status.json";
 import assetDetail from "./fixtures/asset_detail.json";
+import browseList from "./fixtures/browse_list.json";
+import browseTree from "./fixtures/browse_tree.json";
 import commandError from "./fixtures/command_error.json";
 import savedSearches from "./fixtures/saved_searches.json";
 import searchOutcome from "./fixtures/search_outcome.json";
@@ -26,6 +30,8 @@ const typedAssetDetail: AssetDetail = assetDetail as AssetDetail;
 const typedVolumesOutcome: VolumesOutcome = volumesOutcome;
 const typedSavedSearches: SavedSearches = savedSearches;
 const typedCommandError: CommandError = commandError;
+const typedBrowseTree: BrowseTreeOutcome = browseTree;
+const typedBrowseList: BrowseListOutcome = browseList;
 
 describe("wire fixtures", () => {
   it("carry the load-bearing runtime shapes", () => {
@@ -36,6 +42,9 @@ describe("wire fixtures", () => {
     expect(typedVolumesOutcome.notices?.length).toBeGreaterThan(0);
     expect(typedSavedSearches.saved.length).toBeGreaterThan(0);
     expect(typedSavedSearches.notices?.length).toBeGreaterThan(0);
+    expect(typedBrowseTree.notices?.length).toBeGreaterThan(0);
+    expect(typedBrowseList.notices?.length).toBeGreaterThan(0);
+    expect(typedBrowseTree.volumes[0]?.folders.length).toBeGreaterThan(0);
   });
 
   // An optional interface field can vanish from a regenerated fixture (a
@@ -49,5 +58,9 @@ describe("wire fixtures", () => {
     expect(hit?.source).toBeDefined();
     expect(hit?.locator).toBeDefined();
     expect(hit?.snippet).toBeDefined();
+    const [browseHit] = typedBrowseList.results;
+    expect(browseHit?.size).toBeDefined();
+    expect(browseHit?.mtime_ms).toBeDefined();
+    expect(browseHit?.kind).toBeDefined();
   });
 });

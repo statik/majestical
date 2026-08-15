@@ -4,7 +4,7 @@
   // keyframes the index found in it.
   import { api, errorMessage, errorNotices } from "./api";
   import type { AssetDetail, AssetVerification } from "./api";
-  import { isoDay, timecode } from "./format";
+  import { fileSize, isoDay, timecode } from "./format";
   import Notices from "./Notices.svelte";
   import OnlineBadge from "./OnlineBadge.svelte";
   import { fetchKeyframes, keyframeImageUrl, thumbUrl } from "./thumb";
@@ -102,19 +102,6 @@
   function basename(path: string): string {
     const cut = path.lastIndexOf("/");
     return cut === -1 ? path : path.slice(cut + 1);
-  }
-
-  const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
-
-  function fileSize(bytes: number): string {
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < UNITS.length - 1) {
-      value /= 1024;
-      unit += 1;
-    }
-    const rounded = unit === 0 ? String(value) : value.toFixed(1);
-    return `${rounded} ${UNITS[unit] ?? "B"}`;
   }
 </script>
 

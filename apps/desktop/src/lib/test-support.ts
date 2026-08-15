@@ -42,6 +42,19 @@ export function rejectCommand(
 }
 
 /**
+ * Answers every media query with `matches`. jsdom implements no media
+ * queries at all — `matchMedia` is missing outright, not merely inert — so a
+ * surface that asks how wide the window is throws without this.
+ */
+export function stubMatchMedia(matches: boolean): void {
+  vi.stubGlobal("matchMedia", () => ({
+    matches,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
+}
+
+/**
  * Answers the keyframe-manifest `fetch` with one canned response. jsdom has no
  * fetch stack, so the slice of `Response` the manifest reader uses is built by
  * hand; `body` is the text a real protocol handler would return, parsed as

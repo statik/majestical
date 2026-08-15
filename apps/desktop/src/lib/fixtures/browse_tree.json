@@ -1,0 +1,21 @@
+{
+  "notices": [
+    "a warning the browse_tree call collected"
+  ],
+  "volumes": [
+    {
+      "folders": [
+        {
+          "children": [
+            "raw"
+          ],
+          "path": "clips",
+          "recursive_count": 3
+        }
+      ],
+      "id": "vol1",
+      "label": "vol1",
+      "online": true
+    }
+  ]
+}

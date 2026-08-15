@@ -7,9 +7,9 @@
 //! points the var at its own tempdir — the same reason the CLI's suites set
 //! it per child process; here the "process" is this test binary.
 use majestical_desktop::commands::{
-    AppState, CatalogCfg, CommandError, adopt_catalog, app_status_impl, get_asset_impl,
-    initialize_catalog_impl, list_saved_searches_impl, list_volumes_impl, run_saved_search_impl,
-    search_assets_impl, use_existing_catalog_impl,
+    AppState, CatalogCfg, CommandError, adopt_catalog, app_status_impl, browse_list_impl,
+    browse_tree_impl, get_asset_impl, initialize_catalog_impl, list_saved_searches_impl,
+    list_volumes_impl, run_saved_search_impl, search_assets_impl, use_existing_catalog_impl,
 };
 use majestical_desktop::thumb_protocol;
 use std::path::Path;
@@ -45,39 +45,118 @@ fn cfg_for(dir: &Path) -> CatalogCfg {
     }
 }
 
+/// Initializes a fresh catalog at `dir` and emits `ops` into it — the
+/// common preamble every from-scratch seeding helper below starts with.
+#[cfg(test)]
+fn fresh_cfg_with(dir: &Path, ops: Vec<majestical_core::event::Op>) -> CatalogCfg {
+    let cfg = cfg_for(dir);
+    initialize_catalog_impl(&cfg).expect("init");
+    emit_into(&cfg, ops);
+    cfg
+}
+
+/// Opens `cfg`'s catalog and emits `ops` into it — the shared tail every
+/// seeding helper below ends with, whether building a fresh catalog
+/// ([`fresh_cfg_with`]) or adding more assets to an existing one.
+#[cfg(test)]
+fn emit_into(cfg: &CatalogCfg, ops: Vec<majestical_core::event::Op>) {
+    let mut app = majestical_services::app::FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)
+        .expect("open");
+    app.emit(ops).expect("emit");
+}
+
 /// A catalog holding one asset on one volume: the same `Op::VolumeSeen` +
 /// `Op::AssetSeen` literals the services search and volumes tests seed
 /// with, so a query for "clip" finds it here for the same reason it does
 /// there.
 #[cfg(test)]
 fn seeded_cfg(dir: &Path) -> CatalogCfg {
-    let cfg = cfg_for(dir);
-    initialize_catalog_impl(&cfg).expect("init");
-    let mut app = majestical_services::app::FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)
-        .expect("open");
-    app.emit(vec![
-        majestical_core::event::Op::VolumeSeen {
-            volume: "vol1".into(),
-            label: "vol1".into(),
-        },
-        majestical_core::event::Op::AssetSeen {
-            asset: majestical_core::event::AssetId(SEEDED_ASSET.into()),
-            volume: "vol1".into(),
-            path: "clip.txt".into(),
-            size: 5,
-            mtime_ms: 1000,
-        },
-    ])
-    .expect("emit");
-    cfg
+    fresh_cfg_with(
+        dir,
+        vec![
+            majestical_core::event::Op::VolumeSeen {
+                volume: "vol1".into(),
+                label: "vol1".into(),
+            },
+            majestical_core::event::Op::AssetSeen {
+                asset: majestical_core::event::AssetId(SEEDED_ASSET.into()),
+                volume: "vol1".into(),
+                path: "clip.txt".into(),
+                size: 5,
+                mtime_ms: 1000,
+            },
+        ],
+    )
+}
+
+/// A catalog holding one online volume with assets at `A/x.mov`, `A/B/y.jpg`,
+/// and `C/z.pdf` — mirrors `majestical_services::browse::tests::seed_fixture`'s
+/// shape (arrange helper copied from there), just built through a
+/// `CatalogCfg`/`FsApp::open` the way this file's other tests do.
+#[cfg(test)]
+fn browse_seeded_cfg(dir: &Path) -> CatalogCfg {
+    fresh_cfg_with(
+        dir,
+        vec![
+            majestical_core::event::Op::VolumeSeen {
+                volume: "vol1".into(),
+                label: "vol1".into(),
+            },
+            majestical_core::event::Op::AssetSeen {
+                asset: majestical_core::event::AssetId(
+                    "xxh3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ),
+                volume: "vol1".into(),
+                path: "A/x.mov".into(),
+                size: 10,
+                mtime_ms: 3000,
+            },
+            majestical_core::event::Op::AssetSeen {
+                asset: majestical_core::event::AssetId(
+                    "xxh3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                ),
+                volume: "vol1".into(),
+                path: "A/B/y.jpg".into(),
+                size: 20,
+                mtime_ms: 1000,
+            },
+            majestical_core::event::Op::AssetSeen {
+                asset: majestical_core::event::AssetId(
+                    "xxh3:cccccccccccccccccccccccccccccccc".into(),
+                ),
+                volume: "vol1".into(),
+                path: "C/z.pdf".into(),
+                size: 30,
+                mtime_ms: 2000,
+            },
+        ],
+    )
+}
+
+/// A catalog with `count` assets on one volume, all at the volume root —
+/// enough to page through `browse_list`'s default limit. Same id/path
+/// pattern as `seed_extra_clips`, just seeded from scratch rather than added
+/// to an existing catalog.
+#[cfg(test)]
+fn browse_cfg_with_assets(dir: &Path, count: usize) -> CatalogCfg {
+    let mut ops = vec![majestical_core::event::Op::VolumeSeen {
+        volume: "vol1".into(),
+        label: "vol1".into(),
+    }];
+    ops.extend((0..count).map(|n| majestical_core::event::Op::AssetSeen {
+        asset: majestical_core::event::AssetId(format!("xxh3:{n:032x}")),
+        volume: "vol1".into(),
+        path: format!("item-{n}.txt"),
+        size: 5,
+        mtime_ms: 1000,
+    }));
+    fresh_cfg_with(dir, ops)
 }
 
 /// Adds `count` more assets whose names match the "clip" query, so a search
 /// has more hits than one page.
 #[cfg(test)]
 fn seed_extra_clips(cfg: &CatalogCfg, count: usize) {
-    let mut app = majestical_services::app::FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)
-        .expect("open");
     let ops = (0..count)
         .map(|n| majestical_core::event::Op::AssetSeen {
             asset: majestical_core::event::AssetId(format!("xxh3:{n:032x}")),
@@ -87,7 +166,7 @@ fn seed_extra_clips(cfg: &CatalogCfg, count: usize) {
             mtime_ms: 1000,
         })
         .collect();
-    app.emit(ops).expect("emit");
+    emit_into(cfg, ops);
 }
 
 /// Appends an unparseable line to this machine's event segment, so every
@@ -230,6 +309,148 @@ fn list_volumes_lists_the_seeded_volume() {
         let ids: Vec<&str> = outcome.volumes.iter().map(|v| v.id.as_str()).collect();
         assert_eq!(ids, vec!["vol1"]);
         assert_eq!(outcome.volumes[0].asset_count, 1);
+    });
+}
+
+#[test]
+fn browse_tree_computes_exact_recursive_counts() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_seeded_cfg(dir.path());
+        let out = browse_tree_impl(&cfg).expect("browse_tree");
+        assert_eq!(out.volumes.len(), 1);
+        let v = &out.volumes[0];
+        let folder = |path: &str| {
+            v.folders
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("no folder '{path}' in {:?}", v.folders))
+        };
+        assert_eq!(v.folders.len(), 4, "'', A, A/B, C");
+        assert_eq!(folder("").recursive_count, 3);
+        assert_eq!(folder("A").recursive_count, 2);
+        assert_eq!(folder("A/B").recursive_count, 1);
+        assert_eq!(folder("C").recursive_count, 1);
+    });
+}
+
+#[test]
+fn browse_list_returns_rows_with_size_mtime_ms_and_kind() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_seeded_cfg(dir.path());
+        let out = browse_list_impl(
+            &cfg,
+            "vol1".into(),
+            None,
+            None,
+            Some("name".into()),
+            None,
+            None,
+            None,
+        )
+        .expect("browse_list");
+        assert_eq!(out.count, 3);
+        assert_eq!(out.folder_count, 3, "A, A/B, C");
+        let names: Vec<&str> = out.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["x.mov", "y.jpg", "z.pdf"]);
+        let x = &out.results[0];
+        assert_eq!(x.size, Some(10), "the instance's own size");
+        assert_eq!(x.mtime_ms, Some(3000), "the instance's own mtime");
+        assert_eq!(x.kind.as_deref(), Some("video"));
+    });
+}
+
+/// A caller that omits `limit` gets exactly one page of
+/// `majestical_services::browse::DEFAULT_LIMIT` rows, not the whole catalog
+/// — the same strong shape as `search_without_a_limit_returns_one_default_page`:
+/// seeding one more asset than the default page holds means a mutated
+/// default (e.g. `unwrap_or(1)`, or any other wrong constant) fails this
+/// test, where a catalog with only one asset couldn't tell the difference.
+#[test]
+fn browse_list_without_a_limit_uses_the_browse_default() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let total = majestical_services::browse::DEFAULT_LIMIT + 1;
+        let cfg = browse_cfg_with_assets(dir.path(), total);
+        let out = browse_list_impl(&cfg, "vol1".into(), None, None, None, None, None, None)
+            .expect("browse_list");
+        assert_eq!(out.count, total as u64, "count is pre-pagination");
+        assert_eq!(
+            out.results.len(),
+            majestical_services::browse::DEFAULT_LIMIT,
+            "one default-sized page, not the whole catalog"
+        );
+    });
+}
+
+/// One call giving every argument (but `sort`, left at its default) a value
+/// that differs from its default — the file's only positional 7-arg
+/// forward, so a transposed pair (`path`/`kind` are both `Option<String>`
+/// and could swap without a type error) would otherwise compile clean and
+/// only misbehave at runtime. Pins the exact outcome for this exact
+/// combination against `browse_seeded_cfg`'s fixed catalog: `path("A")` +
+/// `flatten(false)` scope the match down to `A/x.mov` alone (`A/B/y.jpg`
+/// sits one level deeper, `C/z.pdf` is a different folder entirely),
+/// `kind("video")` still lets it through, and `offset(1)` then skips past
+/// that one match — a swapped `path`/`kind` would instead scope to a
+/// nonexistent folder or reject `"A"` as an unknown kind, either visible
+/// here as a wrong `count`/`folder_count` or an `Err` where this expects
+/// `Ok`.
+#[test]
+fn browse_list_wires_every_argument_to_its_own_slot() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_seeded_cfg(dir.path());
+        let out = browse_list_impl(
+            &cfg,
+            "vol1".into(),
+            Some("A".into()),
+            Some(false),
+            None,
+            Some("video".into()),
+            Some(1),
+            Some(1),
+        )
+        .expect("browse_list");
+        assert_eq!(
+            out.count, 1,
+            "only A/x.mov sits directly in A and is a video"
+        );
+        assert_eq!(out.folder_count, 1, "just A");
+        assert!(
+            out.results.is_empty(),
+            "the one match is skipped by offset 1: {:?}",
+            out.results
+        );
+    });
+}
+
+/// `limit` and `offset` are both `Option<usize>` and adjacent in the
+/// parameter list, so a transposed pair compiles clean; the test above can't
+/// see it, because it passes `Some(1)` for both. Six same-shaped assets sorted
+/// by name make the window itself the assertion: `limit(2)` + `offset(3)` is
+/// `item-3`/`item-4`, where the swap (`limit(3)` + `offset(2)`) is a
+/// three-row page starting at `item-2`.
+#[test]
+fn browse_list_paginates_with_limit_and_offset_in_their_own_slots() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 6);
+        let out = browse_list_impl(
+            &cfg,
+            "vol1".into(),
+            None,
+            None,
+            Some("name".into()),
+            None,
+            Some(2),
+            Some(3),
+        )
+        .expect("browse_list");
+        assert_eq!(out.count, 6, "count is pre-pagination");
+        let names: Vec<&str> = out.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["item-3.txt", "item-4.txt"]);
     });
 }
 

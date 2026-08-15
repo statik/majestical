@@ -142,6 +142,8 @@ impl Drop for Mcp {
 /// bodies) so the roster itself is already stable.
 const EXPECTED_TOOLS: &[&str] = &[
     "add_sync_location",
+    "browse_assets",
+    "browse_tree",
     "catalog_init",
     "get_asset",
     "get_describer",
@@ -428,6 +430,85 @@ fn list_volumes_matches() {
     assert_eq!(volumes.len(), 1, "{volumes:?}");
     assert_eq!(volumes[0]["id"], serde_json::json!("vol1"));
     assert_eq!(volumes[0]["asset_count"], serde_json::json!(2));
+}
+
+#[test]
+fn browse_tree_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("browse_tree", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let volumes = resp["result"]["structuredContent"]["volumes"]
+        .as_array()
+        .expect("volumes array");
+    assert_eq!(volumes.len(), 1, "{volumes:?}");
+    assert_eq!(volumes[0]["id"], serde_json::json!("vol1"));
+    let folders = volumes[0]["folders"].as_array().expect("folders array");
+    assert_eq!(
+        folders.len(),
+        1,
+        "fixture_catalog's two assets sit flat at the volume root: {folders:?}"
+    );
+    assert_eq!(folders[0]["path"], serde_json::json!(""));
+    assert_eq!(folders[0]["recursive_count"], serde_json::json!(2));
+}
+
+#[test]
+fn browse_assets_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("browse_assets", &serde_json::json!({"volume": "vol1"}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(structured["count"], serde_json::json!(2), "{structured}");
+    assert_eq!(
+        structured["folder_count"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    let results = structured["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "{structured}");
+}
+
+#[test]
+fn browse_assets_unknown_volume_is_a_tool_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "browse_assets",
+        &serde_json::json!({"volume": "no-such-volume"}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(text.contains("no-such-volume"), "{text}");
+    assert!(text.contains("maj volumes list"), "{text}");
+}
+
+/// `browse_tree`/`browse_assets` are read tools, so — unlike every tool in
+/// `MUTATING_TOOLS` — their `inputSchema` must carry no `confirm` property
+/// at all.
+#[test]
+fn browse_tools_carry_no_confirm_param() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request("tools/list", &serde_json::json!({}));
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    for name in ["browse_tree", "browse_assets"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("{name}: missing from tools/list: {resp}"));
+        assert!(
+            tool["inputSchema"]["properties"]["confirm"].is_null(),
+            "{name}: a read tool must not have a confirm param: {tool}"
+        );
+    }
 }
 
 #[test]

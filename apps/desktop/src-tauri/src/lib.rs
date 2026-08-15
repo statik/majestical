@@ -43,6 +43,8 @@ pub fn run() {
             commands::list_volumes,
             commands::list_saved_searches,
             commands::run_saved_search,
+            commands::browse_tree,
+            commands::browse_list,
             commands::initialize_catalog,
             commands::use_existing_catalog,
         ])

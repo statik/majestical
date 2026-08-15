@@ -183,6 +183,13 @@ main > .error {
   cursor: pointer;
 }
 
+/* A chip that is a toggle rather than an action says so by filling in — the
+   same "you are here" weight the sidebar's current surface carries. */
+.chip[aria-pressed="true"] {
+  background: var(--sunken);
+  font-weight: 600;
+}
+
 .count {
   margin: 0.75rem 0 0;
   color: var(--muted);
@@ -253,6 +260,225 @@ main > .error {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;
+}
+
+/* Browse. The folder tree is a column of the surface itself, so this surface
+   is a grid where every other one is a single scrolling column. */
+.browse-surface {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.browse-tree {
+  width: 168px;
+  padding-right: 0.75rem;
+  overflow: hidden;
+  border-right: 1px solid var(--edge);
+}
+
+/* Note 3 of the browse mockup: four columns do not fit a 13" window with the
+   inspector open, so the tree gives up all but its volumes rather than the
+   grid giving up a column of thumbnails.
+
+   Volumes only, deliberately: 36px of column is 23px of content box, and a
+   folder's indent grows with its depth, so a nested button would sit outside
+   the clip — present, styled, and unreachable. The folders are hidden
+   instead, and what stays is a column of drive badges that still select.
+   Each volume's own label stays in the accessibility tree (visually hidden,
+   not `display: none`), so the badge a sighted user reads as a dot is still
+   announced as "SSD-A online". Widen the window to get the folders back. */
+.browse-tree-collapsed {
+  width: 36px;
+}
+
+.browse-tree-collapsed ul ul {
+  display: none;
+}
+
+/* Nothing to disclose once the folders are gone, and the row needs every
+   pixel of the 23px for the badge. */
+.browse-tree-collapsed .browse-caret {
+  display: none;
+}
+
+.browse-tree-collapsed .browse-node {
+  padding-right: 0;
+  padding-left: 0;
+}
+
+.browse-tree-collapsed .browse-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.browse-tree ul {
+  margin: 0;
+  padding-left: 0.75rem;
+  list-style: none;
+}
+
+.browse-tree > ul {
+  padding-left: 0;
+}
+
+.browse-row {
+  display: flex;
+  gap: 0.15rem;
+  align-items: center;
+}
+
+/* A leaf has no caret but keeps its width, so every label in one branch
+   starts at the same x whether or not the node opens. */
+.browse-caret {
+  flex: none;
+  width: 0.9rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+}
+
+.browse-node {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.15rem 0.3rem;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.browse-node[aria-current] {
+  background: var(--sunken);
+}
+
+.browse-vol {
+  font-weight: 600;
+}
+
+/* `min-width: 0`: a grid item's automatic minimum is its content, which one
+   long filename in the card grid would push past this column's share. */
+.browse-main {
+  min-width: 0;
+}
+
+.browse-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.browse-crumb {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.browse-crumb-sep {
+  color: var(--muted);
+}
+
+.browse-sub {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.browse-thumb {
+  position: relative;
+  display: block;
+}
+
+/* An unplugged drive's assets are cataloged in full — thumbnail included —
+   so the card is drawn as usual and marked, rather than left blank. */
+.browse-offthumb {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: color-mix(in srgb, Canvas 65%, transparent);
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.browse-more {
+  margin-top: 0.75rem;
+}
+
+/* Hover-scrub: the keyframe, its timecode and the position strip all draw
+   over the card's own thumbnail, which stays in the layout so that swapping
+   to a keyframe and back cannot reflow the grid under the pointer. */
+.browse-film {
+  position: relative;
+  display: block;
+}
+
+/* One wrapper for the three drawn-over pieces, so a single `aria-hidden`
+   keeps all of them out of the card button's name. */
+.browse-overlay {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.browse-frame {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+/* System colors rather than this sheet's currentcolor mixes: a chip drawn on
+   top of a photograph needs a ground of its own, and `Canvas`/`CanvasText`
+   are the pair that still follows the OS light/dark setting. */
+.browse-tc {
+  position: absolute;
+  top: 0.25rem;
+  left: 0.25rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  background: Canvas;
+  color: CanvasText;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.browse-scrub {
+  position: absolute;
+  inset: auto 0 0;
+  display: flex;
+  height: 22%;
+}
+
+.browse-scrub i {
+  flex: 1;
+  border-right: 1px solid var(--edge);
+  background: color-mix(in srgb, Canvas 55%, transparent);
+}
+
+.browse-scrub i.pos {
+  background: color-mix(in srgb, CanvasText 45%, transparent);
 }
 
 .inspector {
@@ -369,13 +595,14 @@ main > .error {
   border-radius: 4px;
 }
 
-/* Not scoped to `.strip`: a small extracted-keyframe thumbnail, shared by
-   the Inspector's strip here and PR 2's Filmstrip later — one style, both
-   call sites, rather than each redefining its own scoped copy. The `<img>`
-   also carries explicit `width`/`height` attributes (not just this rule's
-   `object-fit`), so the browser reserves the right space before the image
-   has loaded — a strip drawn while extraction is still running must not
-   reflow every sibling as each frame arrives. */
+/* The Inspector strip's own extracted-keyframe thumbnail, at the fixed size
+   a strip of them is laid out at. The browse filmstrip shows the same images
+   but not at this size — a hovered frame fills the card it is drawn over, so
+   it has its own `.browse-frame` rather than overriding half of this rule.
+   The `<img>` here also carries explicit `width`/`height` attributes (not
+   just this rule's `object-fit`), so the browser reserves the right space
+   before the image has loaded — a strip drawn while extraction is still
+   running must not reflow every sibling as each frame arrives. */
 .keyframe {
   display: block;
   width: 64px;

@@ -17,6 +17,7 @@
 //! read the projection and return promptly.
 use crate::config::{self, GuiConfig};
 use majestical_services::app::FsApp;
+use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseTreeOutcome};
 use majestical_services::catalog::AssetDetail;
 use majestical_services::error::ServiceError;
 use majestical_services::search::{SavedSearch, SearchOutcome, SearchRequest};
@@ -217,6 +218,58 @@ pub fn list_saved_searches_impl(cfg: &CatalogCfg) -> Result<SavedSearches, Comma
     })
 }
 
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+pub fn browse_tree_impl(cfg: &CatalogCfg) -> Result<BrowseTreeOutcome, CommandError> {
+    let app = open_app(cfg)?;
+    Ok(majestical_services::browse::browse_tree(
+        &app,
+        &cfg.catalog,
+    )?)
+}
+
+/// `limit` defaults to [`majestical_services::browse::DEFAULT_LIMIT`],
+/// `offset` to 0, `path` to the volume root, `flatten` to true — the same
+/// defaults `maj browse list` and the MCP `browse_assets` tool apply, so all
+/// three heads agree without a caller having to know the number.
+///
+/// # Errors
+/// Returns an error if no catalog is selected, `volume` doesn't name a
+/// cataloged volume, or `sort`/`kind` name an unrecognized value.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors browse_list's own argument list one-for-one — this module's rule is \
+              commands stay one-liners over testable impls, which only holds if the impl \
+              takes the same arguments the wrapper does; see browse_list's own #[expect] \
+              for why the wrapper itself takes seven flat arguments instead of a struct"
+)]
+pub fn browse_list_impl(
+    cfg: &CatalogCfg,
+    volume: String,
+    path: Option<String>,
+    flatten: Option<bool>,
+    sort: Option<String>,
+    kind: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<BrowseListOutcome, CommandError> {
+    let app = open_app(cfg)?;
+    let req = BrowseRequest {
+        volume,
+        path: path.unwrap_or_default(),
+        flatten: flatten.unwrap_or(true),
+        sort,
+        kind,
+        limit: limit.unwrap_or(majestical_services::browse::DEFAULT_LIMIT),
+        offset: offset.unwrap_or(0),
+    };
+    Ok(majestical_services::browse::browse_list(
+        &app,
+        &cfg.catalog,
+        &req,
+    )?)
+}
+
 /// Refuses a root that already holds a catalog: `catalog::init` is
 /// idempotent, so without this guard "initialize" would silently adopt
 /// someone else's catalog instead of creating one.
@@ -409,6 +462,64 @@ pub fn list_volumes(state: State<'_, AppState>) -> Result<VolumesOutcome, Comman
 #[tauri::command]
 pub fn list_saved_searches(state: State<'_, AppState>) -> Result<SavedSearches, CommandError> {
     list_saved_searches_impl(&require_catalog(&state)?)
+}
+
+/// Every volume's folder tree, with a recursive asset count per folder.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn browse_tree(state: State<'_, AppState>) -> Result<BrowseTreeOutcome, CommandError> {
+    browse_tree_impl(&require_catalog(&state)?)
+}
+
+/// Assets under one folder of one volume, sorted, optionally kind-filtered,
+/// and paginated — see [`browse_list_impl`] for the argument defaults. This
+/// wrapper's argument order must match `browse_list_impl`'s exactly: it's a
+/// plain positional forward with no argument names at the call site to
+/// catch a transposition, and — unlike the impl — it's untestable without a
+/// webview (see `tests/commands.rs`'s pass-through test for the coverage
+/// this layer doesn't get on its own).
+///
+/// # Errors
+/// Returns an error if no catalog is selected, `volume` doesn't name a
+/// cataloged volume, or `sort`/`kind` name an unrecognized value.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors BrowseRequest's seven fields one-for-one; a struct param would \
+              arrive nested under its own key on the invoke wire, changing the flat-args \
+              shape all heads share, so collapsing them into a struct here would only \
+              move the count, not remove it"
+)]
+#[tauri::command]
+pub fn browse_list(
+    state: State<'_, AppState>,
+    volume: String,
+    path: Option<String>,
+    flatten: Option<bool>,
+    sort: Option<String>,
+    kind: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<BrowseListOutcome, CommandError> {
+    browse_list_impl(
+        &require_catalog(&state)?,
+        volume,
+        path,
+        flatten,
+        sort,
+        kind,
+        limit,
+        offset,
+    )
 }
 
 /// Creates a catalog at `path`, then selects and persists it.

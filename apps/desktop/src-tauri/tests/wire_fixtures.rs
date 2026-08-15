@@ -10,6 +10,9 @@
 //! to round-trip through a service call for.
 use majestical_core::event::VerifyOutcome;
 use majestical_desktop::commands::{AppStatus, CommandError, SavedSearches};
+use majestical_services::browse::{
+    BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
+};
 use majestical_services::catalog::{AssetDetail, AssetInstance, AssetVerification};
 use majestical_services::search::{
     SavedSearch, SearchHit, SearchOutcome, SemanticCoverage, TextCoverageNotice, VolumeRef,
@@ -108,6 +111,11 @@ fn search_outcome_fixture() {
             source: Some("transcript".to_string()),
             locator: Some(2),
             snippet: Some("a matching snippet".to_string()),
+            // Search never populates these — only browse rows do. Left
+            // `None` so this fixture's JSON stays byte-identical.
+            size: None,
+            mtime_ms: None,
+            kind: None,
         }],
         semantic_coverage: Some(SemanticCoverage {
             embedded: 10,
@@ -192,6 +200,69 @@ fn saved_searches_fixture() {
     check_or_update(
         "saved_searches",
         &serde_json::to_value(&saved_searches).expect("serialize"),
+    );
+}
+
+#[test]
+fn browse_tree_fixture() {
+    let browse_tree_outcome = BrowseTreeOutcome {
+        volumes: vec![BrowseVolume {
+            id: "vol1".to_string(),
+            label: "vol1".to_string(),
+            online: true,
+            folders: vec![BrowseFolder {
+                path: "clips".to_string(),
+                children: vec!["raw".to_string()],
+                recursive_count: 3,
+            }],
+        }],
+        notices: vec!["a warning the browse_tree call collected".to_string()],
+    };
+    check_or_update(
+        "browse_tree",
+        &serde_json::to_value(&browse_tree_outcome).expect("serialize"),
+    );
+}
+
+/// synthetic-maximal: browse itself never populates
+/// `timestamp_ms`/`source`/`locator`/`snippet` — they're `Some` here purely
+/// so the TS side type-checks the full `SearchHit` surface; see
+/// `search.rs`'s field docs (where those four fields are declared) for what
+/// real browse rows carry — `browse.rs`'s `build_rows` is where the `None`
+/// literals for all four actually live.
+#[test]
+fn browse_list_fixture() {
+    // `count`/`folder_count` outrun `results.len()` on purpose — one row
+    // shown out of 3 total matches across 2 folders — so the fixture is
+    // self-documenting about the load-more math a paginated view needs.
+    let browse_list_outcome = BrowseListOutcome {
+        count: 3,
+        folder_count: 2,
+        results: vec![SearchHit {
+            asset: "xxh3:0123456789abcdef0123456789abcdef".to_string(),
+            score: 0.0,
+            known: true,
+            name: "clip.mov".to_string(),
+            volumes: vec![VolumeRef {
+                id: "vol1".to_string(),
+                label: "vol1".to_string(),
+                online: true,
+            }],
+            tags: vec!["demo".to_string()],
+            para: Some("project/client-x".to_string()),
+            timestamp_ms: Some(1500),
+            source: Some("transcript".to_string()),
+            locator: Some(2),
+            snippet: Some("a matching snippet".to_string()),
+            size: Some(1024),
+            mtime_ms: Some(1_700_000_000_000),
+            kind: Some("video".to_string()),
+        }],
+        notices: vec!["a warning the browse_list call collected".to_string()],
+    };
+    check_or_update(
+        "browse_list",
+        &serde_json::to_value(&browse_list_outcome).expect("serialize"),
     );
 }
 

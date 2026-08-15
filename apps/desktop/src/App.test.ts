@@ -4,10 +4,17 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
-import { mockCommands, rejectCommand, stubManifest } from "./lib/test-support";
+import {
+  mockCommands,
+  rejectCommand,
+  stubManifest,
+  stubMatchMedia,
+} from "./lib/test-support";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
+  // The browse surface asks how wide the window is; jsdom has no answer.
+  stubMatchMedia(false);
   // The inspector asks the `thumb://` protocol for a keyframe manifest; this
   // app has none for the fixture asset.
   stubManifest(404, "no keyframe manifest");
@@ -71,6 +78,15 @@ function mockCatalog(volumeLabels: string[]) {
     list_saved_searches: () => ({ saved: [] }),
     search_assets: () => ({ count: 1, results: [hit] }),
     get_asset: () => detail,
+    browse_tree: () => ({
+      volumes: volumeLabels.map((label) => ({
+        id: `label:${label}`,
+        label,
+        online: true,
+        folders: [{ path: "", children: [], recursive_count: 1 }],
+      })),
+    }),
+    browse_list: () => ({ count: 1, folder_count: 1, results: [hit] }),
     list_volumes: () => ({
       volumes: volumeLabels.map((label) => ({
         id: `label:${label}`,
@@ -148,6 +164,50 @@ test("leaving the search surface closes the inspector with it", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Volumes" }));
 
   await waitFor(() => expect(container.querySelector(".inspector")).toBeNull());
+});
+
+test("the sidebar offers exactly the surfaces this phase ships, in order", async () => {
+  mockCatalog(["Card"]);
+  const { container } = render(App);
+
+  await screen.findByRole("searchbox");
+  const surfaces = [...container.querySelectorAll(".surfaces button")].map(
+    (button) => button.textContent,
+  );
+  // No dead buttons: Ingest and Organize arrive with their own surfaces.
+  expect(surfaces).toEqual(["Search", "Browse", "Volumes"]);
+});
+
+test("the browse surface swaps in, and takes the inspector's selection with it", async () => {
+  mockCatalog(["Card"]);
+  const { container } = render(App);
+
+  await userEvent.type(await screen.findByRole("searchbox"), "sunset");
+  await userEvent.click(await screen.findByRole("button", { name: /sunset/u }));
+  await waitFor(() =>
+    expect(container.querySelector(".inspector")).not.toBeNull(),
+  );
+
+  const browse = screen.getByRole("button", { name: "Browse" });
+  await userEvent.click(browse);
+
+  expect(await screen.findByRole("button", { name: /Card/u })).toBeTruthy();
+  expect(screen.queryByRole("searchbox")).toBeNull();
+  expect(browse.getAttribute("aria-current")).toBe("page");
+  expect(container.querySelector(".inspector")).toBeNull();
+});
+
+test("a browse card opens the inspector the same way a search hit does", async () => {
+  mockCatalog(["Card"]);
+  const { container } = render(App);
+
+  await userEvent.click(await screen.findByRole("button", { name: "Browse" }));
+  await userEvent.click(await screen.findByRole("button", { name: /Card/u }));
+  await userEvent.click(await screen.findByRole("button", { name: /sunset/u }));
+
+  await waitFor(() =>
+    expect(container.querySelector(".inspector")).not.toBeNull(),
+  );
 });
 
 test("a failed startup offers a retry that asks again", async () => {

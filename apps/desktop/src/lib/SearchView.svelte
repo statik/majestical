@@ -7,7 +7,14 @@
   import OnlineBadge from "./OnlineBadge.svelte";
   import { thumbUrl } from "./thumb";
 
-  let { onselect }: { onselect: (assetId: string) => void } = $props();
+  let {
+    onselect,
+  }: {
+    /** The click rides along with the asset: which asset the inspector shows
+     *  is this surface's business, but whether a click extends a selection
+     *  is the modifier keys' — and only the event carries those. */
+    onselect: (assetId: string, event: MouseEvent) => void;
+  } = $props();
 
   /** Long enough that a typed word is one search, short enough to feel live. */
   const DEBOUNCE_MS = 200;
@@ -143,7 +150,7 @@
     <ul class="grid">
       {#each outcome.results as hit (hit.asset)}
         <li>
-          <button class="card" onclick={() => onselect(hit.asset)}>
+          <button class="card" onclick={(event) => onselect(hit.asset, event)}>
             {#if hit.known}
               <img src={thumbUrl(hit.asset)} alt="" loading="lazy" />
               <span class="name">{hit.name}</span>

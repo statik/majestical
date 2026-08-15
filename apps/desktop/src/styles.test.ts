@@ -1,10 +1,12 @@
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { render, screen } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeAll, expect, test } from "vitest";
+import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import "./app.css";
+import BrowseView from "./lib/BrowseView.svelte";
 import SearchView from "./lib/SearchView.svelte";
-import { mockCommands } from "./lib/test-support";
+import { mockBrowse, oneClip } from "./lib/browse-test-support";
+import { mockCommands, stubMatchMedia } from "./lib/test-support";
 import VolumesView from "./lib/VolumesView.svelte";
 
 // `app.css` is one global sheet, so a class name means the same thing to every
@@ -26,7 +28,10 @@ beforeAll(() => {
   expect(rules.length).toBeGreaterThan(20);
   expect(rules.map((rule) => rule.cssText).join("")).toContain(".volume-table");
 });
-afterEach(clearMocks);
+afterEach(() => {
+  clearMocks();
+  vi.unstubAllGlobals();
+});
 
 test("the volumes table is laid out as a table", async () => {
   mockCommands({
@@ -48,6 +53,36 @@ test("the volumes table is laid out as a table", async () => {
   await screen.findByRole("table");
   const table = container.querySelector(".volume-table") as HTMLElement;
   expect(globalThis.getComputedStyle(table).display).toBe("table");
+});
+
+/** The browse tree is a column of the surface, and a collapsed tree is a
+ *  strip of volumes — both live only in the sheet, so markup queries
+ *  elsewhere in this suite cannot see either of them. */
+test("the browse tree is a column of the surface, and collapses to its volumes", async () => {
+  mockConvertFileSrc("macos");
+  stubMatchMedia(true);
+  mockBrowse([oneClip]);
+  const { container } = render(BrowseView, {
+    onselect: () => {},
+    inspectorOpen: true,
+  });
+
+  const volume = await screen.findByRole("button", { name: "SSD-A online" });
+  const surface = container.querySelector(".browse-surface") as HTMLElement;
+  const tree = container.querySelector(".browse-tree") as HTMLElement;
+  expect(globalThis.getComputedStyle(surface).display).toBe("grid");
+  expect(globalThis.getComputedStyle(tree).width).toBe("36px");
+
+  // The contract of a collapsed tree: volumes only. A folder's indent grows
+  // with its depth, so inside 36px its button would be clipped out of reach
+  // — present and unclickable. The whole nested list goes instead.
+  const nested = container.querySelector(".browse-tree ul ul") as HTMLElement;
+  expect(globalThis.getComputedStyle(nested).display).toBe("none");
+  // What is left still selects: the volume row is drawn, and its label is
+  // only visually hidden, so a reader still announces which drive it is.
+  expect(globalThis.getComputedStyle(volume).display).toBe("flex");
+  const label = volume.querySelector(".browse-label") as HTMLElement;
+  expect(globalThis.getComputedStyle(label).position).toBe("absolute");
 });
 
 test("a search card's volume badges still sit in a row", async () => {

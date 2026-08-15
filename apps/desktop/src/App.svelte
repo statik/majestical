@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, errorMessage, errorNotices } from "./lib/api";
   import type { AppStatus } from "./lib/api";
+  import BrowseView from "./lib/BrowseView.svelte";
   import Inspector from "./lib/Inspector.svelte";
   import Notices from "./lib/Notices.svelte";
   import SearchView from "./lib/SearchView.svelte";
@@ -8,7 +9,7 @@
   import VolumesView from "./lib/VolumesView.svelte";
   import Welcome from "./lib/Welcome.svelte";
 
-  type Surface = "search" | "volumes";
+  type Surface = "search" | "browse" | "volumes";
 
   let status = $state<AppStatus | null>(null);
   let error = $state<string | null>(null);
@@ -38,11 +39,11 @@
   }
 
   /**
-   * The inspector describes a search result, and this phase has no way to
-   * reach an asset from the volumes surface — so leaving Search drops the
-   * selection rather than parking a panel beside a table it has nothing to
-   * do with. Coming back to Search starts from an empty box either way: the
-   * surface is unmounted while you are on Volumes.
+   * The inspector describes the asset a surface handed it, and no other
+   * surface can reach that same asset — so switching drops the selection
+   * rather than parking a panel beside something it has nothing to do with.
+   * The surface left behind is unmounted, so coming back starts empty
+   * either way.
    */
   function show(next: Surface) {
     surface = next;
@@ -78,6 +79,12 @@
           </li>
           <li>
             <button
+              aria-current={surface === "browse" ? "page" : undefined}
+              onclick={() => show("browse")}>Browse</button
+            >
+          </li>
+          <li>
+            <button
               aria-current={surface === "volumes" ? "page" : undefined}
               onclick={() => show("volumes")}>Volumes</button
             >
@@ -89,6 +96,11 @@
       </nav>
       {#if surface === "search"}
         <SearchView onselect={(asset) => (selected = asset)} />
+      {:else if surface === "browse"}
+        <BrowseView
+          onselect={(asset) => (selected = asset)}
+          inspectorOpen={selected !== null}
+        />
       {:else}
         <VolumesView />
       {/if}

@@ -7,9 +7,11 @@
 //! points the var at its own tempdir — the same reason the CLI's suites set
 //! it per child process; here the "process" is this test binary.
 use majestical_desktop::commands::{
-    AppState, CatalogCfg, CommandError, adopt_catalog, app_status_impl, browse_list_impl,
-    browse_tree_impl, get_asset_impl, initialize_catalog_impl, list_saved_searches_impl,
-    list_volumes_impl, run_saved_search_impl, search_assets_impl, use_existing_catalog_impl,
+    AppState, CatalogCfg, CommandError, add_para_node_impl, adopt_catalog, app_status_impl,
+    archive_node_impl, assign_tags_impl, browse_list_impl, browse_tree_impl, file_assets_impl,
+    get_asset_impl, initialize_catalog_impl, list_para_impl, list_saved_searches_impl,
+    list_tags_impl, list_volumes_impl, merge_tags_impl, rename_para_node_impl, rename_tag_impl,
+    run_saved_search_impl, search_assets_impl, use_existing_catalog_impl,
 };
 use majestical_desktop::thumb_protocol;
 use std::path::Path;
@@ -144,7 +146,7 @@ fn browse_cfg_with_assets(dir: &Path, count: usize) -> CatalogCfg {
         label: "vol1".into(),
     }];
     ops.extend((0..count).map(|n| majestical_core::event::Op::AssetSeen {
-        asset: majestical_core::event::AssetId(format!("xxh3:{n:032x}")),
+        asset: majestical_core::event::AssetId(asset_at(n)),
         volume: "vol1".into(),
         path: format!("item-{n}.txt"),
         size: 5,
@@ -153,13 +155,33 @@ fn browse_cfg_with_assets(dir: &Path, count: usize) -> CatalogCfg {
     fresh_cfg_with(dir, ops)
 }
 
+/// The asset id [`browse_cfg_with_assets`] mints for index `n` — computed
+/// the same way rather than hand-typed, so a test asking for asset 0 or 1
+/// can't silently miscount the hex padding.
+#[cfg(test)]
+fn asset_at(n: usize) -> String {
+    format!("xxh3:{n:032x}")
+}
+
+/// Opens `cfg`'s catalog and calls `tags::tag_add` for each `(asset, tag)`
+/// pair — the shared preamble the tag command tests below all used to
+/// repeat by hand (open, `tag_add`, `tag_add`, `drop(app)`).
+#[cfg(test)]
+fn tag_assets(cfg: &CatalogCfg, pairs: &[(&str, &str)]) {
+    let mut app = majestical_services::app::FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)
+        .expect("open");
+    for (asset, tag) in pairs {
+        majestical_services::tags::tag_add(&mut app, asset, tag).expect("tag_add");
+    }
+}
+
 /// Adds `count` more assets whose names match the "clip" query, so a search
 /// has more hits than one page.
 #[cfg(test)]
 fn seed_extra_clips(cfg: &CatalogCfg, count: usize) {
     let ops = (0..count)
         .map(|n| majestical_core::event::Op::AssetSeen {
-            asset: majestical_core::event::AssetId(format!("xxh3:{n:032x}")),
+            asset: majestical_core::event::AssetId(asset_at(n)),
             volume: "vol1".into(),
             path: format!("clip-{n}.txt"),
             size: 5,
@@ -930,6 +952,256 @@ fn an_unknown_route_is_a_404() {
         let cfg = seeded_cfg(dir.path());
         let response = thumb_protocol::handle(Some(&cfg), "thumb://localhost/nope/whatever");
         assert_eq!(response.status(), 404);
+    });
+}
+
+#[test]
+fn list_tags_reports_every_live_tag_with_its_asset_count() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 2);
+        let (a0, a1) = (asset_at(0), asset_at(1));
+        tag_assets(&cfg, &[(a0.as_str(), "x"), (a1.as_str(), "x")]);
+
+        let outcome = list_tags_impl(&cfg).expect("list_tags");
+        assert_eq!(outcome.tags.len(), 1);
+        assert_eq!(outcome.tags[0].tag, "x");
+        assert_eq!(outcome.tags[0].count, 2);
+    });
+}
+
+#[test]
+fn rename_tag_moves_the_vocabulary_a_follow_up_list_tags_proves_it() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 1);
+        tag_assets(&cfg, &[(asset_at(0).as_str(), "old")]);
+
+        let outcome = rename_tag_impl(&cfg, "old", "new").expect("rename_tag");
+        assert_eq!(outcome.from, "old");
+        assert_eq!(outcome.to, "new");
+        assert_eq!(outcome.rewritten, 1);
+
+        let listed = list_tags_impl(&cfg).expect("list_tags");
+        let names: Vec<&str> = listed.tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["new"],
+            "the old name must be gone from the vocabulary"
+        );
+    });
+}
+
+#[test]
+fn merge_tags_folds_the_source_into_the_target() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 2);
+        let (a0, a1) = (asset_at(0), asset_at(1));
+        tag_assets(&cfg, &[(a0.as_str(), "a"), (a1.as_str(), "b")]);
+
+        let outcome = merge_tags_impl(&cfg, "a", "b").expect("merge_tags");
+        assert_eq!(outcome.from, "a");
+        assert_eq!(outcome.to, "b");
+        assert_eq!(outcome.rewritten, 1);
+
+        let listed = list_tags_impl(&cfg).expect("list_tags");
+        let names: Vec<&str> = listed.tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
+        assert_eq!(listed.tags[0].count, 2);
+    });
+}
+
+#[test]
+fn assign_tags_applies_every_pair_and_reports_an_unknown_asset() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 1);
+        let outcome = assign_tags_impl(
+            &cfg,
+            &[asset_at(0), "xxh3:never-scanned".to_string()],
+            &["x".to_string(), "y".to_string()],
+        )
+        .expect("assign_tags");
+        assert_eq!(
+            outcome.applied, 2,
+            "two tags applied to the one known asset"
+        );
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].asset, "xxh3:never-scanned");
+        assert!(!outcome.failed[0].reason.is_empty());
+    });
+}
+
+/// The all-failed guard lives inside `tags_assign` itself; this pins that
+/// `assign_tags_impl` inherits it rather than silently reporting `applied:
+/// 0` — the `CommandError` must carry the joined per-asset reasons.
+#[test]
+fn assign_tags_when_every_asset_fails_is_a_command_error_with_the_reasons() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 0);
+        let err = assign_tags_impl(
+            &cfg,
+            &[
+                "xxh3:never-scanned-1".to_string(),
+                "xxh3:never-scanned-2".to_string(),
+            ],
+            &["x".to_string()],
+        )
+        .expect_err("every asset must fail");
+        assert!(
+            err.message.contains("every requested asset"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("xxh3:never-scanned-1"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("xxh3:never-scanned-2"),
+            "{}",
+            err.message
+        );
+    });
+}
+
+#[test]
+fn file_assets_files_the_known_asset_under_the_node() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 1);
+        let node = add_para_node_impl(&cfg, "project", "client-x").expect("add node");
+
+        let outcome = file_assets_impl(&cfg, &[asset_at(0)], &node).expect("file_assets");
+        assert_eq!(outcome.applied, 1);
+        assert!(outcome.failed.is_empty());
+    });
+}
+
+#[test]
+fn file_assets_into_an_unknown_node_is_a_command_error() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 1);
+        let err = file_assets_impl(&cfg, &[asset_at(0)], "project/nope")
+            .expect_err("an unknown node must fail");
+        assert!(
+            err.message.contains("no active PARA node"),
+            "{}",
+            err.message
+        );
+    });
+}
+
+#[test]
+fn para_add_rename_list_round_trips() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 0);
+        let node = add_para_node_impl(&cfg, "project", "client-x").expect("add node");
+        assert!(!node.is_empty());
+
+        rename_para_node_impl(&cfg, &node, "client-y").expect("rename node");
+
+        let listed = list_para_impl(&cfg).expect("list_para");
+        assert_eq!(listed.nodes.len(), 1);
+        assert_eq!(listed.nodes[0].id, node);
+        assert_eq!(listed.nodes[0].name, "client-y");
+        assert_eq!(listed.nodes[0].kind, "project");
+        assert!(!listed.nodes[0].archived);
+    });
+}
+
+/// `dry_run: true` must plan the move without touching disk — the source
+/// directory has to survive the call, which the next assertion checks
+/// directly rather than trusting the outcome's own `status` field.
+#[test]
+fn archive_dry_run_plans_without_moving_then_execute_moves() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 0);
+        let node = add_para_node_impl(&cfg, "project", "client-x").expect("add node");
+        let materialized = tempfile::tempdir().expect("tempdir");
+        let source = materialized.path().join("Projects").join("client-x");
+        std::fs::create_dir_all(&source).expect("mkdir");
+        std::fs::write(source.join("a.txt"), b"hello").expect("write");
+        let roots = vec![materialized.path().display().to_string()];
+
+        let preview = archive_node_impl(&cfg, &node, &roots, true).expect("dry-run archive");
+        assert!(!preview.executed);
+        assert_eq!(preview.moves.len(), 1);
+        assert!(
+            source.is_dir(),
+            "a dry-run preview must not move the source directory"
+        );
+
+        let executed = archive_node_impl(&cfg, &node, &roots, false).expect("real archive");
+        assert!(executed.executed);
+        assert_eq!(executed.moves.len(), 1);
+        assert!(
+            !source.exists(),
+            "the real run must move the source directory"
+        );
+        let archived = materialized.path().join("Archives").join("client-x");
+        assert!(archived.join("a.txt").is_file());
+    });
+}
+
+/// A multi-root run failing on the SECOND root must not silently drop the
+/// FIRST root's already-completed move: `ServiceError::ParaArchivePartial`
+/// carries it, and `archive_node_impl` must fold it into the
+/// `CommandError`'s `notices` (the wire has no separate `moves` field) —
+/// quality-review follow-up to Task 14, where the blanket `From<E>` impl
+/// swallowed it because it has no arm for that variant.
+#[test]
+fn archive_partial_failure_reports_the_completed_move_via_notices() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 0);
+        let node = add_para_node_impl(&cfg, "project", "client-x").expect("add node");
+
+        let root1 = tempfile::tempdir().expect("tempdir");
+        let root1_source = root1.path().join("Projects").join("client-x");
+        std::fs::create_dir_all(&root1_source).expect("mkdir");
+        std::fs::write(root1_source.join("a.txt"), b"hello").expect("write");
+        // root2 has no materialized directory at all, so its move fails —
+        // root1's move must already have happened by the time that error
+        // is raised.
+        let root2 = tempfile::tempdir().expect("tempdir");
+        let roots = vec![
+            root1.path().display().to_string(),
+            root2.path().display().to_string(),
+        ];
+
+        let err = archive_node_impl(&cfg, &node, &roots, false)
+            .expect_err("root2's missing source must fail the call");
+        assert!(
+            err.message.contains("does not exist"),
+            "the failure must name root2's missing source: {}",
+            err.message
+        );
+        let root1_archived = root1.path().join("Archives").join("client-x");
+        let expected_notice = format!(
+            "moved {} -> {}",
+            root1_source.display(),
+            root1_archived.display()
+        );
+        assert!(
+            err.notices.contains(&expected_notice),
+            "notices must carry root1's completed move: {:?}",
+            err.notices
+        );
+        assert!(
+            root1_archived.join("a.txt").is_file(),
+            "root1's move must have really happened on disk, not just been reported"
+        );
+        assert!(
+            !root1_source.exists(),
+            "root1's source directory must be gone after the real move"
+        );
     });
 }
 

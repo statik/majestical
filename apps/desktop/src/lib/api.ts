@@ -184,6 +184,71 @@ export interface AppStatus {
   catalog_ready: boolean;
 }
 
+/** `majestical_services::tags::TagRow` */
+export interface TagRow {
+  tag: string;
+  count: number;
+  last_used_ms: number;
+}
+
+/** `majestical_services::tags::TagsListOutcome` */
+export interface TagsListOutcome {
+  tags: TagRow[];
+  notices?: string[];
+}
+
+/** `majestical_services::tags::TagRenameOutcome` — `tag_rename` and `tag_merge` share this shape. */
+export interface TagRenameOutcome {
+  from: string;
+  to: string;
+  rewritten: number;
+  notices?: string[];
+}
+
+/** `majestical_services::tags::AssignFailure` */
+export interface AssignFailure {
+  asset: string;
+  reason: string;
+}
+
+/** `majestical_services::tags::AssignOutcome` — shared by `assign_tags` and `file_assets`. */
+export interface AssignOutcome {
+  applied: number;
+  failed: AssignFailure[];
+  notices?: string[];
+}
+
+/** `majestical_services::para::ParaNodeRow` */
+export interface ParaNodeRow {
+  id: string;
+  kind: string;
+  name: string;
+  archived: boolean;
+}
+
+/** `majestical_services::para::ParaOutcome` */
+export interface ParaOutcome {
+  nodes: ParaNodeRow[];
+  notices?: string[];
+}
+
+/** `majestical_services::para::MoveStatus`, which serializes snake_case. */
+export type MoveStatus = "moved" | "already_archived" | "planned";
+
+/** `majestical_services::para::ArchiveMove` */
+export interface ArchiveMove {
+  from: string;
+  to: string;
+  status: MoveStatus;
+}
+
+/** `majestical_services::para::ArchiveOutcome` */
+export interface ArchiveOutcome {
+  moves: ArchiveMove[];
+  executed: boolean;
+  notices?: string[];
+}
+
 /**
  * Argument names are camelCase because `#[tauri::command]` defaults to
  * `rename_all = "camelCase"` — Rust's `asset_id` is looked up as `assetId`.
@@ -216,6 +281,25 @@ export const api = {
     invoke<AppStatus>("initialize_catalog", { path }),
   useExistingCatalog: (path: string) =>
     invoke<AppStatus>("use_existing_catalog", { path }),
+  listTags: () => invoke<TagsListOutcome>("list_tags"),
+  renameTag: (from: string, to: string) =>
+    invoke<TagRenameOutcome>("rename_tag", { from, to }),
+  // The Rust command's parameter is named `into_tag` (`into` is a reserved
+  // keyword), so Tauri's default camelCase renders the wire key as
+  // `intoTag` — see `commands::merge_tags`'s own comment for the other half.
+  mergeTags: (from: string, into: string) =>
+    invoke<TagRenameOutcome>("merge_tags", { from, intoTag: into }),
+  assignTags: (assetIds: string[], tags: string[]) =>
+    invoke<AssignOutcome>("assign_tags", { assetIds, tags }),
+  fileAssets: (assetIds: string[], node: string) =>
+    invoke<AssignOutcome>("file_assets", { assetIds, node }),
+  listPara: () => invoke<ParaOutcome>("list_para"),
+  addParaNode: (kind: string, name: string) =>
+    invoke<string>("add_para_node", { kind, name }),
+  renameParaNode: (node: string, name: string) =>
+    invoke<void>("rename_para_node", { node, name }),
+  archiveNode: (node: string, roots: string[], dryRun: boolean) =>
+    invoke<ArchiveOutcome>("archive_node", { node, roots, dryRun }),
 };
 
 /**

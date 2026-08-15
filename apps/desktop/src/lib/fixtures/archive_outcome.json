@@ -1,0 +1,18 @@
+{
+  "executed": true,
+  "moves": [
+    {
+      "from": "/fixtures/root/Projects/client-x",
+      "status": "moved",
+      "to": "/fixtures/root/Archives/client-x"
+    },
+    {
+      "from": "/fixtures/root2/Projects/client-x",
+      "status": "already_archived",
+      "to": "/fixtures/root2/Archives/client-x"
+    }
+  ],
+  "notices": [
+    "a warning the archive_node call collected"
+  ]
+}

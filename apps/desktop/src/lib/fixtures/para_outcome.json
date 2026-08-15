@@ -1,0 +1,13 @@
+{
+  "nodes": [
+    {
+      "archived": false,
+      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "kind": "project",
+      "name": "client-x"
+    }
+  ],
+  "notices": [
+    "a warning the list_para call collected"
+  ]
+}

@@ -10,5 +10,28 @@
     // Vite's CSS entry (`import "./app.css"`) is a side-effect import by
     // design; there is nothing to assign it to.
     "import/no-unassigned-import": "off"
-  }
+  },
+  "overrides": [
+    {
+      // `api.ts` is the hand-written wire contract with `commands.rs`: one
+      // interface plus one wrapper per Tauri command, growing by design as
+      // organize/ingest surfaces land (phase 7C's watchlist already tracks
+      // "api.ts codegen" as the eventual fix for this file's size). Default
+      // 300 is the wrong gate for a file whose length tracks the command
+      // count, not its complexity.
+      "files": ["src/lib/api.ts"],
+      "rules": {
+        "max-lines": ["warn", { "max": 400 }]
+      }
+    },
+    {
+      // `fixtures.test.ts` assigns one committed fixture per pinned outcome
+      // struct (see its own header comment) — its import count tracks the
+      // number of Tauri commands, not incidental coupling.
+      "files": ["src/lib/fixtures.test.ts"],
+      "rules": {
+        "import/max-dependencies": ["warn", { "max": 20 }]
+      }
+    }
+  ]
 }

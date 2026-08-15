@@ -21,8 +21,8 @@
 //! Display chain: MCP has no stderr, so these blocks are the only channel
 //! a failure's warnings have. See `split_notices`/`tool_error_split` below.
 //!
-//! Split into submodules by concern: `read_tools` (the 12 read-only tools),
-//! `write_tools` (the 16 mutating tools, each gated behind a `confirm`
+//! Split into submodules by concern: `read_tools` (the 13 read-only tools),
+//! `write_tools` (the 20 mutating tools, each gated behind a `confirm`
 //! parameter — see that module's own doc for the dry-run/execute
 //! contract), and `resources` (the `majestical://` MCP resources: thumbnails
 //! and keyframe manifests). This file keeps only what every submodule

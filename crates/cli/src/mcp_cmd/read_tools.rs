@@ -1,4 +1,4 @@
-//! The 12 read-only MCP tools: each opens (or, for the two that never touch
+//! The 13 read-only MCP tools: each opens (or, for the two that never touch
 //! the event log, guards) a fresh catalog handle and serializes the matching
 //! `majestical_services` outcome straight through — see `super`'s module doc
 //! for the shared wire contract.
@@ -322,6 +322,22 @@ impl MajServer {
                 json!({ "configured": false }),
                 notices.drain(),
             )),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists the catalog's live tag vocabulary — every effective tag after
+    /// alias resolution (a renamed-away name resolves to its target and
+    /// disappears), with the number of assets carrying it and the wall
+    /// time of its newest surviving add.
+    #[tool]
+    fn list_tags(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::tags::tags_list(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
     }

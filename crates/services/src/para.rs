@@ -1,6 +1,6 @@
 //! PARA node reference resolution, shared by `maj para` and `search`'s
 //! `para:` filter. Moved verbatim from `crates/cli/src/commands.rs`.
-//! [`para_file`] shares [`AssignOutcome`] with `maj tags assign`: both are
+//! [`para_file`] shares [`AssignOutcome`] with `maj tag assign`: both are
 //! bulk per-asset writes with the same "report the rows you couldn't do,
 //! do the rest" contract, so they must not drift into two shapes.
 use crate::app::FsApp;
@@ -350,11 +350,19 @@ fn archive_impl(
 /// an unresolvable reference fails the whole call: a typo'd node is
 /// operator-fixable, and filing a selection somewhere else is worse than
 /// filing it nowhere. A per-asset problem (an id the catalog has never
-/// scanned) is an [`AssignFailure`] row instead, so the rest still land.
+/// scanned) is an [`AssignFailure`] row instead, so the rest still land —
+/// unless EVERY asset fails, in which case there is no partial progress
+/// worth preserving in an `Ok`, so that case is a hard error instead of a
+/// silent `Ok` with `applied: 0` — see this function's own `Errors` section.
 ///
 /// # Errors
-/// Returns an error if `node` doesn't resolve to a known node, or the event
-/// log can't be read or appended to. A per-asset problem is a `failed` row.
+/// Returns an error if `assets` is empty, if `node` doesn't resolve to a
+/// known node, if every asset in `assets` fails (the failures' reasons are
+/// joined into the message — a partial failure still reports the rest as an
+/// `Ok` `failed` row instead), or if the event log can't be read or
+/// appended to. Validating the non-empty-list and all-failed cases here, not
+/// just in the CLI/MCP heads, means a direct call to this function (a future
+/// head, a test, an agent script) can't silently no-op.
 pub fn para_file(
     app: &mut FsApp,
     assets: &[String],
@@ -365,6 +373,10 @@ pub fn para_file(
 }
 
 fn para_file_impl(app: &mut FsApp, assets: &[String], node: &str) -> Result<AssignOutcome> {
+    anyhow::ensure!(
+        !assets.is_empty(),
+        "para file requires a non-empty asset list"
+    );
     let projection = app.projection()?;
     let node_id = resolve_para_node(&projection, node)?;
     let mut ops = Vec::new();
@@ -382,6 +394,16 @@ fn para_file_impl(app: &mut FsApp, assets: &[String], node: &str) -> Result<Assi
             }),
         }
     }
+    anyhow::ensure!(
+        failed.len() < assets.len(),
+        "para file failed for every requested asset ({}) — {}",
+        assets.len(),
+        failed
+            .iter()
+            .map(|f| f.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     let emitted = app.emit(ops)?;
     Ok(AssignOutcome {
         applied: u64::try_from(emitted.len()).unwrap_or(u64::MAX),
@@ -556,6 +578,50 @@ mod para_file_tests {
             outcome.failed[0].reason
         );
         assert_eq!(para_sets(&app).len(), 1);
+    }
+
+    /// Quality-review Task 13 follow-up: the non-empty-`assets` guard used
+    /// to live only in the MCP head (`write_tools.rs`); hoisted here so a
+    /// direct call to this function — a future head, a test, an agent
+    /// script — can't silently no-op on an empty list.
+    #[test]
+    fn para_file_of_an_empty_asset_list_errors_without_filing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+        let err = para_file(&mut app, &[], "project/client-x").expect_err("must fail");
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        assert!(para_sets(&app).is_empty());
+    }
+
+    /// The all-failed policy: when EVERY requested asset fails, there is no
+    /// partial progress worth reporting as an `Ok` with `applied: 0` — this
+    /// errors instead, distinct from
+    /// `para_file_reports_an_unknown_asset_and_still_files_the_known_ones`,
+    /// where at least one asset succeeds and the call stays `Ok`.
+    #[test]
+    fn para_file_errors_without_filing_when_every_asset_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+        let err = para_file(
+            &mut app,
+            &[
+                "xxh3:never-scanned-1".to_string(),
+                "xxh3:never-scanned-2".to_string(),
+            ],
+            "project/client-x",
+        )
+        .expect_err("must fail when every asset fails");
+        let message = err.to_string();
+        assert!(message.contains("every requested asset"), "{message}");
+        assert!(message.contains("(2)"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-1"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-2"), "{message}");
+        assert!(
+            para_sets(&app).is_empty(),
+            "an all-failed file must not emit"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The 16 mutating MCP tools. Every tool takes `confirm: bool` (default
+//! The 20 mutating MCP tools. Every tool takes `confirm: bool` (default
 //! `false`): a dry run returns a structured description of what would
 //! happen (`executed: false`) without touching anything; `confirm: true`
 //! performs the operation for real (`executed: true`). Both arms serialize
@@ -263,6 +263,184 @@ fn tag_assets_result(
         }
     };
     Ok(super::with_notices(done, app.notices().drain()))
+}
+
+/// Params for `rename_tag`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameTagArgs {
+    from: String,
+    to: String,
+    /// `false` (default) returns a dry-run description of what would
+    /// happen; `true` executes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `rename_tag`'s dry run reads real state through
+/// [`majestical_services::tags::rename_plan`] — the SAME guards and count
+/// the real rename applies, not a hand-rolled re-check — so a preview can
+/// never promise a rename `confirm: true` then refuses.
+fn rename_tag_result(app: &mut FsApp, args: &RenameTagArgs) -> anyhow::Result<serde_json::Value> {
+    if !args.confirm {
+        let projection = app.projection()?;
+        let rewritten = majestical_services::tags::rename_plan(&projection, &args.from, &args.to)?;
+        return Ok(super::with_notices(
+            json!({
+                "from": args.from,
+                "to": args.to,
+                "rewritten": rewritten,
+                "would": format!(
+                    "rewrite {rewritten} asset(s) from '{}' to '{}'", args.from, args.to
+                ),
+            }),
+            app.notices().drain(),
+        ));
+    }
+    let outcome = majestical_services::tags::tag_rename(app, &args.from, &args.to)?;
+    serde_json::to_value(&outcome).map_err(anyhow::Error::from)
+}
+
+/// Params for `merge_tags`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MergeTagsArgs {
+    from: String,
+    into: String,
+    /// `false` (default) returns a dry-run description of what would
+    /// happen; `true` executes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `merge_tags`'s dry run: same real-state contract as [`rename_tag_result`]
+/// via [`majestical_services::tags::merge_plan`], plus `into`'s current
+/// asset count via the public
+/// [`majestical_services::tags::assets_carrying`] rather than re-walking the
+/// projection's tag adds here.
+fn merge_tags_result(app: &mut FsApp, args: &MergeTagsArgs) -> anyhow::Result<serde_json::Value> {
+    if !args.confirm {
+        let projection = app.projection()?;
+        let rewritten = majestical_services::tags::merge_plan(&projection, &args.from, &args.into)?;
+        let target_count = majestical_services::tags::assets_carrying(&projection, &args.into);
+        return Ok(super::with_notices(
+            json!({
+                "from": args.from,
+                "into": args.into,
+                "rewritten": rewritten,
+                "target_count": target_count,
+                "would": format!(
+                    "rewrite {rewritten} asset(s) from '{}' into '{}' ({target_count} already there)",
+                    args.from, args.into
+                ),
+            }),
+            app.notices().drain(),
+        ));
+    }
+    let outcome = majestical_services::tags::tag_merge(app, &args.from, &args.into)?;
+    serde_json::to_value(&outcome).map_err(anyhow::Error::from)
+}
+
+/// Splits `assets` into those the projection already knows and those it
+/// doesn't — shared by `assign_tags`/`file_assets`'s dry-run previews, which
+/// per the module doc's second bucket must "name how many of the requested
+/// assets exist and list unknown ids" without over-promising a write that
+/// `confirm: true` would refuse.
+fn split_known_assets(
+    projection: &majestical_core::projection::Projection,
+    assets: &[String],
+) -> (usize, Vec<String>) {
+    let mut known = 0usize;
+    let mut unknown = Vec::new();
+    for asset in assets {
+        let asset_id = AssetId(asset.clone());
+        if majestical_services::catalog::ensure_asset_known(projection, &asset_id).is_ok() {
+            known += 1;
+        } else {
+            unknown.push(asset.clone());
+        }
+    }
+    (known, unknown)
+}
+
+/// Params for `assign_tags` — the bulk multi-asset form of `tag_assets`'
+/// `add` op, mirroring `maj tag assign`/`majestical_services::tags::
+/// tags_assign`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AssignTagsArgs {
+    assets: Vec<String>,
+    tags: Vec<String>,
+    /// `false` (default) returns a dry-run description of what would
+    /// happen; `true` executes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Empty `assets`/`tags` lists are not checked here: `tags_assign` (the
+/// service call `confirm: true` reaches below) validates both and errors
+/// cleanly, and the same guard now covers every caller — not just this
+/// tool's own dry-run text — so it isn't duplicated at this layer.
+fn assign_tags_result(app: &mut FsApp, args: &AssignTagsArgs) -> anyhow::Result<serde_json::Value> {
+    if !args.confirm {
+        let projection = app.projection()?;
+        let (known_count, unknown_assets) = split_known_assets(&projection, &args.assets);
+        return Ok(super::with_notices(
+            json!({
+                "assets": args.assets,
+                "tags": args.tags,
+                "known_count": known_count,
+                "unknown_assets": unknown_assets,
+                "would": format!(
+                    "add {} tag(s) to {known_count} of {} requested asset(s)",
+                    args.tags.len(), args.assets.len()
+                ),
+            }),
+            app.notices().drain(),
+        ));
+    }
+    let outcome = majestical_services::tags::tags_assign(app, &args.assets, &args.tags)?;
+    serde_json::to_value(&outcome).map_err(anyhow::Error::from)
+}
+
+/// Params for `file_assets`, the MCP analogue of `maj para file`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FileAssetsArgs {
+    /// Node reference (`<kind>/<name>` or a raw node id).
+    node: String,
+    assets: Vec<String>,
+    /// `false` (default) returns a dry-run description of what would
+    /// happen; `true` executes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `file_assets`'s dry run resolves `node` through
+/// [`majestical_services::para::resolve_para_node`] first, so an unknown
+/// node fails the preview exactly like `confirm: true` would, before ever
+/// getting to the per-asset known/unknown split.
+/// Empty `assets` is not checked here — same reasoning as
+/// [`assign_tags_result`]'s doc: `para_file` (reached below when
+/// `confirm: true`) validates it and errors cleanly for every caller.
+fn file_assets_result(app: &mut FsApp, args: &FileAssetsArgs) -> anyhow::Result<serde_json::Value> {
+    if !args.confirm {
+        let projection = app.projection()?;
+        let resolved_node = majestical_services::para::resolve_para_node(&projection, &args.node)?;
+        let (known_count, unknown_assets) = split_known_assets(&projection, &args.assets);
+        return Ok(super::with_notices(
+            json!({
+                "node": args.node,
+                "resolved_node": resolved_node,
+                "assets": args.assets,
+                "known_count": known_count,
+                "unknown_assets": unknown_assets,
+                "would": format!(
+                    "file {known_count} of {} requested asset(s) under {}",
+                    args.assets.len(), args.node
+                ),
+            }),
+            app.notices().drain(),
+        ));
+    }
+    let outcome = majestical_services::para::para_file(app, &args.assets, &args.node)?;
+    serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
 
 /// Params for `set_metadata`.
@@ -1034,6 +1212,19 @@ impl MajServer {
         confirm_gate(args.confirm, add_sync_location_result(&self.catalog, &args))
     }
 
+    /// Bulk-adds one or more tags to one or more assets in one call — the
+    /// multi-asset form of `tag_assets`' `add` op. `false` reports how many
+    /// of the requested assets exist and lists the unknown ones; `true`
+    /// applies it, skipping unknown assets rather than aborting the batch.
+    #[tool]
+    fn assign_tags(&self, Parameters(args): Parameters<AssignTagsArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        confirm_gate(args.confirm, assign_tags_result(&mut app, &args))
+    }
+
     /// Initializes a new catalog directory. Refuses (even with `confirm:
     /// true`) if a catalog already exists at this server's catalog path.
     #[tool]
@@ -1042,6 +1233,20 @@ impl MajServer {
             args.confirm,
             catalog_init_result(&self.catalog, &self.machine_id, &self.author, args.confirm),
         )
+    }
+
+    /// Files one or more assets under a PARA node — the MCP analogue of
+    /// `maj para file`. `false` resolves `node` for real (an unknown node
+    /// fails the preview) and reports how many of the requested assets
+    /// exist; `true` applies it, skipping unknown assets rather than
+    /// aborting the batch.
+    #[tool]
+    fn file_assets(&self, Parameters(args): Parameters<FileAssetsArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        confirm_gate(args.confirm, file_assets_result(&mut app, &args))
     }
 
     /// Works one pass of the derivation queue (thumbnails, embeddings,
@@ -1114,6 +1319,20 @@ impl MajServer {
         }
     }
 
+    /// Folds one live tag into another live tag — both must already exist;
+    /// merging into a name nothing carries is a rename (`rename_tag`), not
+    /// a merge. `false` returns the real rewrite count plus the target's
+    /// current asset count (real state, via `rename_plan`/`assets_carrying`);
+    /// `true` applies it.
+    #[tool]
+    fn merge_tags(&self, Parameters(args): Parameters<MergeTagsArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        confirm_gate(args.confirm, merge_tags_result(&mut app, &args))
+    }
+
     /// Creates (`add`), renames (`rename`), or archives (`archive`) a PARA
     /// node. `archive`'s dry run is `para::archive`'s own real dry-run
     /// plan (`Planned` moves); `add`/`rename` build a `{"would": ...}`
@@ -1134,6 +1353,18 @@ impl MajServer {
             }
             majestical_services::para::ParaOp::Archive => move_para_archive(&mut app, &args),
         }
+    }
+
+    /// Renames a live tag to a name nothing carries yet — renaming onto an
+    /// existing tag is a merge (`merge_tags`), not a rename. `false`
+    /// returns the real rewrite count via `rename_plan`; `true` applies it.
+    #[tool]
+    fn rename_tag(&self, Parameters(args): Parameters<RenameTagArgs>) -> CallToolResult {
+        let mut app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        confirm_gate(args.confirm, rename_tag_result(&mut app, &args))
     }
 
     /// Removes a saved search. `false` reports whether the name currently

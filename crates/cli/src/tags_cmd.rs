@@ -1,10 +1,52 @@
-//! Suggestion review: list pending, confirm into the folksonomy, reject
-//! into a per-machine jsonl (never synced, survives projection rebuilds).
-//! Compute for all three lives in `majestical_services::tags`; this module
-//! only renders.
+//! `maj tags list`: the catalog's live vocabulary. Suggestion review: list
+//! pending, confirm into the folksonomy, reject into a per-machine jsonl
+//! (never synced, survives projection rebuilds). Compute for all of these
+//! lives in `majestical_services::tags`; this module only renders.
 use anyhow::Result;
 use majestical_services::app::FsApp;
+use majestical_services::iso8601::iso8601_ms;
+use majestical_services::tags::TagRow;
 use std::path::Path;
+
+/// `maj tags list [--json]`: every live tag after alias resolution, sorted
+/// by name, with its asset count and newest surviving add time.
+///
+/// `--json` prints [`majestical_services::tags::TagsListOutcome`] AS-IS —
+/// see `crates/cli/src/commands.rs::cmd_browse_tree`'s doc for the policy
+/// this follows (every outcome struct is already the wire contract for the
+/// GUI and MCP heads, so the CLI's `--json` reshapes nothing).
+///
+/// # Errors
+/// Returns [`majestical_services::error::ServiceError::NoCatalog`] if
+/// there's no catalog at `catalog_root`, or an error if the event log can't
+/// be read.
+pub(crate) fn cmd_tags_list(app: &FsApp, catalog_root: &Path, json: bool) -> Result<()> {
+    let outcome = majestical_services::tags::tags_list(app, catalog_root)?;
+    crate::print_notices(&outcome.notices);
+    if json {
+        println!("{}", serde_json::to_string(&outcome)?);
+    } else {
+        print_tags_table(&outcome.tags);
+    }
+    Ok(())
+}
+
+/// Renders the human-readable tag-vocabulary table, following
+/// `commands.rs::print_volumes_table`'s width-sizing pattern.
+fn print_tags_table(tags: &[TagRow]) {
+    let tag_w = tags.iter().map(|r| r.tag.len()).max().unwrap_or(0).max(3);
+    let count_w = tags
+        .iter()
+        .map(|r| r.count.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(5);
+    println!("{:<tag_w$} {:<count_w$} LAST USED", "TAG", "COUNT");
+    for row in tags {
+        let last_used = iso8601_ms(row.last_used_ms);
+        println!("{:<tag_w$} {:<count_w$} {last_used}", row.tag, row.count);
+    }
+}
 
 /// `maj tags suggestions`: lists every pending AI tag suggestion across the
 /// catalog, sorted by asset then tag.

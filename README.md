@@ -31,12 +31,13 @@ with:
 } } }
 ```
 
-The server exposes 28 tools mirroring the CLI's verbs: 12 read-only tools
+The server exposes 33 tools mirroring the CLI's verbs: 13 read-only tools
 (search, get_asset, browse the folder tree/listing, list
-volumes/saved-searches/sync-locations, sync/index status, review pending AI
-tag suggestions, etc.) plus 16 mutating tools
-covering tagging, PARA moves, metadata, scanning,
-verification, ingest, sync, and describer configuration. Mutating tools
+volumes/saved-searches/sync-locations/tags, sync/index status, review pending
+AI tag suggestions, etc.) plus 20 mutating tools
+covering tagging, tag rename/merge/bulk-assign, PARA moves and filing,
+metadata, scanning, verification, ingest, sync, and describer configuration.
+Mutating tools
 default to a dry-run preview; pass `confirm: true` to execute. Two
 resources — `majestical://` thumbnails and keyframe manifests — let a
 client fetch imagery for an asset. Every read result carries the asset's

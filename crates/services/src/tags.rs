@@ -1,5 +1,5 @@
 //! `maj tag add`/`maj tag rm` compute, the vocabulary verbs (`maj tags
-//! list`, `maj tag rename`, `maj tag merge`, `maj tags assign`), plus `maj
+//! list`, `maj tag rename`, `maj tag merge`, `maj tag assign`), plus `maj
 //! tags suggestions`: every AI
 //! tag suggestion not yet confirmed or rejected, and `maj tags confirm`/`maj
 //! tags reject`. `tag add`/`tag rm` moved from
@@ -368,7 +368,7 @@ pub struct AssignFailure {
     pub reason: String,
 }
 
-/// Everything a bulk assignment (`maj tags assign`, `maj para file`) did.
+/// Everything a bulk assignment (`maj tag assign`, `maj para file`) did.
 /// `applied` counts events actually emitted, not assets asked for.
 #[derive(Debug, serde::Serialize)]
 pub struct AssignOutcome {
@@ -482,11 +482,16 @@ fn tags_list_impl(app: &FsApp) -> Result<TagsListOutcome> {
     })
 }
 
-/// How many assets carry `tag` as an effective (post-alias) tag. Serves
-/// both jobs a rename has: liveness (zero means no such tag) and the
-/// `rewritten` count, which is read BEFORE emitting so it describes the
-/// assets the rename is about to move.
-fn assets_carrying(projection: &Projection, tag: &str) -> u64 {
+/// How many assets carry `tag` as an effective (post-alias) tag. Serves both
+/// jobs a rename has — liveness (zero means no such tag) and the
+/// `rewritten` count, read BEFORE emitting so it describes the assets the
+/// rename is about to move — and doubles as the public surface a dry-run
+/// preview reads (e.g. `merge_tags`'s target count) without duplicating this
+/// walk in a CLI/MCP head. Zero is a value here, not an error: an unknown
+/// tag simply carries no assets, which is exactly what a preview building a
+/// target's "already there" count needs to render.
+#[must_use]
+pub fn assets_carrying(projection: &Projection, tag: &str) -> u64 {
     let mut count = 0;
     for (asset, _state) in projection.assets() {
         if projection
@@ -629,14 +634,22 @@ fn tag_merge_impl(app: &mut FsApp, from: &str, into: &str) -> Result<TagRenameOu
     emit_rename(app, from, into, rewritten)
 }
 
-/// `maj tags assign`: adds every tag in `tags` to every asset in `assets` —
+/// `maj tag assign`: adds every tag in `tags` to every asset in `assets` —
 /// one `TagAdd` per pair. An asset that was never scanned is reported as a
 /// [`AssignFailure`] row and skipped; the rest are still applied, so a
-/// selection with one stale id doesn't cost the whole batch.
+/// selection with one stale id doesn't cost the whole batch. When EVERY
+/// asset fails there is no partial progress worth preserving in an `Ok`, so
+/// that case is a hard error instead of a silent `Ok` with `applied: 0` —
+/// see this function's own `Errors` section.
 ///
 /// # Errors
-/// Returns an error only when the whole operation fails: the event log
-/// can't be read or appended to. A per-asset problem is a `failed` row.
+/// Returns an error if `assets` or `tags` is empty, if every asset in
+/// `assets` fails (the failures' reasons are joined into the message — a
+/// partial failure still reports the rest as an `Ok` `failed` row instead),
+/// or if the event log can't be read or appended to. Validating the
+/// non-empty-list and all-failed cases here, not just in the CLI/MCP heads,
+/// means a direct call to this function (a future head, a test, an agent
+/// script) can't silently no-op.
 pub fn tags_assign(
     app: &mut FsApp,
     assets: &[String],
@@ -647,6 +660,11 @@ pub fn tags_assign(
 }
 
 fn tags_assign_impl(app: &mut FsApp, assets: &[String], tags: &[String]) -> Result<AssignOutcome> {
+    anyhow::ensure!(
+        !assets.is_empty(),
+        "tag assign requires a non-empty asset list"
+    );
+    anyhow::ensure!(!tags.is_empty(), "tag assign requires a non-empty tag list");
     let projection = app.projection()?;
     let mut ops = Vec::new();
     let mut failed = Vec::new();
@@ -666,6 +684,16 @@ fn tags_assign_impl(app: &mut FsApp, assets: &[String], tags: &[String]) -> Resu
             });
         }
     }
+    anyhow::ensure!(
+        failed.len() < assets.len(),
+        "tag assign failed for every requested asset ({}) — {}",
+        assets.len(),
+        failed
+            .iter()
+            .map(|f| f.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     let emitted = app.emit(ops)?;
     Ok(AssignOutcome {
         applied: u64::try_from(emitted.len()).unwrap_or(u64::MAX),
@@ -1186,6 +1214,26 @@ mod organize_tests {
         );
     }
 
+    /// [`assets_carrying`] is the public surface Task 13's `merge_tags` MCP
+    /// preview reads for the target's "already there" count — pinned
+    /// directly against a merge rather than only through [`merge_plan`]'s
+    /// own `rewritten` count, since the two answer different questions
+    /// (`rewritten` is the SOURCE's count; `assets_carrying` here is read
+    /// against the TARGET).
+    #[test]
+    fn assets_carrying_reports_the_live_asset_count_and_zero_for_an_unknown_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 3);
+        tag_add(&mut app, &asset_id(0).0, "a").expect("add");
+        tag_add(&mut app, &asset_id(1).0, "a").expect("add");
+        tag_add(&mut app, &asset_id(2).0, "b").expect("add");
+        let projection = app.projection().expect("projection");
+
+        assert_eq!(assets_carrying(&projection, "a"), 2);
+        assert_eq!(assets_carrying(&projection, "b"), 1);
+        assert_eq!(assets_carrying(&projection, "nope"), 0);
+    }
+
     #[test]
     fn tag_rename_of_a_tag_to_itself_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1273,6 +1321,54 @@ mod organize_tests {
             outcome.failed[0].reason
         );
         assert_eq!(adds(&app).len(), 1);
+    }
+
+    /// Quality-review Task 13 follow-up: the non-empty-list guards used to
+    /// live only in the MCP head (`write_tools.rs`); hoisted here so a
+    /// direct call to this function — a future head, a test, an agent
+    /// script — can't silently no-op on an empty list.
+    #[test]
+    fn tags_assign_of_an_empty_asset_list_errors_without_emitting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        let err = tags_assign(&mut app, &[], &["x".to_string()]).expect_err("must fail");
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        assert!(adds(&app).is_empty());
+    }
+
+    #[test]
+    fn tags_assign_of_an_empty_tag_list_errors_without_emitting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        let err = tags_assign(&mut app, &[asset_id(0).0.clone()], &[]).expect_err("must fail");
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        assert!(adds(&app).is_empty());
+    }
+
+    /// The all-failed policy: when EVERY requested asset fails, there is no
+    /// partial progress worth reporting as an `Ok` with `applied: 0` — this
+    /// errors instead, distinct from
+    /// `tags_assign_reports_an_unknown_asset_and_still_applies_the_known_ones`,
+    /// where at least one asset succeeds and the call stays `Ok`.
+    #[test]
+    fn tags_assign_errors_without_emitting_when_every_asset_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        let err = tags_assign(
+            &mut app,
+            &[
+                "xxh3:never-scanned-1".to_string(),
+                "xxh3:never-scanned-2".to_string(),
+            ],
+            &["x".to_string()],
+        )
+        .expect_err("must fail when every asset fails");
+        let message = err.to_string();
+        assert!(message.contains("every requested asset"), "{message}");
+        assert!(message.contains("(2)"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-1"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-2"), "{message}");
+        assert!(adds(&app).is_empty(), "an all-failed assign must not emit");
     }
 
     /// Spec-review F9: after a rename the raw adds still sit under the

@@ -209,6 +209,13 @@ enum ParaCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// File one or more assets under a PARA node.
+    File {
+        /// Node reference (`<kind>/<name>` or a raw node id).
+        node: String,
+        #[arg(required = true)]
+        assets: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -449,8 +456,34 @@ enum CatalogCmd {
 
 #[derive(Subcommand)]
 enum TagCmd {
-    Add { asset: String, tag: String },
-    Rm { asset: String, tag: String },
+    Add {
+        asset: String,
+        tag: String,
+    },
+    Rm {
+        asset: String,
+        tag: String,
+    },
+    /// Rename a live tag to a name nothing carries yet — merging onto an
+    /// existing tag is a merge (`maj tag merge`), not a rename.
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Fold one live tag into another live tag.
+    Merge {
+        from: String,
+        into: String,
+    },
+    /// Bulk-add one or more tags to one or more assets in one call — the
+    /// bulk form of `maj tag add`.
+    Assign {
+        /// Tag to add (repeatable: `--tag a --tag b`).
+        #[arg(long = "tag", required = true)]
+        tags: Vec<String>,
+        #[arg(required = true)]
+        assets: Vec<String>,
+    },
 }
 
 /// The human review flow for AI tag suggestions (`Caption`/tag-suggestion
@@ -460,6 +493,12 @@ enum TagCmd {
 /// derived data that was never a CRDT op until confirmed.
 #[derive(Subcommand)]
 enum TagsCmd {
+    /// List the catalog's live tag vocabulary — every effective tag after
+    /// alias resolution, with its asset count and newest surviving add time.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// List pending AI tag suggestions not yet confirmed or rejected.
     Suggestions,
     /// Confirm suggestion(s) into the folksonomy — emits a plain `TagAdd`,
@@ -589,6 +628,7 @@ fn dispatch_inbox(app: &mut FsApp, catalog: &Path, cmd: InboxCmd) -> Result<()> 
 /// under the crate's max-function-length lint, matching [`dispatch_index`].
 fn dispatch_tags(app: &mut FsApp, catalog: &Path, cmd: TagsCmd) -> Result<()> {
     match cmd {
+        TagsCmd::List { json } => tags_cmd::cmd_tags_list(app, catalog, json),
         TagsCmd::Suggestions => tags_cmd::cmd_suggestions(app, catalog),
         TagsCmd::Confirm { asset, tags } => tags_cmd::cmd_confirm(app, &asset, &tags),
         TagsCmd::Reject { asset, tags } => tags_cmd::cmd_reject(catalog, &asset, &tags),

@@ -118,27 +118,17 @@ test("a listing's notices render verbatim under its count", async () => {
 
 test("a card names its kind and size, and selects its asset when clicked", async () => {
   const chosen: string[] = [];
-  const events: MouseEvent[] = [];
   mockBrowse([oneClip]);
-  await openBRoll((asset, event) => {
-    chosen.push(asset);
-    events.push(event);
-  });
+  await openBRoll((asset) => chosen.push(asset));
 
   const card = await screen.findByRole("button", { name: /A012_C004/u });
   expect(within(card).getByText("video · 4.1 GB")).toBeTruthy();
-
-  // One `setup()` session, so the held modifier is still held at the click —
-  // the direct API starts a fresh session per call and would drop it.
-  const user = userEvent.setup();
-  await user.keyboard("{Meta>}");
-  await user.click(card);
-  await user.keyboard("{/Meta}");
+  await userEvent.click(card);
 
   expect(chosen).toEqual(["xxh3:A012_C004.braw"]);
-  // The click itself is handed over, not just the id: which modifier was
-  // held is the caller's to read, and only the event carries it.
-  expect(events[0]?.metaKey).toBe(true);
+  // One card selected is the inspector's business alone: no bar.
+  expect(card.getAttribute("aria-pressed")).toBe("true");
+  expect(screen.queryByRole("group", { name: "Selection" })).toBeNull();
 });
 
 test("a card whose every copy is offline says so instead of its size", async () => {

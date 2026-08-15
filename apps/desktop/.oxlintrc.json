@@ -25,6 +25,22 @@
       }
     },
     {
+      // `BrowseView.svelte` is the one surface built of four parts — the
+      // folder tree, the breadcrumb, the chip toolbar and the paged grid —
+      // and the multi-selection wiring is the last thing to join them. The
+      // rules it wires in are already modules of their own (`selection.ts`,
+      // `browse-paths.ts`), so what is left in the file is the surface
+      // itself; the fix when it next grows is to lift the tree column into
+      // its own component, not to delete the comments that say why each
+      // part behaves as it does. The cap sits two lines above where the
+      // script block is today (oxlint counts the script block, 308 lines),
+      // so nearly any growth forces the split.
+      "files": ["src/lib/BrowseView.svelte"],
+      "rules": {
+        "max-lines": ["warn", { "max": 310 }]
+      }
+    },
+    {
       // `fixtures.test.ts` assigns one committed fixture per pinned outcome
       // struct (see its own header comment) — its import count tracks the
       // number of Tauri commands, not incidental coupling.

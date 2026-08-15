@@ -4,6 +4,7 @@
 // once per file.
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 
 /** What one command answers with; a promise is fine, and so is a rejection.
@@ -41,6 +42,48 @@ export function rejectCommand(
   return Promise.reject(
     notices.length > 0 ? { message, notices } : { message },
   );
+}
+
+/**
+ * A promise the test settles by hand: what a "still loading" case needs — a
+ * command that answers only once the assertions about the waiting state have
+ * been made.
+ */
+export function deferred<T>(): {
+  promise: Promise<T>;
+  settle: (value: T) => void;
+} {
+  let settle!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+}
+
+/** Long enough for a late arrival to land, so asserting it did not is not
+ *  just asserting it has not yet. Shared by every suite that pins something
+ *  a late answer must not do. */
+export function settlingTime(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 50);
+  });
+}
+
+/**
+ * Clicks with a modifier held down — how a grid is multi-selected. One
+ * `setup()` session per call, so the key is still held at the click: the
+ * direct `userEvent.click` API starts a fresh session and would drop it.
+ * Shared by the Browse and Search grid suites, which must agree about what
+ * ⌘- and shift-clicking do.
+ */
+export async function clickWith(
+  target: HTMLElement,
+  modifier: "Meta" | "Control" | "Shift",
+): Promise<void> {
+  const user = userEvent.setup();
+  await user.keyboard(`{${modifier}>}`);
+  await user.click(target);
+  await user.keyboard(`{/${modifier}}`);
 }
 
 /**

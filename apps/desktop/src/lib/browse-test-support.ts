@@ -94,9 +94,7 @@ export function mockBrowse(pages: BrowseListOutcome[]): ListArgs[] {
   return calls;
 }
 
-export function renderBrowse(
-  onselect: (assetId: string, event: MouseEvent) => void = () => {},
-) {
+export function renderBrowse(onselect: (assetId: string) => void = () => {}) {
   return render(BrowseView, { onselect, inspectorOpen: false });
 }
 
@@ -106,9 +104,7 @@ export function renderBrowse(
  * it too, and the request counts these suites assert are of the requests the
  * test itself asked for.
  */
-export async function openBRoll(
-  onselect: (assetId: string, event: MouseEvent) => void = () => {},
-) {
+export async function openBRoll(onselect: (assetId: string) => void = () => {}) {
   const view = renderBrowse(onselect);
   await userEvent.click(
     await screen.findByRole("button", { name: "ProjectX folders" }),
@@ -156,12 +152,4 @@ export async function leaveFirstListingBehind(count: () => number) {
   await userEvent.click(screen.getByRole("button", { name: "Campaigns" }));
   await waitFor(() => expect(count()).toBe(2));
   await screen.findByText("second.mov");
-}
-
-/** Long enough for a late arrival to land, so asserting it did not is not
- *  just asserting it has not yet. */
-export function settlingTime(): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, 50);
-  });
 }

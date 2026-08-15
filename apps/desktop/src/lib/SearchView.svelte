@@ -5,15 +5,18 @@
   import { timecode } from "./format";
   import Notices from "./Notices.svelte";
   import OnlineBadge from "./OnlineBadge.svelte";
+  import type { SelectionState } from "./selection";
+  import { EMPTY_SELECTION, clickSelection, reconcileSelection } from "./selection";
+  import SelectionBar from "./SelectionBar.svelte";
   import { thumbUrl } from "./thumb";
 
   let {
     onselect,
   }: {
-    /** The click rides along with the asset: which asset the inspector shows
-     *  is this surface's business, but whether a click extends a selection
-     *  is the modifier keys' — and only the event carries those. */
-    onselect: (assetId: string, event: MouseEvent) => void;
+    /** Show this asset in the inspector. Only a plain click asks for it:
+     *  the modified clicks build this surface's own multi-selection, which
+     *  is a different selection and none of the inspector's business. */
+    onselect: (assetId: string) => void;
   } = $props();
 
   /** Long enough that a typed word is one search, short enough to feel live. */
@@ -32,6 +35,18 @@
    * not land on the surface however late it arrives.
    */
   let requestSeq = 0;
+  /** The results picked out for a bulk action — this surface's own
+   *  selection, kept apart from the inspector's by `selection.ts`, and
+   *  reconciled against every new set of results. */
+  let selection = $state<SelectionState>(EMPTY_SELECTION);
+
+  /** What the grid is drawing, in the order it draws it. */
+  let results = $derived(outcome?.results ?? []);
+  /** The selected assets in that same order — what the assignment verbs are
+   *  handed. */
+  let picked = $derived(
+    results.filter((hit) => selection.selected.has(hit.asset)).map((h) => h.asset),
+  );
 
   $effect(() => {
     void loadSaved();
@@ -60,7 +75,7 @@
       // in-flight search for the text just deleted, which would otherwise
       // render results — or an error — under a box asking for nothing.
       requestSeq += 1;
-      outcome = null;
+      setResults(null);
       error = null;
       failureNotices = [];
       return;
@@ -71,6 +86,32 @@
     );
   }
 
+  /**
+   * Every path that replaces the results goes through here, so a selection
+   * can never outlive the cards it was made over: a new query that no longer
+   * finds an asset drops it, and a bulk action can only ever reach what the
+   * user is looking at.
+   */
+  function setResults(next: SearchOutcome | null) {
+    outcome = next;
+    selection = reconcileSelection(
+      selection,
+      (next?.results ?? []).map((hit) => hit.asset),
+    );
+  }
+
+  /**
+   * A click on a result. Which asset the inspector shows and which assets
+   * the bar acts on are two different selections; `clickSelection` is where
+   * the modifier keys decide between them.
+   */
+  function clickCard(assetId: string, event: MouseEvent) {
+    const order = results.map((hit) => hit.asset);
+    const click = clickSelection(selection, order, assetId, event);
+    selection = click.state;
+    if (click.inspect !== null) onselect(click.inspect);
+  }
+
   async function runSearch(call: () => Promise<SearchOutcome>) {
     const seq = ++requestSeq;
     error = null;
@@ -78,12 +119,12 @@
     try {
       const result = await call();
       if (seq !== requestSeq) return;
-      outcome = result;
+      setResults(result);
     } catch (failure) {
       if (seq !== requestSeq) return;
       // The failed query owns the surface: leaving the previous query's count
       // and grid under the error would attribute those results to this one.
-      outcome = null;
+      setResults(null);
       error = errorMessage(failure);
       failureNotices = errorNotices(failure);
     }
@@ -148,9 +189,17 @@
 
   {#if outcome}
     <ul class="grid">
-      {#each outcome.results as hit (hit.asset)}
+      {#each results as hit (hit.asset)}
         <li>
-          <button class="card" onclick={(event) => onselect(hit.asset, event)}>
+          <!-- `aria-pressed` only on the cards in the set: an unpressed
+               toggle on every card would announce a selection state this
+               grid does not have until one is made. -->
+          <button
+            class="card"
+            class:card-picked={selection.selected.has(hit.asset)}
+            aria-pressed={selection.selected.has(hit.asset) ? "true" : undefined}
+            onclick={(event) => clickCard(hit.asset, event)}
+          >
             {#if hit.known}
               <img src={thumbUrl(hit.asset)} alt="" loading="lazy" />
               <span class="name">{hit.name}</span>
@@ -175,4 +224,9 @@
       {/each}
     </ul>
   {/if}
+
+  <!-- Outside the results: the bar draws itself only when two or more cards
+       are picked, and the set it counts is already reconciled against
+       whatever the grid is showing. -->
+  <SelectionBar selected={picked} onclear={() => (selection = EMPTY_SELECTION)} />
 </div>

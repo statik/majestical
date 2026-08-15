@@ -654,6 +654,98 @@ main > .error {
   cursor: default;
 }
 
+/* The selection bar (mockup: organize.html's third frame). The naming note's
+   second kind again — Browse and Search raise the same bar over the same
+   kind of selection — so it takes a neutral `sel-` prefix rather than either
+   surface's, and its buttons and inputs are the `ctl-` controls above.
+
+   Fixed and centred over the bottom of the window: the surfaces scroll, and
+   a bar that scrolls away is one the user has to go and find again. It
+   shares the update banner's layer; the archive modal sits above both at 2,
+   because a preview of a move on disk must not be clickable past. */
+.sel-bar {
+  position: fixed;
+  bottom: 1rem;
+  left: 50%;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: max-content;
+  max-width: min(36rem, 90vw);
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: Canvas;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+  transform: translateX(-50%);
+}
+
+.sel-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* The count changes with every ⌘-click; tabular figures keep the buttons
+   beside it from shifting each time it does. */
+.sel-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Clear is the way out of the selection, not a third thing to do to it. */
+.ctl-btn.sel-quiet {
+  border-color: transparent;
+  color: var(--muted);
+}
+
+/* The pickers, opening upward out of the bar. Scrolls at its own edge: a
+   vocabulary of hundreds of tags must not push the bar off the window. */
+.sel-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--edge);
+}
+
+.sel-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* What the service would not do, per asset. The ids are long and unbroken,
+   and these rows are the only record of the refusal — so they wrap rather
+   than being clipped, and the list scrolls at its own edge: the bar grows
+   upward from the bottom of the window, so a refusal naming a hundred
+   assets would otherwise push its own first rows off the top, out of reach.
+   A quarter of the window, against the picker's 40vh above it. */
+.sel-fails {
+  display: grid;
+  gap: 0.15rem;
+  max-height: 25vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  color: var(--alert);
+  font-size: 0.8rem;
+  list-style: none;
+}
+
+/* A card in the multi-selection. Both grids draw it, so it sits with the
+   card itself rather than in either surface's block. */
+.card-picked {
+  border-color: currentcolor;
+  background: var(--sunken);
+}
+
 /* The archive modal. Fixed over the whole window rather than positioned
    inside the surface: the surface scrolls, and a preview of a move that can
    scroll out of view is a confirmation nobody read. */

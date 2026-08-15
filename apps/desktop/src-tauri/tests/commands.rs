@@ -9,9 +9,10 @@
 use majestical_desktop::commands::{
     AppState, CatalogCfg, CommandError, add_para_node_impl, adopt_catalog, app_status_impl,
     archive_node_impl, assign_tags_impl, browse_list_impl, browse_tree_impl, file_assets_impl,
-    get_asset_impl, initialize_catalog_impl, list_para_impl, list_saved_searches_impl,
-    list_tags_impl, list_volumes_impl, merge_tags_impl, rename_para_node_impl, rename_tag_impl,
-    run_saved_search_impl, search_assets_impl, use_existing_catalog_impl,
+    get_asset_impl, initialize_catalog_impl, list_mounted_roots_impl, list_para_impl,
+    list_saved_searches_impl, list_tags_impl, list_volumes_impl, merge_tags_impl,
+    rename_para_node_impl, rename_tag_impl, run_saved_search_impl, search_assets_impl,
+    use_existing_catalog_impl,
 };
 use majestical_desktop::thumb_protocol;
 use std::path::Path;
@@ -1203,6 +1204,42 @@ fn archive_partial_failure_reports_the_completed_move_via_notices() {
             "root1's source directory must be gone after the real move"
         );
     });
+}
+
+/// The archive modal's candidate roots. "/" is mounted on any machine this
+/// suite runs on, so the list is never empty, and every row has to carry a
+/// path that really is a directory — the modal hands these straight to
+/// `archive_node` as the roots to move a materialized node from.
+#[test]
+fn list_mounted_roots_reports_the_root_volume_as_a_real_directory() {
+    let roots = list_mounted_roots_impl();
+
+    assert!(
+        roots.iter().any(|root| root.path == "/"),
+        "the root volume is always mounted: {roots:?}"
+    );
+    for root in &roots {
+        assert!(!root.volume.is_empty(), "{root:?} has no volume id");
+        assert!(!root.label.is_empty(), "{root:?} has no label");
+        assert!(
+            Path::new(&root.path).is_dir(),
+            "{root:?} does not name a mounted directory"
+        );
+    }
+}
+
+/// The root volume's label is `volume_identity`'s own `ROOT_LABEL`, not the
+/// empty string `"/".file_name()` yields — the modal prints this label
+/// beside the path, and a blank one would read as a missing drive.
+#[test]
+fn the_root_volumes_label_is_the_shared_root_label() {
+    let roots = list_mounted_roots_impl();
+
+    let root = roots
+        .iter()
+        .find(|root| root.path == "/")
+        .expect("the root volume");
+    assert_eq!(root.label, majestical_services::volume_identity::ROOT_LABEL);
 }
 
 /// Every event this app writes is stamped with this identity, and an empty

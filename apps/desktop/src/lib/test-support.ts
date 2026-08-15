@@ -6,8 +6,10 @@ import type { InvokeArgs } from "@tauri-apps/api/core";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { vi } from "vitest";
 
-/** What one command answers with; a promise is fine, and so is a rejection. */
-type CommandHandler = (args?: InvokeArgs) => unknown;
+/** What one command answers with; a promise is fine, and so is a rejection.
+ *  Exported so a surface's own support file can compose handlers of its own
+ *  (`organize-test-support.ts` records every call before delegating). */
+export type CommandHandler = (args?: InvokeArgs) => unknown;
 
 /**
  * Answers exactly the commands named and nothing else: an invoke this test did

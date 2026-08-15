@@ -54,6 +54,7 @@ pub fn run() {
             commands::add_para_node,
             commands::rename_para_node,
             commands::archive_node,
+            commands::list_mounted_roots,
             commands::initialize_catalog,
             commands::use_existing_catalog,
         ])

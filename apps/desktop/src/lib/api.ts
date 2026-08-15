@@ -250,6 +250,17 @@ export interface ArchiveOutcome {
 }
 
 /**
+ * `commands::MountedRoot`. The archive modal's candidate roots: nothing in
+ * the catalog records where a node was materialized, so the roots a dry run
+ * is planned against are the volumes plugged in right now.
+ */
+export interface MountedRoot {
+  volume: string;
+  label: string;
+  path: string;
+}
+
+/**
  * Argument names are camelCase because `#[tauri::command]` defaults to
  * `rename_all = "camelCase"` — Rust's `asset_id` is looked up as `assetId`.
  *
@@ -300,6 +311,7 @@ export const api = {
     invoke<void>("rename_para_node", { node, name }),
   archiveNode: (node: string, roots: string[], dryRun: boolean) =>
     invoke<ArchiveOutcome>("archive_node", { node, roots, dryRun }),
+  listMountedRoots: () => invoke<MountedRoot[]>("list_mounted_roots"),
 };
 
 /**

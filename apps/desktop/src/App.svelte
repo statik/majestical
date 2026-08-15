@@ -4,12 +4,13 @@
   import BrowseView from "./lib/BrowseView.svelte";
   import Inspector from "./lib/Inspector.svelte";
   import Notices from "./lib/Notices.svelte";
+  import OrganizeView from "./lib/OrganizeView.svelte";
   import SearchView from "./lib/SearchView.svelte";
   import UpdateBanner from "./lib/UpdateBanner.svelte";
   import VolumesView from "./lib/VolumesView.svelte";
   import Welcome from "./lib/Welcome.svelte";
 
-  type Surface = "search" | "browse" | "volumes";
+  type Surface = "search" | "browse" | "organize" | "volumes";
 
   let status = $state<AppStatus | null>(null);
   let error = $state<string | null>(null);
@@ -85,6 +86,12 @@
           </li>
           <li>
             <button
+              aria-current={surface === "organize" ? "page" : undefined}
+              onclick={() => show("organize")}>Organize</button
+            >
+          </li>
+          <li>
+            <button
               aria-current={surface === "volumes" ? "page" : undefined}
               onclick={() => show("volumes")}>Volumes</button
             >
@@ -101,6 +108,10 @@
           onselect={(asset) => (selected = asset)}
           inspectorOpen={selected !== null}
         />
+      {:else if surface === "organize"}
+        <!-- No `onselect`: Organize manages the taxonomy, and nothing on it
+             addresses an asset, so it never opens the inspector. -->
+        <OrganizeView />
       {:else}
         <VolumesView />
       {/if}

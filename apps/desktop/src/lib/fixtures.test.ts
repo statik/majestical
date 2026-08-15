@@ -7,6 +7,7 @@ import type {
   BrowseListOutcome,
   BrowseTreeOutcome,
   CommandError,
+  MountedRoot,
   MoveStatus,
   ParaOutcome,
   SavedSearches,
@@ -22,6 +23,7 @@ import assignOutcome from "./fixtures/assign_outcome.json";
 import browseList from "./fixtures/browse_list.json";
 import browseTree from "./fixtures/browse_tree.json";
 import commandError from "./fixtures/command_error.json";
+import mountedRoots from "./fixtures/mounted_roots.json";
 import paraOutcome from "./fixtures/para_outcome.json";
 import savedSearches from "./fixtures/saved_searches.json";
 import searchOutcome from "./fixtures/search_outcome.json";
@@ -56,6 +58,9 @@ const typedArchiveOutcome: ArchiveOutcome = archiveOutcome as ArchiveOutcome;
 // literal is what breaks compilation if a `MoveStatus` variant drifts from
 // para.rs's `#[serde(rename_all = "snake_case")]` spelling.
 const allMoveStatuses: MoveStatus[] = ["moved", "already_archived", "planned"];
+// A bare array on the wire — `list_mounted_roots` reads the mount table, so
+// it has no outcome struct and no notices to carry.
+const typedMountedRoots: MountedRoot[] = mountedRoots;
 
 describe("wire fixtures", () => {
   it("carry the load-bearing runtime shapes", () => {
@@ -81,6 +86,7 @@ describe("wire fixtures", () => {
     expect(typedArchiveOutcome.moves[0]?.status).toBe("moved");
     expect(typedArchiveOutcome.moves[1]?.status).toBe("already_archived");
     expect(allMoveStatuses).toContain(typedArchiveOutcome.moves[0]?.status);
+    expect(typedMountedRoots[0]?.path.length).toBeGreaterThan(0);
   });
 
   // An optional interface field can vanish from a regenerated fixture (a

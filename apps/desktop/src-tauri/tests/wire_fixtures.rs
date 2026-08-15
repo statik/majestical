@@ -9,7 +9,7 @@
 //! `*_impl` (the path `tests/commands.rs` uses) — there is nothing private
 //! to round-trip through a service call for.
 use majestical_core::event::VerifyOutcome;
-use majestical_desktop::commands::{AppStatus, CommandError, SavedSearches};
+use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
 use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
@@ -364,6 +364,22 @@ fn archive_outcome_fixture() {
     check_or_update(
         "archive_outcome",
         &serde_json::to_value(&archive_outcome).expect("serialize"),
+    );
+}
+
+/// A bare array on the wire, not an outcome struct: `list_mounted_roots`
+/// reads the mount table rather than a catalog, so there is no notices sink
+/// to drain and nothing for a wrapper object to name.
+#[test]
+fn mounted_roots_fixture() {
+    let mounted_roots = vec![MountedRoot {
+        volume: "uuid:9E1F0C7A-0B4E-4C1D-9A2B-6D5E4F3C2B1A".to_string(),
+        label: "SSD-A".to_string(),
+        path: "/Volumes/SSD-A".to_string(),
+    }];
+    check_or_update(
+        "mounted_roots",
+        &serde_json::to_value(&mounted_roots).expect("serialize"),
     );
 }
 

@@ -87,6 +87,14 @@ function mockCatalog(volumeLabels: string[]) {
       })),
     }),
     browse_list: () => ({ count: 1, folder_count: 1, results: [hit] }),
+    list_para: () => ({
+      nodes: [
+        { id: "01PROJECT", kind: "project", name: "client-x", archived: false },
+      ],
+    }),
+    list_tags: () => ({
+      tags: [{ tag: "b-roll", count: 412, last_used_ms: 1_754_000_000_000 }],
+    }),
     list_volumes: () => ({
       volumes: volumeLabels.map((label) => ({
         id: `label:${label}`,
@@ -174,8 +182,8 @@ test("the sidebar offers exactly the surfaces this phase ships, in order", async
   const surfaces = [...container.querySelectorAll(".surfaces button")].map(
     (button) => button.textContent,
   );
-  // No dead buttons: Ingest and Organize arrive with their own surfaces.
-  expect(surfaces).toEqual(["Search", "Browse", "Volumes"]);
+  // No dead buttons: Ingest arrives with its own surface.
+  expect(surfaces).toEqual(["Search", "Browse", "Organize", "Volumes"]);
 });
 
 test("the browse surface swaps in, and takes the inspector's selection with it", async () => {
@@ -208,6 +216,36 @@ test("a browse card opens the inspector the same way a search hit does", async (
   await waitFor(() =>
     expect(container.querySelector(".inspector")).not.toBeNull(),
   );
+});
+
+test("the organize surface swaps in with both of its columns", async () => {
+  mockCatalog(["Card"]);
+  render(App);
+
+  const organize = await screen.findByRole("button", { name: "Organize" });
+  await userEvent.click(organize);
+
+  expect(await screen.findByRole("list", { name: "Projects" })).toBeTruthy();
+  expect(screen.getByRole("searchbox", { name: "Filter tags" })).toBeTruthy();
+  expect(screen.queryByRole("searchbox", { name: /^Search the catalog/u })).toBeNull();
+  expect(organize.getAttribute("aria-current")).toBe("page");
+});
+
+test("leaving a surface for Organize closes the inspector with it", async () => {
+  mockCatalog(["Card"]);
+  const { container } = render(App);
+
+  await userEvent.type(await screen.findByRole("searchbox"), "sunset");
+  await userEvent.click(await screen.findByRole("button", { name: /sunset/u }));
+  await waitFor(() =>
+    expect(container.querySelector(".inspector")).not.toBeNull(),
+  );
+
+  // Organize never selects an asset, so the panel goes with the surface
+  // that opened it — the same rule every other switch follows.
+  await userEvent.click(screen.getByRole("button", { name: "Organize" }));
+
+  await waitFor(() => expect(container.querySelector(".inspector")).toBeNull());
 });
 
 test("a failed startup offers a retry that asks again", async () => {

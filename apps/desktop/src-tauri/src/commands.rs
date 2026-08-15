@@ -108,6 +108,48 @@ pub struct SavedSearches {
     pub notices: Vec<String>,
 }
 
+/// One volume mounted on this machine right now: its stable volume id, its
+/// label, and the directory it is mounted at.
+///
+/// The archive modal's candidate roots. `para::archive` takes filesystem
+/// roots to move a node's materialized directory out of, and nothing in the
+/// catalog records where a node was materialized — so the GUI offers what is
+/// plugged in now, which is also the only place a move could succeed.
+#[derive(Debug, Serialize)]
+pub struct MountedRoot {
+    pub volume: String,
+    pub label: String,
+    pub path: String,
+}
+
+/// Every volume mounted right now, from
+/// [`majestical_services::volume_identity::mounted_volumes`]'s map of volume
+/// id → mount point.
+///
+/// The label is the mount point's last path component, or
+/// [`majestical_services::volume_identity::ROOT_LABEL`] for `/` — the same
+/// derivation `volume_identity::resolve` does, repeated here rather than
+/// calling `resolve` again, which would shell out to `diskutil` a second
+/// time per mount for a string already on hand.
+///
+/// Takes no [`CatalogCfg`]: this reads the mount table, not the catalog.
+#[must_use]
+pub fn list_mounted_roots_impl() -> Vec<MountedRoot> {
+    let mut roots = Vec::new();
+    for (volume, path) in majestical_services::volume_identity::mounted_volumes() {
+        let label = path.file_name().map_or_else(
+            || majestical_services::volume_identity::ROOT_LABEL.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        roots.push(MountedRoot {
+            volume,
+            label,
+            path: path.display().to_string(),
+        });
+    }
+    roots
+}
+
 /// This machine's identity for authored events — the hostname, which is
 /// what a `maj` user passes as `--machine-id` on the same machine. Both the
 /// machine id and the author take it, matching the CLI's own default of
@@ -810,6 +852,24 @@ pub fn rename_para_node(
     name: String,
 ) -> Result<(), CommandError> {
     rename_para_node_impl(&require_catalog(&state)?, &node, &name)
+}
+
+/// Every volume mounted on this machine right now — the roots the archive
+/// modal previews a node's move against. Reads the mount table, so it
+/// answers whether or not a catalog is selected.
+///
+/// `async`, and on the blocking pool: resolving each mount's identity shells
+/// out to `diskutil` once per mounted volume (see
+/// [`majestical_services::volume_identity::resolve`]), which is the same
+/// work `search_assets` already hands to that pool rather than run on the
+/// main thread.
+///
+/// # Errors
+/// Returns an error only if the background task itself fails to run;
+/// enumerating mounts cannot fail, it answers with what it could read.
+#[tauri::command]
+pub async fn list_mounted_roots() -> Result<Vec<MountedRoot>, CommandError> {
+    blocking(|| Ok(list_mounted_roots_impl())).await
 }
 
 /// Archives a PARA node. `dry_run: true` previews without touching disk or

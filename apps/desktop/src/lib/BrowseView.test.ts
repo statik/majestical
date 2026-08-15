@@ -14,9 +14,13 @@ import {
   openBRoll,
   renderBrowse,
   row,
-  settlingTime,
 } from "./browse-test-support";
-import { mockCommands, rejectCommand, stubMatchMedia } from "./test-support";
+import {
+  mockCommands,
+  rejectCommand,
+  settlingTime,
+  stubMatchMedia,
+} from "./test-support";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");

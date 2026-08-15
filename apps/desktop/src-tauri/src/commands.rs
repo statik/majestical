@@ -20,7 +20,9 @@ use majestical_services::app::FsApp;
 use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseTreeOutcome};
 use majestical_services::catalog::AssetDetail;
 use majestical_services::error::ServiceError;
+use majestical_services::para::{self, ArchiveOutcome, ParaOutcome};
 use majestical_services::search::{SavedSearch, SearchOutcome, SearchRequest};
+use majestical_services::tags::{self, AssignOutcome, TagRenameOutcome, TagsListOutcome};
 use majestical_services::volumes::VolumesOutcome;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -104,6 +106,48 @@ pub struct SavedSearches {
     pub saved: Vec<SavedSearch>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<String>,
+}
+
+/// One volume mounted on this machine right now: its stable volume id, its
+/// label, and the directory it is mounted at.
+///
+/// The archive modal's candidate roots. `para::archive` takes filesystem
+/// roots to move a node's materialized directory out of, and nothing in the
+/// catalog records where a node was materialized — so the GUI offers what is
+/// plugged in now, which is also the only place a move could succeed.
+#[derive(Debug, Serialize)]
+pub struct MountedRoot {
+    pub volume: String,
+    pub label: String,
+    pub path: String,
+}
+
+/// Every volume mounted right now, from
+/// [`majestical_services::volume_identity::mounted_volumes`]'s map of volume
+/// id → mount point.
+///
+/// The label is the mount point's last path component, or
+/// [`majestical_services::volume_identity::ROOT_LABEL`] for `/` — the same
+/// derivation `volume_identity::resolve` does, repeated here rather than
+/// calling `resolve` again, which would shell out to `diskutil` a second
+/// time per mount for a string already on hand.
+///
+/// Takes no [`CatalogCfg`]: this reads the mount table, not the catalog.
+#[must_use]
+pub fn list_mounted_roots_impl() -> Vec<MountedRoot> {
+    let mut roots = Vec::new();
+    for (volume, path) in majestical_services::volume_identity::mounted_volumes() {
+        let label = path.file_name().map_or_else(
+            || majestical_services::volume_identity::ROOT_LABEL.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        roots.push(MountedRoot {
+            volume,
+            label,
+            path: path.display().to_string(),
+        });
+    }
+    roots
 }
 
 /// This machine's identity for authored events — the hostname, which is
@@ -268,6 +312,152 @@ pub fn browse_list_impl(
         &cfg.catalog,
         &req,
     )?)
+}
+
+/// `maj tags list`: the catalog's live folksonomy vocabulary.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+pub fn list_tags_impl(cfg: &CatalogCfg) -> Result<TagsListOutcome, CommandError> {
+    let app = open_app(cfg)?;
+    Ok(tags::tags_list(&app, &cfg.catalog)?)
+}
+
+/// `maj tag rename`: renames a live tag to a name nothing carries yet.
+///
+/// # Errors
+/// Returns an error if `from` and `to` are the same name, no asset carries
+/// `from`, `to` has itself been renamed away, some asset already carries
+/// `to` (that's a merge), or the event log can't be read or appended to.
+pub fn rename_tag_impl(
+    cfg: &CatalogCfg,
+    from: &str,
+    to: &str,
+) -> Result<TagRenameOutcome, CommandError> {
+    let mut app = open_app(cfg)?;
+    Ok(tags::tag_rename(&mut app, from, to)?)
+}
+
+/// `maj tag merge`: folds one live tag into another live tag.
+///
+/// # Errors
+/// Returns an error if `from` and `into_tag` are the same tag, no asset
+/// carries `from`, `into_tag` has been renamed away, no asset carries
+/// `into_tag` (that's a rename), or the event log can't be read or appended
+/// to.
+pub fn merge_tags_impl(
+    cfg: &CatalogCfg,
+    from: &str,
+    into_tag: &str,
+) -> Result<TagRenameOutcome, CommandError> {
+    let mut app = open_app(cfg)?;
+    Ok(tags::tag_merge(&mut app, from, into_tag)?)
+}
+
+/// `maj tag assign`: adds every tag in `tags` to every asset in `asset_ids`.
+///
+/// # Errors
+/// Returns an error if `asset_ids` or `tags` is empty, every asset fails
+/// (the joined per-asset reasons name why), or the event log can't be read
+/// or appended to.
+pub fn assign_tags_impl(
+    cfg: &CatalogCfg,
+    asset_ids: &[String],
+    tags: &[String],
+) -> Result<AssignOutcome, CommandError> {
+    let mut app = open_app(cfg)?;
+    Ok(tags::tags_assign(&mut app, asset_ids, tags)?)
+}
+
+/// `maj para file`: files every asset in `asset_ids` under one PARA node.
+///
+/// # Errors
+/// Returns an error if `asset_ids` is empty, `node` doesn't resolve, every
+/// asset fails, or the event log can't be read or appended to.
+pub fn file_assets_impl(
+    cfg: &CatalogCfg,
+    asset_ids: &[String],
+    node: &str,
+) -> Result<AssignOutcome, CommandError> {
+    let mut app = open_app(cfg)?;
+    Ok(para::para_file(&mut app, asset_ids, node)?)
+}
+
+/// `maj para list`: every PARA node the catalog has ever created.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+pub fn list_para_impl(cfg: &CatalogCfg) -> Result<ParaOutcome, CommandError> {
+    let app = open_app(cfg)?;
+    Ok(para::para_list(&app, &cfg.catalog)?)
+}
+
+/// `maj para add`: creates a node and returns its freshly minted id.
+///
+/// # Errors
+/// Returns an error if `kind` isn't a known PARA kind, an active node
+/// already exists at `<kind>/<name>`, or the event log can't be read or
+/// appended to.
+pub fn add_para_node_impl(
+    cfg: &CatalogCfg,
+    kind: &str,
+    name: &str,
+) -> Result<String, CommandError> {
+    let mut app = open_app(cfg)?;
+    let para::NodeId(id) = para::add(&mut app, kind, name)?;
+    Ok(id)
+}
+
+/// `maj para rename`: renames a node.
+///
+/// # Errors
+/// Returns an error if `node` doesn't resolve to a known active node, or the
+/// event log can't be read or appended to.
+pub fn rename_para_node_impl(cfg: &CatalogCfg, node: &str, name: &str) -> Result<(), CommandError> {
+    let mut app = open_app(cfg)?;
+    Ok(para::rename(&mut app, node, name)?)
+}
+
+/// `maj para archive`: archives a node, moving each root's materialized
+/// directory first. `dry_run` plans without touching disk or the event log
+/// — the GUI's archive modal calls this once with `dry_run: true` to preview
+/// and once more with `dry_run: false` to execute.
+///
+/// A multi-root run that fails partway through still reports the roots
+/// already moved (or classified) BEFORE the failing one — folded into the
+/// `CommandError`'s `notices` as `moved <from> -> <to>` lines, since the
+/// wire shape carries no dedicated `moves` field (unlike MCP's
+/// `move_para_archive`, which returns them as structured JSON). Built
+/// directly here rather than through the blanket `From<E>` impl above,
+/// which has no [`ServiceError::ParaArchivePartial`] arm and would
+/// otherwise format only the trailing error, silently dropping every
+/// completed move — the CLI's `cmd_para_archive` and MCP's
+/// `move_para_archive` both render this same carrier on their own wires.
+///
+/// # Errors
+/// Returns an error if `node` doesn't resolve, the resolved node has no
+/// recorded kind/name, the node is of kind `archive`, a root's source
+/// directory is missing (not `dry_run`, not already archived), a root's
+/// archive target already exists, or a filesystem operation fails.
+pub fn archive_node_impl(
+    cfg: &CatalogCfg,
+    node: &str,
+    roots: &[String],
+    dry_run: bool,
+) -> Result<ArchiveOutcome, CommandError> {
+    let mut app = open_app(cfg)?;
+    let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+    match para::archive(&mut app, node, &roots, dry_run) {
+        Ok(outcome) => Ok(outcome),
+        Err(ServiceError::ParaArchivePartial { moves, source }) => Err(CommandError {
+            message: format!("{source:#}"),
+            notices: moves
+                .iter()
+                .map(|mv| format!("moved {} -> {}", mv.from.display(), mv.to.display()))
+                .collect(),
+        }),
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// Refuses a root that already holds a catalog: `catalog::init` is
@@ -520,6 +710,189 @@ pub fn browse_list(
         limit,
         offset,
     )
+}
+
+/// The catalog's live folksonomy vocabulary.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<TagsListOutcome, CommandError> {
+    list_tags_impl(&require_catalog(&state)?)
+}
+
+/// Renames a live tag to a name nothing carries yet.
+///
+/// # Errors
+/// Returns an error if `from` and `to` are the same name, no asset carries
+/// `from`, `to` has itself been renamed away, some asset already carries
+/// `to` (that's a merge), or the event log can't be read or appended to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn rename_tag(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<TagRenameOutcome, CommandError> {
+    rename_tag_impl(&require_catalog(&state)?, &from, &to)
+}
+
+/// Folds one live tag into another live tag. The Rust parameter is named
+/// `into_tag` rather than `into` (a reserved keyword); Tauri's default
+/// `rename_all = "camelCase"` renders that on the wire as `intoTag`, and
+/// `api.ts`'s `mergeTags` wrapper sends exactly that key — see its own
+/// comment for the other half of this pairing.
+///
+/// # Errors
+/// Returns an error if `from` and `into_tag` are the same tag, no asset
+/// carries `from`, `into_tag` has been renamed away, no asset carries
+/// `into_tag` (that's a rename), or the event log can't be read or appended
+/// to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn merge_tags(
+    state: State<'_, AppState>,
+    from: String,
+    into_tag: String,
+) -> Result<TagRenameOutcome, CommandError> {
+    merge_tags_impl(&require_catalog(&state)?, &from, &into_tag)
+}
+
+/// Adds every tag in `tags` to every asset in `asset_ids`.
+///
+/// # Errors
+/// Returns an error if `asset_ids` or `tags` is empty, every asset fails, or
+/// the event log can't be read or appended to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn assign_tags(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+    tags: Vec<String>,
+) -> Result<AssignOutcome, CommandError> {
+    assign_tags_impl(&require_catalog(&state)?, &asset_ids, &tags)
+}
+
+/// Files every asset in `asset_ids` under one PARA node.
+///
+/// # Errors
+/// Returns an error if `asset_ids` is empty, `node` doesn't resolve, every
+/// asset fails, or the event log can't be read or appended to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn file_assets(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+    node: String,
+) -> Result<AssignOutcome, CommandError> {
+    file_assets_impl(&require_catalog(&state)?, &asset_ids, &node)
+}
+
+/// Every PARA node the catalog has ever created.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or the catalog can't be read.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn list_para(state: State<'_, AppState>) -> Result<ParaOutcome, CommandError> {
+    list_para_impl(&require_catalog(&state)?)
+}
+
+/// Creates a PARA node and returns its freshly minted id.
+///
+/// # Errors
+/// Returns an error if `kind` isn't a known PARA kind, an active node
+/// already exists at `<kind>/<name>`, or the event log can't be read or
+/// appended to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn add_para_node(
+    state: State<'_, AppState>,
+    kind: String,
+    name: String,
+) -> Result<String, CommandError> {
+    add_para_node_impl(&require_catalog(&state)?, &kind, &name)
+}
+
+/// Renames a PARA node.
+///
+/// # Errors
+/// Returns an error if `node` doesn't resolve to a known active node, or the
+/// event log can't be read or appended to.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn rename_para_node(
+    state: State<'_, AppState>,
+    node: String,
+    name: String,
+) -> Result<(), CommandError> {
+    rename_para_node_impl(&require_catalog(&state)?, &node, &name)
+}
+
+/// Every volume mounted on this machine right now — the roots the archive
+/// modal previews a node's move against. Reads the mount table, so it
+/// answers whether or not a catalog is selected.
+///
+/// `async`, and on the blocking pool: resolving each mount's identity shells
+/// out to `diskutil` once per mounted volume (see
+/// [`majestical_services::volume_identity::resolve`]), which is the same
+/// work `search_assets` already hands to that pool rather than run on the
+/// main thread.
+///
+/// # Errors
+/// Returns an error only if the background task itself fails to run;
+/// enumerating mounts cannot fail, it answers with what it could read.
+#[tauri::command]
+pub async fn list_mounted_roots() -> Result<Vec<MountedRoot>, CommandError> {
+    blocking(|| Ok(list_mounted_roots_impl())).await
+}
+
+/// Archives a PARA node. `dry_run: true` previews without touching disk or
+/// the event log; the GUI's archive modal calls this once to preview and
+/// once more with `dry_run: false` to execute.
+///
+/// # Errors
+/// Returns an error if `node` doesn't resolve, the resolved node has no
+/// recorded kind/name, the node is of kind `archive`, a root's source
+/// directory is missing (not `dry_run`, not already archived), a root's
+/// archive target already exists, or a filesystem operation fails.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn archive_node(
+    state: State<'_, AppState>,
+    node: String,
+    roots: Vec<String>,
+    dry_run: bool,
+) -> Result<ArchiveOutcome, CommandError> {
+    archive_node_impl(&require_catalog(&state)?, &node, &roots, dry_run)
 }
 
 /// Creates a catalog at `path`, then selects and persists it.

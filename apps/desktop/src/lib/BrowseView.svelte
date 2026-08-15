@@ -27,16 +27,19 @@
   import { fileSize } from "./format";
   import Notices from "./Notices.svelte";
   import OnlineBadge from "./OnlineBadge.svelte";
+  import type { SelectionState } from "./selection";
+  import { EMPTY_SELECTION, clickSelection, reconcileSelection } from "./selection";
+  import SelectionBar from "./SelectionBar.svelte";
   import { thumbUrl } from "./thumb";
 
   let {
     onselect,
     inspectorOpen,
   }: {
-    /** The click is passed on with the asset: which asset the inspector
-     *  shows is this surface's business, but whether a click extends a
-     *  selection is the modifier keys' — and only the event carries those. */
-    onselect: (assetId: string, event: MouseEvent) => void;
+    /** Show this asset in the inspector. Only a plain click asks for it:
+     *  the modified clicks build this surface's own multi-selection, which
+     *  is a different selection and none of the inspector's business. */
+    onselect: (assetId: string) => void;
     inspectorOpen: boolean;
   } = $props();
 
@@ -100,6 +103,14 @@
   /** Same rule as the search surface: a listing the user has already clicked
    *  past must not land on the grid however late it arrives. */
   let requestSeq = 0;
+  /** The cards picked out for a bulk action — this surface's own selection,
+   *  which the inspector's single one knows nothing about (`selection.ts`). */
+  let selection = $state<SelectionState>(EMPTY_SELECTION);
+  /** Those cards in the order the grid draws them: the order the assignment
+   *  verbs are handed them in. */
+  let picked = $derived(
+    rows.filter((hit) => selection.selected.has(hit.asset)).map((h) => h.asset),
+  );
 
   let crumbs = $derived(path === "" ? [] : path.split("/"));
   /**
@@ -195,7 +206,7 @@
         offset,
       });
       if (seq !== requestSeq) return;
-      rows = offset === 0 ? outcome.results : appended(outcome.results);
+      setRows(offset === 0 ? outcome.results : appended(outcome.results));
       count = outcome.count;
       folderCount = outcome.folder_count;
       listNotices = outcome.notices ?? [];
@@ -204,7 +215,7 @@
       if (offset === 0) {
         // A failed first page owns the pane: leaving the previous folder's
         // grid under the error would attribute those assets to this folder.
-        rows = [];
+        setRows([]);
         count = 0;
         folderCount = 0;
         listNotices = [];
@@ -217,6 +228,23 @@
     } finally {
       if (seq === requestSeq) loading = false;
     }
+  }
+
+  /** Every path that replaces the rows goes through here, so a selection
+   *  can never outlive the cards it was made over. */
+  function setRows(next: SearchHit[]) {
+    rows = next;
+    selection = reconcileSelection(selection, next.map((hit) => hit.asset));
+  }
+
+  /** A click on a card. Which asset the inspector shows and which assets the
+   *  bar acts on are two selections, and `clickSelection` is where the
+   *  modifier keys decide between them. */
+  function clickCard(assetId: string, event: MouseEvent) {
+    const order = rows.map((hit) => hit.asset);
+    const click = clickSelection(selection, order, assetId, event);
+    selection = click.state;
+    if (click.inspect !== null) onselect(click.inspect);
   }
 
   /**
@@ -459,9 +487,16 @@
              `appended` keeps that true across pages. -->
         {#each rows as hit (hit.asset)}
           <li>
+            <!-- `aria-pressed` only on the cards in the set: an unpressed
+                 toggle on every card would announce a selection state this
+                 grid does not have until one is made. -->
             <button
               class="card"
-              onclick={(event) => onselect(hit.asset, event)}
+              class:card-picked={selection.selected.has(hit.asset)}
+              aria-pressed={selection.selected.has(hit.asset)
+                ? "true"
+                : undefined}
+              onclick={(event) => clickCard(hit.asset, event)}
             >
               {#if hit.kind === "video"}
                 <Filmstrip assetId={hit.asset}>{@render thumb(hit)}</Filmstrip>
@@ -485,5 +520,13 @@
         </button>
       {/if}
     {/if}
+
+    <!-- Outside the listing: the bar draws itself only when two or more
+         cards are picked, and the set it counts is already reconciled
+         against whatever the grid is showing. -->
+    <SelectionBar
+      selected={picked}
+      onclear={() => (selection = EMPTY_SELECTION)}
+    />
   </div>
 </div>

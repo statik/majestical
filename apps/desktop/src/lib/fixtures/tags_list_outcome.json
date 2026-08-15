@@ -1,0 +1,12 @@
+{
+  "notices": [
+    "a warning the list_tags call collected"
+  ],
+  "tags": [
+    {
+      "count": 3,
+      "last_used_ms": 1700000000000,
+      "tag": "golden-hour"
+    }
+  ]
+}

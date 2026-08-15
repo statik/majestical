@@ -1,0 +1,12 @@
+{
+  "applied": 2,
+  "failed": [
+    {
+      "asset": "xxh3:never-scanned",
+      "reason": "unknown asset xxh3:never-scanned"
+    }
+  ],
+  "notices": [
+    "a warning the assign_tags call collected"
+  ]
+}

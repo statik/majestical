@@ -9,13 +9,19 @@
 //! `*_impl` (the path `tests/commands.rs` uses) — there is nothing private
 //! to round-trip through a service call for.
 use majestical_core::event::VerifyOutcome;
-use majestical_desktop::commands::{AppStatus, CommandError, SavedSearches};
+use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
 use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
 use majestical_services::catalog::{AssetDetail, AssetInstance, AssetVerification};
+use majestical_services::para::{
+    ArchiveMove, ArchiveOutcome, MoveStatus, ParaNodeRow, ParaOutcome,
+};
 use majestical_services::search::{
     SavedSearch, SearchHit, SearchOutcome, SemanticCoverage, TextCoverageNotice, VolumeRef,
+};
+use majestical_services::tags::{
+    AssignFailure, AssignOutcome, TagRenameOutcome, TagRow, TagsListOutcome,
 };
 use majestical_services::volumes::{VolumeRow, VolumesOutcome};
 use std::path::PathBuf;
@@ -263,6 +269,117 @@ fn browse_list_fixture() {
     check_or_update(
         "browse_list",
         &serde_json::to_value(&browse_list_outcome).expect("serialize"),
+    );
+}
+
+#[test]
+fn tags_list_outcome_fixture() {
+    let tags_list_outcome = TagsListOutcome {
+        tags: vec![TagRow {
+            tag: "golden-hour".to_string(),
+            count: 3,
+            last_used_ms: 1_700_000_000_000,
+        }],
+        notices: vec!["a warning the list_tags call collected".to_string()],
+    };
+    check_or_update(
+        "tags_list_outcome",
+        &serde_json::to_value(&tags_list_outcome).expect("serialize"),
+    );
+}
+
+#[test]
+fn tag_rename_outcome_fixture() {
+    let tag_rename_outcome = TagRenameOutcome {
+        from: "goldenhour".to_string(),
+        to: "golden-hour".to_string(),
+        rewritten: 3,
+        notices: vec!["a warning the rename_tag call collected".to_string()],
+    };
+    check_or_update(
+        "tag_rename_outcome",
+        &serde_json::to_value(&tag_rename_outcome).expect("serialize"),
+    );
+}
+
+/// synthetic-maximal: a bulk assignment's `failed` is populated here purely
+/// so the TS side type-checks `AssignFailure`'s full surface — a real
+/// success carries an empty `failed`, which `assign_tags`/`file_assets`
+/// still return (just not pinned by this fixture; see `fixtures.test.ts`).
+#[test]
+fn assign_outcome_fixture() {
+    let assign_outcome = AssignOutcome {
+        applied: 2,
+        failed: vec![AssignFailure {
+            asset: "xxh3:never-scanned".to_string(),
+            reason: "unknown asset xxh3:never-scanned".to_string(),
+        }],
+        notices: vec!["a warning the assign_tags call collected".to_string()],
+    };
+    check_or_update(
+        "assign_outcome",
+        &serde_json::to_value(&assign_outcome).expect("serialize"),
+    );
+}
+
+#[test]
+fn para_outcome_fixture() {
+    let para_outcome = ParaOutcome {
+        nodes: vec![ParaNodeRow {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            kind: "project".to_string(),
+            name: "client-x".to_string(),
+            archived: false,
+        }],
+        notices: vec!["a warning the list_para call collected".to_string()],
+    };
+    check_or_update(
+        "para_outcome",
+        &serde_json::to_value(&para_outcome).expect("serialize"),
+    );
+}
+
+#[test]
+fn archive_outcome_fixture() {
+    // Two moves, two statuses: a multi-root archive can mix a genuine move
+    // with a root an earlier partial run already handled — pins
+    // `already_archived`'s serde spelling on the Rust side (the TS side is
+    // pinned by `fixtures.test.ts`'s `allMoveStatuses` literal).
+    let archive_outcome = ArchiveOutcome {
+        moves: vec![
+            ArchiveMove {
+                from: PathBuf::from("/fixtures/root/Projects/client-x"),
+                to: PathBuf::from("/fixtures/root/Archives/client-x"),
+                status: MoveStatus::Moved,
+            },
+            ArchiveMove {
+                from: PathBuf::from("/fixtures/root2/Projects/client-x"),
+                to: PathBuf::from("/fixtures/root2/Archives/client-x"),
+                status: MoveStatus::AlreadyArchived,
+            },
+        ],
+        executed: true,
+        notices: vec!["a warning the archive_node call collected".to_string()],
+    };
+    check_or_update(
+        "archive_outcome",
+        &serde_json::to_value(&archive_outcome).expect("serialize"),
+    );
+}
+
+/// A bare array on the wire, not an outcome struct: `list_mounted_roots`
+/// reads the mount table rather than a catalog, so there is no notices sink
+/// to drain and nothing for a wrapper object to name.
+#[test]
+fn mounted_roots_fixture() {
+    let mounted_roots = vec![MountedRoot {
+        volume: "uuid:9E1F0C7A-0B4E-4C1D-9A2B-6D5E4F3C2B1A".to_string(),
+        label: "SSD-A".to_string(),
+        path: "/Volumes/SSD-A".to_string(),
+    }];
+    check_or_update(
+        "mounted_roots",
+        &serde_json::to_value(&mounted_roots).expect("serialize"),
     );
 }
 

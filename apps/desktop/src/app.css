@@ -481,6 +481,359 @@ main > .error {
   background: color-mix(in srgb, CanvasText 45%, transparent);
 }
 
+/* Organize. Two columns of equal width — structure on the left, vocabulary
+   on the right — both visible at once, which is the point of the surface
+   (mockup: organize.html, "my read"). */
+.org-surface {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+/* `min-width: 0`: a grid item's automatic minimum is its content, and one
+   long node name or archive path would push its column past its share. */
+.org-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.org-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.org-kind {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.org-nodes,
+.org-taglist {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.org-node,
+.org-tagrow {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.2rem 0.4rem;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.org-node[aria-current],
+.org-tagrow[aria-current] {
+  background: var(--sunken);
+  font-weight: 600;
+}
+
+.org-name {
+  overflow-wrap: anywhere;
+}
+
+/* The "archived" mark on a node, and the ≈ hint on a tag: both are read as
+   asides to the name they sit beside, never as the name itself. */
+.org-chip {
+  padding: 0 0.35rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 400;
+}
+
+.org-dupe {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 400;
+}
+
+.org-tagpill {
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+}
+
+/* Counts and dates line up in a column of their own at the row's end. */
+.org-num {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.org-num:first-of-type {
+  margin-left: auto;
+}
+
+/* The compact controls. These are the naming note's second kind — one thing
+   rendered the same way everywhere — so they take a neutral prefix rather
+   than a surface's: the small button, input, detail card and action row are
+   what Organize draws, and what the selection bar in Browse and Search
+   draws too. Everything only Organize ever renders stays `org-`. */
+.ctl-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+}
+
+.ctl-detail-title {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+
+.ctl-detail-sub {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.ctl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.ctl-input {
+  min-width: 0;
+  flex: 1;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.ctl-btn {
+  flex: none;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+/* An action that moves real directories is drawn as one. */
+.ctl-btn.ctl-warn {
+  border-color: color-mix(in srgb, var(--alert) 45%, transparent);
+  color: var(--alert);
+}
+
+.ctl-btn:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* The selection bar (mockup: organize.html's third frame). The naming note's
+   second kind again — Browse and Search raise the same bar over the same
+   kind of selection — so it takes a neutral `sel-` prefix rather than either
+   surface's, and its buttons and inputs are the `ctl-` controls above.
+
+   Fixed and centred over the bottom of the window: the surfaces scroll, and
+   a bar that scrolls away is one the user has to go and find again. It
+   shares the update banner's layer; the archive modal sits above both at 2,
+   because a preview of a move on disk must not be clickable past. */
+.sel-bar {
+  position: fixed;
+  bottom: 1rem;
+  left: 50%;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: max-content;
+  max-width: min(36rem, 90vw);
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: Canvas;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+  transform: translateX(-50%);
+}
+
+.sel-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* The count changes with every ⌘-click; tabular figures keep the buttons
+   beside it from shifting each time it does. */
+.sel-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Clear is the way out of the selection, not a third thing to do to it. */
+.ctl-btn.sel-quiet {
+  border-color: transparent;
+  color: var(--muted);
+}
+
+/* The pickers, opening upward out of the bar. Scrolls at its own edge: a
+   vocabulary of hundreds of tags must not push the bar off the window. */
+.sel-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--edge);
+}
+
+.sel-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* What the service would not do, per asset. The ids are long and unbroken,
+   and these rows are the only record of the refusal — so they wrap rather
+   than being clipped, and the list scrolls at its own edge: the bar grows
+   upward from the bottom of the window, so a refusal naming a hundred
+   assets would otherwise push its own first rows off the top, out of reach.
+   A quarter of the window, against the picker's 40vh above it. */
+.sel-fails {
+  display: grid;
+  gap: 0.15rem;
+  max-height: 25vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  color: var(--alert);
+  font-size: 0.8rem;
+  list-style: none;
+}
+
+/* A card in the multi-selection. Both grids draw it, so it sits with the
+   card itself rather than in either surface's block. */
+.card-picked {
+  border-color: currentcolor;
+  background: var(--sunken);
+}
+
+/* The archive modal. Fixed over the whole window rather than positioned
+   inside the surface: the surface scrolls, and a preview of a move that can
+   scroll out of view is a confirmation nobody read. */
+.org-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 30%);
+}
+
+.org-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: min(30rem, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: Canvas;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 30%);
+}
+
+.org-modal-title {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.95rem;
+}
+
+.org-modal-sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* A notice inside this modal is not an ordinary degradation notice: a
+   partial archive reports the directories it already moved as notices, and
+   those lines are the only record that the disk changed. So they are drawn
+   at full contrast with a rule of their own, where every other notice on
+   the app is muted body text. */
+.org-modal .notice {
+  padding: 0.2rem 0.5rem;
+  border-left: 2px solid var(--alert);
+  overflow-wrap: anywhere;
+  color: CanvasText;
+  font-size: 0.8rem;
+}
+
+.org-moves {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  list-style: none;
+}
+
+.org-moves li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--edge);
+  font-size: 0.8rem;
+}
+
+.org-moves li:last-child {
+  border-bottom: 0;
+}
+
+.org-move-status {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.org-move-path {
+  overflow-wrap: anywhere;
+}
+
+.org-modal-row {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+  margin-top: 0.3rem;
+}
+
 .inspector {
   padding: 1rem;
   overflow-y: auto;

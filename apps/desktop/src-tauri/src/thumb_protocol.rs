@@ -101,7 +101,9 @@ pub fn handle(cfg: Option<&CatalogCfg>, uri: &str) -> Response<Vec<u8>> {
 enum Route {
     Thumb,
     Keyframes,
-    KeyframeImage { index_text: String },
+    KeyframeImage {
+        index_text: String,
+    },
     /// `/keyframe/{asset_id}/{index}` where `asset_id` itself failed
     /// validation — reported directly as `BlobError::MalformedAssetId`
     /// rather than routed through [`blobs::read_keyframe_image`], whose

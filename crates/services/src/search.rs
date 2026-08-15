@@ -36,7 +36,7 @@ pub struct SearchRequest {
 
 /// One volume holding an instance of a hit asset, and whether it's currently
 /// mounted.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct VolumeRef {
     pub id: String,
     pub label: String,
@@ -45,7 +45,7 @@ pub struct VolumeRef {
 
 /// One ranked search result, carrying everything a head needs to render a
 /// row without re-querying the catalog.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub asset: String,
     pub score: f64,
@@ -69,6 +69,21 @@ pub struct SearchHit {
     pub locator: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// Populated by browse rows, from the scoped instance's own attributes
+    /// (`browse.rs`'s representative-instance pick). Search hits leave this
+    /// absent this phase — absent-when-`None` keeps every existing search
+    /// wire shape byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Populated by browse rows the same way as [`Self::size`]; absent for
+    /// search hits this phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime_ms: Option<u64>,
+    /// Populated by browse rows the same way as [`Self::size`] — the
+    /// `media_kind` name ("video", "image", "audio", "pdf", "other") of the
+    /// representative instance. Absent for search hits this phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// One text source's coverage notice: how much of the eligible catalog it
@@ -304,6 +319,12 @@ fn build_outcome(
                 source: meta.as_ref().map(|m| m.source.clone()),
                 locator: meta.as_ref().map(|m| m.locator),
                 snippet: meta.map(|m| m.snippet),
+                // Search carries no per-instance attributes this phase —
+                // only browse rows (see `browse.rs::build_rows`) populate
+                // these.
+                size: None,
+                mtime_ms: None,
+                kind: None,
             }
         })
         .collect();
@@ -1172,6 +1193,36 @@ fn searches_rm_impl(app: &mut FsApp, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A search hit never populates `size`/`mtime_ms`/`kind` (only
+    /// `browse_list` does) — pins that those three keys are absent from the
+    /// wire entirely when `None`, not emitted as `null`. Protects the
+    /// existing `wire_fixtures` search fixtures: if this regresses, the
+    /// added fields would land on top of every search result the desktop
+    /// app already snapshotted.
+    #[test]
+    fn a_search_hit_with_no_instance_attributes_omits_those_keys_on_the_wire() {
+        let hit = SearchHit {
+            asset: "xxh3:aa".into(),
+            score: 0.0,
+            known: true,
+            name: "clip.mov".into(),
+            volumes: Vec::new(),
+            tags: Vec::new(),
+            para: None,
+            timestamp_ms: None,
+            source: None,
+            locator: None,
+            snippet: None,
+            size: None,
+            mtime_ms: None,
+            kind: None,
+        };
+        let json = serde_json::to_string(&hit).expect("serialize");
+        assert!(!json.contains("\"size\""), "json: {json}");
+        assert!(!json.contains("\"mtime_ms\""), "json: {json}");
+        assert!(!json.contains("\"kind\""), "json: {json}");
+    }
 
     #[test]
     fn search_outcome_carries_rows_and_notices() {

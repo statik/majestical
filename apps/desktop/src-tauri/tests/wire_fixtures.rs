@@ -108,6 +108,11 @@ fn search_outcome_fixture() {
             source: Some("transcript".to_string()),
             locator: Some(2),
             snippet: Some("a matching snippet".to_string()),
+            // Search never populates these — only browse rows do. Left
+            // `None` so this fixture's JSON stays byte-identical.
+            size: None,
+            mtime_ms: None,
+            kind: None,
         }],
         semantic_coverage: Some(SemanticCoverage {
             embedded: 10,

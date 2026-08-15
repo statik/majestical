@@ -28,10 +28,20 @@ export interface SearchHit {
   volumes: VolumeRef[];
   tags: string[];
   para: string | null;
+  /**
+   * Populated by a search hit's semantic match; browse rows never carry
+   * these — they're `Some` only in the synthetic wire fixture (see
+   * `wire_fixtures.rs`'s `browse_list_fixture`) so the TS side type-checks
+   * the full surface.
+   */
   timestamp_ms?: number;
   source?: string;
   locator?: number;
   snippet?: string;
+  /** Browse populates size/mtime_ms/kind; search leaves them absent. */
+  size?: number;
+  mtime_ms?: number;
+  kind?: string;
 }
 
 /** `majestical_services::search::SemanticCoverage` */
@@ -87,6 +97,48 @@ export interface VolumesOutcome {
   notices?: string[];
 }
 
+/** `majestical_services::browse::BrowseFolder` */
+export interface BrowseFolder {
+  path: string;
+  children: string[];
+  recursive_count: number;
+}
+
+/** `majestical_services::browse::BrowseVolume` */
+export interface BrowseVolume {
+  id: string;
+  label: string;
+  online: boolean;
+  folders: BrowseFolder[];
+}
+
+/** `majestical_services::browse::BrowseTreeOutcome` */
+export interface BrowseTreeOutcome {
+  volumes: BrowseVolume[];
+  notices?: string[];
+}
+
+/** `majestical_services::browse::BrowseListOutcome` */
+export interface BrowseListOutcome {
+  count: number;
+  folder_count: number;
+  results: SearchHit[];
+  notices?: string[];
+}
+
+/**
+ * `browse_list`'s `sort` values — mirrors `SORT_VALUES` in
+ * `majestical_services::browse` (browse.rs), the same source of truth the
+ * Rust side validates against.
+ */
+export type BrowseSort = "captured" | "name" | "size";
+
+/**
+ * `browse_list`'s `kind` filter values — mirrors
+ * `majestical_core::media_kind::MediaKind::ALL`.
+ */
+export type BrowseKind = "image" | "video" | "audio" | "pdf" | "other";
+
 /** `majestical_services::catalog::AssetInstance` */
 export interface AssetInstance {
   volume: string;
@@ -136,8 +188,9 @@ export interface AppStatus {
  * Argument names are camelCase because `#[tauri::command]` defaults to
  * `rename_all = "camelCase"` — Rust's `asset_id` is looked up as `assetId`.
  *
- * Neither search wrapper passes `limit`: the commands already default it
- * (`commands::DEFAULT_LIMIT`), and a second copy of that number here would be
+ * Neither search wrapper passes `limit`, and `browseList` doesn't either: the
+ * commands already default it (`commands::DEFAULT_LIMIT` /
+ * `browse::DEFAULT_LIMIT`), and a second copy of that number here would be
  * a second place to change it.
  */
 export const api = {
@@ -150,6 +203,15 @@ export const api = {
     invoke<AssetDetail | null>("get_asset", { assetId }),
   listVolumes: () => invoke<VolumesOutcome>("list_volumes"),
   listSavedSearches: () => invoke<SavedSearches>("list_saved_searches"),
+  browseTree: () => invoke<BrowseTreeOutcome>("browse_tree"),
+  browseList: (req: {
+    volume: string;
+    path?: string | undefined;
+    flatten?: boolean | undefined;
+    sort?: BrowseSort | undefined;
+    kind?: BrowseKind | undefined;
+    offset?: number | undefined;
+  }) => invoke<BrowseListOutcome>("browse_list", req),
   initializeCatalog: (path: string) =>
     invoke<AppStatus>("initialize_catalog", { path }),
   useExistingCatalog: (path: string) =>

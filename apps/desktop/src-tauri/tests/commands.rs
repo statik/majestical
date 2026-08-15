@@ -400,6 +400,141 @@ fn keyframes_route_serves_the_manifest_as_json() {
     });
 }
 
+/// Plants a keyframe manifest with two timestamps and an extracted image
+/// blob for each — `keyframe/{asset}/{index}` selects by position, so this
+/// pins that index 0 and index 1 each serve the byte content planted at
+/// THEIR OWN timestamp's blob, not the other one's.
+#[test]
+fn keyframe_route_serves_the_extracted_image_at_each_index() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeManifest {
+                model_tag: majestical_index::model::MODEL_TAG,
+            },
+            br#"{"model_tag":"m","detected":2,"timestamps":[1500,4500]}"#,
+        );
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeImage {
+                model_tag: majestical_index::model::MODEL_TAG,
+                timestamp_ms: 1500,
+            },
+            b"frame-0",
+        );
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeImage {
+                model_tag: majestical_index::model::MODEL_TAG,
+                timestamp_ms: 4500,
+            },
+            b"frame-1",
+        );
+
+        let first = thumb_protocol::handle(
+            Some(&cfg),
+            &format!("thumb://localhost/keyframe/{}/0", encoded(SEEDED_ASSET)),
+        );
+        assert_eq!(first.status(), 200);
+        assert_eq!(content_type(&first), Some("image/webp"));
+        assert_eq!(first.body(), b"frame-0");
+
+        let second = thumb_protocol::handle(
+            Some(&cfg),
+            &format!("thumb://localhost/keyframe/{}/1", encoded(SEEDED_ASSET)),
+        );
+        assert_eq!(second.status(), 200);
+        assert_eq!(content_type(&second), Some("image/webp"));
+        assert_eq!(second.body(), b"frame-1");
+    });
+}
+
+/// An index the manifest has no timestamp at is a 404, never a panic.
+#[test]
+fn keyframe_route_out_of_range_index_is_a_404() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeManifest {
+                model_tag: majestical_index::model::MODEL_TAG,
+            },
+            br#"{"model_tag":"m","detected":1,"timestamps":[1500]}"#,
+        );
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!("thumb://localhost/keyframe/{}/1", encoded(SEEDED_ASSET)),
+        );
+        assert_eq!(response.status(), 404);
+        assert!(
+            body_of(&response).contains("no keyframe image at index 1"),
+            "{}",
+            body_of(&response)
+        );
+    });
+}
+
+/// A malformed index (not an integer) is a 404, never a panic, and reached
+/// without ever joining a path — the manifest here is never even planted, so
+/// a version that read the manifest before validating the index would 404
+/// with the WRONG reason (`NotDerived`, not `MalformedKeyframeIndex`).
+#[test]
+fn keyframe_route_malformed_index_is_a_404() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!("thumb://localhost/keyframe/{}/x", encoded(SEEDED_ASSET)),
+        );
+        assert_eq!(response.status(), 404);
+        assert!(
+            body_of(&response).contains("not a valid keyframe index"),
+            "{}",
+            body_of(&response)
+        );
+    });
+}
+
+/// The same traversal-payload guard `a_malformed_asset_id_is_a_400` pins for
+/// `/thumb/`, mirrored for `/keyframe/`: an asset id containing a raw `/`
+/// (here, unencoded on purpose) must not be mis-split into a bogus
+/// asset-id/index pair and must never reach a path join. Pins the REASON,
+/// not just a non-200 status: the payload must be reported as an invalid
+/// ASSET ID (400, same as `/thumb/` and `/keyframes/` give for the same
+/// payload) — not misattributed to the index, which a version that always
+/// routed through `read_keyframe_image` would report instead (its own
+/// integer parse runs first and fails on the mis-split remainder, a 404
+/// naming "keyframe index" rather than "asset id").
+#[test]
+fn keyframe_route_traversal_payload_in_asset_id_is_a_clean_failure() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            "thumb://localhost/keyframe/xxh3:../../../etc/passwd/0",
+        );
+        assert_eq!(
+            response.status(),
+            400,
+            "a malformed asset id is the caller's mistake, same as /thumb/ and /keyframes/: {}",
+            body_of(&response)
+        );
+        assert!(
+            body_of(&response).contains("not a valid asset id"),
+            "must report the asset id as the failure, not the index: {}",
+            body_of(&response)
+        );
+    });
+}
+
 #[test]
 fn an_underived_thumb_is_a_404_naming_the_remedy() {
     with_state_dir(|| {

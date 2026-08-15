@@ -363,10 +363,26 @@ main > .error {
   list-style: none;
 }
 
-.strip li {
+.strip .timecode {
   padding: 0.15rem 0.4rem;
   border: 1px solid var(--edge);
   border-radius: 4px;
+}
+
+/* Not scoped to `.strip`: a small extracted-keyframe thumbnail, shared by
+   the Inspector's strip here and PR 2's Filmstrip later — one style, both
+   call sites, rather than each redefining its own scoped copy. The `<img>`
+   also carries explicit `width`/`height` attributes (not just this rule's
+   `object-fit`), so the browser reserves the right space before the image
+   has loaded — a strip drawn while extraction is still running must not
+   reflow every sibling as each frame arrives. */
+.keyframe {
+  display: block;
+  width: 64px;
+  height: 48px;
+  border-radius: 4px;
+  background: var(--sunken);
+  object-fit: cover;
 }
 
 .instances .path {

@@ -61,7 +61,18 @@ pub enum CatalogError {
 /// Bumped to 7: `MediaKind` gained `Audio` and `Pdf` variants, so pre-existing
 /// audio/pdf files (previously classified `Other` in the `instances.kind`
 /// column) need a full rebuild to reclassify.
-pub(crate) const SNAPSHOT_VERSION: i64 = 7;
+///
+/// Bumped to 8: `Projection` gained the `tag_aliases` field (`Op::TagRenamed`).
+/// The field carries `#[serde(default)]`, so a v7 row would deserialize — but
+/// deserializing it is exactly the bug. A new binary writes `tag_renamed` into
+/// the shared log; an older binary syncs, cannot parse those lines, skips them
+/// *past its cursor* (the documented corrupt-line behavior), and saves a v7
+/// snapshot holding no aliases. Without a version change the new binary then
+/// accepts that snapshot and resumes beyond the renames, leaving `tag_aliases`
+/// permanently empty and every tag read wrong at every head. The bump makes
+/// the round trip self-healing: the mismatch forces one full rebuild from the
+/// log, which is the truth. Same shape as the bump to 4.
+pub(crate) const SNAPSHOT_VERSION: i64 = 8;
 
 /// How `open_synced` populated the catalog: from a stored cursor plus new
 /// events, or from scratch.

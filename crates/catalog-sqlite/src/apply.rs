@@ -158,6 +158,7 @@ impl SqliteCatalog {
                     tx.execute("DELETE FROM manifests WHERE volume = ?1", [volume])?;
                     Self::insert_manifests_for(&tx, projection, volume)?;
                 }
+                Touched::Tag => Self::rebuild_tags(&tx, projection)?,
             }
         }
         Self::write_apply_state(&tx, cursors, &snapshot_json)?;
@@ -313,6 +314,32 @@ impl SqliteCatalog {
                     hashdate_ms,
                 ),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Re-derives every `tags` row from `projection`. A rename edits the
+    /// projection-level alias map, not any one asset, so every asset's
+    /// effective tags can move at once — and `Touched::Tag` carries no
+    /// payload precisely because there is no bounded set of assets to
+    /// refresh instead.
+    ///
+    /// A targeted refresh keyed on the renamed-from name cannot work here:
+    /// this table stores *resolved* names, so once `x -> y` has been
+    /// applied, a later LWW-winning `x -> z` finds no `x` rows to refresh
+    /// and would leave the stale `y` rows behind, diverging from a full
+    /// rebuild. Rewriting the table has no such failure mode, and renames
+    /// are rare. Deliberately scoped to `tags` rather than routed through
+    /// `rebuild`, which would drop `text_fts` (populated from blobs by
+    /// `maj index run`, not from events) and blank text search until the
+    /// next heal.
+    fn rebuild_tags(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM tags", [])?;
+        let mut insert = tx.prepare("INSERT INTO tags (asset, tag) VALUES (?1, ?2)")?;
+        for (asset, _) in projection.assets() {
+            for tag in projection.tags(asset) {
+                insert.execute((&asset.0, &tag))?;
+            }
         }
         Ok(())
     }

@@ -634,19 +634,46 @@ git commit -m "feat: Op::TagRenamed with LWW alias-map projection"
 
 ### Task 11: `Touched::Tag` in catalog-sqlite
 
-**Files:**
-- Modify: `crates/catalog-sqlite/src/apply.rs` (match at :120, tests at bottom)
+**AMENDED — the arm landed in Task 10; this task is reduced to its test.**
 
-- [ ] **Step 1: failing test** (mirror the rename test at `apply.rs:908`): seed two assets tagged "old" and one tagged "other" through the normal event path; apply a `TagRenamed old->new` event + `apply_touched` with `Touched::Tag("old")`; query the tags table: both assets now row "new", "other" untouched; a search by `tag:new` (the query.rs path) finds both.
-- [ ] **Step 2: run — red** (non-exhaustive match on `Touched`).
-- [ ] **Step 3: implement** the arm: `SELECT DISTINCT asset FROM tags WHERE tag = ?1` (the alias source), then for each asset delete+reinsert its tag rows from `projection.tags(&asset)` — the same refresh the `Touched::Asset` arm does for tags (reuse its helper; extract one if it is inline). Also handle the alias-target side: if a rename lands BEFORE any add of `from` reaches this machine, the arm finds zero rows and does nothing — correct, because those later adds arrive as `Touched::Asset` events and refresh through `tags()`, which resolves. State that in the arm's comment.
-- [ ] **Step 4: run** `cargo test -p majestical-catalog-sqlite && cargo clippy -p majestical-catalog-sqlite --all-targets -- -D warnings`.
-- [ ] **Step 5: Commit**
+The recipe originally written here (`SELECT DISTINCT asset FROM tags WHERE
+tag = ?1`, then refresh those assets) is **wrong** and must not be
+implemented. The `tags` table stores *resolved* names, not raw ones. Once
+`x -> y` has been applied and the rows say `y`, a later LWW-winning
+`x -> z` finds **zero** rows matching `x`, refreshes nothing, and leaves the
+stale `y` rows behind — diverging from a full rebuild, which resolves `x`
+to `z`. The targeted refresh is unfixable without tracking raw names in
+SQL, so Task 10 superseded it with a whole-table rewrite (`rebuild_tags`:
+`DELETE FROM tags` + reinsert from `projection.tags()` for every asset,
+scoped to `tags` so `text_fts` survives). `Touched::Tag` consequently
+carries **no payload** — there is no bounded entity set to refresh, and a
+payload-free variant makes `BTreeSet<Touched>` collapse K renames in one
+apply into a single rewrite.
+
+**Files:**
+- Modify: `crates/catalog-sqlite/src/apply.rs` (tests at bottom)
+
+- [ ] **Step 1: the deterministic test** (mirror the rename test at
+  `apply.rs:908`): seed two assets tagged "old" and one tagged "other"
+  through the normal event path; apply a `TagRenamed old->new` event, then
+  `apply_touched` with `Touched::Tag`; query the tags table — both assets
+  now row "new", "other" untouched; a search by `tag:new` (the query.rs
+  path) finds both. Then extend it with the case that killed the targeted
+  recipe: a second rename `old->newer` with a higher HLC must leave **no**
+  "new" rows. Assert `apply_touched` output equals a full rebuild over the
+  same ops.
+- [ ] **Step 2: run** `cargo test -p majestical-catalog-sqlite && cargo clippy -p majestical-catalog-sqlite --all-targets -- -D warnings`.
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/catalog-sqlite/src/apply.rs
-git commit -m "feat: Touched::Tag refreshes renamed tags in SQLite"
+git commit -m "test: Touched::Tag rewrite matches a full rebuild"
 ```
+
+> Already covered by Task 10, do not redo: the arm itself, and the
+> `incremental_equals_full_rebuild` proptest extension that generates
+> `TagRenamed` (verified load-bearing — neutering `rebuild_tags` fails it).
+> Task 11 adds the *deterministic* companion to that property.
 
 ### Task 12: organize service verbs
 

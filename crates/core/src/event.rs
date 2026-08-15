@@ -122,6 +122,9 @@ pub enum Op {
         generation: u32,
         roothash: String,
     },
+    /// HLC-LWW tag rename; merge = rename onto an existing tag. Aliases
+    /// resolve at read time, chained, cycle-guarded.
+    TagRenamed { from: String, to: String },
     /// Save (or overwrite) a named search query. HLC-LWW per name.
     SavedSearchSet { name: String, query: String },
     /// Remove a named search. An LWW tombstone: a later Set revives the name.
@@ -260,6 +263,13 @@ mod tests {
                     roothash: "xxh64:8899aabbccddeeff".into(),
                 },
                 r#"{"type":"manifest_recorded","volume":"uuid:abc","mhl_path":"ascmhl/0001_dest_2026-07-29_120000.mhl","generation":1,"roothash":"xxh64:8899aabbccddeeff"}"#,
+            ),
+            (
+                Op::TagRenamed {
+                    from: "goldenhour".into(),
+                    to: "golden-hour".into(),
+                },
+                r#"{"type":"tag_renamed","from":"goldenhour","to":"golden-hour"}"#,
             ),
             (
                 Op::SavedSearchSet {

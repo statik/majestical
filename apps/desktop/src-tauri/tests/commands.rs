@@ -426,6 +426,34 @@ fn browse_list_wires_every_argument_to_its_own_slot() {
     });
 }
 
+/// `limit` and `offset` are both `Option<usize>` and adjacent in the
+/// parameter list, so a transposed pair compiles clean; the test above can't
+/// see it, because it passes `Some(1)` for both. Six same-shaped assets sorted
+/// by name make the window itself the assertion: `limit(2)` + `offset(3)` is
+/// `item-3`/`item-4`, where the swap (`limit(3)` + `offset(2)`) is a
+/// three-row page starting at `item-2`.
+#[test]
+fn browse_list_paginates_with_limit_and_offset_in_their_own_slots() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = browse_cfg_with_assets(dir.path(), 6);
+        let out = browse_list_impl(
+            &cfg,
+            "vol1".into(),
+            None,
+            None,
+            Some("name".into()),
+            None,
+            Some(2),
+            Some(3),
+        )
+        .expect("browse_list");
+        assert_eq!(out.count, 6, "count is pre-pagination");
+        let names: Vec<&str> = out.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["item-3.txt", "item-4.txt"]);
+    });
+}
+
 #[test]
 fn list_saved_searches_carries_notices() {
     with_state_dir(|| {

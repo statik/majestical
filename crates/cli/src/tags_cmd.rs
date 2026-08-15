@@ -45,7 +45,7 @@ pub(crate) fn cmd_suggestions(app: &FsApp, catalog_root: &Path) -> Result<()> {
 /// Returns an error if the asset has never been scanned (no
 /// `AssetSeen` on record) or the event log can't be read/appended.
 pub(crate) fn cmd_confirm(app: &mut FsApp, asset: &str, tags: &[String]) -> Result<()> {
-    majestical_services::tags::confirm(app, asset, tags)?;
+    crate::surface_err_notices(majestical_services::tags::confirm(app, asset, tags))?;
     for tag in tags {
         println!("confirmed: {asset} {tag}");
     }
@@ -64,8 +64,11 @@ pub(crate) fn cmd_confirm(app: &mut FsApp, asset: &str, tags: &[String]) -> Resu
 pub(crate) fn cmd_reject(catalog_root: &Path, asset: &str, tags: &[String]) -> Result<()> {
     let notices = majestical_services::notices::Notices::new();
     let result = majestical_services::tags::reject(catalog_root, asset, tags, &notices);
+    // `reject` attaches the sink to an `Err`, so on that path the drain
+    // below finds nothing and the carrier's split prints the same lines in
+    // the same place; on `Ok` the drain is still what surfaces them.
     crate::drain_notices(&notices);
-    result?;
+    crate::surface_err_notices(result)?;
     println!(
         "{} tag(s) rejected on {asset} (this machine only)",
         tags.len()

@@ -22,6 +22,8 @@ pub mod search;
 pub mod state_dir;
 pub mod sync;
 pub mod tags;
+#[cfg(test)]
+mod test_support;
 pub mod verify;
 pub mod volume_identity;
 pub mod volumes;

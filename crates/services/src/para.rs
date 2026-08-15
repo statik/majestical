@@ -1,10 +1,14 @@
 //! PARA node reference resolution, shared by `maj para` and `search`'s
 //! `para:` filter. Moved verbatim from `crates/cli/src/commands.rs`.
+//! [`para_file`] shares [`AssignOutcome`] with `maj tags assign`: both are
+//! bulk per-asset writes with the same "report the rows you couldn't do,
+//! do the rest" contract, so they must not drift into two shapes.
 use crate::app::FsApp;
-use crate::catalog::open_catalog;
+use crate::catalog::{ensure_asset_known, open_catalog};
 use crate::error::ServiceError;
+use crate::tags::{AssignFailure, AssignOutcome};
 use anyhow::{Context, Result};
-use majestical_core::event::{Op, ParaKind};
+use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
 use std::path::{Path, PathBuf};
 
@@ -341,6 +345,51 @@ fn archive_impl(
     })
 }
 
+/// `maj para file`: files every asset in `assets` under one PARA node —
+/// one `AssetParaSet` per asset. The node is resolved once, up front, and
+/// an unresolvable reference fails the whole call: a typo'd node is
+/// operator-fixable, and filing a selection somewhere else is worse than
+/// filing it nowhere. A per-asset problem (an id the catalog has never
+/// scanned) is an [`AssignFailure`] row instead, so the rest still land.
+///
+/// # Errors
+/// Returns an error if `node` doesn't resolve to a known node, or the event
+/// log can't be read or appended to. A per-asset problem is a `failed` row.
+pub fn para_file(
+    app: &mut FsApp,
+    assets: &[String],
+    node: &str,
+) -> Result<AssignOutcome, ServiceError> {
+    let result = para_file_impl(app, assets, node).map_err(ServiceError::from);
+    app.notices().attach_on_err(result)
+}
+
+fn para_file_impl(app: &mut FsApp, assets: &[String], node: &str) -> Result<AssignOutcome> {
+    let projection = app.projection()?;
+    let node_id = resolve_para_node(&projection, node)?;
+    let mut ops = Vec::new();
+    let mut failed = Vec::new();
+    for asset in assets {
+        let asset_id = AssetId(asset.clone());
+        match ensure_asset_known(&projection, &asset_id) {
+            Ok(()) => ops.push(Op::AssetParaSet {
+                asset: asset_id,
+                node: node_id.clone(),
+            }),
+            Err(error) => failed.push(AssignFailure {
+                asset: asset.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    let emitted = app.emit(ops)?;
+    Ok(AssignOutcome {
+        applied: u64::try_from(emitted.len()).unwrap_or(u64::MAX),
+        failed,
+        notices: app.notices().drain(),
+    })
+}
+
 /// One PARA node row, as returned by the sqlite catalog's `para_nodes`
 /// query.
 #[derive(serde::Serialize)]
@@ -429,6 +478,113 @@ mod para_list_tests {
         assert_eq!(row.name, "client-x");
         assert_eq!(row.kind, "project");
         assert!(!row.archived);
+    }
+}
+
+#[cfg(test)]
+mod para_file_tests {
+    use super::*;
+    use crate::test_support::{asset_id, seeded_app};
+
+    /// Every `AssetParaSet` (asset, node) pair in the log, in log order.
+    fn para_sets(app: &FsApp) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        for event in app.events().expect("events") {
+            if let Op::AssetParaSet { asset, node } = event.op {
+                pairs.push((asset.0, node));
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn para_file_emits_one_assignment_per_known_asset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 2);
+        let NodeId(node) = add(&mut app, "project", "client-x").expect("add node");
+
+        let outcome = para_file(
+            &mut app,
+            &[asset_id(0).0.clone(), asset_id(1).0.clone()],
+            "project/client-x",
+        )
+        .expect("para_file");
+        assert_eq!(outcome.applied, 2);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(
+            para_sets(&app),
+            vec![
+                (asset_id(0).0.clone(), node.clone()),
+                (asset_id(1).0.clone(), node.clone())
+            ]
+        );
+        let projection = app.projection().expect("projection");
+        assert_eq!(projection.asset_para(&asset_id(0)), Some(node.as_str()));
+    }
+
+    #[test]
+    fn para_file_into_an_unknown_node_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        let err =
+            para_file(&mut app, &[asset_id(0).0.clone()], "project/nope").expect_err("must fail");
+        assert!(err.to_string().contains("no active PARA node"), "{err}");
+        assert!(
+            para_sets(&app).is_empty(),
+            "an unresolvable node must not file anything"
+        );
+    }
+
+    #[test]
+    fn para_file_reports_an_unknown_asset_and_still_files_the_known_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+
+        let outcome = para_file(
+            &mut app,
+            &[asset_id(0).0.clone(), "xxh3:never-scanned".to_string()],
+            "project/client-x",
+        )
+        .expect("para_file");
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].asset, "xxh3:never-scanned");
+        assert!(
+            outcome.failed[0].reason.contains("unknown asset"),
+            "{}",
+            outcome.failed[0].reason
+        );
+        assert_eq!(para_sets(&app).len(), 1);
+    }
+
+    #[test]
+    fn a_failing_para_file_carries_the_notices_its_sink_was_holding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = seeded_app(dir.path(), 1);
+        let segment = root.join("events").join("m1").join("0001.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .expect("open segment");
+        std::io::Write::write_all(&mut file, b"this is not json\n").expect("append");
+
+        let err =
+            para_file(&mut app, &[asset_id(0).0.clone()], "project/nope").expect_err("must fail");
+        let ServiceError::WithNotices { notices, source } = err else {
+            panic!("a failing para_file with a non-empty sink must carry its notices");
+        };
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("skipped 1 corrupt event log line(s)")),
+            "{notices:?}"
+        );
+        assert!(
+            source.to_string().contains("no active PARA node"),
+            "{source}"
+        );
     }
 }
 

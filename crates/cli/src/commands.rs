@@ -23,9 +23,16 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
 }
 
 pub(crate) fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
+    // Both verbs attach their sink to an `Err`, so the carrier is split
+    // here — otherwise a failure renders the carrier's own label instead
+    // of the notices and the real message.
     match cmd {
-        TagCmd::Add { asset, tag } => majestical_services::tags::tag_add(app, &asset, &tag)?,
-        TagCmd::Rm { asset, tag } => majestical_services::tags::tag_rm(app, &asset, &tag)?,
+        TagCmd::Add { asset, tag } => {
+            crate::surface_err_notices(majestical_services::tags::tag_add(app, &asset, &tag))?;
+        }
+        TagCmd::Rm { asset, tag } => {
+            crate::surface_err_notices(majestical_services::tags::tag_rm(app, &asset, &tag))?;
+        }
     }
     println!("ok");
     Ok(())

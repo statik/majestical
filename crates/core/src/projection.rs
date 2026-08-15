@@ -504,6 +504,47 @@ impl Projection {
         self.tag_aliases.get(tag).map(|(_, to)| to.as_str())
     }
 
+    /// Each of `asset`'s live add groups, keyed by the EFFECTIVE
+    /// (post-alias) tag name — one entry per RAW name, so a rename or merge
+    /// yields two entries under the same effective name and the caller
+    /// folds them. That is the difference from [`Self::tags`], which dedupes
+    /// and drops the ids: a caller that needs both the vocabulary and the
+    /// add ids behind it (counting tags, dating them) gets them in one pass
+    /// here instead of re-walking the raw names once per resolved name.
+    pub fn effective_tag_adds<'a>(
+        &'a self,
+        asset: &AssetId,
+    ) -> impl Iterator<Item = (&'a str, &'a BTreeSet<EventId>)> {
+        self.assets.get(asset).into_iter().flat_map(move |state| {
+            state
+                .tag_adds
+                .iter()
+                .map(move |(tag, ids)| (self.resolve_alias(tag), ids))
+        })
+    }
+
+    /// Every raw tag name on `asset` whose alias chain ends at `effective` —
+    /// the inverse of the resolution [`Self::tags`] performs, and the map
+    /// back a caller working from displayed names needs before it can call
+    /// [`Self::tag_add_ids`]. After a rename the adds still sit under the
+    /// source name, and after a merge under both names, so a removal keyed
+    /// on what the user sees must cite the ids of every raw name listed
+    /// here. Empty when `effective` isn't a live tag on `asset` — including
+    /// when it is a name a rename has moved on from.
+    #[must_use]
+    pub fn raw_tags_resolving_to<'a>(&'a self, asset: &AssetId, effective: &str) -> Vec<&'a str> {
+        let Some(state) = self.assets.get(asset) else {
+            return Vec::new();
+        };
+        let mut raw = Vec::new();
+        for tag in state.tag_adds.keys() {
+            if self.resolve_alias(tag) == effective {
+                raw.push(tag.as_str());
+            }
+        }
+        raw
+    }
+
     /// Live add-event ids for a tag — what a remove must cite as observed.
     /// Keyed by the *raw* name the add carried, not the effective name
     /// [`Self::tags`] reports: removing a tag that a rename moved means
@@ -1822,6 +1863,65 @@ mod tests {
         assert_eq!(fwd, rev);
         assert_eq!(fwd.tags(&a), tagset(&["b"]), "stops at the cycle entry");
         assert_eq!(rev.tags(&a), fwd.tags(&a));
+    }
+
+    /// One entry per RAW add group, keyed by the effective name — the two
+    /// sides of a merge stay separate entries so a caller can fold their
+    /// ids (and their event times) itself, which `tags()` can't offer.
+    #[test]
+    fn effective_tag_adds_keys_each_raw_group_by_its_resolved_name() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&tagged(2, 2, &a, "y"));
+        p.apply(&tagged(3, 3, &a, "other"));
+        p.apply(&renamed(4, 4, "m1", "x", "y"));
+        let seen: Vec<(&str, usize)> = p
+            .effective_tag_adds(&a)
+            .map(|(tag, ids)| (tag, ids.len()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("other", 1), ("y", 1), ("y", 1)],
+            "raw 'x' and raw 'y' both report under 'y', one entry each"
+        );
+        assert_eq!(
+            p.effective_tag_adds(&AssetId("xxh3:missing".into()))
+                .count(),
+            0,
+            "an asset with no state has no add groups"
+        );
+    }
+
+    /// The inverse of the read-time resolution: a caller holding a
+    /// displayed tag name needs the raw names its adds actually live under.
+    /// After a merge that is more than one name, and after a rename it is a
+    /// name the displayed vocabulary no longer contains at all — which is
+    /// exactly why `tag_add_ids` alone can't serve a removal keyed on what
+    /// the user sees.
+    #[test]
+    fn raw_tags_resolving_to_names_every_raw_add_behind_a_displayed_tag() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&tagged(2, 2, &a, "y"));
+        p.apply(&tagged(3, 3, &a, "other"));
+        p.apply(&renamed(4, 4, "m1", "x", "y"));
+        assert_eq!(
+            p.raw_tags_resolving_to(&a, "y"),
+            vec!["x", "y"],
+            "both sides of the merge are raw names behind the displayed tag"
+        );
+        assert_eq!(p.raw_tags_resolving_to(&a, "other"), vec!["other"]);
+        assert!(
+            p.raw_tags_resolving_to(&a, "x").is_empty(),
+            "a renamed-away name is no longer a displayed tag"
+        );
+        assert!(
+            p.raw_tags_resolving_to(&AssetId("xxh3:missing".into()), "y")
+                .is_empty(),
+            "an asset with no state has no raw tags"
+        );
     }
 
     #[test]

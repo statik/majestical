@@ -18,6 +18,13 @@ pub enum Touched {
     Manifests(String),
     /// A named saved search was set or removed.
     SavedSearch(String),
+    /// A tag rename landed. Deliberately payload-free: aliases resolve at
+    /// read time, so a rename can move the effective tags of any asset
+    /// carrying the old name — there is no bounded set of entities to name,
+    /// and every consumer re-derives tags wholesale. Carrying no `from` also
+    /// makes batching structural: a `BTreeSet<Touched>` collapses K renames
+    /// in one apply into a single rewrite.
+    Tag,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +230,14 @@ pub struct Projection {
     /// event can be a saved-search op, so the empty default is still correct.
     #[serde(default)]
     saved_searches: BTreeMap<String, (Hlc, Option<String>)>,
+    /// from -> (hlc, to) tag renames, HLC-LWW per `from`. Projection-level,
+    /// not per-asset: `tag_adds` keeps whatever name was written, and
+    /// [`Self::tags`] resolves through this map at read time, so a rename
+    /// and a concurrent add of the old name converge whichever arrives
+    /// first. `#[serde(default)]` lets pre-phase-7D snapshots deserialize —
+    /// no older event can be a rename, so the empty default is correct.
+    #[serde(default)]
+    tag_aliases: BTreeMap<String, (Hlc, String)>,
 }
 
 impl Projection {
@@ -303,6 +318,10 @@ impl Projection {
                 self.insert_manifest(volume, ManifestRecord::from_op(&event.op));
                 Touched::Manifests(volume.clone())
             }
+            Op::TagRenamed { from, to } => {
+                Self::lww_entry(&mut self.tag_aliases, from, event.hlc.clone(), to.clone());
+                Touched::Tag
+            }
             Op::SavedSearchSet { name, query } => {
                 self.apply_saved_search(name, event.hlc.clone(), Some(query.clone()));
                 Touched::SavedSearch(name.clone())
@@ -365,13 +384,7 @@ impl Projection {
 
     fn apply_field_set(&mut self, asset: &AssetId, hlc: Hlc, field: &str, value: &str) {
         let st = self.assets.entry(asset.clone()).or_default();
-        let candidate = (hlc, value.to_string());
-        match st.fields.get(field) {
-            Some(current) if *current >= candidate => {}
-            _ => {
-                st.fields.insert(field.to_string(), candidate);
-            }
-        }
+        Self::lww_entry(&mut st.fields, field, hlc, value.to_string());
     }
 
     /// HLC-LWW slot update: the higher `(hlc, value)` tuple wins, matching
@@ -381,6 +394,19 @@ impl Projection {
         match slot {
             Some(current) if *current >= candidate => {}
             _ => *slot = Some(candidate),
+        }
+    }
+
+    /// [`Self::lww`] for the LWW slots keyed inside a map rather than held
+    /// in an `Option` — fields, saved searches, tag aliases. Same rule, one
+    /// implementation, so no keyed slot can drift to a different tiebreak.
+    fn lww_entry<T: Ord>(map: &mut BTreeMap<String, (Hlc, T)>, key: &str, hlc: Hlc, value: T) {
+        let candidate = (hlc, value);
+        match map.get(key) {
+            Some(current) if *current >= candidate => {}
+            _ => {
+                map.insert(key.to_string(), candidate);
+            }
         }
     }
 
@@ -413,13 +439,7 @@ impl Projection {
     /// `None` for a Remove tombstone — either way the higher `(hlc, query)`
     /// tuple wins, so a later Set revives a name a Remove tombstoned.
     fn apply_saved_search(&mut self, name: &str, hlc: Hlc, query: Option<String>) {
-        let candidate = (hlc, query);
-        match self.saved_searches.get(name) {
-            Some(current) if *current >= candidate => {}
-            _ => {
-                self.saved_searches.insert(name.to_string(), candidate);
-            }
-        }
+        Self::lww_entry(&mut self.saved_searches, name, hlc, query);
     }
 
     /// Grow-only insert: a manifest generation is a plain fact, so this is
@@ -431,15 +451,106 @@ impl Projection {
             .insert(record);
     }
 
+    /// The asset's effective tags: every live raw add, resolved through the
+    /// alias chain. Two raw tags that resolve to the same name collapse into
+    /// one — the returned set dedupes by construction.
     #[must_use]
     pub fn tags(&self, asset: &AssetId) -> BTreeSet<String> {
-        self.assets
-            .get(asset)
-            .map(|s| s.tag_adds.keys().cloned().collect())
-            .unwrap_or_default()
+        let Some(state) = self.assets.get(asset) else {
+            return BTreeSet::new();
+        };
+        let mut resolved = BTreeSet::new();
+        for tag in state.tag_adds.keys() {
+            resolved.insert(self.resolve_alias(tag).to_string());
+        }
+        resolved
+    }
+
+    /// Walks `tag` down the alias chain, stopping at the first name with no
+    /// alias — or, if the chain cycles, on the first repeat, returning the
+    /// name that repeats. So `a -> b -> a` resolves "a" to "a" and "b" to
+    /// "b": the cycle is broken, not merged. The visited set makes that
+    /// terminate instead of spinning, and the answer depends only on the
+    /// alias map, which converges — so every replica walks the same chain to
+    /// the same end regardless of apply order.
+    ///
+    /// Convergent, but not monotone under partial replication: a peer
+    /// holding only `a -> b` reads "a" as "b", and reads it as "a" again
+    /// once `b -> a` arrives. That is the honest consequence of resolving at
+    /// read time — the answer tracks the events a replica has actually seen,
+    /// and all replicas agree once they have seen the same set.
+    fn resolve_alias<'a>(&'a self, tag: &'a str) -> &'a str {
+        if self.tag_aliases.is_empty() {
+            return tag;
+        }
+        let mut seen = BTreeSet::new();
+        let mut current = tag;
+        while seen.insert(current) {
+            match self.tag_aliases.get(current) {
+                Some((_, to)) => current = to,
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// The tag `tag` was renamed to, or `None` if no rename names it as a
+    /// source. One hop, not the resolved end of the chain: callers
+    /// validating a rename or a merge want to know whether this exact name
+    /// has already been renamed away, while readers wanting the effective
+    /// name go through [`Self::tags`].
+    #[must_use]
+    pub fn tag_alias_target(&self, tag: &str) -> Option<&str> {
+        self.tag_aliases.get(tag).map(|(_, to)| to.as_str())
+    }
+
+    /// Each of `asset`'s live add groups, keyed by the EFFECTIVE
+    /// (post-alias) tag name — one entry per RAW name, so a rename or merge
+    /// yields two entries under the same effective name and the caller
+    /// folds them. That is the difference from [`Self::tags`], which dedupes
+    /// and drops the ids: a caller that needs both the vocabulary and the
+    /// add ids behind it (counting tags, dating them) gets them in one pass
+    /// here instead of re-walking the raw names once per resolved name.
+    pub fn effective_tag_adds<'a>(
+        &'a self,
+        asset: &AssetId,
+    ) -> impl Iterator<Item = (&'a str, &'a BTreeSet<EventId>)> {
+        self.assets.get(asset).into_iter().flat_map(move |state| {
+            state
+                .tag_adds
+                .iter()
+                .map(move |(tag, ids)| (self.resolve_alias(tag), ids))
+        })
+    }
+
+    /// Every raw tag name on `asset` whose alias chain ends at `effective` —
+    /// the inverse of the resolution [`Self::tags`] performs, and the map
+    /// back a caller working from displayed names needs before it can call
+    /// [`Self::tag_add_ids`]. After a rename the adds still sit under the
+    /// source name, and after a merge under both names, so a removal keyed
+    /// on what the user sees must cite the ids of every raw name listed
+    /// here. Empty when `effective` isn't a live tag on `asset` — including
+    /// when it is a name a rename has moved on from.
+    #[must_use]
+    pub fn raw_tags_resolving_to<'a>(&'a self, asset: &AssetId, effective: &str) -> Vec<&'a str> {
+        let Some(state) = self.assets.get(asset) else {
+            return Vec::new();
+        };
+        let mut raw = Vec::new();
+        for tag in state.tag_adds.keys() {
+            if self.resolve_alias(tag) == effective {
+                raw.push(tag.as_str());
+            }
+        }
+        raw
     }
 
     /// Live add-event ids for a tag — what a remove must cite as observed.
+    /// Keyed by the *raw* name the add carried, not the effective name
+    /// [`Self::tags`] reports: removing a tag that a rename moved means
+    /// citing the adds under every raw name that resolves to it, so a
+    /// caller working from displayed tags must map back through the
+    /// aliases first.
     #[must_use]
     pub fn tag_add_ids(&self, asset: &AssetId, tag: &str) -> Vec<EventId> {
         self.assets
@@ -580,6 +691,45 @@ mod tests {
         }
     }
 
+    /// How many `Op` variants [`variant_name`] discriminates, checked
+    /// against the number [`sample_ops`] actually covers.
+    const OP_VARIANT_COUNT: usize = 14;
+
+    /// Names the `Op` variant of `op`, so a test can count how many distinct
+    /// variants [`sample_ops`] covers — that list is a plain `Vec`, and
+    /// nothing else notices when a variant is missing from it.
+    ///
+    /// Precisely what this buys, and what it does not: the match below has
+    /// no wildcard arm, so adding an `Op` variant fails to compile *here*,
+    /// which is the part the compiler guarantees. It does not by itself
+    /// force `sample_ops` to grow — `OP_VARIANT_COUNT` is a hand-written
+    /// number, and a new variant added with its arm but without bumping the
+    /// count would still pass. The bump reminder sits inside the match body
+    /// next to the last arm, where the compiler drops you; bumping it is
+    /// what turns `apply_tracking_touches_the_correct_entity_for_every_op_variant`
+    /// red until `sample_ops` carries the new variant. Compiler-forced stop,
+    /// honor-system link, mechanical check once the link is honored.
+    fn variant_name(op: &Op) -> &'static str {
+        match op {
+            Op::AssetSeen { .. } => "asset_seen",
+            Op::VolumeSeen { .. } => "volume_seen",
+            Op::TagAdd { .. } => "tag_add",
+            Op::TagRemove { .. } => "tag_remove",
+            Op::FieldSet { .. } => "field_set",
+            Op::ParaNodeCreate { .. } => "para_node_create",
+            Op::ParaNodeRename { .. } => "para_node_rename",
+            Op::ParaNodeArchive { .. } => "para_node_archive",
+            Op::AssetParaSet { .. } => "asset_para_set",
+            Op::VerificationRecorded { .. } => "verification_recorded",
+            Op::ManifestRecorded { .. } => "manifest_recorded",
+            Op::TagRenamed { .. } => "tag_renamed",
+            Op::SavedSearchSet { .. } => "saved_search_set",
+            // Adding an arm here? Bump `OP_VARIANT_COUNT` in the same edit,
+            // then add the variant to `sample_ops` to get back to green.
+            Op::SavedSearchRemove { .. } => "saved_search_remove",
+        }
+    }
+
     /// One op of every current `Op` variant, values borrowed from the golden
     /// wire-format tests in `event.rs`, paired with the `Touched` value
     /// `apply_tracking` must report for it — so both the serde round-trip
@@ -592,15 +742,17 @@ mod tests {
     /// pre-existing ops the verified-ingest pipeline already produces — and
     /// phase 7A (services extraction + `maj mcp`) adds none either: the
     /// services crate and the MCP server call the same verbs the CLI
-    /// already called, and expose no new mutation. If a future phase adds
-    /// a variant, it must be added here too.
+    /// already called, and expose no new mutation. Phase 7D adds exactly
+    /// one, `TagRenamed` (the tag-alias map; `tag_rename`/`tag_merge` both
+    /// emit it). If a future phase adds a variant, it must be added here too.
     ///
-    /// Split across two functions purely to stay under the crate's
-    /// max-function-length lint; the two lists together are one logical
+    /// Split across three functions purely to stay under the crate's
+    /// max-function-length lint; the three lists together are one logical
     /// sample set.
     fn sample_ops() -> Vec<(Op, Touched)> {
         let mut ops = sample_ops_facts();
         ops.extend(sample_ops_saved_search());
+        ops.extend(sample_ops_tag_rename());
         ops
     }
 
@@ -712,6 +864,16 @@ mod tests {
                 Touched::SavedSearch("n1".into()),
             ),
         ]
+    }
+
+    fn sample_ops_tag_rename() -> Vec<(Op, Touched)> {
+        vec![(
+            Op::TagRenamed {
+                from: "goldenhour".into(),
+                to: "golden-hour".into(),
+            },
+            Touched::Tag,
+        )]
     }
 
     #[test]
@@ -829,10 +991,18 @@ mod tests {
     #[test]
     fn apply_tracking_touches_the_correct_entity_for_every_op_variant() {
         let mut p = Projection::default();
+        let mut sampled = BTreeSet::new();
         for (n, (op, expected)) in sample_ops().into_iter().enumerate() {
             let n = u64::try_from(n).unwrap_or(0) + 1;
+            sampled.insert(variant_name(&op));
             assert_eq!(p.apply_tracking(&test_event(n, op)), expected);
         }
+        assert_eq!(
+            sampled.len(),
+            OP_VARIANT_COUNT,
+            "sample_ops must carry one op of every Op variant; it currently \
+             covers {sampled:?}"
+        );
     }
 
     #[test]
@@ -1524,5 +1694,259 @@ mod tests {
         ));
         assert_eq!(p.saved_search("picks"), None);
         assert_eq!(p.saved_searches().count(), 0);
+    }
+
+    fn tagset(tags: &[&str]) -> BTreeSet<String> {
+        tags.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    fn renamed(n: u128, wall: u64, machine: &str, from: &str, to: &str) -> Event {
+        ev(
+            n,
+            wall,
+            machine,
+            Op::TagRenamed {
+                from: from.to_string(),
+                to: to.to_string(),
+            },
+        )
+    }
+
+    fn tagged(n: u128, wall: u64, asset: &AssetId, tag: &str) -> Event {
+        ev(
+            n,
+            wall,
+            "m1",
+            Op::TagAdd {
+                asset: asset.clone(),
+                tag: tag.to_string(),
+            },
+        )
+    }
+
+    /// Aliases resolve at read time, so a rename reaches both the adds that
+    /// preceded it and the adds that follow it — the latter is the whole
+    /// point of not rewriting stored tags: a peer that never saw the rename
+    /// keeps emitting the old name, and its adds still land on the new one.
+    #[test]
+    fn tag_renamed_resolves_existing_and_future_adds() {
+        let a = AssetId("xxh3:a".into());
+        let b = AssetId("xxh3:b".into());
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "goldenhour"));
+        p.apply(&renamed(2, 2, "m1", "goldenhour", "golden-hour"));
+        assert_eq!(p.tags(&a), tagset(&["golden-hour"]));
+        p.apply(&tagged(3, 3, &b, "goldenhour"));
+        assert_eq!(
+            p.tags(&b),
+            tagset(&["golden-hour"]),
+            "an add minted after the rename must still resolve through it"
+        );
+    }
+
+    #[test]
+    fn tag_renamed_is_order_independent() {
+        let a = asset();
+        let add = tagged(1, 1, &a, "goldenhour");
+        let rename = renamed(2, 2, "m2", "goldenhour", "golden-hour");
+        let mut fwd = Projection::default();
+        for e in [&add, &rename] {
+            fwd.apply(e);
+        }
+        let mut rev = Projection::default();
+        for e in [&rename, &add] {
+            rev.apply(e);
+        }
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd.tags(&a), tagset(&["golden-hour"]));
+        assert_eq!(rev.tags(&a), fwd.tags(&a));
+    }
+
+    /// The later rename comes from the lexically-smaller machine, so a bug
+    /// picking the winner by machine-id tiebreak alone would keep "early"
+    /// and fail here — the same confound the volume-label and PARA-rename
+    /// LWW tests guard against.
+    #[test]
+    fn concurrent_renames_of_one_tag_resolve_lww() {
+        let a = asset();
+        let add = tagged(1, 1, &a, "t");
+        let early = renamed(2, 2, "bob", "t", "early");
+        let late = renamed(3, 3, "amy", "t", "late");
+        let mut fwd = Projection::default();
+        for e in [&add, &early, &late] {
+            fwd.apply(e);
+        }
+        let mut rev = Projection::default();
+        for e in [&late, &early, &add] {
+            rev.apply(e);
+        }
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd.tags(&a), tagset(&["late"]));
+        assert_eq!(rev.tags(&a), tagset(&["late"]));
+        assert_eq!(fwd.tag_alias_target("t"), Some("late"));
+        assert_eq!(fwd.tag_alias_target("late"), None, "no alias out of 'late'");
+    }
+
+    /// Two merges in sequence — `x` into `y`, then `y` into `z` — leave a
+    /// two-hop chain no single alias entry records. The read-time walk must
+    /// follow it to the end, or assets tagged `x` would strand on `y`.
+    #[test]
+    fn chained_renames_resolve_to_the_end_of_the_chain() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&renamed(2, 2, "m1", "x", "y"));
+        p.apply(&renamed(3, 3, "m1", "y", "z"));
+        assert_eq!(p.tags(&a), tagset(&["z"]));
+        assert_eq!(
+            p.tag_alias_target("x"),
+            Some("y"),
+            "tag_alias_target is one hop; the chain is walked by tags()"
+        );
+    }
+
+    /// A rename cycle is pathological but reachable by concurrent editors.
+    /// The read-time walk stops on the first repeat and returns the name
+    /// that repeats, so `a -> b -> a` resolves "a" to "a" *and* "b" to "b" —
+    /// the cycle breaks rather than merging the two tags. Both ends are
+    /// pinned here: asserting only the "a" side would let a walk that
+    /// collapsed everything onto one name pass. No hang, and identical under
+    /// either apply order because the alias map itself is order-independent.
+    #[test]
+    fn rename_cycles_terminate_deterministically() {
+        let a = asset();
+        let b = AssetId("xxh3:b".into());
+        let add_a = tagged(1, 1, &a, "a");
+        let add_b = tagged(2, 2, &b, "b");
+        let a_to_b = renamed(3, 3, "m1", "a", "b");
+        let b_to_a = renamed(4, 4, "m2", "b", "a");
+        let mut fwd = Projection::default();
+        for e in [&add_a, &add_b, &a_to_b, &b_to_a] {
+            fwd.apply(e);
+        }
+        let mut rev = Projection::default();
+        for e in [&b_to_a, &a_to_b, &add_b, &add_a] {
+            rev.apply(e);
+        }
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd.tags(&a), tagset(&["a"]));
+        assert_eq!(fwd.tags(&b), tagset(&["b"]), "the other end stays put too");
+        assert_eq!(rev.tags(&a), fwd.tags(&a));
+        assert_eq!(rev.tags(&b), fwd.tags(&b));
+    }
+
+    /// A tail running into a cycle — `a -> b`, `b -> c`, `c -> b` — is the
+    /// shape a plain 2-cycle test cannot distinguish. Walking from "a" must
+    /// follow the tail and stop at the cycle *entry*, "b"; a resolver that
+    /// bailed out with its own input on detecting a cycle would hand back
+    /// "a", which is a name a rename has already moved on from. The
+    /// property in `crdt_properties.rs` cannot pin this: its
+    /// `assert_fully_resolved` accepts any name that sits on a cycle, and
+    /// every member of a cycle sits on one — so a walk stopping at the
+    /// wrong member passes in every apply order. Only a deterministic
+    /// example fixes which member is the answer.
+    #[test]
+    fn a_tail_running_into_a_cycle_resolves_to_the_cycle_entry() {
+        let a = asset();
+        let mut fwd = Projection::default();
+        let add = tagged(1, 1, &a, "a");
+        let a_to_b = renamed(2, 2, "m1", "a", "b");
+        let b_to_c = renamed(3, 3, "m1", "b", "c");
+        let c_to_b = renamed(4, 4, "m2", "c", "b");
+        for e in [&add, &a_to_b, &b_to_c, &c_to_b] {
+            fwd.apply(e);
+        }
+        let mut rev = Projection::default();
+        for e in [&c_to_b, &b_to_c, &a_to_b, &add] {
+            rev.apply(e);
+        }
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd.tags(&a), tagset(&["b"]), "stops at the cycle entry");
+        assert_eq!(rev.tags(&a), fwd.tags(&a));
+    }
+
+    /// One entry per RAW add group, keyed by the effective name — the two
+    /// sides of a merge stay separate entries so a caller can fold their
+    /// ids (and their event times) itself, which `tags()` can't offer.
+    #[test]
+    fn effective_tag_adds_keys_each_raw_group_by_its_resolved_name() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&tagged(2, 2, &a, "y"));
+        p.apply(&tagged(3, 3, &a, "other"));
+        p.apply(&renamed(4, 4, "m1", "x", "y"));
+        let seen: Vec<(&str, usize)> = p
+            .effective_tag_adds(&a)
+            .map(|(tag, ids)| (tag, ids.len()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("other", 1), ("y", 1), ("y", 1)],
+            "raw 'x' and raw 'y' both report under 'y', one entry each"
+        );
+        assert_eq!(
+            p.effective_tag_adds(&AssetId("xxh3:missing".into()))
+                .count(),
+            0,
+            "an asset with no state has no add groups"
+        );
+    }
+
+    /// The inverse of the read-time resolution: a caller holding a
+    /// displayed tag name needs the raw names its adds actually live under.
+    /// After a merge that is more than one name, and after a rename it is a
+    /// name the displayed vocabulary no longer contains at all — which is
+    /// exactly why `tag_add_ids` alone can't serve a removal keyed on what
+    /// the user sees.
+    #[test]
+    fn raw_tags_resolving_to_names_every_raw_add_behind_a_displayed_tag() {
+        let a = asset();
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&tagged(2, 2, &a, "y"));
+        p.apply(&tagged(3, 3, &a, "other"));
+        p.apply(&renamed(4, 4, "m1", "x", "y"));
+        assert_eq!(
+            p.raw_tags_resolving_to(&a, "y"),
+            vec!["x", "y"],
+            "both sides of the merge are raw names behind the displayed tag"
+        );
+        assert_eq!(p.raw_tags_resolving_to(&a, "other"), vec!["other"]);
+        assert!(
+            p.raw_tags_resolving_to(&a, "x").is_empty(),
+            "a renamed-away name is no longer a displayed tag"
+        );
+        assert!(
+            p.raw_tags_resolving_to(&AssetId("xxh3:missing".into()), "y")
+                .is_empty(),
+            "an asset with no state has no raw tags"
+        );
+    }
+
+    #[test]
+    fn merge_into_an_existing_tag_collapses_both_sides_onto_the_target() {
+        let a = AssetId("xxh3:a".into());
+        let b = AssetId("xxh3:b".into());
+        // Carries both sides of the merge, so its two raw adds resolve to
+        // the same name and must collapse to one effective tag.
+        let both = AssetId("xxh3:c".into());
+        let mut p = Projection::default();
+        p.apply(&tagged(1, 1, &a, "x"));
+        p.apply(&tagged(2, 2, &b, "y"));
+        p.apply(&tagged(3, 3, &both, "x"));
+        p.apply(&tagged(4, 4, &both, "y"));
+        p.apply(&renamed(5, 5, "m1", "x", "y"));
+        assert_eq!(
+            p.tags(&a),
+            tagset(&["y"]),
+            "merged-away tag reads as target"
+        );
+        assert_eq!(p.tags(&b), tagset(&["y"]), "target's own assets unchanged");
+        assert_eq!(
+            p.tags(&both),
+            tagset(&["y"]),
+            "both sides of the merge collapse to one tag"
+        );
     }
 }

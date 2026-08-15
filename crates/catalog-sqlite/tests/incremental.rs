@@ -128,6 +128,11 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (arb_saved_search_name(), "[x-z]{1,3}")
             .prop_map(|(name, query)| Op::SavedSearchSet { name, query }),
         arb_saved_search_name().prop_map(|name| Op::SavedSearchRemove { name }),
+        // Same tag alphabet as the adds above, so renames land on tags that
+        // exist and chain into each other — which is what makes the
+        // `Touched::Tag` arm's whole-table rewrite meet a rebuild that
+        // resolves the same aliases from scratch.
+        ("[a-c]{1,3}", "[a-c]{1,3}").prop_map(|(from, to)| Op::TagRenamed { from, to }),
     ]
 }
 

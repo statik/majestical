@@ -1,10 +1,14 @@
 //! PARA node reference resolution, shared by `maj para` and `search`'s
 //! `para:` filter. Moved verbatim from `crates/cli/src/commands.rs`.
+//! [`para_file`] shares [`AssignOutcome`] with `maj tag assign`: both are
+//! bulk per-asset writes with the same "report the rows you couldn't do,
+//! do the rest" contract, so they must not drift into two shapes.
 use crate::app::FsApp;
-use crate::catalog::open_catalog;
+use crate::catalog::{ensure_asset_known, open_catalog};
 use crate::error::ServiceError;
+use crate::tags::{AssignFailure, AssignOutcome};
 use anyhow::{Context, Result};
-use majestical_core::event::{Op, ParaKind};
+use majestical_core::event::{AssetId, Op, ParaKind};
 use majestical_core::projection::Projection;
 use std::path::{Path, PathBuf};
 
@@ -341,6 +345,73 @@ fn archive_impl(
     })
 }
 
+/// `maj para file`: files every asset in `assets` under one PARA node —
+/// one `AssetParaSet` per asset. The node is resolved once, up front, and
+/// an unresolvable reference fails the whole call: a typo'd node is
+/// operator-fixable, and filing a selection somewhere else is worse than
+/// filing it nowhere. A per-asset problem (an id the catalog has never
+/// scanned) is an [`AssignFailure`] row instead, so the rest still land —
+/// unless EVERY asset fails, in which case there is no partial progress
+/// worth preserving in an `Ok`, so that case is a hard error instead of a
+/// silent `Ok` with `applied: 0` — see this function's own `Errors` section.
+///
+/// # Errors
+/// Returns an error if `assets` is empty, if `node` doesn't resolve to a
+/// known node, if every asset in `assets` fails (the failures' reasons are
+/// joined into the message — a partial failure still reports the rest as an
+/// `Ok` `failed` row instead), or if the event log can't be read or
+/// appended to. Validating the non-empty-list and all-failed cases here, not
+/// just in the CLI/MCP heads, means a direct call to this function (a future
+/// head, a test, an agent script) can't silently no-op.
+pub fn para_file(
+    app: &mut FsApp,
+    assets: &[String],
+    node: &str,
+) -> Result<AssignOutcome, ServiceError> {
+    let result = para_file_impl(app, assets, node).map_err(ServiceError::from);
+    app.notices().attach_on_err(result)
+}
+
+fn para_file_impl(app: &mut FsApp, assets: &[String], node: &str) -> Result<AssignOutcome> {
+    anyhow::ensure!(
+        !assets.is_empty(),
+        "para file requires a non-empty asset list"
+    );
+    let projection = app.projection()?;
+    let node_id = resolve_para_node(&projection, node)?;
+    let mut ops = Vec::new();
+    let mut failed = Vec::new();
+    for asset in assets {
+        let asset_id = AssetId(asset.clone());
+        match ensure_asset_known(&projection, &asset_id) {
+            Ok(()) => ops.push(Op::AssetParaSet {
+                asset: asset_id,
+                node: node_id.clone(),
+            }),
+            Err(error) => failed.push(AssignFailure {
+                asset: asset.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    anyhow::ensure!(
+        failed.len() < assets.len(),
+        "para file failed for every requested asset ({}) — {}",
+        assets.len(),
+        failed
+            .iter()
+            .map(|f| f.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let emitted = app.emit(ops)?;
+    Ok(AssignOutcome {
+        applied: u64::try_from(emitted.len()).unwrap_or(u64::MAX),
+        failed,
+        notices: app.notices().drain(),
+    })
+}
+
 /// One PARA node row, as returned by the sqlite catalog's `para_nodes`
 /// query.
 #[derive(serde::Serialize)]
@@ -429,6 +500,157 @@ mod para_list_tests {
         assert_eq!(row.name, "client-x");
         assert_eq!(row.kind, "project");
         assert!(!row.archived);
+    }
+}
+
+#[cfg(test)]
+mod para_file_tests {
+    use super::*;
+    use crate::test_support::{asset_id, seeded_app};
+
+    /// Every `AssetParaSet` (asset, node) pair in the log, in log order.
+    fn para_sets(app: &FsApp) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        for event in app.events().expect("events") {
+            if let Op::AssetParaSet { asset, node } = event.op {
+                pairs.push((asset.0, node));
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn para_file_emits_one_assignment_per_known_asset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 2);
+        let NodeId(node) = add(&mut app, "project", "client-x").expect("add node");
+
+        let outcome = para_file(
+            &mut app,
+            &[asset_id(0).0.clone(), asset_id(1).0.clone()],
+            "project/client-x",
+        )
+        .expect("para_file");
+        assert_eq!(outcome.applied, 2);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(
+            para_sets(&app),
+            vec![
+                (asset_id(0).0.clone(), node.clone()),
+                (asset_id(1).0.clone(), node.clone())
+            ]
+        );
+        let projection = app.projection().expect("projection");
+        assert_eq!(projection.asset_para(&asset_id(0)), Some(node.as_str()));
+    }
+
+    #[test]
+    fn para_file_into_an_unknown_node_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        let err =
+            para_file(&mut app, &[asset_id(0).0.clone()], "project/nope").expect_err("must fail");
+        assert!(err.to_string().contains("no active PARA node"), "{err}");
+        assert!(
+            para_sets(&app).is_empty(),
+            "an unresolvable node must not file anything"
+        );
+    }
+
+    #[test]
+    fn para_file_reports_an_unknown_asset_and_still_files_the_known_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+
+        let outcome = para_file(
+            &mut app,
+            &[asset_id(0).0.clone(), "xxh3:never-scanned".to_string()],
+            "project/client-x",
+        )
+        .expect("para_file");
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].asset, "xxh3:never-scanned");
+        assert!(
+            outcome.failed[0].reason.contains("unknown asset"),
+            "{}",
+            outcome.failed[0].reason
+        );
+        assert_eq!(para_sets(&app).len(), 1);
+    }
+
+    /// Quality-review Task 13 follow-up: the non-empty-`assets` guard used
+    /// to live only in the MCP head (`write_tools.rs`); hoisted here so a
+    /// direct call to this function — a future head, a test, an agent
+    /// script — can't silently no-op on an empty list.
+    #[test]
+    fn para_file_of_an_empty_asset_list_errors_without_filing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+        let err = para_file(&mut app, &[], "project/client-x").expect_err("must fail");
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        assert!(para_sets(&app).is_empty());
+    }
+
+    /// The all-failed policy: when EVERY requested asset fails, there is no
+    /// partial progress worth reporting as an `Ok` with `applied: 0` — this
+    /// errors instead, distinct from
+    /// `para_file_reports_an_unknown_asset_and_still_files_the_known_ones`,
+    /// where at least one asset succeeds and the call stays `Ok`.
+    #[test]
+    fn para_file_errors_without_filing_when_every_asset_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = seeded_app(dir.path(), 1);
+        add(&mut app, "project", "client-x").expect("add node");
+        let err = para_file(
+            &mut app,
+            &[
+                "xxh3:never-scanned-1".to_string(),
+                "xxh3:never-scanned-2".to_string(),
+            ],
+            "project/client-x",
+        )
+        .expect_err("must fail when every asset fails");
+        let message = err.to_string();
+        assert!(message.contains("every requested asset"), "{message}");
+        assert!(message.contains("(2)"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-1"), "{message}");
+        assert!(message.contains("xxh3:never-scanned-2"), "{message}");
+        assert!(
+            para_sets(&app).is_empty(),
+            "an all-failed file must not emit"
+        );
+    }
+
+    #[test]
+    fn a_failing_para_file_carries_the_notices_its_sink_was_holding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = seeded_app(dir.path(), 1);
+        let segment = root.join("events").join("m1").join("0001.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .expect("open segment");
+        std::io::Write::write_all(&mut file, b"this is not json\n").expect("append");
+
+        let err =
+            para_file(&mut app, &[asset_id(0).0.clone()], "project/nope").expect_err("must fail");
+        let ServiceError::WithNotices { notices, source } = err else {
+            panic!("a failing para_file with a non-empty sink must carry its notices");
+        };
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("skipped 1 corrupt event log line(s)")),
+            "{notices:?}"
+        );
+        assert!(
+            source.to_string().contains("no active PARA node"),
+            "{source}"
+        );
     }
 }
 

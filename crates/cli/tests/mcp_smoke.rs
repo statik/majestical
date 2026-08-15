@@ -142,9 +142,11 @@ impl Drop for Mcp {
 /// bodies) so the roster itself is already stable.
 const EXPECTED_TOOLS: &[&str] = &[
     "add_sync_location",
+    "assign_tags",
     "browse_assets",
     "browse_tree",
     "catalog_init",
+    "file_assets",
     "get_asset",
     "get_describer",
     "index_run",
@@ -153,8 +155,11 @@ const EXPECTED_TOOLS: &[&str] = &[
     "inbox_process",
     "list_saved_searches",
     "list_sync_locations",
+    "list_tags",
     "list_volumes",
+    "merge_tags",
     "move_para",
+    "rename_tag",
     "rm_saved_search",
     "rm_sync_location",
     "run_saved_search",
@@ -243,6 +248,40 @@ fn corrupt_the_event_log(root: &std::path::Path) {
     let mut bytes = std::fs::read(&segment).expect("read segment");
     bytes.extend_from_slice(b"this is not json\n");
     std::fs::write(&segment, bytes).expect("re-write segment");
+}
+
+/// Every `.jsonl` segment under `<root>/events`, across every machine
+/// directory, as (relative path, raw bytes) pairs sorted by path — the
+/// byte-identical-log-dir check a `confirm: false` dry run must pass: not
+/// just "its own visible effect is absent" but "nothing in the log changed
+/// at all". Mirrors the event-count assertions
+/// `crates/services/src/tags.rs`'s own unit tests use (`app.events().len()`
+/// before/after), at the byte level since this suite drives a real `maj
+/// mcp` subprocess rather than an in-process `FsApp`. Walking every
+/// machine's segments (not just the MCP server's own "m1") also catches
+/// this machine's directory not existing yet before the first tool call —
+/// `FileEventLog::open` creates the directory eagerly but the segment file
+/// itself only on first `append`, so a fixture with no prior "m1" writes has
+/// nothing under `events/m1/` at all until (if ever) one lands.
+#[cfg(test)]
+fn events_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let events_dir = root.join("events");
+    let mut snapshot: Vec<(std::path::PathBuf, Vec<u8>)> = walkdir::WalkDir::new(&events_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            let rel = entry
+                .path()
+                .strip_prefix(&events_dir)
+                .expect("strip events-dir prefix")
+                .to_path_buf();
+            let bytes = std::fs::read(entry.path()).expect("read segment");
+            (rel, bytes)
+        })
+        .collect();
+    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+    snapshot
 }
 
 /// The notices contract end-to-end: a diagnostic that used to be stderr
@@ -792,15 +831,38 @@ fn suggest_tags_review_matches() {
     );
 }
 
-/// The 16 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —
+/// `list_tags` serializes `majestical_services::tags::TagsListOutcome`
+/// as-is — the fixture's one `demo` tag on `a.txt` (see
+/// `common::fixture_catalog`) must appear with `count: 1`.
+#[test]
+fn list_tags_matches_service_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_tags", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let tags = resp["result"]["structuredContent"]["tags"]
+        .as_array()
+        .expect("tags array");
+    assert_eq!(tags.len(), 1, "{resp}");
+    assert_eq!(tags[0]["tag"], serde_json::json!("demo"), "{resp}");
+    assert_eq!(tags[0]["count"], serde_json::json!(1), "{resp}");
+    assert!(tags[0]["last_used_ms"].is_u64(), "{resp}");
+}
+
+/// The 20 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —
 /// every one of these takes `confirm: bool`, checked below.
 const MUTATING_TOOLS: &[&str] = &[
     "add_sync_location",
+    "assign_tags",
     "catalog_init",
+    "file_assets",
     "index_run",
     "ingest_source",
     "inbox_process",
+    "merge_tags",
     "move_para",
+    "rename_tag",
     "rm_saved_search",
     "rm_sync_location",
     "scan_volume",
@@ -1262,6 +1324,491 @@ fn tag_assets_confirm_executes_and_is_visible_to_cli() {
         .expect("run");
     let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(hits["count"], serde_json::json!(1), "{hits}");
+}
+
+#[test]
+fn rename_tag_defaults_to_dry_run_and_leaves_the_log_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let before = events_snapshot(&root);
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "rename_tag",
+        &serde_json::json!({"from": "demo", "to": "reviewed"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["rewritten"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert!(
+        structured["would"]
+            .as_str()
+            .is_some_and(|s| s.contains("demo") && s.contains("reviewed")),
+        "{structured}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a dry run must not append anything to the event log"
+    );
+}
+
+#[test]
+fn rename_tag_dry_run_fails_on_an_unknown_tag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "rename_tag",
+        &serde_json::json!({"from": "nope", "to": "reviewed"}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    // The service message verbatim — same remedy `maj tag rename` surfaces.
+    assert!(text.contains("no tag 'nope'"), "{text}");
+    assert!(text.contains("maj tags list"), "{text}");
+}
+
+#[test]
+fn rename_tag_confirm_executes_and_is_visible_to_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "rename_tag",
+        &serde_json::json!({"from": "demo", "to": "reviewed", "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["rewritten"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+
+    let out = common::maj_as(&root, &state, "cli-checker")
+        .args(["search", "tag:reviewed", "--json"])
+        .output()
+        .expect("run");
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(hits["count"], serde_json::json!(1), "{hits}");
+}
+
+#[test]
+fn merge_tags_dry_run_reports_rewritten_and_target_count_and_leaves_the_log_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let b = common::asset_id_of(&root, &state, "b.txt");
+    common::maj(&root, &state)
+        .args(["tag", "add", &b, "keeper"])
+        .assert()
+        .success();
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "merge_tags",
+        &serde_json::json!({"from": "demo", "into": "keeper"}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["rewritten"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["target_count"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert!(
+        structured["would"]
+            .as_str()
+            .is_some_and(|s| s.contains("demo") && s.contains("keeper")),
+        "{structured}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a dry run must not append anything to the event log"
+    );
+}
+
+#[test]
+fn merge_tags_confirm_executes_and_is_visible_to_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let b = common::asset_id_of(&root, &state, "b.txt");
+    common::maj(&root, &state)
+        .args(["tag", "add", &b, "keeper"])
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "merge_tags",
+        &serde_json::json!({"from": "demo", "into": "keeper", "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["structuredContent"]["executed"],
+        serde_json::json!(true),
+        "{resp}"
+    );
+
+    let out = common::maj_as(&root, &state, "cli-checker")
+        .args(["search", "tag:keeper", "--json"])
+        .output()
+        .expect("run");
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(hits["count"], serde_json::json!(2), "{hits}");
+}
+
+/// The other half of the guard: merging into a tag nothing carries is a
+/// rename, not a merge — pointed at `rename_tag` exactly like the CLI's own
+/// `maj tag merge` (see `merge_plan`'s doc).
+#[test]
+fn merge_tags_dry_run_fails_into_a_tag_nothing_carries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "merge_tags",
+        &serde_json::json!({"from": "demo", "into": "nope"}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(
+        text.contains("rename_tag") || text.contains("maj tag rename"),
+        "{text}"
+    );
+}
+
+#[test]
+fn assign_tags_dry_run_reports_known_and_unknown_assets_and_leaves_the_log_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let a = common::asset_id_of(&root, &state, "a.txt");
+    let unknown = "xxh3:ffffffffffffffffffffffffffffffff";
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "assign_tags",
+        &serde_json::json!({"assets": [a, unknown], "tags": ["kf"]}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["known_count"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["unknown_assets"],
+        serde_json::json!([unknown]),
+        "{structured}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a dry run must not append anything to the event log"
+    );
+}
+
+#[test]
+fn assign_tags_confirm_executes_and_is_visible_to_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let a = common::asset_id_of(&root, &state, "a.txt");
+    let b = common::asset_id_of(&root, &state, "b.txt");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "assign_tags",
+        &serde_json::json!({"assets": [a, b], "tags": ["kf", "x"], "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(structured["applied"], serde_json::json!(4), "{structured}");
+
+    let out = common::maj_as(&root, &state, "cli-checker")
+        .args(["search", "tag:kf", "--json"])
+        .output()
+        .expect("run");
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(hits["count"], serde_json::json!(2), "{hits}");
+}
+
+/// All-failed policy: when every requested asset fails, `tags_assign`
+/// itself errors (no partial-progress `Ok` with `applied: 0`) — so
+/// `assign_tags` with `confirm: true` against only unknown assets is
+/// `isError: true`, and the error text carries each failing asset's own
+/// row info (id + "unknown asset" reason), not just a generic refusal.
+/// Partial success (at least one known asset) stays `Ok` — see
+/// `assign_tags_confirm_executes_and_is_visible_to_cli` above.
+#[test]
+fn assign_tags_confirm_is_an_error_when_every_asset_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let unknown_a = "xxh3:ffffffffffffffffffffffffffffffff";
+    let unknown_b = "xxh3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "assign_tags",
+        &serde_json::json!({"assets": [unknown_a, unknown_b], "tags": ["kf"], "confirm": true}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(text.contains("every requested asset"), "{text}");
+    assert!(
+        text.contains(unknown_a) && text.contains(unknown_b),
+        "{text}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "an all-failed assign must not emit anything"
+    );
+}
+
+/// `tags_assign`'s `anyhow::ensure!` guard against an empty `assets` list —
+/// moved down from `assign_tags_result` into the service itself so every
+/// caller inherits it, not just this MCP tool (quality-review Task 13
+/// follow-up). Checked with `confirm: true` so the assertion covers what
+/// matters most: the guard fires before any event is emitted, not just
+/// before the dry-run preview text is built. The error text is now the
+/// service's own message (`"tag assign requires a non-empty asset
+/// list"`), not a string this tool built.
+#[test]
+fn assign_tags_confirm_with_an_empty_assets_list_is_a_clean_error_and_emits_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "assign_tags",
+        &serde_json::json!({"assets": [], "tags": ["kf"], "confirm": true}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(
+        text.contains("non-empty") && text.contains("asset"),
+        "{text}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a rejected empty-assets call must not emit anything"
+    );
+}
+
+#[test]
+fn file_assets_dry_run_fails_on_an_unknown_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let a = common::asset_id_of(&root, &state, "a.txt");
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "file_assets",
+        &serde_json::json!({"node": "project/nope", "assets": [a]}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(text.contains("no active PARA node"), "{text}");
+}
+
+#[test]
+fn file_assets_dry_run_reports_known_and_unknown_assets_and_leaves_the_log_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let a = common::asset_id_of(&root, &state, "a.txt");
+    let unknown = "xxh3:ffffffffffffffffffffffffffffffff";
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "file_assets",
+        &serde_json::json!({"node": "project/client-x", "assets": [a, unknown]}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(false),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["known_count"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["unknown_assets"],
+        serde_json::json!([unknown]),
+        "{structured}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a dry run must not append anything to the event log"
+    );
+}
+
+#[test]
+fn file_assets_confirm_executes_and_is_visible_to_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let a = common::asset_id_of(&root, &state, "a.txt");
+    let b = common::asset_id_of(&root, &state, "b.txt");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "file_assets",
+        &serde_json::json!({
+            "node": "project/client-x", "assets": [a, b], "confirm": true
+        }),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["executed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    assert_eq!(structured["applied"], serde_json::json!(2), "{structured}");
+
+    let out = common::maj_as(&root, &state, "cli-checker")
+        .args(["search", "para:project/client-x", "--json"])
+        .output()
+        .expect("run");
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(hits["count"], serde_json::json!(2), "{hits}");
+}
+
+/// All-failed policy, `file_assets`' half — same shape as
+/// `assign_tags_confirm_is_an_error_when_every_asset_fails`: a real node but
+/// every requested asset unknown is `isError: true`, with the error text
+/// naming each failing asset's own row info, not a generic refusal.
+#[test]
+fn file_assets_confirm_is_an_error_when_every_asset_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let unknown_a = "xxh3:ffffffffffffffffffffffffffffffff";
+    let unknown_b = "xxh3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "file_assets",
+        &serde_json::json!({
+            "node": "project/client-x", "assets": [unknown_a, unknown_b], "confirm": true
+        }),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(text.contains("every requested asset"), "{text}");
+    assert!(
+        text.contains(unknown_a) && text.contains(unknown_b),
+        "{text}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "an all-failed file must not emit anything"
+    );
+}
+
+/// `para_file`'s `anyhow::ensure!` guard against an empty `assets` list —
+/// same shape as
+/// [`assign_tags_confirm_with_an_empty_assets_list_is_a_clean_error_and_emits_nothing`],
+/// moved down into the service itself (quality-review Task 13 follow-up),
+/// checked with `confirm: true` so a real node still doesn't let an
+/// empty-assets call through.
+#[test]
+fn file_assets_confirm_with_an_empty_assets_list_is_a_clean_error_and_emits_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "client-x"])
+        .assert()
+        .success();
+    let before = events_snapshot(&root);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "file_assets",
+        &serde_json::json!({"node": "project/client-x", "assets": [], "confirm": true}),
+    );
+    assert_eq!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error text must reach the client: {resp}"));
+    assert!(
+        text.contains("non-empty") && text.contains("asset"),
+        "{text}"
+    );
+    assert_eq!(
+        events_snapshot(&root),
+        before,
+        "a rejected empty-assets call must not emit anything"
+    );
 }
 
 #[test]

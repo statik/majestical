@@ -4,6 +4,7 @@ use majestical_core::clock::{Hlc, MachineId};
 use majestical_core::event::{AssetId, Event, EventId, Op, ParaKind, VerifyOutcome};
 use majestical_core::projection::{Projection, Touched};
 use proptest::prelude::*;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 enum OpKind {
@@ -63,6 +64,10 @@ enum OpKind {
     },
     SavedSearchRemove {
         name: String,
+    },
+    TagRename {
+        from: String,
+        to: String,
     },
 }
 
@@ -152,6 +157,10 @@ fn op_from_kind(asset: &AssetId, kind: &OpKind, ids: &[EventId]) -> Op {
             query: query.clone(),
         },
         OpKind::SavedSearchRemove { name } => Op::SavedSearchRemove { name: name.clone() },
+        OpKind::TagRename { from, to } => Op::TagRenamed {
+            from: from.clone(),
+            to: to.clone(),
+        },
     }
 }
 
@@ -253,7 +262,52 @@ fn arb_kind() -> impl Strategy<Value = OpKind> {
         ),
         ("[a-b]", "[q-r]{1,2}").prop_map(|(name, query)| OpKind::SavedSearchSet { name, query }),
         "[a-b]".prop_map(|name| OpKind::SavedSearchRemove { name }),
+        // Both ends drawn from the same three-letter alphabet the tag adds
+        // use, so generated renames collide with real tags and with each
+        // other: chains, self-renames, and two-rename cycles all show up.
+        ("[a-c]{1,3}", "[a-c]{1,3}").prop_map(|(from, to)| OpKind::TagRename { from, to }),
     ]
+}
+
+/// Every asset's effective tags — the read-time view, which structural
+/// projection equality does not by itself exercise: `resolve_alias` runs
+/// here and nowhere in `apply`.
+fn effective_tags(p: &Projection) -> Vec<(AssetId, BTreeSet<String>)> {
+    p.assets().map(|(id, _)| (id.clone(), p.tags(id))).collect()
+}
+
+/// Asserts `tags()` handed back a *resolved* name: either nothing aliases
+/// it, or it sits on a cycle the walk deliberately breaks. Comparing
+/// effective tags across apply orders cannot catch a resolver that ignores
+/// the alias map — that failure is equally wrong in every order — so this
+/// is the check with teeth: under a no-op resolver a plain `a -> b` rename
+/// reads back as "a" while "b" aliases nothing, and the walk below lands
+/// somewhere other than where it started.
+fn assert_fully_resolved(p: &Projection, tag: &str) -> Result<(), TestCaseError> {
+    let mut seen = BTreeSet::new();
+    let mut current = tag;
+    while let Some(next) = p.tag_alias_target(current) {
+        if !seen.insert(current.to_string()) {
+            // Reaching a repeat is only correct if the repeat is `tag`
+            // itself. Landing on some *other* name means `tag` sat on the
+            // tail running into the cycle (`a -> b -> c -> b` handed back
+            // "a"), which the walk should have followed to the entry.
+            prop_assert_eq!(
+                current,
+                tag,
+                "tags() returned a name on the tail leading into a cycle, \
+                 not the cycle entry the walk stops at"
+            );
+            return Ok(());
+        }
+        current = next;
+    }
+    prop_assert_eq!(
+        current,
+        tag,
+        "tags() returned a name that a rename had already moved on from"
+    );
+    Ok(())
 }
 
 proptest! {
@@ -290,5 +344,16 @@ proptest! {
         for e in shuffled { shf.apply(e); }
         prop_assert_eq!(&fwd, &rev);
         prop_assert_eq!(&fwd, &shf);
+        // Read back through the alias chain in every order, so the
+        // resolution path — not just the stored state — is under the
+        // property, and check each name it hands out is really resolved.
+        let tags_fwd = effective_tags(&fwd);
+        prop_assert_eq!(&tags_fwd, &effective_tags(&rev));
+        prop_assert_eq!(&tags_fwd, &effective_tags(&shf));
+        for (_, tags) in &tags_fwd {
+            for tag in tags {
+                assert_fully_resolved(&fwd, tag)?;
+            }
+        }
     }
 }

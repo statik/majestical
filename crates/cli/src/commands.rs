@@ -22,13 +22,64 @@ pub(crate) fn cmd_scan(app: &mut FsApp, dir: &Path, volume: Option<String>) -> R
     Ok(())
 }
 
+/// `maj tag add/rm/rename/merge/assign`. Every verb here attaches its sink
+/// to an `Err`, so the carrier is split at each call site — otherwise a
+/// failure renders the carrier's own label instead of the notices and the
+/// real message. Mutating verbs execute directly (catalog events, cheap,
+/// revertible-by-rename) — no `--dry-run` gate; only `maj para archive`
+/// keeps one, since it moves files. `TagCmd::Assign` (and `maj para file`,
+/// which shares its `AssignOutcome`) reports a per-asset failure as a
+/// `FAILED` line and still applies the rest — UNLESS every asset failed, in
+/// which case `tags_assign` itself errors out rather than reporting an
+/// empty-looking `Ok`, so `?` here surfaces it like any other failure.
 pub(crate) fn cmd_tag(app: &mut FsApp, cmd: TagCmd) -> Result<()> {
     match cmd {
-        TagCmd::Add { asset, tag } => majestical_services::tags::tag_add(app, &asset, &tag)?,
-        TagCmd::Rm { asset, tag } => majestical_services::tags::tag_rm(app, &asset, &tag)?,
+        TagCmd::Add { asset, tag } => {
+            crate::surface_err_notices(majestical_services::tags::tag_add(app, &asset, &tag))?;
+            println!("ok");
+        }
+        TagCmd::Rm { asset, tag } => {
+            crate::surface_err_notices(majestical_services::tags::tag_rm(app, &asset, &tag))?;
+            println!("ok");
+        }
+        TagCmd::Rename { from, to } => {
+            let outcome =
+                crate::surface_err_notices(majestical_services::tags::tag_rename(app, &from, &to))?;
+            crate::print_notices(&outcome.notices);
+            println!(
+                "renamed '{}' to '{}' — rewrote {} asset(s)",
+                outcome.from, outcome.to, outcome.rewritten
+            );
+        }
+        TagCmd::Merge { from, into } => {
+            let outcome = crate::surface_err_notices(majestical_services::tags::tag_merge(
+                app, &from, &into,
+            ))?;
+            crate::print_notices(&outcome.notices);
+            println!(
+                "merged '{}' into '{}' — rewrote {} asset(s)",
+                outcome.from, outcome.to, outcome.rewritten
+            );
+        }
+        TagCmd::Assign { tags, assets } => {
+            let outcome = crate::surface_err_notices(majestical_services::tags::tags_assign(
+                app, &assets, &tags,
+            ))?;
+            crate::print_notices(&outcome.notices);
+            println!("applied {} tag assignment(s)", outcome.applied);
+            print_assign_failures(&outcome.failed);
+        }
     }
-    println!("ok");
     Ok(())
+}
+
+/// Renders a bulk assign/file outcome's per-asset failures — shared by
+/// `maj tag assign` and `maj para file`, whose [`AssignOutcome`] shape is
+/// itself shared (see `majestical_services::para`'s module doc).
+fn print_assign_failures(failed: &[majestical_services::tags::AssignFailure]) {
+    for failure in failed {
+        println!("FAILED {}: {}", failure.asset, failure.reason);
+    }
 }
 
 pub(crate) fn cmd_meta(app: &mut FsApp, cmd: MetaCmd) -> Result<()> {
@@ -154,7 +205,20 @@ pub(crate) fn cmd_para(app: &mut FsApp, catalog_dir: &Path, cmd: ParaCmd) -> Res
             root,
             dry_run,
         } => cmd_para_archive(app, &node, &root, dry_run)?,
+        ParaCmd::File { node, assets } => cmd_para_file(app, &node, &assets)?,
     }
+    Ok(())
+}
+
+/// `maj para file <node> <asset>...`: files every asset under one PARA
+/// node. Executes directly, no `--dry-run` gate — see `cmd_tag`'s doc for
+/// why organize verbs skip the gate `para archive` keeps.
+fn cmd_para_file(app: &mut FsApp, node: &str, assets: &[String]) -> Result<()> {
+    let outcome =
+        crate::surface_err_notices(majestical_services::para::para_file(app, assets, node))?;
+    crate::print_notices(&outcome.notices);
+    println!("filed {} asset(s) to {node}", outcome.applied);
+    print_assign_failures(&outcome.failed);
     Ok(())
 }
 

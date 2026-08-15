@@ -634,19 +634,46 @@ git commit -m "feat: Op::TagRenamed with LWW alias-map projection"
 
 ### Task 11: `Touched::Tag` in catalog-sqlite
 
-**Files:**
-- Modify: `crates/catalog-sqlite/src/apply.rs` (match at :120, tests at bottom)
+**AMENDED — the arm landed in Task 10; this task is reduced to its test.**
 
-- [ ] **Step 1: failing test** (mirror the rename test at `apply.rs:908`): seed two assets tagged "old" and one tagged "other" through the normal event path; apply a `TagRenamed old->new` event + `apply_touched` with `Touched::Tag("old")`; query the tags table: both assets now row "new", "other" untouched; a search by `tag:new` (the query.rs path) finds both.
-- [ ] **Step 2: run — red** (non-exhaustive match on `Touched`).
-- [ ] **Step 3: implement** the arm: `SELECT DISTINCT asset FROM tags WHERE tag = ?1` (the alias source), then for each asset delete+reinsert its tag rows from `projection.tags(&asset)` — the same refresh the `Touched::Asset` arm does for tags (reuse its helper; extract one if it is inline). Also handle the alias-target side: if a rename lands BEFORE any add of `from` reaches this machine, the arm finds zero rows and does nothing — correct, because those later adds arrive as `Touched::Asset` events and refresh through `tags()`, which resolves. State that in the arm's comment.
-- [ ] **Step 4: run** `cargo test -p majestical-catalog-sqlite && cargo clippy -p majestical-catalog-sqlite --all-targets -- -D warnings`.
-- [ ] **Step 5: Commit**
+The recipe originally written here (`SELECT DISTINCT asset FROM tags WHERE
+tag = ?1`, then refresh those assets) is **wrong** and must not be
+implemented. The `tags` table stores *resolved* names, not raw ones. Once
+`x -> y` has been applied and the rows say `y`, a later LWW-winning
+`x -> z` finds **zero** rows matching `x`, refreshes nothing, and leaves the
+stale `y` rows behind — diverging from a full rebuild, which resolves `x`
+to `z`. The targeted refresh is unfixable without tracking raw names in
+SQL, so Task 10 superseded it with a whole-table rewrite (`rebuild_tags`:
+`DELETE FROM tags` + reinsert from `projection.tags()` for every asset,
+scoped to `tags` so `text_fts` survives). `Touched::Tag` consequently
+carries **no payload** — there is no bounded entity set to refresh, and a
+payload-free variant makes `BTreeSet<Touched>` collapse K renames in one
+apply into a single rewrite.
+
+**Files:**
+- Modify: `crates/catalog-sqlite/src/apply.rs` (tests at bottom)
+
+- [ ] **Step 1: the deterministic test** (mirror the rename test at
+  `apply.rs:908`): seed two assets tagged "old" and one tagged "other"
+  through the normal event path; apply a `TagRenamed old->new` event, then
+  `apply_touched` with `Touched::Tag`; query the tags table — both assets
+  now row "new", "other" untouched; a search by `tag:new` (the query.rs
+  path) finds both. Then extend it with the case that killed the targeted
+  recipe: a second rename `old->newer` with a higher HLC must leave **no**
+  "new" rows. Assert `apply_touched` output equals a full rebuild over the
+  same ops.
+- [ ] **Step 2: run** `cargo test -p majestical-catalog-sqlite && cargo clippy -p majestical-catalog-sqlite --all-targets -- -D warnings`.
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/catalog-sqlite/src/apply.rs
-git commit -m "feat: Touched::Tag refreshes renamed tags in SQLite"
+git commit -m "test: Touched::Tag rewrite matches a full rebuild"
 ```
+
+> Already covered by Task 10, do not redo: the arm itself, and the
+> `incremental_equals_full_rebuild` proptest extension that generates
+> `TagRenamed` (verified load-bearing — neutering `rebuild_tags` fails it).
+> Task 11 adds the *deterministic* companion to that property.
 
 ### Task 12: organize service verbs
 
@@ -725,6 +752,7 @@ git commit -m "feat: tags_list/rename/merge/assign and para_file verbs"
 - [ ] **Step 1: failing e2e tests**: `maj tags list --json`; `maj tag rename <from> <to>`; `maj tag merge <from> <into>`; `maj para file <node> <asset>...` (multiple assets). Destructive-verb doctrine: rename/merge/file mutate the catalog log — follow whatever the existing `maj tag add` does (it executes directly; these do too — catalog events are cheap and revertible-by-rename, NOT `--dry-run` gated; only archive keeps its dry-run because it moves files).
 - [ ] **Step 2-3: implement** clap + renderers.
 - [ ] **Step 4: MCP tools**: `list_tags` (read), `rename_tag`, `merge_tags`, `tag_assets`, `file_assets` (mutating: `confirm` defaulting false → dry-run preview). Each preview reads REAL state: `rename_tag` preview says `would rewrite N assets from 'x' to 'y'` with N from the projection; `merge_tags` additionally names the target's current count; `tag_assets`/`file_assets` previews name how many of the requested assets exist (and list the unknown ids). Tests assert preview text against fixture state AND that `confirm: false` leaves the event log untouched (byte-identical log dir).
+  **AMENDED — the bulk-assign tool is `assign_tags`, not `tag_assets`**: `tag_assets` was a drafting slip — it collides with the existing single-asset op-dispatch tool of that name (`add`/`rm`/`confirm_suggestion`/`reject_suggestion`, a different param shape entirely), and Task 14 below already names the Tauri command `assign_tags`.
 - [ ] **Step 5: run** `cargo test -p majestical-cli && cargo clippy -p majestical-cli --all-targets -- -D warnings`.
 - [ ] **Step 6: Commit; open PR 3** (`feat: tag rename/merge as CRDT events + assignment verbs, all heads`).
 

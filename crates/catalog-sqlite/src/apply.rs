@@ -158,6 +158,7 @@ impl SqliteCatalog {
                     tx.execute("DELETE FROM manifests WHERE volume = ?1", [volume])?;
                     Self::insert_manifests_for(&tx, projection, volume)?;
                 }
+                Touched::Tag => Self::rebuild_tags(&tx, projection)?,
             }
         }
         Self::write_apply_state(&tx, cursors, &snapshot_json)?;
@@ -313,6 +314,32 @@ impl SqliteCatalog {
                     hashdate_ms,
                 ),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Re-derives every `tags` row from `projection`. A rename edits the
+    /// projection-level alias map, not any one asset, so every asset's
+    /// effective tags can move at once — and `Touched::Tag` carries no
+    /// payload precisely because there is no bounded set of assets to
+    /// refresh instead.
+    ///
+    /// A targeted refresh keyed on the renamed-from name cannot work here:
+    /// this table stores *resolved* names, so once `x -> y` has been
+    /// applied, a later LWW-winning `x -> z` finds no `x` rows to refresh
+    /// and would leave the stale `y` rows behind, diverging from a full
+    /// rebuild. Rewriting the table has no such failure mode, and renames
+    /// are rare. Deliberately scoped to `tags` rather than routed through
+    /// `rebuild`, which would drop `text_fts` (populated from blobs by
+    /// `maj index run`, not from events) and blank text search until the
+    /// next heal.
+    fn rebuild_tags(tx: &Transaction, projection: &Projection) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM tags", [])?;
+        let mut insert = tx.prepare("INSERT INTO tags (asset, tag) VALUES (?1, ?2)")?;
+        for (asset, _) in projection.assets() {
+            for tag in projection.tags(asset) {
+                insert.execute((&asset.0, &tag))?;
+            }
         }
         Ok(())
     }
@@ -1002,6 +1029,177 @@ pub(crate) mod tests {
             !dump.contains("saved_searches|"),
             "the saved search row must be gone after the incremental remove, got: {dump}"
         );
+    }
+
+    /// Builds an `Event` with a distinct `EventId` (`ulid_low`) and `Hlc`
+    /// (`wall_ms`) for [`tags_follow_incremental_renames`], so that test's
+    /// arrange steps don't repeat the full struct literal at every call
+    /// site.
+    fn hlc_event(ulid_low: u128, wall_ms: u64, op: Op) -> Event {
+        Event {
+            id: EventId(ulid::Ulid::from_parts(1, ulid_low)),
+            hlc: Hlc {
+                wall_ms,
+                counter: 0,
+                machine: MachineId("m1".into()),
+            },
+            author: "t".into(),
+            op,
+        }
+    }
+
+    /// Asserts `dump` (a [`SqliteCatalog::debug_dump`] output) has a `tags`
+    /// row pairing `asset` with `tag`.
+    fn assert_tag_row(dump: &str, asset: &AssetId, tag: &str) {
+        assert!(
+            dump.contains(&format!("tags|Text(\"{}\")|Text(\"{tag}\")", asset.0)),
+            "expected asset {} to read tag \"{tag}\", got: {dump}",
+            asset.0
+        );
+    }
+
+    /// The two closing checks of [`tags_follow_incremental_renames`]: no
+    /// tags row still carries the stale alias source (scoped to `tags|`
+    /// lines so an unrelated fixture value of "x" cannot fail it), and the
+    /// `tag:` query path resolves against the post-rename name — plan Task
+    /// 11 Step 1's literal ask.
+    fn assert_stale_source_purged(db: &SqliteCatalog, dump: &str, winner_asset: &AssetId) {
+        assert!(
+            !dump
+                .lines()
+                .filter(|line| line.starts_with("tags|"))
+                .any(|line| line.contains("Text(\"x\")")),
+            "no tags row may still carry the stale alias source \"x\", got: {dump}"
+        );
+        assert_eq!(
+            db.assets_matching(&[Filter::Tag {
+                value: "z".into(),
+                negated: false,
+            }])
+            .expect("tag query"),
+            BTreeSet::from([winner_asset.clone()])
+        );
+    }
+
+    /// `Touched::Tag` triggers a whole-table `tags` rewrite (`rebuild_tags`)
+    /// rather than a targeted refresh, because the table stores *resolved*
+    /// tag names: a targeted `WHERE tag = <renamed-from>` recipe would find
+    /// nothing once an earlier rename has already moved those rows onto a
+    /// new name. This pins that against a full rebuild over the same op
+    /// history at two points: right after one rename, and again after a
+    /// second, LWW-winning rename of the same source tag — the case the
+    /// targeted recipe could not have handled, since by then no row still
+    /// says the original name.
+    #[test]
+    fn tags_follow_incremental_renames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = SqliteCatalog::open(&dir.path().join("catalog.db")).expect("open");
+        db.rebuild(&Projection::default()).expect("initial rebuild");
+
+        let a = AssetId("xxh3:a".into());
+        let b = AssetId("xxh3:b".into());
+        let seed_ops = vec![
+            Op::AssetSeen {
+                asset: a.clone(),
+                volume: "v".into(),
+                path: "a.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            },
+            Op::AssetSeen {
+                asset: b.clone(),
+                volume: "v".into(),
+                path: "b.mov".into(),
+                size: 1,
+                mtime_ms: 0,
+            },
+            Op::TagAdd {
+                asset: a.clone(),
+                tag: "x".into(),
+            },
+            Op::TagAdd {
+                asset: b.clone(),
+                tag: "y".into(),
+            },
+        ];
+
+        // Seed via the normal event path: apply_tracking + apply_touched,
+        // the same loop `open_synced` runs on a real resume.
+        let mut projection = Projection::default();
+        let mut seed_touched = BTreeSet::new();
+        for (n, op) in seed_ops.iter().cloned().enumerate() {
+            let wall_ms = u64::try_from(n).expect("small") + 1;
+            let event = hlc_event(n as u128, wall_ms, op);
+            seed_touched.insert(projection.apply_tracking(&event));
+        }
+        db.apply_touched(&projection, &seed_touched, &[])
+            .expect("apply seed");
+
+        // First rename: x -> y. Asset A's raw "x" resolves to "y", landing
+        // on the same name asset B was tagged with directly. Rename wall
+        // times (5, 6) continue `rebuild_from_ops`'s `wall_ms = index + 1`
+        // sequence past the 4 seed ops, so the incremental and rebuilt
+        // sides fold identical HLCs — a new seed op must shift them.
+        let rename1 = hlc_event(
+            10,
+            5,
+            Op::TagRenamed {
+                from: "x".into(),
+                to: "y".into(),
+            },
+        );
+        assert_eq!(projection.apply_tracking(&rename1), Touched::Tag);
+        db.apply_touched(&projection, &BTreeSet::from([Touched::Tag]), &[])
+            .expect("apply rename1");
+
+        let mut ops_after_rename1 = seed_ops.clone();
+        ops_after_rename1.push(Op::TagRenamed {
+            from: "x".into(),
+            to: "y".into(),
+        });
+        let fresh_after_rename1 =
+            rebuild_from_ops(&dir.path().join("fresh1.db"), ops_after_rename1.clone());
+        let dump_after_rename1 = db.debug_dump().expect("dump after rename1");
+        assert_eq!(
+            dump_after_rename1,
+            fresh_after_rename1.debug_dump().expect("dump")
+        );
+        assert_tag_row(&dump_after_rename1, &a, "y");
+        assert_tag_row(&dump_after_rename1, &b, "y");
+
+        // THE KILLING CASE: a second rename of the same source ("x"),
+        // with a later HLC so it wins LWW over the first. The table
+        // stores resolved names, so a targeted `WHERE tag = 'x'` refresh
+        // would find zero rows and strand A on the stale "y" — only the
+        // whole-table rewrite moves A to "z". B was never an alias
+        // source, so it must keep its own "y" untouched.
+        let rename2 = hlc_event(
+            11,
+            6,
+            Op::TagRenamed {
+                from: "x".into(),
+                to: "z".into(),
+            },
+        );
+        assert_eq!(projection.apply_tracking(&rename2), Touched::Tag);
+        db.apply_touched(&projection, &BTreeSet::from([Touched::Tag]), &[])
+            .expect("apply rename2");
+
+        let mut ops_after_rename2 = ops_after_rename1;
+        ops_after_rename2.push(Op::TagRenamed {
+            from: "x".into(),
+            to: "z".into(),
+        });
+        let fresh_after_rename2 =
+            rebuild_from_ops(&dir.path().join("fresh2.db"), ops_after_rename2);
+        let dump_after_rename2 = db.debug_dump().expect("dump after rename2");
+        assert_eq!(
+            dump_after_rename2,
+            fresh_after_rename2.debug_dump().expect("dump")
+        );
+        assert_tag_row(&dump_after_rename2, &a, "z");
+        assert_tag_row(&dump_after_rename2, &b, "y");
+        assert_stale_source_purged(&db, &dump_after_rename2, &a);
     }
 
     /// Every other `debug_dump` test only compares two independently-built

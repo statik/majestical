@@ -812,8 +812,8 @@ fn inbox_dry_run(inbox: &Path) -> anyhow::Result<serde_json::Value> {
 /// Params for `index_run`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IndexRunArgs {
-    /// Subset of: thumbs, embeddings, keyframes, transcripts, ocr, pdf,
-    /// captions. Omit to run every kind.
+    /// Subset of: thumbs, embeddings, keyframes, keyframe-images,
+    /// transcripts, ocr, pdf, captions. Omit to run every kind.
     #[serde(default)]
     kinds: Option<Vec<String>>,
     /// Stop after this many items per kind.
@@ -1045,9 +1045,9 @@ impl MajServer {
     }
 
     /// Works one pass of the derivation queue (thumbnails, embeddings,
-    /// keyframes, transcripts, OCR, PDF text, captions). Always a single
-    /// pass — there is no `--watch` equivalent over MCP. The describer API
-    /// key comes from `MAJ_OPENROUTER_KEY`, same as the CLI.
+    /// keyframes, keyframe images, transcripts, OCR, PDF text, captions).
+    /// Always a single pass — there is no `--watch` equivalent over MCP. The
+    /// describer API key comes from `MAJ_OPENROUTER_KEY`, same as the CLI.
     #[tool]
     fn index_run(&self, Parameters(args): Parameters<IndexRunArgs>) -> CallToolResult {
         let kinds = match parse_index_kinds(args.kinds.as_deref()) {

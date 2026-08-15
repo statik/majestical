@@ -57,6 +57,12 @@ fn run_result_json(o: &IndexRunOutcome) -> serde_json::Value {
             "keyframes_failed": o.keyframes.keyframes_failed,
             "failed": failed_json(&o.keyframes.failed),
         },
+        "keyframe-images": {
+            "videos_done": o.keyframe_images.videos_done,
+            "images_written": o.keyframe_images.images_written,
+            "images_skipped": o.keyframe_images.images_skipped,
+            "failed": failed_json(&o.keyframe_images.failed),
+        },
         "transcripts": {
             "transcribed": o.transcribe.written,
             "chunks_written": o.transcript_embed.chunks_written,
@@ -101,6 +107,13 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
             o.keyframes.failed.len()
         );
         println!(
+            "keyframe-images: {} videos, {} images written, {} already present, {} videos failed",
+            o.keyframe_images.videos_done,
+            o.keyframe_images.images_written,
+            o.keyframe_images.images_skipped,
+            o.keyframe_images.failed.len()
+        );
+        println!(
             "transcripts: {} transcribed, {} chunks embedded, {} loaded from blobs, {} empty, \
              {} failed",
             o.transcribe.written,
@@ -136,6 +149,7 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
         .iter()
         .chain(&o.embed.failed)
         .chain(&o.keyframes.failed)
+        .chain(&o.keyframe_images.failed)
         .chain(&o.transcribe.failed)
         .chain(&o.transcript_embed.failed)
         .chain(&o.ocr.failed)
@@ -146,13 +160,27 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
     }
 }
 
-/// True when `--kinds` was passed explicitly and names `keyframes` — the one
-/// case where a missing ffmpeg is a hard error rather than a degrade: an
-/// unqualified `index run` silently reports `needs_ffmpeg` in its kind
-/// status, but asking for keyframes by name and getting nothing back, with
-/// no explanation, is a worse experience than failing loudly.
-fn explicitly_requested_keyframes(kinds: Option<&[String]>) -> bool {
-    kinds.is_some_and(|kinds| kinds.iter().any(|k| k == "keyframes"))
+/// The `--kinds` names whose work is entirely ffmpeg-bound: without ffmpeg
+/// they can produce nothing at all, unlike kinds that merely skip their
+/// video assets. This covers the ffmpeg ask only — `keyframes` also needs
+/// the vision model, and that gap deliberately stays a silent degrade
+/// (`index status` reports it as `needs_model`, with a `model fetch`
+/// remedy) rather than a hard error, since a model is downloadable where a
+/// missing ffmpeg is the user's own install to make.
+const FFMPEG_ONLY_KINDS: &[&str] = &["keyframes", "keyframe-images"];
+
+/// The first [`FFMPEG_ONLY_KINDS`] name `--kinds` was explicitly passed, if
+/// any — the one case where a missing ffmpeg is a hard error rather than a
+/// degrade: an unqualified `index run` silently reports `needs_ffmpeg` in
+/// its kind status, but asking for one of these kinds by name and getting
+/// nothing back, with no explanation, is a worse experience than failing
+/// loudly.
+fn explicitly_requested_ffmpeg_kind(kinds: Option<&[String]>) -> Option<&'static str> {
+    let kinds = kinds?;
+    FFMPEG_ONLY_KINDS
+        .iter()
+        .copied()
+        .find(|name| kinds.iter().any(|kind| kind == name))
 }
 
 /// One `index run` pass: calls the services engine, updates the on-disk
@@ -182,14 +210,15 @@ fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> R
 ///
 /// # Errors
 /// Returns an error if `--kinds` names an unknown kind, if `--kinds`
-/// explicitly names `keyframes` while ffmpeg is absent, or the catalog can't
-/// be opened/synced.
+/// explicitly names an ffmpeg-only kind (see [`FFMPEG_ONLY_KINDS`]) while
+/// ffmpeg is absent, or the catalog can't be opened/synced.
 pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs) -> Result<()> {
     let kinds = parse_kinds(args.kinds.as_deref())?;
-    if explicitly_requested_keyframes(args.kinds.as_deref())
-        && !majestical_index::video::ffmpeg_available()
-    {
-        anyhow::bail!("--kinds keyframes requires ffmpeg/ffprobe on PATH (brew install ffmpeg)");
+    if let Some(kind) = explicitly_requested_ffmpeg_kind(args.kinds.as_deref()) {
+        anyhow::ensure!(
+            majestical_index::video::ffmpeg_available(),
+            "--kinds {kind} requires ffmpeg/ffprobe on PATH (brew install ffmpeg)"
+        );
     }
     loop {
         // Rebuilt every pass (not hoisted above the loop): the describer API
@@ -287,6 +316,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
                 "thumbs": kind_status_json(&outcome.thumbs),
                 "embeddings": kind_status_json(&outcome.embeddings),
                 "keyframes": kind_status_json(&outcome.keyframes),
+                "keyframe-images": kind_status_json(&outcome.keyframe_images),
                 "transcripts": kind_status_json(&outcome.transcripts),
                 "ocr": kind_status_json(&outcome.ocr),
                 "pdf": kind_status_json(&outcome.pdf),
@@ -298,6 +328,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
         print_kind_status("thumbs", &outcome.thumbs);
         print_kind_status("embeddings", &outcome.embeddings);
         print_kind_status("keyframes", &outcome.keyframes);
+        print_kind_status("keyframe-images", &outcome.keyframe_images);
         print_kind_status("transcripts", &outcome.transcripts);
         print_kind_status("ocr", &outcome.ocr);
         print_kind_status("pdf", &outcome.pdf);

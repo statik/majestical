@@ -11,6 +11,17 @@ export const keyframesUrl = (assetId: string) =>
   convertFileSrc(`keyframes/${assetId}`, "thumb");
 
 /**
+ * One extracted keyframe image, selected by its position in the manifest's
+ * `timestamps` (the same order `Inspector`'s strip renders them in) rather
+ * than by timestamp — `thumb_protocol.rs`'s `keyframe/<asset_id>/<index>`
+ * route maps the index to a timestamp on the Rust side. May 404: extraction
+ * runs after keyframe detection, so a manifest can list a timestamp before
+ * its image exists.
+ */
+export const keyframeImageUrl = (assetId: string, index: number) =>
+  convertFileSrc(`keyframe/${assetId}/${index}`, "thumb");
+
+/**
  * The keyframe manifest body, field-for-field from
  * `crates/services/src/index/run.rs::keyframes_manifest_json`. `detected` is
  * the video's full scene-detected count and `timestamps` only the keyframes

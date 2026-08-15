@@ -1,9 +1,10 @@
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor, within } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { AssetDetail, AssetVerification } from "./api";
 import Inspector from "./Inspector.svelte";
 import { mockCommands, rejectCommand, stubManifest } from "./test-support";
+import { keyframeImageUrl } from "./thumb";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
@@ -167,7 +168,7 @@ test("an asset nobody has verified says so, with no history to open", async () =
   expect(container.querySelector("details")).toBeNull();
 });
 
-test("the keyframe strip lists the manifest's timestamps as timecodes", async () => {
+test("the keyframe strip renders one image per timestamp, addressed by index", async () => {
   mockAsset(detail);
   stubManifest(
     200,
@@ -175,11 +176,62 @@ test("the keyframe strip lists the manifest's timestamps as timecodes", async ()
   );
   render(Inspector, { assetId: "xxh3:abc123" });
 
-  // `@MmSSs`, the timecode `maj search` prints for a keyframe hit.
-  expect(await screen.findByText("@0m01s")).toBeTruthy();
-  expect(screen.getByText("@1m05s")).toBeTruthy();
+  // `@MmSSs`, the timecode `maj search` prints for a keyframe hit — carried
+  // as the accessible name (`alt`) of each strip image.
+  const first = await screen.findByRole("img", { name: "@0m01s" });
+  const second = screen.getByRole("img", { name: "@1m05s" });
+  // The literal URL `mockConvertFileSrc("macos")` produces for
+  // `keyframe/xxh3:abc123/0` — spelled out rather than comparing against
+  // `keyframeImageUrl(...)` itself, which would just check the component
+  // calls the same function this assertion also calls.
+  expect(first.getAttribute("src")).toBe(
+    "thumb://localhost/keyframe%2Fxxh3%3Aabc123%2F0",
+  );
+  expect(second.getAttribute("src")).toBe(keyframeImageUrl("xxh3:abc123", 1));
   // Every detected keyframe was indexed: there is no gap to report.
   expect(screen.queryByText(/detected keyframes indexed/u)).toBeNull();
+});
+
+test("a strip image that fails to load falls back to the timecode chip", async () => {
+  mockAsset(detail);
+  stubManifest(
+    200,
+    '{"model_tag":"siglip2-b16-v1","detected":1,"timestamps":[1500]}',
+  );
+  render(Inspector, { assetId: "xxh3:abc123" });
+
+  const image = await screen.findByRole("img", { name: "@0m01s" });
+  await fireEvent.error(image);
+
+  expect(screen.queryByRole("img", { name: "@0m01s" })).toBeNull();
+  expect(screen.getByText("@0m01s")).toBeTruthy();
+});
+
+test("switching to a different asset resets the previous asset's failed-image fallback", async () => {
+  const second: AssetDetail = { ...detail, asset: "xxh3:def456" };
+  mockCommands({
+    get_asset: (args) => {
+      const record = args as Record<string, unknown> | undefined;
+      return record?.["assetId"] === "xxh3:def456" ? second : detail;
+    },
+  });
+  stubManifest(
+    200,
+    '{"model_tag":"siglip2-b16-v1","detected":1,"timestamps":[1500]}',
+  );
+  const { rerender } = render(Inspector, { assetId: "xxh3:abc123" });
+
+  const firstImage = await screen.findByRole("img", { name: "@0m01s" });
+  await fireEvent.error(firstImage);
+  expect(screen.queryByRole("img", { name: "@0m01s" })).toBeNull();
+  expect(screen.getByText("@0m01s")).toBeTruthy();
+
+  await rerender({ assetId: "xxh3:def456" });
+
+  // The second asset's own strip image has never failed — a stale
+  // `failedKeyframes` left over from the first asset would still show the
+  // timecode chip here even though nothing about THIS image has 404'd.
+  expect(await screen.findByRole("img", { name: "@0m01s" })).toBeTruthy();
 });
 
 test("an asset with no keyframe manifest shows no strip", async () => {
@@ -190,6 +242,7 @@ test("an asset with no keyframe manifest shows no strip", async () => {
   // not put anything on the panel.
   await screen.findByText("sunset.mov");
   await waitFor(() => expect(screen.getByText("Never verified")).toBeTruthy());
+  expect(screen.queryByRole("img", { name: /^@/u })).toBeNull();
   expect(screen.queryByText(/^@/u)).toBeNull();
   expect(screen.queryByText(/no keyframe manifest/u)).toBeNull();
 });

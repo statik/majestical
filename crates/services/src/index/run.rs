@@ -1,11 +1,11 @@
 //! `maj index run`'s compute: builds the derivation plan, works every kind's
-//! queued items (thumbnails, embeddings, keyframes, transcripts,
-//! transcript-embeddings, OCR, PDF text, captions), and heals `text_fts` from
-//! blobs. Moved from `crates/cli/src/index_cmd.rs`. The `--watch` loop, the
-//! failure-report bookkeeping (`failure_report_json`/`merge_failure_report`/
-//! `write_failure_report`), and all rendering (`print_run_result`/
-//! `run_result_json`) stay in the CLI — this module hands back one
-//! [`IndexRunOutcome`] per pass and never prints.
+//! queued items (thumbnails, embeddings, keyframes, keyframe images,
+//! transcripts, transcript-embeddings, OCR, PDF text, captions), and heals
+//! `text_fts` from blobs. Moved from `crates/cli/src/index_cmd.rs`. The
+//! `--watch` loop, the failure-report bookkeeping (`failure_report_json`/
+//! `merge_failure_report`/`write_failure_report`), and all rendering
+//! (`print_run_result`/`run_result_json`) stay in the CLI — this module
+//! hands back one [`IndexRunOutcome`] per pass and never prints.
 use crate::app::FsApp;
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
@@ -293,6 +293,7 @@ fn run_all_kinds(
         thumbs: run_thumb_items(blobs, &items.thumbs, jobs),
         embed: run_embed_items(paths, blobs, &items.embeds, env.notices)?,
         keyframes: run_keyframe_items(paths, blobs, &items.keyframes, env.notices)?,
+        keyframe_images: run_keyframe_image_items(blobs, &items.keyframe_images),
         transcribe: run_transcribe_items(blobs, &items.transcribes)?,
         transcript_embed: run_transcript_embed_items(
             paths,
@@ -316,6 +317,7 @@ struct KindItems {
     thumbs: Vec<work::WorkItem>,
     embeds: Vec<work::WorkItem>,
     keyframes: Vec<work::WorkItem>,
+    keyframe_images: Vec<work::WorkItem>,
     transcribes: Vec<work::WorkItem>,
     transcript_embeds: Vec<work::WorkItem>,
     ocr_images: Vec<work::WorkItem>,
@@ -329,6 +331,7 @@ impl KindItems {
         self.thumbs.truncate(limit);
         self.embeds.truncate(limit);
         self.keyframes.truncate(limit);
+        self.keyframe_images.truncate(limit);
         self.transcribes.truncate(limit);
         self.transcript_embeds.truncate(limit);
         self.ocr_images.truncate(limit);
@@ -348,6 +351,7 @@ fn split_and_cap_items(items: Vec<work::WorkItem>, limit: Option<usize>) -> Kind
             WorkKind::Thumb => split.thumbs.push(item),
             WorkKind::ImageEmbed => split.embeds.push(item),
             WorkKind::Keyframes => split.keyframes.push(item),
+            WorkKind::KeyframeImages => split.keyframe_images.push(item),
             WorkKind::Transcribe => split.transcribes.push(item),
             WorkKind::TranscriptEmbed => split.transcript_embeds.push(item),
             WorkKind::OcrImage => split.ocr_images.push(item),
@@ -864,6 +868,142 @@ fn run_keyframe_items(
         store.add(batch)?;
     }
     Ok(outcome)
+}
+
+/// One pass's keyframe-image result: `videos_done` videos whose every
+/// manifest timestamp now has an image blob (the pass that wrote their
+/// `KeyframeImagesComplete` marker), `images_written` frames freshly
+/// extracted and encoded this pass, `images_skipped` timestamps whose blob
+/// an earlier pass had already written (the resume path), and per-video
+/// `failed` (path, reason) — mirroring [`OcrOutcome`], the other kind that
+/// works a video's manifest timestamps into one blob each.
+#[derive(Default, serde::Serialize)]
+pub struct KeyframeImageOutcome {
+    pub videos_done: u64,
+    pub images_written: u64,
+    pub images_skipped: u64,
+    #[serde(serialize_with = "serialize_failed_items")]
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// One video's keyframe-image pass result — [`VideoOcrResult`]'s shape, for
+/// the same per-timestamp bookkeeping, plus the resume count.
+struct VideoKeyframeImageResult {
+    images_written: u64,
+    images_skipped: u64,
+    failures: usize,
+    total: usize,
+    first_failure: Option<String>,
+}
+
+/// Works one `KeyframeImages` video: reads the keyframe manifest, extracts
+/// every timestamp whose image blob is missing, and — only once EVERY
+/// timestamp has a blob — writes the `KeyframeImagesComplete` marker. The
+/// marker body carries the manifest's timestamp list under the same
+/// `timestamps` key `OcrComplete` uses, so a later manifest change stays
+/// auditable against exactly which frames were extracted.
+///
+/// Timestamps are worked SEQUENTIALLY, unlike the thumbnail kind's worker
+/// pool: each extraction materializes a full-resolution `RgbImage` (tens to
+/// hundreds of MB for 4K/8K sources), so parallel workers would multiply
+/// peak memory by the worker count for no gain on work ffmpeg already
+/// saturates a core with.
+fn extract_video_keyframe_images(
+    blobs: &BlobStore,
+    item: &work::WorkItem,
+) -> Result<VideoKeyframeImageResult> {
+    let model_tag = majestical_index::model::MODEL_TAG;
+    let manifest_path =
+        blobs.path_for(&item.asset_hex, &Derivation::KeyframeManifest { model_tag });
+    let bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading keyframe manifest {}", manifest_path.display()))?;
+    let (_, _, timestamps) = keyframes_manifest_read(&bytes)?;
+
+    let mut result = VideoKeyframeImageResult {
+        images_written: 0,
+        images_skipped: 0,
+        failures: 0,
+        total: timestamps.len(),
+        first_failure: None,
+    };
+    for &ts_ms in &timestamps {
+        let blob_path = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::KeyframeImage {
+                model_tag,
+                timestamp_ms: ts_ms,
+            },
+        );
+        if blob_path.is_file() {
+            result.images_skipped += 1;
+            continue;
+        }
+        match keyframe_image_one(blobs, &item.abs_path, &blob_path, ts_ms) {
+            Ok(()) => result.images_written += 1,
+            Err(err) => {
+                result.failures += 1;
+                result.first_failure.get_or_insert(err.to_string());
+            }
+        }
+    }
+    if result.failures == 0 {
+        let marker = blobs.path_for(
+            &item.asset_hex,
+            &Derivation::KeyframeImagesComplete { model_tag },
+        );
+        write_json_blob_uncompressed(
+            blobs,
+            &marker,
+            &serde_json::json!({ "timestamps": timestamps }),
+        )?;
+    }
+    Ok(result)
+}
+
+/// Extracts one timestamp's frame at thumbnail scale and writes it to
+/// `blob_path`. Not batched through `video::analysis_frames`: those frames
+/// are decoded at 160x90, below `THUMB_EDGE`, so a batch would only ever
+/// yield upscaled thumbnails.
+fn keyframe_image_one(blobs: &BlobStore, video: &Path, blob_path: &Path, ts_ms: u64) -> Result<()> {
+    let webp = majestical_index::keyframe_images::extract_keyframe_webp(video, ts_ms)?;
+    blobs.write_atomic(blob_path, &webp)?;
+    Ok(())
+}
+
+/// Works every `KeyframeImages` item. ffmpeg is the only capability this
+/// kind needs and the planner already gated on it, so there's no re-check
+/// here (the OCR runner's precedent); per-item failures are collected, never
+/// propagated, and a video with any failed timestamp keeps the images it did
+/// produce and re-plans next pass.
+fn run_keyframe_image_items(blobs: &BlobStore, items: &[work::WorkItem]) -> KeyframeImageOutcome {
+    let mut outcome = KeyframeImageOutcome::default();
+    for item in items {
+        match extract_video_keyframe_images(blobs, item) {
+            Ok(result) => {
+                outcome.images_written += result.images_written;
+                outcome.images_skipped += result.images_skipped;
+                if result.failures == 0 {
+                    outcome.videos_done += 1;
+                } else {
+                    let first = result.first_failure.as_deref().unwrap_or("<no reason>");
+                    // No path in the message: the tuple's first element
+                    // already carries it (ffmpeg reasons embed it too).
+                    outcome.failed.push((
+                        item.abs_path.clone(),
+                        format!(
+                            "{}/{} keyframe images failed to extract — first failure: {first} \
+                             — video incomplete, will retry",
+                            result.failures, result.total,
+                        ),
+                    ));
+                }
+            }
+            Err(err) => outcome
+                .failed
+                .push((item.abs_path.clone(), err.to_string())),
+        }
+    }
+    outcome
 }
 
 /// One pass's transcribe-kind result: `written` new transcript blobs and
@@ -1733,12 +1873,18 @@ fn open_and_probe_text(dir: &Path) -> Result<TextVectorStore, String> {
 }
 
 /// Every kind's outcome for one pass, bundled so the CLI's printers and
-/// failure-report bookkeeping take one value instead of eight.
+/// failure-report bookkeeping take one value instead of nine.
 #[derive(serde::Serialize)]
 pub struct IndexRunOutcome {
     pub thumbs: ThumbOutcome,
     pub embed: EmbedOutcome,
     pub keyframes: KeyframeOutcome,
+    /// Serialized under the `--kinds` name (`keyframe-images`) rather than
+    /// the Rust field name, so every wire shape — this struct, the CLI's
+    /// hand-built `--json`, and the failure report's per-kind map — names
+    /// the kind identically.
+    #[serde(rename = "keyframe-images")]
+    pub keyframe_images: KeyframeImageOutcome,
     pub transcribe: TranscribeOutcome,
     pub transcript_embed: TranscriptEmbedOutcome,
     pub ocr: OcrOutcome,
@@ -2080,6 +2226,265 @@ mod tests {
         // and blob↔Lance diffs are all no-ops with nothing to heal/load.
         let outcome2 = run(&app, &root, &req).expect("second run");
         assert_eq!(outcome2.thumbs.written, 0);
+    }
+
+    /// The 640x360 three-segment (red/green/blue, 3s each at 25fps) lavfi
+    /// clip `crates/index/src/keyframe_images.rs`'s own tests synthesize —
+    /// double `THUMB_EDGE`, so every extracted frame really goes through the
+    /// thumbnail resize on its way to WebP.
+    fn generate_test_clip(path: &Path) {
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=640x360:d=3:r=25,format=yuv420p",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:s=640x360:d=3:r=25,format=yuv420p",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=640x360:d=3:r=25,format=yuv420p",
+            ])
+            .args(["-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]"])
+            .args(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+            .arg(path)
+            .status()
+            .expect("running ffmpeg to generate the test clip");
+        assert!(status.success(), "ffmpeg clip generation failed");
+    }
+
+    const KEYFRAME_IMAGE_HEX: &str = "abcd0123abcd0123abcd0123abcd0123";
+
+    /// Writes the keyframe manifest the `KeyframeImages` runner reads —
+    /// exactly the blob `run_keyframe_items` would have left behind.
+    fn seed_keyframe_manifest(blobs: &BlobStore, hex: &str, timestamps: &[u64]) {
+        let model_tag = majestical_index::model::MODEL_TAG;
+        let path = blobs.path_for(hex, &Derivation::KeyframeManifest { model_tag });
+        blobs
+            .write_atomic(
+                &path,
+                &keyframes_manifest_json(model_tag, timestamps.len(), timestamps),
+            )
+            .expect("seed keyframe manifest");
+    }
+
+    fn keyframe_image_path(blobs: &BlobStore, hex: &str, ts_ms: u64) -> PathBuf {
+        blobs.path_for(
+            hex,
+            &Derivation::KeyframeImage {
+                model_tag: majestical_index::model::MODEL_TAG,
+                timestamp_ms: ts_ms,
+            },
+        )
+    }
+
+    fn keyframe_images_marker(blobs: &BlobStore, hex: &str) -> PathBuf {
+        blobs.path_for(
+            hex,
+            &Derivation::KeyframeImagesComplete {
+                model_tag: majestical_index::model::MODEL_TAG,
+            },
+        )
+    }
+
+    fn keyframe_image_item(hex: &str, video: &Path) -> work::WorkItem {
+        work::WorkItem {
+            asset: format!("xxh3:{hex}"),
+            asset_hex: hex.to_string(),
+            abs_path: video.to_path_buf(),
+            kind: WorkKind::KeyframeImages,
+        }
+    }
+
+    /// Re-plans the one video against the blob store the runner just wrote
+    /// into, with the capabilities the planner needs to have anything to say
+    /// about this kind (a vision model tag for the manifest lookup, ffmpeg
+    /// for extraction) — no model or ffmpeg has to be installed for the
+    /// planner itself, which only diffs paths.
+    fn replan_keyframe_images(blobs: &BlobStore, hex: &str, video: &Path) -> work::WorkPlan {
+        let sources = vec![work::AssetSource {
+            asset: format!("xxh3:{hex}"),
+            kind: MediaKind::Video,
+            abs_path: Some(video.to_path_buf()),
+        }];
+        let caps = work::Capabilities {
+            model_tag: Some(majestical_index::model::MODEL_TAG.to_string()),
+            ffmpeg: true,
+            whisper: false,
+            text_model: false,
+            describer_tag: None,
+        };
+        work::plan_work(&sources, blobs, &caps)
+    }
+
+    /// The split is where a `KeyframeImages` item used to vanish (a no-op
+    /// arm kept the match exhaustive while `VALID_KINDS` didn't name the
+    /// kind): route it to its own bucket, and cap it with every other kind.
+    #[test]
+    fn split_routes_keyframe_image_items_to_their_own_bucket() {
+        let video = Path::new("/media/clip.mp4");
+        let items = vec![
+            keyframe_image_item(KEYFRAME_IMAGE_HEX, video),
+            keyframe_image_item(KEYFRAME_IMAGE_HEX, video),
+        ];
+
+        let split = split_and_cap_items(items.clone(), None);
+        assert_eq!(split.keyframe_images.len(), 2);
+
+        let capped = split_and_cap_items(items, Some(1));
+        assert_eq!(
+            capped.keyframe_images.len(),
+            1,
+            "--limit caps this kind too"
+        );
+    }
+
+    /// The happy path: every manifest timestamp gets a thumb-scale WebP blob
+    /// and the video gets its completion marker (listing exactly the
+    /// timestamps that were extracted, `OcrComplete`'s marker shape), after
+    /// which the planner counts it done instead of re-queueing it.
+    #[test]
+    fn keyframe_images_run_writes_every_image_and_the_completion_marker() {
+        if !majestical_index::video::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video = dir.path().join("clip.mp4");
+        generate_test_clip(&video);
+        let blobs = BlobStore::new(&dir.path().join("cat"));
+        let hex = KEYFRAME_IMAGE_HEX;
+        seed_keyframe_manifest(&blobs, hex, &[1500, 4500]);
+
+        let outcome = run_keyframe_image_items(&blobs, &[keyframe_image_item(hex, &video)]);
+
+        assert_eq!(outcome.images_written, 2, "{:?}", outcome.failed);
+        assert_eq!(outcome.images_skipped, 0);
+        assert_eq!(outcome.videos_done, 1);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        for ts_ms in [1500u64, 4500] {
+            let path = keyframe_image_path(&blobs, hex, ts_ms);
+            let bytes = std::fs::read(&path).expect("keyframe image blob");
+            assert_eq!(&bytes[..4], b"RIFF", "{} is not WebP", path.display());
+            assert_eq!(&bytes[8..12], b"WEBP", "{} is not WebP", path.display());
+        }
+        let marker = std::fs::read(keyframe_images_marker(&blobs, hex)).expect("marker");
+        let marker: serde_json::Value = serde_json::from_slice(&marker).expect("marker json");
+        assert_eq!(marker["timestamps"], serde_json::json!([1500, 4500]));
+
+        let plan = replan_keyframe_images(&blobs, hex, &video);
+        assert_eq!(plan.keyframe_images.done, 1);
+        assert_eq!(plan.keyframe_images.pending, 0);
+        assert!(
+            !plan
+                .items
+                .iter()
+                .any(|item| item.kind == WorkKind::KeyframeImages),
+            "a completed video must not re-plan"
+        );
+    }
+
+    /// One failing timestamp (past the end of the clip — ffmpeg returns no
+    /// frame there) keeps the other timestamp's image, records ONE per-video
+    /// failure row, withholds the completion marker, and leaves the video
+    /// queued for the next pass.
+    #[test]
+    fn keyframe_images_partial_failure_keeps_progress_and_withholds_the_marker() {
+        if !majestical_index::video::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video = dir.path().join("clip.mp4");
+        generate_test_clip(&video);
+        let blobs = BlobStore::new(&dir.path().join("cat"));
+        let hex = KEYFRAME_IMAGE_HEX;
+        // 99_000ms is well past the 9s clip: ffmpeg produces no frame there.
+        seed_keyframe_manifest(&blobs, hex, &[1500, 99_000]);
+
+        let outcome = run_keyframe_image_items(&blobs, &[keyframe_image_item(hex, &video)]);
+
+        assert_eq!(outcome.images_written, 1);
+        assert_eq!(outcome.videos_done, 0);
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        assert_eq!(outcome.failed[0].0, video);
+        assert!(
+            outcome.failed[0].1.contains("1/2"),
+            "the row must carry the failure/total counts: {}",
+            outcome.failed[0].1
+        );
+        assert!(
+            keyframe_image_path(&blobs, hex, 1500).is_file(),
+            "the timestamp that succeeded keeps its image"
+        );
+        assert!(
+            !keyframe_images_marker(&blobs, hex).is_file(),
+            "no completion marker while a timestamp is still missing"
+        );
+
+        let plan = replan_keyframe_images(&blobs, hex, &video);
+        assert_eq!(plan.keyframe_images.pending, 1);
+        assert_eq!(plan.keyframe_images.done, 0);
+    }
+
+    /// Resume: a timestamp whose blob already exists is never re-extracted —
+    /// pinned with sentinel bytes that must survive the pass byte-for-byte.
+    #[test]
+    fn keyframe_images_run_skips_timestamps_that_already_have_a_blob() {
+        if !majestical_index::video::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video = dir.path().join("clip.mp4");
+        generate_test_clip(&video);
+        let blobs = BlobStore::new(&dir.path().join("cat"));
+        let hex = KEYFRAME_IMAGE_HEX;
+        seed_keyframe_manifest(&blobs, hex, &[1500, 4500]);
+        let sentinel = b"SENTINEL-NOT-A-REAL-WEBP";
+        let existing = keyframe_image_path(&blobs, hex, 1500);
+        blobs
+            .write_atomic(&existing, sentinel)
+            .expect("pre-write one image blob");
+
+        let outcome = run_keyframe_image_items(&blobs, &[keyframe_image_item(hex, &video)]);
+
+        assert_eq!(outcome.images_written, 1, "{:?}", outcome.failed);
+        assert_eq!(outcome.images_skipped, 1);
+        assert_eq!(outcome.videos_done, 1);
+        assert_eq!(
+            std::fs::read(&existing).expect("existing blob"),
+            sentinel,
+            "an existing image blob must be left untouched"
+        );
+        assert!(keyframe_image_path(&blobs, hex, 4500).is_file());
+        assert!(keyframe_images_marker(&blobs, hex).is_file());
+    }
+
+    /// A manifest the runner can't read is a video-level failure row, not a
+    /// pass-level error — and no marker.
+    #[test]
+    fn keyframe_images_unreadable_manifest_is_a_failure_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = BlobStore::new(&dir.path().join("cat"));
+        let hex = KEYFRAME_IMAGE_HEX;
+        let video = dir.path().join("clip.mp4");
+
+        let outcome = run_keyframe_image_items(&blobs, &[keyframe_image_item(hex, &video)]);
+
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        assert!(
+            outcome.failed[0].1.contains("keyframe manifest"),
+            "{}",
+            outcome.failed[0].1
+        );
+        assert_eq!(outcome.videos_done, 0);
+        assert!(!keyframe_images_marker(&blobs, hex).is_file());
     }
 
     /// `--limit`-bounded run against a text-only catalog with `--kinds

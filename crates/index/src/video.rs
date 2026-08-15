@@ -9,10 +9,15 @@
 //! [`ANALYSIS_W`]x[`ANALYSIS_H`] RGB24 that's roughly 600MB/hour of footage
 //! held in memory at once (ffmpeg's raw stdout plus the copied `Frame`
 //! vec briefly coexist); switching to a streaming decode is a tracked
-//! follow-up, not implemented here. Every ffmpeg/ffprobe call in this
-//! module (`probe`, `analysis_frames`, `extract_frame`) is a blocking
-//! subprocess call that waits for the child to exit — a video on a stalled
-//! or disconnecting volume stalls whichever `index run` pass is working it.
+//! follow-up, not implemented here. `probe` and `analysis_frames` are
+//! blocking subprocess calls that wait for the child to exit with no
+//! timeout — a video on a stalled or disconnecting volume stalls whichever
+//! `index run` pass is working it. [`extract_frame`] and
+//! [`extract_audio_pcm`] are the exceptions: both are hard-timed out
+//! ([`frame_timeout`]/[`audio_timeout`]), because a hung ffmpeg in either
+//! would block a whole pass indefinitely — `extract_audio_pcm` decodes an
+//! entire audio track, and `extract_frame` runs once per manifest
+//! timestamp, up to [`MAX_KEYFRAMES`] times for a single video.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -208,20 +213,24 @@ fn frame_timestamp_ms(index: usize) -> u64 {
     ((index as f64) * 1000.0 / ANALYSIS_FPS) as u64
 }
 
-/// Extracts a single full-resolution frame at `ts_ms` as a decoded PNG.
+/// Extracts a single full-resolution frame at `ts_ms` as a decoded PNG,
+/// hard-timed out by [`frame_timeout`].
 ///
 /// # Errors
 ///
-/// Returns [`IndexError::Video`] if ffmpeg can't run, exits with a failure
-/// status, produces no output, or the output doesn't decode as an image.
+/// Returns [`IndexError::Video`] if ffmpeg can't run, times out, exits with
+/// a failure status, produces no output, or the output doesn't decode as an
+/// image.
 pub fn extract_frame(path: &Path, ts_ms: u64) -> Result<image::RgbImage, IndexError> {
     let ts_arg = format_timestamp(ts_ms);
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss", &ts_arg, "-i"])
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-nostdin", "-v", "error", "-ss", &ts_arg, "-i"])
         .arg(path)
-        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
-        .output()
-        .map_err(|e| video_err(path, format!("running ffmpeg: {e}")))?;
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]);
+
+    let output = run_with_timeout(command, frame_timeout(ts_ms))
+        .map_err(|message| video_err(path, format!("frame extract: {message}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -303,6 +312,16 @@ pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Resul
 /// second, so a long clip isn't starved by a floor sized for short ones.
 pub(crate) fn audio_timeout(duration_ms: u64) -> Duration {
     Duration::from_secs(60 + duration_ms / 1000)
+}
+
+/// Timeout for a single-frame extract, [`audio_timeout`]'s shape scaled by
+/// the only quantity that bounds this work: the seek distance. `-ss` before
+/// `-i` normally seeks near-instantly, but a container whose index is
+/// missing or unusable makes ffmpeg decode forward from the start of the
+/// file to reach `ts_ms`, so the budget grows with the timestamp rather
+/// than being a flat ceiling that a deep seek into a long video would trip.
+pub(crate) fn frame_timeout(ts_ms: u64) -> Duration {
+    Duration::from_secs(60 + ts_ms / 1000)
 }
 
 /// Extracts mono 16kHz `f32` PCM (whisper's native input format) from any
@@ -558,8 +577,8 @@ mod tests {
     use super::{
         ANALYSIS_H, ANALYSIS_W, Frame, MAX_KEYFRAMES, VideoInfo, audio_timeout, binary_runs,
         chunk_frames, detect_scenes, enforce_min_scene_length, extract_audio_pcm, ffmpeg_available,
-        format_timestamp, frame_timestamp_ms, parse_probe_json, raw_candidate_cuts, rgb_to_hsv_u8,
-        run_with_timeout, scene_midpoints, seconds_to_ms,
+        format_timestamp, frame_timeout, frame_timestamp_ms, parse_probe_json, raw_candidate_cuts,
+        rgb_to_hsv_u8, run_with_timeout, scene_midpoints, seconds_to_ms,
     };
     use std::path::Path;
 
@@ -918,6 +937,15 @@ mod tests {
         let output = run_with_timeout(command, std::time::Duration::from_secs(5)).expect("fast");
 
         assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    }
+
+    /// The frame budget grows with the seek distance, never shrinking below
+    /// the same one-minute floor `audio_timeout` uses — a frame near the end
+    /// of a long video may cost a full forward decode to reach.
+    #[test]
+    fn frame_timeout_scales_with_the_seek_distance() {
+        assert_eq!(frame_timeout(0), std::time::Duration::from_mins(1));
+        assert_eq!(frame_timeout(3_600_000), std::time::Duration::from_mins(61));
     }
 
     #[test]

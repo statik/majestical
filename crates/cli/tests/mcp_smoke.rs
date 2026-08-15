@@ -470,6 +470,14 @@ fn index_status_matches() {
         serde_json::json!(0),
         "{structured}"
     );
+    // The keyframe-images row rides the wire under its `--kinds` name, not
+    // the Rust field name (`IndexStatusOutcome`'s serde rename) — pinned
+    // here because an agent reading this tool's output keys on it.
+    assert_eq!(
+        structured["keyframe-images"]["done"],
+        serde_json::json!(0),
+        "{structured}"
+    );
     assert!(structured["failed_last_run"].is_object(), "{structured}");
 }
 
@@ -2395,6 +2403,228 @@ fn keyframes_resource_serves_manifest_json() {
         parsed["timestamps"],
         serde_json::json!([1500, 4500]),
         "{text}"
+    );
+}
+
+/// Plants a manifest with two timestamps but only ONE extracted keyframe
+/// image blob, at the real `BlobStore` paths — the exact "extraction is
+/// still in progress" shape this test suite pins.
+///
+/// `#[cfg(test)]` is NOT redundant here despite this whole file already
+/// building with `--cfg test`: this repo's `clippy.toml` sets
+/// `allow-expect-in-tests`, and clippy's in-test detection for that config
+/// keys off `#[test]`/`#[cfg(test)]` directly on the item, not the ambient
+/// test-binary cfg — see the fuller rationale on `Mcp`'s own methods above.
+/// Removing this attribute makes every `.expect()` below a hard
+/// `clippy::expect_used` error under `-D warnings` (confirmed: `cargo
+/// clippy --workspace --all-targets --all-features -- -D warnings` fails
+/// with 7 `expect_used` errors on exactly this function without it).
+#[cfg(test)]
+fn plant_manifest_and_one_keyframe_image(root: &std::path::Path, asset: &str) {
+    let hex = majestical_index::blob::asset_hex(asset).expect("xxh3 asset id");
+    let store = majestical_index::blob::BlobStore::new(root);
+    let manifest_path = store.path_for(
+        hex,
+        &majestical_index::blob::Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    std::fs::create_dir_all(manifest_path.parent().expect("parent")).expect("mkdir");
+    let manifest_json = br#"{"model_tag":"siglip2-b16-v1","detected":2,"timestamps":[1500,4500]}"#;
+    std::fs::write(&manifest_path, manifest_json).expect("plant keyframe manifest");
+
+    let image_path = store.path_for(
+        hex,
+        &majestical_index::blob::Derivation::KeyframeImage {
+            model_tag: majestical_index::model::MODEL_TAG,
+            timestamp_ms: 1500,
+        },
+    );
+    std::fs::create_dir_all(image_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&image_path, b"frame-at-1500").expect("plant keyframe image blob");
+}
+
+/// Reading `majestical://keyframes/{asset}/{index}` returns the extracted
+/// keyframe image at that manifest position — `image/webp` bytes matching
+/// exactly what was written to the blob store, mirroring
+/// `thumb_resource_serves_webp_bytes`'s own shape assertions. Both images are
+/// planted up front and one server spawned for the whole test — spawning a
+/// fresh `maj mcp` child per loop iteration would work, but is needless
+/// per-iteration process overhead for a check that only reads two blobs.
+#[test]
+fn keyframe_image_resource_serves_webp_bytes_for_each_extracted_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let hex = majestical_index::blob::asset_hex(&asset).expect("xxh3 asset id");
+    let store = majestical_index::blob::BlobStore::new(&root);
+    let manifest_path = store.path_for(
+        hex,
+        &majestical_index::blob::Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    std::fs::create_dir_all(manifest_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &manifest_path,
+        br#"{"model_tag":"siglip2-b16-v1","detected":2,"timestamps":[1500,4500]}"#,
+    )
+    .expect("plant keyframe manifest");
+    let frames: [(u64, &[u8]); 2] = [(1500, b"frame-0".as_slice()), (4500, b"frame-1".as_slice())];
+    for (timestamp_ms, bytes) in frames {
+        let image_path = store.path_for(
+            hex,
+            &majestical_index::blob::Derivation::KeyframeImage {
+                model_tag: majestical_index::model::MODEL_TAG,
+                timestamp_ms,
+            },
+        );
+        std::fs::create_dir_all(image_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&image_path, bytes).expect("plant keyframe image blob");
+    }
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    for (index, (_, bytes)) in frames.iter().copied().enumerate() {
+        let resp = mcp.request(
+            "resources/read",
+            &serde_json::json!({"uri": format!("majestical://keyframes/{asset}/{index}")}),
+        );
+        let contents = &resp["result"]["contents"][0];
+        assert_eq!(
+            contents["mimeType"],
+            serde_json::json!("image/webp"),
+            "{resp}"
+        );
+        let blob = contents["blob"].as_str().expect("base64 blob field");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .expect("valid base64");
+        assert_eq!(decoded.as_slice(), bytes);
+    }
+}
+
+/// An index the manifest has no timestamp at (2, when only 2 exist — valid
+/// indices are 0 and 1) is a clean not-found, never a panic.
+#[test]
+fn keyframe_image_out_of_range_index_is_a_clean_resource_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    plant_manifest_and_one_keyframe_image(&root, &asset);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://keyframes/{asset}/2")}),
+    );
+    assert!(resp["result"].is_null(), "must not be a success: {resp}");
+    let message = resp["error"]["message"]
+        .as_str()
+        .expect("a protocol-level error");
+    assert!(
+        message.contains("no keyframe image at index 2"),
+        "{message}"
+    );
+}
+
+/// A malformed index (not an integer at all) is the same clean not-found as
+/// an out-of-range one — never a panic, and never a path join.
+#[test]
+fn keyframe_image_malformed_index_is_a_clean_resource_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    plant_manifest_and_one_keyframe_image(&root, &asset);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://keyframes/{asset}/x")}),
+    );
+    assert!(resp["result"].is_null(), "must not be a success: {resp}");
+    let message = resp["error"]["message"]
+        .as_str()
+        .expect("a protocol-level error");
+    assert!(message.contains("not a valid keyframe index"), "{message}");
+}
+
+/// The bare manifest resource lists an `images` entry for every timestamp
+/// whose extracted image blob actually exists — here, two timestamps but
+/// only ONE extracted image, so `images` names exactly index 0, not index 1
+/// (which the manifest has a timestamp for, but no blob yet).
+#[test]
+fn keyframes_resource_images_field_lists_only_extracted_indices() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    plant_manifest_and_one_keyframe_image(&root, &asset);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://keyframes/{asset}")}),
+    );
+    let contents = &resp["result"]["contents"][0];
+    let text = contents["text"].as_str().expect("text contents");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("valid json");
+    assert_eq!(
+        parsed["images"],
+        serde_json::json!([format!("majestical://keyframes/{asset}/0")]),
+        "{text}"
+    );
+}
+
+/// The panic this test suite guards against: `[]` is valid JSON but not a
+/// JSON OBJECT, so a version of `read_keyframes` that indexed a
+/// `serde_json::Value` parsed from these bytes (`value["images"] = ...`)
+/// would panic — `Value`'s `IndexMut` coerces `Null` into an object but
+/// PANICS on any other non-object shape (array, string, number, bool). A
+/// corrupted or hand-edited manifest blob on disk must be a clean protocol
+/// error, never something that can take the long-lived `maj mcp` process
+/// down. Only the MCP resource needs this test: the desktop app's
+/// `thumb://` `keyframes/<asset_id>` route (`thumb_protocol.rs`) never
+/// parses the manifest at all — it serves the blob's bytes verbatim as
+/// `application/json`, so it has no `images` augmentation to panic in.
+#[test]
+fn keyframes_resource_on_a_valid_json_non_object_manifest_is_a_clean_error_not_a_panic() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let asset = common::asset_id_of(&root, &state, "a.txt");
+    let hex = majestical_index::blob::asset_hex(&asset).expect("xxh3 asset id");
+    let store = majestical_index::blob::BlobStore::new(&root);
+    let manifest_path = store.path_for(
+        hex,
+        &majestical_index::blob::Derivation::KeyframeManifest {
+            model_tag: majestical_index::model::MODEL_TAG,
+        },
+    );
+    std::fs::create_dir_all(manifest_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&manifest_path, b"[]").expect("plant a non-object manifest");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.request(
+        "resources/read",
+        &serde_json::json!({"uri": format!("majestical://keyframes/{asset}")}),
+    );
+    assert!(
+        resp["result"].is_null(),
+        "a non-object manifest must not succeed: {resp}"
+    );
+    let message = resp["error"]["message"]
+        .as_str()
+        .expect("a protocol-level error, not a crashed server");
+    assert!(
+        message.contains("keyframe manifest") && message.contains("not valid JSON"),
+        "{message}"
+    );
+
+    // The server itself must still be alive and answering — a hard proof
+    // this wasn't a panic that killed the request-handling thread out from
+    // under a still-running process.
+    let alive = mcp.request("resources/templates/list", &serde_json::json!({}));
+    assert!(
+        alive["result"]["resourceTemplates"].is_array(),
+        "the server must still be responsive after the malformed manifest: {alive}"
     );
 }
 

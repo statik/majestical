@@ -6,6 +6,7 @@ pub mod blob;
 pub mod chunk;
 pub mod encoder;
 pub mod error;
+pub mod keyframe_images;
 pub mod model;
 pub mod ocr;
 pub mod pdf;

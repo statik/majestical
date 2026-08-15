@@ -7,7 +7,7 @@
   import { isoDay, timecode } from "./format";
   import Notices from "./Notices.svelte";
   import OnlineBadge from "./OnlineBadge.svelte";
-  import { fetchKeyframes, thumbUrl } from "./thumb";
+  import { fetchKeyframes, keyframeImageUrl, thumbUrl } from "./thumb";
   import type { KeyframeManifest } from "./thumb";
 
   let { assetId }: { assetId: string | null } = $props();
@@ -24,6 +24,10 @@
    *  not a failure and leaves this null: most assets are stills and have no
    *  manifest at all. */
   let keyframeError = $state<string | null>(null);
+  /** Indices of the strip whose `<img>` 404'd (extraction hasn't reached that
+   *  timestamp yet, or never will). Tracked so those slots fall back to the
+   *  plain timecode chip instead of a broken-image icon. */
+  let failedKeyframes = $state<number[]>([]);
   /** Same rule as the search surface: a slow lookup for an asset the user has
    *  already clicked past must not replace the one they are looking at. */
   let requestSeq = 0;
@@ -49,6 +53,7 @@
     failureNotices = [];
     keyframes = null;
     keyframeError = null;
+    failedKeyframes = [];
     if (id === null) return;
     try {
       const found = await api.getAsset(id);
@@ -86,6 +91,12 @@
   function newestFirst(records: AssetVerification[]): AssetVerification[] {
     // eslint-disable-next-line unicorn/no-array-sort -- see above.
     return [...records].sort((a, b) => b.hashdate_ms - a.hashdate_ms);
+  }
+
+  /** Falls the strip slot at `index` back to the timecode chip. Idempotent:
+   *  a broken `<img>` can fire `error` more than once. */
+  function markKeyframeFailed(index: number) {
+    if (!failedKeyframes.includes(index)) failedKeyframes.push(index);
   }
 
   function basename(path: string): string {
@@ -180,11 +191,35 @@
       {:else if keyframes !== null && keyframes.timestamps.length > 0}
         <section class="keyframes">
           <h3>Keyframes</h3>
-          <!-- Timestamps only: keyframe images are never stored (the manifest
-               is what exists), so this is a strip of timecodes. -->
+          <!-- One extracted image per timestamp, addressed by its position
+               in `timestamps` (`keyframeImageUrl`). A slot whose image 404s
+               (extraction hasn't reached it yet, or never will) falls back
+               to the plain timecode chip instead of a broken-image icon. -->
           <ul class="strip">
-            {#each keyframes.timestamps as ts}
-              <li class="timecode">{timecode(ts)}</li>
+            <!-- No key expression: `timestamps` came straight off the
+                 `thumb://` `keyframes` route, which serves the manifest
+                 blob's bytes verbatim with no uniqueness check on its own
+                 `timestamps` entries — a keyed `{#each}` would throw
+                 Svelte's duplicate-key error on a hand-edited or corrupt
+                 manifest and take the whole panel down with it. Position
+                 (`index`) is what `failedKeyframes` already keys on, so an
+                 unkeyed block's index-based diffing matches that model
+                 exactly. -->
+            {#each keyframes.timestamps as ts, index}
+              <li>
+                {#if failedKeyframes.includes(index)}
+                  <span class="timecode">{timecode(ts)}</span>
+                {:else}
+                  <img
+                    class="keyframe"
+                    src={keyframeImageUrl(assetId, index)}
+                    alt={timecode(ts)}
+                    width="64"
+                    height="48"
+                    onerror={() => markKeyframeFailed(index)}
+                  />
+                {/if}
+              </li>
             {/each}
           </ul>
           {#if keyframes.detected > keyframes.timestamps.length}

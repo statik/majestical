@@ -377,6 +377,37 @@ fn thumb_route_serves_the_planted_webp_bytes() {
     });
 }
 
+/// The real webview request shape: `convertFileSrc` percent-encodes the
+/// WHOLE path (`thumb%2Fxxh3%3A...`), not just the asset id's `:`
+/// (`thumb/xxh3%3A...`, [`encoded`]'s shape) — a version of `path_of` that
+/// decoded only after matching a literal `/thumb/` prefix would 404 every
+/// request a packaged app actually sends. Regression test for the bug that
+/// shipped in phase 7B: this exact request 404'd before `path_of` decoded
+/// the whole path up front.
+#[test]
+fn thumb_route_serves_the_planted_webp_bytes_when_the_whole_path_is_percent_encoded() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::Thumb,
+            b"RIFFfakewebp",
+        );
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!(
+                "thumb://localhost/{}",
+                fully_encoded(&format!("thumb/{SEEDED_ASSET}"))
+            ),
+        );
+        assert_eq!(response.status(), 200, "{}", body_of(&response));
+        assert_eq!(content_type(&response), Some("image/webp"));
+        assert_eq!(response.body(), b"RIFFfakewebp");
+    });
+}
+
 #[test]
 fn keyframes_route_serves_the_manifest_as_json() {
     with_state_dir(|| {
@@ -395,6 +426,34 @@ fn keyframes_route_serves_the_manifest_as_json() {
             &format!("thumb://localhost/keyframes/{}", encoded(SEEDED_ASSET)),
         );
         assert_eq!(response.status(), 200);
+        assert_eq!(content_type(&response), Some("application/json"));
+        assert_eq!(body_of(&response), r#"{"keyframes":[0,1500]}"#);
+    });
+}
+
+/// The real webview request shape for `keyframes` — see
+/// `thumb_route_serves_the_planted_webp_bytes_when_the_whole_path_is_percent_encoded`.
+#[test]
+fn keyframes_route_serves_the_manifest_as_json_when_the_whole_path_is_percent_encoded() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeManifest {
+                model_tag: majestical_index::model::MODEL_TAG,
+            },
+            br#"{"keyframes":[0,1500]}"#,
+        );
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!(
+                "thumb://localhost/{}",
+                fully_encoded(&format!("keyframes/{SEEDED_ASSET}"))
+            ),
+        );
+        assert_eq!(response.status(), 200, "{}", body_of(&response));
         assert_eq!(content_type(&response), Some("application/json"));
         assert_eq!(body_of(&response), r#"{"keyframes":[0,1500]}"#);
     });
@@ -448,6 +507,46 @@ fn keyframe_route_serves_the_extracted_image_at_each_index() {
         assert_eq!(second.status(), 200);
         assert_eq!(content_type(&second), Some("image/webp"));
         assert_eq!(second.body(), b"frame-1");
+    });
+}
+
+/// The real webview request shape for `keyframe/<asset_id>/<index>` — see
+/// `thumb_route_serves_the_planted_webp_bytes_when_the_whole_path_is_percent_encoded`.
+/// Also proves the two-segment split still lands on the right boundary once
+/// the WHOLE path (asset id, `/`, and index alike) has gone through one
+/// decode pass: `%2F` between the asset id and `0` decodes back to the `/`
+/// `keyframe_asset_and_index` splits on.
+#[test]
+fn keyframe_route_serves_the_extracted_image_when_the_whole_path_is_percent_encoded() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeManifest {
+                model_tag: majestical_index::model::MODEL_TAG,
+            },
+            br#"{"model_tag":"m","detected":2,"timestamps":[1500,4500]}"#,
+        );
+        plant_blob(
+            &cfg,
+            &majestical_index::blob::Derivation::KeyframeImage {
+                model_tag: majestical_index::model::MODEL_TAG,
+                timestamp_ms: 1500,
+            },
+            b"frame-0",
+        );
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!(
+                "thumb://localhost/{}",
+                fully_encoded(&format!("keyframe/{SEEDED_ASSET}/0"))
+            ),
+        );
+        assert_eq!(response.status(), 200, "{}", body_of(&response));
+        assert_eq!(content_type(&response), Some("image/webp"));
+        assert_eq!(response.body(), b"frame-0");
     });
 }
 
@@ -525,6 +624,40 @@ fn keyframe_route_traversal_payload_in_asset_id_is_a_clean_failure() {
             response.status(),
             400,
             "a malformed asset id is the caller's mistake, same as /thumb/ and /keyframes/: {}",
+            body_of(&response)
+        );
+        assert!(
+            body_of(&response).contains("not a valid asset id"),
+            "must report the asset id as the failure, not the index: {}",
+            body_of(&response)
+        );
+    });
+}
+
+/// The same guard, composed with the whole-path decode: a traversal
+/// payload's `/`s arrive as `%2F` (the real wire shape — see
+/// `thumb_route_serves_the_planted_webp_bytes_when_the_whole_path_is_percent_encoded`),
+/// decode back to real `/`s in `path_of`'s single decode pass, and
+/// `is_well_formed_asset_id` still rejects the result exactly as it does
+/// the literal-slash form above — the decode step doesn't weaken the guard,
+/// it just lets a REAL request ever reach it.
+#[test]
+fn keyframe_route_traversal_payload_arriving_fully_percent_encoded_is_a_clean_failure() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+
+        let response = thumb_protocol::handle(
+            Some(&cfg),
+            &format!(
+                "thumb://localhost/{}",
+                fully_encoded("keyframe/xxh3:../../../etc/passwd/0")
+            ),
+        );
+        assert_eq!(
+            response.status(),
+            400,
+            "a malformed asset id is the caller's mistake, same as the literal-slash form: {}",
             body_of(&response)
         );
         assert!(
@@ -617,10 +750,27 @@ fn a_selected_but_missing_catalog_is_a_503_naming_the_remedy() {
 }
 
 /// What `convertFileSrc` does to an asset id on the frontend side: the `:`
-/// in `xxh3:<hex>` arrives percent-encoded.
+/// in `xxh3:<hex>` arrives percent-encoded. Historical test convention —
+/// only the asset id's own `:` is encoded, the surrounding `/`s left
+/// literal — which is NOT the real wire shape (see [`fully_encoded`]), but
+/// decodes to the identical path either way, so both stay valid inputs.
 #[cfg(test)]
 fn encoded(asset_id: &str) -> String {
     asset_id.replace(':', "%3A")
+}
+
+/// What `convertFileSrc(filePath, protocol)` actually does, per Tauri
+/// 2.11.5's `core.js`: `encodeURIComponent` runs over the WHOLE `filePath`
+/// argument, not just an asset id inside it, so every `/` in `path` is
+/// `%2F` right along with any `:` becoming `%3A` — the real request shape a
+/// packaged app's webview sends, and what `Inspector.test.ts`'s vitest
+/// assertions compute for the same inputs via `mockConvertFileSrc`. A plain
+/// two-step replace is exact for every path this module builds (only `:`
+/// and `/` ever appear in one), without pulling in a JS-compatible
+/// percent-encoding crate feature just for tests.
+#[cfg(test)]
+fn fully_encoded(path: &str) -> String {
+    path.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// Every command error carries the whole `{err:#}` chain, which is where a

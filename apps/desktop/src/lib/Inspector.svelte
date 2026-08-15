@@ -196,7 +196,16 @@
                (extraction hasn't reached it yet, or never will) falls back
                to the plain timecode chip instead of a broken-image icon. -->
           <ul class="strip">
-            {#each keyframes.timestamps as ts, index (ts)}
+            <!-- No key expression: `timestamps` came straight off the
+                 `thumb://` `keyframes` route, which serves the manifest
+                 blob's bytes verbatim with no uniqueness check on its own
+                 `timestamps` entries — a keyed `{#each}` would throw
+                 Svelte's duplicate-key error on a hand-edited or corrupt
+                 manifest and take the whole panel down with it. Position
+                 (`index`) is what `failedKeyframes` already keys on, so an
+                 unkeyed block's index-based diffing matches that model
+                 exactly. -->
+            {#each keyframes.timestamps as ts, index}
               <li>
                 {#if failedKeyframes.includes(index)}
                   <span class="timecode">{timecode(ts)}</span>

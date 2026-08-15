@@ -1,9 +1,10 @@
 //! One cmd_* handler per CLI verb. main.rs owns clap definitions and dispatch;
 //! handlers own behavior.
-use crate::{MetaCmd, ParaCmd, TagCmd};
+use crate::{BrowseCmd, MetaCmd, ParaCmd, TagCmd};
 use anyhow::Result;
 use majestical_ingest::{engine, mhl, plan};
 use majestical_services::app::FsApp;
+use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseVolume};
 use majestical_services::iso8601::iso8601_ms;
 use majestical_services::volumes::VolumeRow;
 use std::path::{Path, PathBuf};
@@ -269,6 +270,153 @@ fn print_archive_moves(moves: &[majestical_services::para::ArchiveMove]) {
                 println!("moved {} -> {}", mv.from.display(), mv.to.display());
             }
         }
+    }
+}
+
+/// `maj browse tree`/`maj browse list`: dispatches to the two `browse`
+/// service verbs and renders their outcome. Only the DISPATCH shape follows
+/// `cmd_para`'s pattern (a subcommand `match` handing each arm to its own
+/// `cmd_browse_*` helper) — that's a structural borrow, not a rendering
+/// one: `cmd_para`'s `--json` output is hand-built (see `cmd_para_list`),
+/// while browse's is not. See `cmd_browse_tree`'s doc for that policy.
+pub(crate) fn cmd_browse(app: &mut FsApp, catalog_dir: &Path, cmd: BrowseCmd) -> Result<()> {
+    match cmd {
+        BrowseCmd::Tree { json } => cmd_browse_tree(app, catalog_dir, json),
+        BrowseCmd::List {
+            volume,
+            path,
+            no_flatten,
+            sort,
+            kind,
+            limit,
+            offset,
+            json,
+        } => {
+            let req = BrowseRequest {
+                volume,
+                path,
+                flatten: !no_flatten,
+                sort,
+                kind,
+                limit,
+                offset,
+            };
+            cmd_browse_list(app, catalog_dir, &req, json)
+        }
+    }
+}
+
+/// `browse`'s `--json` output is the service outcome struct serialized
+/// AS-IS (`serde_json::to_string(&outcome)`), not a hand-built
+/// `serde_json::json!` payload the way `cmd_volumes_list`/`cmd_para_list`
+/// render theirs. This is deliberate, not a gap to "harmonize" later:
+/// `volumes`/`para`'s hand-built payloads predate the services extraction,
+/// from when the CLI's rendering WAS the wire contract. Browse has no such
+/// history — its outcome structs (`BrowseTreeOutcome`/`BrowseListOutcome`)
+/// are already the wire contract for every other head: the GUI reads them
+/// directly, and the MCP `browse_tree`/`browse_assets` tools
+/// (`mcp_cmd/read_tools.rs`) serialize them verbatim as `structuredContent`
+/// per this server's own wire-contract doc (`mcp_cmd/mod.rs`). Reshaping
+/// the CLI's `--json` here would fork that contract between heads for no
+/// benefit — every consumer already gets, and expects, the struct as
+/// `browse.rs` defines it.
+///
+/// One consequence of "as-is": in `--json` mode, `outcome.notices` appears
+/// TWICE — once inside the JSON payload itself (dropped only when empty,
+/// via `#[serde(skip_serializing_if)]`), and again on stderr from
+/// `print_notices` below. That's not a bug either: every read verb in this
+/// file prints notices to stderr unconditionally, `--json` or not (the
+/// house convention every other `cmd_*_list` here follows), and an
+/// outcome's own `notices` field is part of the struct being serialized
+/// as-is per the policy above. Suppressing the payload's copy — or moving
+/// `print_notices` inside the `else` branch to suppress the stderr copy —
+/// would each break one of those two rules to "fix" the other.
+/// `browse_list_json_offline_notice_appears_on_stderr_and_in_payload` in
+/// `browse_smoke.rs` pins both appearances so neither regresses quietly.
+fn cmd_browse_tree(app: &FsApp, catalog_dir: &Path, json: bool) -> Result<()> {
+    let outcome = majestical_services::browse::browse_tree(app, catalog_dir)?;
+    crate::print_notices(&outcome.notices);
+    if json {
+        println!("{}", serde_json::to_string(&outcome)?);
+    } else {
+        print_browse_tree(&outcome.volumes);
+    }
+    Ok(())
+}
+
+/// Renders every volume's folder tree: a header line per volume (label, id,
+/// online/offline), then one indented line per non-root folder — full
+/// `/`-separated path (not just the leaf name, so a folder's line is a
+/// stable, greppable substring regardless of nesting) plus its recursive
+/// asset count. The root folder ("") is implied by the header line, so it's
+/// skipped here. Folders arrive from `browse_tree` already sorted
+/// lexicographically by path (a `BTreeMap` internally), which happens to
+/// also keep every folder after its parent.
+fn print_browse_tree(volumes: &[BrowseVolume]) {
+    if volumes.is_empty() {
+        println!("no volumes");
+        return;
+    }
+    for v in volumes {
+        let online = if v.online { "online" } else { "offline" };
+        println!("{} ({}) [{online}]", v.label, v.id);
+        for folder in &v.folders {
+            if folder.path.is_empty() {
+                continue;
+            }
+            let depth = folder.path.matches('/').count();
+            let indent = "  ".repeat(depth + 1);
+            println!("{indent}{}  {}", folder.path, folder.recursive_count);
+        }
+    }
+}
+
+/// Same `--json`-is-the-outcome-struct-verbatim policy as `cmd_browse_tree`
+/// — see that function's doc for why, and for the double-notice
+/// consequence in `--json` mode.
+fn cmd_browse_list(app: &FsApp, catalog_dir: &Path, req: &BrowseRequest, json: bool) -> Result<()> {
+    let outcome = majestical_services::browse::browse_list(app, catalog_dir, req)?;
+    crate::print_notices(&outcome.notices);
+    if json {
+        println!("{}", serde_json::to_string(&outcome)?);
+    } else {
+        print_browse_list(&outcome);
+    }
+    Ok(())
+}
+
+/// Renders a `browse list` outcome: a count line ("N items across M
+/// folders"), then one row per result — asset id, name, kind, size, and
+/// volume labels with an online/offline dot — following
+/// `search.rs::print_search_results_text`'s row style. The id leads each
+/// row (not just name/kind/size) so a browsed row alone gives an agent or
+/// user everything `maj meta`/`maj tag`/`maj para` need, without a
+/// re-resolving search. `kind`/`size` render "-" when absent (never
+/// expected for a browse row — see `browse_list`'s own doc — but `SearchHit`
+/// is the same row type `search` uses, where they can be `None`); both use
+/// the same placeholder rather than two different ones.
+fn print_browse_list(outcome: &BrowseListOutcome) {
+    println!(
+        "{} items across {} folders",
+        outcome.count, outcome.folder_count
+    );
+    for hit in &outcome.results {
+        let volumes: Vec<String> = hit
+            .volumes
+            .iter()
+            .map(|v| {
+                let dot = if v.online { '\u{25cf}' } else { '\u{25cb}' };
+                format!("{}{dot}", v.label)
+            })
+            .collect();
+        let kind = hit.kind.as_deref().unwrap_or("-");
+        let size = hit.size.map_or_else(|| "-".to_string(), |s| s.to_string());
+        println!(
+            "{}  {}  {kind}  {size}  [{}]",
+            hit.asset,
+            hit.name,
+            volumes.join(",")
+        );
     }
 }
 

@@ -93,6 +93,12 @@ pub struct BrowseListOutcome {
 /// unrecognized one.
 const SORT_VALUES: [&str; 3] = ["captured", "name", "size"];
 
+/// [`BrowseRequest::limit`]'s default across every head — the CLI's
+/// `--limit` and the MCP `browse_assets` tool's `limit` param both reference
+/// this rather than repeating the literal `50`, so the three defaults (here,
+/// clap, and the tool schema) can never drift apart.
+pub const DEFAULT_LIMIT: usize = 50;
+
 /// `maj browse tree`: every volume's folder structure, derived from every
 /// cataloged instance path on it.
 ///

@@ -1,4 +1,4 @@
-//! The 10 read-only MCP tools: each opens (or, for the two that never touch
+//! The 12 read-only MCP tools: each opens (or, for the two that never touch
 //! the event log, guards) a fresh catalog handle and serializes the matching
 //! `majestical_services` outcome straight through — see `super`'s module doc
 //! for the shared wire contract.
@@ -52,6 +52,48 @@ struct RunSavedSearchArgs {
     /// Max results (default 50).
     #[serde(default = "default_search_limit")]
     limit: usize,
+}
+
+/// `browse_assets`'s `limit` default, sharing `majestical_services::browse`'s
+/// own constant with `maj browse list`'s `--limit` — one source for the
+/// default so the CLI, this tool's schema, and the service can never drift
+/// apart.
+fn default_browse_limit() -> usize {
+    majestical_services::browse::DEFAULT_LIMIT
+}
+
+/// `browse_assets`'s `flatten` default: true, matching `maj browse list`
+/// (flatten is opt-out there, via `--no-flatten`).
+fn default_flatten() -> bool {
+    true
+}
+
+/// Params for `browse_assets`, mirroring
+/// `majestical_services::browse::BrowseRequest`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BrowseAssetsArgs {
+    /// Volume id (see `list_volumes`).
+    volume: String,
+    /// Folder path relative to the volume root (default: "", the root).
+    #[serde(default)]
+    path: String,
+    /// Include the whole subtree under `path` (default true), not just its
+    /// immediate children (false).
+    #[serde(default = "default_flatten")]
+    flatten: bool,
+    /// "captured" (default: newest `mtime_ms` first), "name" (ascending),
+    /// or "size" (descending).
+    #[serde(default)]
+    sort: Option<String>,
+    /// Filter to one media kind (image, video, audio, pdf, other).
+    #[serde(default)]
+    kind: Option<String>,
+    /// Max results (default 50).
+    #[serde(default = "default_browse_limit")]
+    limit: usize,
+    /// Pagination offset (default 0).
+    #[serde(default)]
+    offset: usize,
 }
 
 /// `list_saved_searches`'s structured result — the service verb returns a
@@ -143,6 +185,46 @@ impl MajServer {
             Err(result) => return result,
         };
         match majestical_services::volumes::volumes_list(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Every volume's folder tree, with a recursive asset count per folder
+    /// (an asset with multiple instances under one folder's subtree still
+    /// counts once).
+    #[tool]
+    fn browse_tree(&self) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        match majestical_services::browse::browse_tree(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists assets under one folder of one volume — the whole subtree by
+    /// default (`flatten: true`), sorted newest-first by default
+    /// (`sort: "captured"`). Rows are the same shape `search_assets`
+    /// returns, plus `size`/`mtime_ms`/`kind`.
+    #[tool]
+    fn browse_assets(&self, Parameters(args): Parameters<BrowseAssetsArgs>) -> CallToolResult {
+        let app = match self.open_app() {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        let req = majestical_services::browse::BrowseRequest {
+            volume: args.volume,
+            path: args.path,
+            flatten: args.flatten,
+            sort: args.sort,
+            kind: args.kind,
+            limit: args.limit,
+            offset: args.offset,
+        };
+        match majestical_services::browse::browse_list(&app, &self.catalog, &req) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }

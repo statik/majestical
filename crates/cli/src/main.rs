@@ -127,6 +127,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ParaCmd,
     },
+    /// Browse the catalog by folder: every volume's folder tree, or one
+    /// folder's listing.
+    Browse {
+        #[command(subcommand)]
+        cmd: BrowseCmd,
+    },
     /// Re-verify a destination against its ASC MHL history; appends a generation.
     Verify {
         dir: PathBuf,
@@ -202,6 +208,46 @@ enum ParaCmd {
         root: Vec<PathBuf>,
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrowseCmd {
+    /// Every volume's folder tree, with a recursive asset count per folder.
+    Tree {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List assets under one folder of one volume — the whole subtree by
+    /// default (see `--no-flatten`), sorted newest-first by default (see
+    /// `--sort`).
+    List {
+        /// Volume id (see `maj volumes list`).
+        #[arg(long, required = true)]
+        volume: String,
+        /// Folder path relative to the volume root ("" for the root).
+        #[arg(long, default_value = "")]
+        path: String,
+        /// List only this folder's immediate children instead of its whole
+        /// subtree.
+        #[arg(long)]
+        no_flatten: bool,
+        /// "captured" (newest `mtime` first, default), "name" (A-Z), or
+        /// "size" (largest first).
+        #[arg(long)]
+        sort: Option<String>,
+        /// Filter to one media kind (image, video, audio, pdf, other).
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = majestical_services::browse::DEFAULT_LIMIT)]
+        limit: usize,
+        /// Skip this many matches (post-sort, pre-limit) before the page
+        /// starts — pair with `--limit` to page through results past the
+        /// first `--limit`-sized batch.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -668,6 +714,9 @@ fn main() -> Result<()> {
         })?,
         Cmd::Para { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
             commands::cmd_para(app, &cli.catalog, cmd)
+        })?,
+        Cmd::Browse { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            commands::cmd_browse(app, &cli.catalog, cmd)
         })?,
         // Deliberately does not open a catalog: `verify` re-checks a
         // destination directory against its own ASC MHL history, which

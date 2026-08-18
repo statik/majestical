@@ -1177,6 +1177,111 @@ fn ingest_dry_run_places_nothing_and_writes_no_journal() {
     );
 }
 
+/// `maj ingest unfinished` lists the runs `--resume` can still finish, and
+/// only those. Arranged with a real, deterministic per-file failure: a
+/// directory sitting at one file's final path makes its rename fail while
+/// the other file places normally, so the run's journal ends with one of
+/// two files placed — the two-asset shape that tells `1` apart from "all"
+/// and from "none".
+#[test]
+fn ingest_unfinished_lists_a_run_with_files_left_and_nothing_once_it_is_done() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("a.mov"), b"AAAA").unwrap();
+    std::fs::write(media.path().join("b.mov"), b"BBBB").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let d1 = tempfile::tempdir().unwrap();
+
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+
+    // Nothing has run yet.
+    let out = maj(&root, &state)
+        .args(["ingest", "unfinished", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["runs"].as_array().unwrap().len(), 0);
+
+    // A fixed template makes the destination path predictable, so a.mov's
+    // final path can be occupied by a directory before the run starts.
+    std::fs::create_dir_all(d1.path().join("Projects/shoot/fixed/a.mov")).unwrap();
+    maj(&root, &state)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .args(["--para", "project/shoot", "--template", "fixed"])
+        .assert()
+        .failure();
+
+    let out = maj(&root, &state)
+        .args(["ingest", "unfinished", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let runs = parsed["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{parsed}");
+    assert_eq!(runs[0]["placed"], 1, "{parsed}");
+    assert_eq!(runs[0]["planned"], 2, "{parsed}");
+    assert_eq!(
+        runs[0]["source"],
+        serde_json::json!(media.path().display().to_string())
+    );
+    assert_eq!(
+        runs[0]["destinations"],
+        serde_json::json!([d1.path().display().to_string()])
+    );
+    let run_id = runs[0]["run_id"].as_str().unwrap().to_string();
+
+    // The human rendering names the same run, its counts, and its source.
+    maj(&root, &state)
+        .args(["ingest", "unfinished"])
+        .assert()
+        .success()
+        .stdout(contains(&run_id))
+        .stdout(contains("1/2 placed"));
+
+    // Clear the obstruction and resume: with everything placed, the run
+    // drops off the listing entirely.
+    std::fs::remove_dir(d1.path().join("Projects/shoot/fixed/a.mov")).unwrap();
+    maj(&root, &state)
+        .args(["ingest"])
+        .arg(media.path())
+        .arg("--dest")
+        .arg(d1.path())
+        .args([
+            "--para",
+            "project/shoot",
+            "--template",
+            "fixed",
+            "--resume",
+            &run_id,
+        ])
+        .assert()
+        .success();
+
+    let out = maj(&root, &state)
+        .args(["ingest", "unfinished", "--json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        parsed["runs"].as_array().unwrap().len(),
+        0,
+        "a run that placed everything it planned is finished: {parsed}"
+    );
+}
+
 /// A source that isn't a directory is rejected up front, before any
 /// planning, copying, or journal writes.
 #[test]

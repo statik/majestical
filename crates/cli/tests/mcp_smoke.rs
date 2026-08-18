@@ -156,6 +156,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "list_saved_searches",
     "list_sync_locations",
     "list_tags",
+    "list_unfinished_ingests",
     "list_volumes",
     "merge_tags",
     "move_para",
@@ -528,9 +529,9 @@ fn browse_assets_unknown_volume_is_a_tool_error() {
     assert!(text.contains("maj volumes list"), "{text}");
 }
 
-/// `browse_tree`/`browse_assets` are read tools, so — unlike every tool in
-/// `MUTATING_TOOLS` — their `inputSchema` must carry no `confirm` property
-/// at all.
+/// `browse_tree`/`browse_assets`/`list_unfinished_ingests` are read tools,
+/// so — unlike every tool in `MUTATING_TOOLS` — their `inputSchema` must
+/// carry no `confirm` property at all.
 #[test]
 fn browse_tools_carry_no_confirm_param() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -538,7 +539,7 @@ fn browse_tools_carry_no_confirm_param() {
     let mut mcp = Mcp::spawn(&root, &state);
     let resp = mcp.request("tools/list", &serde_json::json!({}));
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    for name in ["browse_tree", "browse_assets"] {
+    for name in ["browse_tree", "browse_assets", "list_unfinished_ingests"] {
         let tool = tools
             .iter()
             .find(|t| t["name"] == serde_json::json!(name))
@@ -848,6 +849,67 @@ fn list_tags_matches_service_outcome() {
     assert_eq!(tags[0]["tag"], serde_json::json!("demo"), "{resp}");
     assert_eq!(tags[0]["count"], serde_json::json!(1), "{resp}");
     assert!(tags[0]["last_used_ms"].is_u64(), "{resp}");
+}
+
+/// `list_unfinished_ingests` serializes
+/// `majestical_services::ingest::UnfinishedRunsOutcome` as-is. Arranged
+/// through the CLI so the run is a real one: a directory parked at
+/// `a.mov`'s final path fails that file's rename while `b.mov` places, so
+/// the run ends one of two files placed.
+#[test]
+fn list_unfinished_ingests_matches_service_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_unfinished_ingests", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["structuredContent"],
+        serde_json::json!({"runs": []}),
+        "a catalog nothing has ingested into has no resumable runs: {resp}"
+    );
+    drop(mcp);
+
+    let media = dir.path().join("card");
+    std::fs::create_dir_all(&media).expect("mkdir");
+    std::fs::write(media.join("a.mov"), b"AAAA").expect("write");
+    std::fs::write(media.join("b.mov"), b"BBBB").expect("write");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(dest.join("Projects/shoot/fixed/a.mov")).expect("mkdir");
+    common::maj(&root, &state)
+        .args(["para", "add", "project", "shoot"])
+        .assert()
+        .success();
+    common::maj(&root, &state)
+        .args(["ingest"])
+        .arg(&media)
+        .arg("--dest")
+        .arg(&dest)
+        .args(["--para", "project/shoot", "--template", "fixed"])
+        .assert()
+        .failure();
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("list_unfinished_ingests", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let runs = resp["result"]["structuredContent"]["runs"]
+        .as_array()
+        .expect("runs array");
+    assert_eq!(runs.len(), 1, "{resp}");
+    assert_eq!(runs[0]["placed"], serde_json::json!(1), "{resp}");
+    assert_eq!(runs[0]["planned"], serde_json::json!(2), "{resp}");
+    assert_eq!(
+        runs[0]["source"],
+        serde_json::json!(media.display().to_string()),
+        "{resp}"
+    );
+    assert_eq!(
+        runs[0]["destinations"],
+        serde_json::json!([dest.display().to_string()]),
+        "{resp}"
+    );
+    assert!(runs[0]["run_id"].is_string(), "{resp}");
 }
 
 /// The 20 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —

@@ -1,7 +1,7 @@
-//! The 13 read-only MCP tools: each opens (or, for the two that never touch
-//! the event log, guards) a fresh catalog handle and serializes the matching
-//! `majestical_services` outcome straight through — see `super`'s module doc
-//! for the shared wire contract.
+//! The 14 read-only MCP tools: each opens (or, for the three that never
+//! touch the event log, guards) a fresh catalog handle and serializes the
+//! matching `majestical_services` outcome straight through — see `super`'s
+//! module doc for the shared wire contract.
 use super::MajServer;
 use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
@@ -337,6 +337,21 @@ impl MajServer {
             Err(result) => return result,
         };
         match majestical_services::tags::tags_list(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Lists ingest runs whose journal still has planned files that were
+    /// never placed — the runs `ingest_source`'s CLI counterpart can finish
+    /// with `maj ingest <source> --resume <run_id>`. Newest first. A run
+    /// that placed everything it planned is finished and is not listed.
+    #[tool]
+    fn list_unfinished_ingests(&self) -> CallToolResult {
+        if let Err(result) = self.ensure_catalog() {
+            return result;
+        }
+        match majestical_services::ingest::ingest_unfinished(&self.catalog) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }

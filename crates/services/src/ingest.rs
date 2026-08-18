@@ -185,12 +185,40 @@ fn plan_impl(
 /// only that one contribution without aborting its pass.
 pub struct ExecuteIngest<'a> {
     pub plan: &'a plan::IngestPlan,
+    /// The directory the plan was walked from — recorded in the run's
+    /// journal so [`ingest_unfinished`] can name it later.
+    pub source: &'a Path,
     pub dest: &'a [PathBuf],
     pub subdir: &'a str,
     pub node_id: &'a str,
     pub source_volume: (&'a str, &'a str),
     pub jobs: Option<usize>,
     pub resume: Option<&'a str>,
+    /// Where progress goes and how the run is asked to stop. A head with
+    /// nothing to render passes [`silent_control`].
+    pub control: &'a engine::RunControl<'a>,
+}
+
+/// A `RunControl` that discards every progress event and never cancels —
+/// what a head passes while it has no progress surface to render to and no
+/// cancel affordance to offer (`maj ingest`, `maj inbox process`, and the
+/// MCP `ingest_source` tool, all of which run to completion or fail).
+/// Backed by statics so it borrows nothing from the caller.
+///
+/// The returned cancel flag is shared process-wide — never store into it. A
+/// single `store(true)` anywhere would permanently cancel every later
+/// silent run in the same process, which in a long-lived host (the GUI
+/// backend) means every subsequent ingest stops after its first file. A
+/// caller that needs a cancellable run builds its own `RunControl` over a
+/// flag it owns.
+#[must_use]
+pub fn silent_control() -> engine::RunControl<'static> {
+    static DISCARD: fn(engine::ProgressEvent) = |_event| {};
+    static NEVER: engine::CancelFlag = engine::CancelFlag::new(false);
+    engine::RunControl {
+        progress: &DISCARD,
+        cancel: &NEVER,
+    }
 }
 
 /// One `run_ingest` call's identity plus its engine result and the ASC MHL
@@ -235,6 +263,14 @@ pub struct IngestRun {
 ///   would wrongly mark healthy ones failed too. Truthful incompleteness
 ///   beats a confidently wrong record; see the phase 3 watchlist.
 ///
+/// `exec.control` carries the run's progress sink and cancel flag straight
+/// through to the engine, unchanged and unthrottled: the engine emits one
+/// `BytesCopied` per 1 MiB copy buffer, and this layer deliberately does
+/// not coalesce them. Whether that cadence is too chatty is a per-head
+/// question — an in-process GUI forwarding them as IPC events is the head
+/// that has to decide (Task 19), and it can throttle what it forwards
+/// without every other caller paying for a policy it didn't ask for.
+///
 /// Moved from `crates/cli/src/commands.rs::run_ingest`.
 ///
 /// # Errors
@@ -267,8 +303,10 @@ fn run_ingest_impl(
         catalog_dir,
         run_id: &run_id,
         ingest_plan: exec.plan,
+        source: exec.source,
         dests: &dests,
         jobs: exec.jobs,
+        control: exec.control,
         notices: app.notices(),
     })?;
     let hashdate_ms = physical_now_ms();
@@ -291,6 +329,157 @@ fn run_ingest_impl(
         generations,
         notices: app.notices().drain(),
     })
+}
+
+/// One resumable run: how many files it set out to copy, how many landed,
+/// and what it was copying between. `planned`, `source`, and
+/// `destinations` all come from the run's `RunStarted` journal record — a
+/// journal written before that record was ever appended (or one whose
+/// first line was lost to a torn write) falls back to the files it
+/// actually attempted, and lists source and destinations empty rather than
+/// guessing at them.
+#[derive(Debug, serde::Serialize)]
+pub struct UnfinishedRun {
+    pub run_id: String,
+    pub placed: u64,
+    pub planned: u64,
+    pub source: String,
+    pub destinations: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct UnfinishedRunsOutcome {
+    pub runs: Vec<UnfinishedRun>,
+    /// Diagnostics collected during this operation, verbatim — the lines the
+    /// CLI prints to stderr. Absent from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notices: Vec<String>,
+}
+
+/// Every run whose journal shows planned files that were never checkpointed
+/// placed — the `--resume` candidates, newest first (run ids are ULIDs, so
+/// descending lexicographic order is descending chronological order).
+///
+/// "Unfinished" is "the run placed fewer files than it set out to copy".
+/// The total is the count its `RunStarted` record recorded, so a run that
+/// stopped for any reason — cancelled with files still queued, crashed
+/// mid-file, or ended with failures — is listed, because `--resume` is the
+/// right next step in every one of those cases. A run that placed
+/// everything it set out to copy is finished and is not listed; neither is
+/// a journal that set out to copy nothing.
+///
+/// A journal that cannot be read is a notice on the outcome and a skipped
+/// row, never an aborted listing — one unreadable file must not hide every
+/// other resumable run.
+///
+/// # Errors
+/// Returns an error only if the catalog's state directory can't be resolved
+/// or its `runs/` directory can't be listed at all.
+pub fn ingest_unfinished(
+    catalog_dir: &Path,
+) -> Result<UnfinishedRunsOutcome, crate::error::ServiceError> {
+    let notices = crate::notices::Notices::new();
+    let result = ingest_unfinished_impl(catalog_dir, &notices)
+        .map_err(crate::error::ServiceError::from)
+        .map(|runs| UnfinishedRunsOutcome {
+            runs,
+            notices: notices.drain(),
+        });
+    notices.attach_on_err(result)
+}
+
+fn ingest_unfinished_impl(
+    catalog_dir: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<Vec<UnfinishedRun>> {
+    let runs_dir = crate::state_dir::catalog_paths(catalog_dir, notices)?.runs_dir;
+    let entries = std::fs::read_dir(&runs_dir)
+        .with_context(|| format!("listing ingest run journals in {}", runs_dir.display()))?;
+    let mut runs = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                notices.push(format!(
+                    "skipping an unreadable entry in {}: {err}",
+                    runs_dir.display()
+                ));
+                continue;
+            }
+        };
+        let Some(file_stem) = journal_run_id(&path) else {
+            continue;
+        };
+        match unfinished_run_at(&path, file_stem) {
+            Ok(run) => runs.extend(run),
+            Err(err) => notices.push(format!(
+                "skipping unreadable run journal {}: {err:#}",
+                path.display()
+            )),
+        }
+    }
+    // ULIDs sort chronologically, so descending run id is newest-first.
+    runs.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+    Ok(runs)
+}
+
+/// The run id a `<run id>.jsonl` filename carries, or `None` for anything
+/// else living in the runs directory — one question answered once, rather
+/// than an extension check followed by a stem extraction that can no longer
+/// fail but still has to be written as if it could.
+fn journal_run_id(path: &Path) -> Option<String> {
+    if path.extension()? != "jsonl" {
+        return None;
+    }
+    Some(path.file_stem()?.to_string_lossy().into_owned())
+}
+
+/// Folds one journal and reports it as unfinished, or `None` when every
+/// file it set out to copy was placed (or it set out to copy nothing).
+///
+/// The total comes from the `RunStarted` record, which is the only line
+/// that knows how big the run was: `FilePlanned` records only cover files a
+/// worker reached, so a cancelled run's untouched queue entries left no
+/// trace. Taking the larger of the two keeps that count honest for a
+/// journal with no start record at all (nothing recorded it) and for a
+/// resume whose plan grew (more files attempted than the original run
+/// intended) — in both cases the attempted files are the floor.
+///
+/// `file_stem` is only a fallback identity: the run's own `RunStarted`
+/// record is what a resume must be given, and a journal that was copied or
+/// renamed on disk would otherwise be listed under a run id `--resume`
+/// doesn't know.
+fn unfinished_run_at(path: &Path, file_stem: String) -> Result<Option<UnfinishedRun>> {
+    let folded = journal::Journal::load(path)
+        .with_context(|| format!("loading journal at {}", path.display()))?;
+    let attempted = folded.planned.len() as u64;
+    let planned = folded
+        .started
+        .as_ref()
+        .map_or(0, |started| started.planned)
+        .max(attempted);
+    // Counted over the attempted set rather than `placed.len()` so a
+    // journal holding a placed rel nobody planned (a hand-edited or
+    // interleaved file) can never report more placed than planned.
+    let placed = folded
+        .planned
+        .keys()
+        .filter(|rel| folded.placed.contains(*rel))
+        .count() as u64;
+    if placed >= planned {
+        return Ok(None);
+    }
+    let (run_id, source, destinations) = folded.started.map_or_else(
+        || (file_stem, String::new(), Vec::new()),
+        |started| (started.run, started.source, started.dests),
+    );
+    Ok(Some(UnfinishedRun {
+        run_id,
+        placed,
+        planned,
+        source,
+        destinations,
+    }))
 }
 
 /// Default worker count: available CPU cores, capped at 8 — a card reader or
@@ -351,8 +540,10 @@ struct RunEngineArgs<'a> {
     catalog_dir: &'a Path,
     run_id: &'a str,
     ingest_plan: &'a plan::IngestPlan,
+    source: &'a Path,
     dests: &'a [engine::DestSpec],
     jobs: Option<usize>,
+    control: &'a engine::RunControl<'a>,
     notices: &'a crate::notices::Notices,
 }
 
@@ -364,13 +555,20 @@ struct RunEngineArgs<'a> {
 /// call `check_resume_journal_exists` first — this function creates the
 /// journal file if it's missing, which is correct for a fresh run but would
 /// silently paper over a typo'd `--resume` id.
+///
+/// A `RunStarted` record goes in before any file record: it is the only
+/// place a journal keeps what the run was copying and where to, which is
+/// what lets [`ingest_unfinished`] describe a run it never saw start. A
+/// resume appends a second one; the fold keeps the first.
 fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
     let RunEngineArgs {
         catalog_dir,
         run_id,
         ingest_plan,
+        source,
         dests,
         jobs,
+        control,
         notices,
     } = *args;
     let journal_path = journal_path_for(catalog_dir, run_id, notices)?;
@@ -379,14 +577,17 @@ fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
         .placed;
     let mut journal = journal::Journal::open_append(&journal_path)
         .with_context(|| format!("opening journal at {}", journal_path.display()))?;
+    journal
+        .append(&journal::Record::RunStarted {
+            run: run_id.to_string(),
+            source: source.display().to_string(),
+            dests: dests.iter().map(|d| d.root.display().to_string()).collect(),
+            planned: ingest_plan.copyable_files(),
+        })
+        .with_context(|| format!("recording the run start at {}", journal_path.display()))?;
     let config = engine::EngineConfig {
         jobs: jobs.unwrap_or_else(default_jobs),
     };
-    // Task 18 threads a real progress sink and a caller-owned cancel flag
-    // through this layer; until then every run here is uninterruptible and
-    // its events go nowhere.
-    let discard = |_event: engine::ProgressEvent| {};
-    let cancel = engine::CancelFlag::new(false);
     engine::run(
         ingest_plan,
         dests,
@@ -394,10 +595,7 @@ fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
         &mut journal,
         &engine::RealSinks,
         &config,
-        &engine::RunControl {
-            progress: &discard,
-            cancel: &cancel,
-        },
+        control,
     )
     .context("running ingest engine")
 }
@@ -675,12 +873,14 @@ mod tests {
             &dir.path().join("cat"),
             &ExecuteIngest {
                 plan: &planned.plan,
+                source: source.path(),
                 dest: &dest_roots,
                 subdir: &planned.subdir,
                 node_id: &planned.node_id,
                 source_volume: (&planned.source_volume_id, &planned.source_volume_label),
                 jobs: Some(1),
                 resume: None,
+                control: &silent_control(),
             },
             &mut |line| notices.push(line.to_string()),
         )
@@ -691,6 +891,240 @@ mod tests {
         assert!(notices[0].contains(&run.run_id));
         assert!(notices[0].contains("--resume"));
         assert_eq!(run.generations.len(), 1);
+    }
+
+    /// Arranges a catalog with one PARA node and a two-file source, plans
+    /// it, and hands back everything `run_ingest` needs. Returns the temp
+    /// dirs too — dropping them would delete the source and destination
+    /// mid-test.
+    struct IngestFixture {
+        app: FsApp,
+        catalog_dir: PathBuf,
+        planned: IngestPlanOutcome,
+        dest_roots: Vec<PathBuf>,
+        _dir: tempfile::TempDir,
+        source: tempfile::TempDir,
+        _dest: tempfile::TempDir,
+    }
+
+    fn two_file_fixture() -> IngestFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = init_app(dir.path());
+        crate::para::add(&mut app, "project", "client-x").expect("add");
+        let source = tempfile::tempdir().expect("tempdir");
+        std::fs::write(source.path().join("a.mov"), b"hello").expect("write");
+        std::fs::write(source.path().join("b.mov"), b"there").expect("write");
+        let planned = plan(
+            &app,
+            source.path(),
+            "project/client-x",
+            "raw",
+            plan::DedupeMode::Skip,
+        )
+        .expect("plan");
+        let dest = tempfile::tempdir().expect("tempdir");
+        IngestFixture {
+            catalog_dir: dir.path().join("cat"),
+            dest_roots: vec![dest.path().to_path_buf()],
+            app,
+            planned,
+            _dir: dir,
+            source,
+            _dest: dest,
+        }
+    }
+
+    impl IngestFixture {
+        /// Runs the fixture's plan under `control`, returning the run.
+        fn run(&mut self, control: &engine::RunControl<'_>) -> IngestRun {
+            run_ingest(
+                &mut self.app,
+                &self.catalog_dir,
+                &ExecuteIngest {
+                    plan: &self.planned.plan,
+                    source: self.source.path(),
+                    dest: &self.dest_roots,
+                    subdir: &self.planned.subdir,
+                    node_id: &self.planned.node_id,
+                    source_volume: (
+                        &self.planned.source_volume_id,
+                        &self.planned.source_volume_label,
+                    ),
+                    jobs: Some(1),
+                    resume: None,
+                    control,
+                },
+                &mut |_line| {},
+            )
+            .expect("run_ingest")
+        }
+    }
+
+    /// The engine's event stream must reach the caller's closure unchanged
+    /// and unfiltered — this layer only passes the control through.
+    #[test]
+    fn run_ingest_forwards_every_engine_progress_event_to_the_caller() {
+        let mut fixture = two_file_fixture();
+        let events = std::sync::Mutex::new(Vec::new());
+        let cancel = engine::CancelFlag::new(false);
+        let progress = |event: engine::ProgressEvent| {
+            events.lock().expect("events lock").push(event);
+        };
+        let run = fixture.run(&engine::RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        });
+        assert_eq!(run.outcome.placed.len(), 2);
+
+        let events = events.into_inner().expect("events");
+        assert_eq!(
+            events.first(),
+            Some(&engine::ProgressEvent::RunStarted {
+                files_total: 2,
+                bytes_total: 10,
+            })
+        );
+        assert_eq!(
+            events.last(),
+            Some(&engine::ProgressEvent::RunStopped { cancelled: false })
+        );
+        let placed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                engine::ProgressEvent::FilePlaced { rel } => Some(rel.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(placed, vec!["a.mov", "b.mov"], "{events:?}");
+    }
+
+    /// A cancelled run is the case this listing exists for: the flag is set
+    /// from inside the first `FilePlaced`, so with one worker the second
+    /// file is never popped — and nothing in the journal's per-file records
+    /// would show it was ever meant to be copied.
+    #[test]
+    fn ingest_unfinished_lists_a_cancelled_run_with_its_placed_and_planned_counts() {
+        let mut fixture = two_file_fixture();
+        let cancel = engine::CancelFlag::new(false);
+        let progress = |event: engine::ProgressEvent| {
+            if let engine::ProgressEvent::FilePlaced { .. } = event {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let run = fixture.run(&engine::RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        });
+        assert_eq!(run.outcome.placed.len(), 1, "one file of two got through");
+
+        let outcome = ingest_unfinished(&fixture.catalog_dir).expect("unfinished");
+        assert_eq!(outcome.runs.len(), 1, "{outcome:?}");
+        let listed = &outcome.runs[0];
+        assert_eq!(listed.run_id, run.run_id);
+        assert_eq!(listed.placed, 1);
+        assert_eq!(
+            listed.planned, 2,
+            "the queued file nobody popped still counts as planned"
+        );
+        assert_eq!(listed.source, fixture.source.path().display().to_string());
+        assert_eq!(
+            listed.destinations,
+            vec![fixture.dest_roots[0].display().to_string()]
+        );
+        assert!(outcome.notices.is_empty(), "{:?}", outcome.notices);
+    }
+
+    /// A run that placed everything it planned is finished — listing it
+    /// would send an operator resuming a run with nothing left to do.
+    #[test]
+    fn ingest_unfinished_ignores_a_run_that_placed_everything() {
+        let mut fixture = two_file_fixture();
+        let run = fixture.run(&silent_control());
+        assert_eq!(run.outcome.placed.len(), 2);
+        let outcome = ingest_unfinished(&fixture.catalog_dir).expect("unfinished");
+        assert!(outcome.runs.is_empty(), "{outcome:?}");
+    }
+
+    /// A catalog nothing has ever ingested into lists nothing, and says so
+    /// with an empty outcome rather than an error.
+    #[test]
+    fn ingest_unfinished_on_a_fresh_catalog_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _app = init_app(dir.path());
+        let outcome = ingest_unfinished(&dir.path().join("cat")).expect("unfinished");
+        assert!(outcome.runs.is_empty(), "{outcome:?}");
+        assert!(outcome.notices.is_empty(), "{:?}", outcome.notices);
+    }
+
+    /// Run ids are ULIDs, so newest-first is descending id order. Written
+    /// by hand rather than by two real runs: two runs in the same
+    /// millisecond would order by ULID randomness, which is exactly the
+    /// ambiguity this assertion must not depend on.
+    #[test]
+    fn ingest_unfinished_lists_the_newest_run_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog_dir = dir.path().join("cat");
+        let _app = init_app(dir.path());
+        let notices = crate::notices::Notices::new();
+        for run_id in ["01AAAAAAAAAAAAAAAAAAAAAAAA", "01BBBBBBBBBBBBBBBBBBBBBBBB"] {
+            let path = journal_path_for(&catalog_dir, run_id, &notices).expect("journal path");
+            let mut journal = journal::Journal::open_append(&path).expect("open_append");
+            journal
+                .append(&journal::Record::RunStarted {
+                    run: run_id.to_string(),
+                    source: "/Volumes/card".to_string(),
+                    dests: vec!["/Volumes/one".to_string()],
+                    planned: 2,
+                })
+                .expect("append started");
+        }
+
+        let outcome = ingest_unfinished(&catalog_dir).expect("unfinished");
+        let ids: Vec<&str> = outcome.runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["01BBBBBBBBBBBBBBBBBBBBBBBB", "01AAAAAAAAAAAAAAAAAAAAAAAA"]
+        );
+        assert_eq!(outcome.runs[0].placed, 0, "nothing was ever placed");
+        assert_eq!(outcome.runs[0].planned, 2);
+    }
+
+    /// One unreadable journal must cost exactly one row, not the listing: a
+    /// directory sitting where a journal file belongs is the same
+    /// non-`NotFound` read error a permissions problem produces.
+    #[test]
+    fn ingest_unfinished_notices_an_unreadable_journal_and_keeps_the_rest() {
+        let mut fixture = two_file_fixture();
+        let cancel = engine::CancelFlag::new(false);
+        let progress = |event: engine::ProgressEvent| {
+            if let engine::ProgressEvent::FilePlaced { .. } = event {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let run = fixture.run(&engine::RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        });
+
+        let notices = crate::notices::Notices::new();
+        let runs_dir = crate::state_dir::catalog_paths(&fixture.catalog_dir, &notices)
+            .expect("paths")
+            .runs_dir;
+        std::fs::create_dir(runs_dir.join("01BOGUSRUNID.jsonl")).expect("mkdir");
+
+        let outcome = ingest_unfinished(&fixture.catalog_dir).expect("unfinished");
+        assert_eq!(
+            outcome.runs.len(),
+            1,
+            "the readable run still lists: {outcome:?}"
+        );
+        assert_eq!(outcome.runs[0].run_id, run.run_id);
+        assert_eq!(outcome.notices.len(), 1, "{:?}", outcome.notices);
+        assert!(
+            outcome.notices[0].contains("01BOGUSRUNID"),
+            "the notice must name the file it skipped: {}",
+            outcome.notices[0]
+        );
     }
 
     #[test]
@@ -715,12 +1149,14 @@ mod tests {
             &dir.path().join("cat"),
             &ExecuteIngest {
                 plan: &planned.plan,
+                source: source.path(),
                 dest: &dest_roots,
                 subdir: &planned.subdir,
                 node_id: &planned.node_id,
                 source_volume: (&planned.source_volume_id, &planned.source_volume_label),
                 jobs: Some(1),
                 resume: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                control: &silent_control(),
             },
             &mut |_| {},
         )

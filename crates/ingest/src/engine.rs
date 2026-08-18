@@ -129,7 +129,11 @@ pub struct Outcome {
 pub enum ProgressEvent {
     /// Once, before any copying: totals from the plan partition. Counts
     /// only the files this run will actually copy — resumed, deduplicated,
-    /// and rejected files are excluded.
+    /// and rejected files are excluded. `bytes_total` is a plan-time sum
+    /// while every `BytesCopied` is measured at copy time, so the two can
+    /// legitimately disagree when a source changed between planning and
+    /// copying: a consumer turning them into a percentage should expect an
+    /// occasional over- or undershoot rather than treat it as a bug.
     RunStarted {
         files_total: u64,
         bytes_total: u64,
@@ -177,6 +181,12 @@ pub enum ProgressEvent {
 /// file-granular: the in-flight file finishes (so the journal stays
 /// consistent), and the queue entries nobody popped are left unplaced —
 /// resumable by run id.
+///
+/// Every load and store uses `Ordering::Relaxed`: the flag publishes no
+/// data of its own, and the queue it guards is behind a `Mutex` whose
+/// acquire/release already orders everything a worker can observe — so the
+/// only guarantee needed here is that the write eventually becomes visible,
+/// which `Relaxed` gives. A late observation costs at most one more file.
 pub type CancelFlag = std::sync::atomic::AtomicBool;
 
 /// A run's live controls: where progress goes, and the flag that asks the
@@ -216,6 +226,11 @@ pub fn run(
         bytes_total: queue.iter().map(|pf| pf.size).sum(),
     });
     let mut work = run_workers(queue, dests, journal, sinks, config.jobs, control)?;
+    // Announced before the sweep, not after, for promptness: the sweep
+    // stats every placed file at every destination, so a watching head
+    // would otherwise sit on a finished-looking run for as long as that
+    // takes. The sweep can still demote a file afterwards, which is exactly
+    // why `Outcome` — not this event — is the authority on what was placed.
     (control.progress)(ProgressEvent::RunStopped {
         cancelled: work.cancelled,
     });
@@ -534,20 +549,26 @@ fn append_or_abort(ctx: &WorkerContext<'_>, record: &Record) -> Result<(), CopyO
     guard.append(record).map_err(CopyOutcome::Abort)
 }
 
-fn fail(ctx: &WorkerContext<'_>, rel: &str, reason: String) -> Result<PlacedFile, CopyOutcome> {
+/// Journals the failure, announces it, and hands back the `FailedFile` the
+/// worker records. The announcement goes through `progress` like every
+/// other per-file event rather than reaching for `ctx.progress` directly,
+/// so `FileProgress` stays the single place a file's `rel` is stamped onto
+/// an event.
+fn fail(
+    ctx: &WorkerContext<'_>,
+    progress: &FileProgress<'_>,
+    reason: String,
+) -> Result<PlacedFile, CopyOutcome> {
     append_or_abort(
         ctx,
         &Record::FileFailed {
-            rel: rel.to_string(),
+            rel: progress.rel.to_string(),
             reason: reason.clone(),
         },
     )?;
-    (ctx.progress)(ProgressEvent::FileFailed {
-        rel: rel.to_string(),
-        reason: reason.clone(),
-    });
+    progress.failed(&reason);
     Err(CopyOutcome::Failed(FailedFile {
-        rel: rel.to_string(),
+        rel: progress.rel.to_string(),
         reason,
     }))
 }
@@ -587,6 +608,13 @@ impl FileProgress<'_> {
             rel: self.rel.to_string(),
         });
     }
+
+    fn failed(&self, reason: &str) {
+        (self.emit)(ProgressEvent::FileFailed {
+            rel: self.rel.to_string(),
+            reason: reason.to_string(),
+        });
+    }
 }
 
 /// Copies one file: journal the plan, stream the source once into every
@@ -606,7 +634,7 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
 
     let stream = match stream_to_sinks(&pf.source, &mut attempts, &progress) {
         Ok(stream) => stream,
-        Err(reason) => return fail(ctx, &pf.rel, reason),
+        Err(reason) => return fail(ctx, &progress, reason),
     };
 
     if let Some(prehash) = &pf.prehash
@@ -619,7 +647,7 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
              delete the partial(s) and re-run",
             stream.xxh3_hex
         );
-        return fail(ctx, &pf.rel, reason);
+        return fail(ctx, &progress, reason);
     }
 
     append_or_abort(
@@ -657,7 +685,7 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
     // genuinely remains (read-back mismatch); sink-open/write/finish
     // failures and read-back I/O errors have no confirmed partial to point
     // at, so no blanket suffix is added here.
-    fail(ctx, &pf.rel, failures.join("; "))
+    fail(ctx, &progress, failures.join("; "))
 }
 
 fn dest_rel_for(dests: &[DestSpec], rel: &str) -> String {

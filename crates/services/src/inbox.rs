@@ -754,7 +754,10 @@ fn triage_loose_files_ingest(
 /// Where an ingest run reads from and how its output is attributed —
 /// bundled so [`run_shared_ingest`] stays within the house
 /// 5-positional-parameter limit. `probe_dir` is what `resolve_volume`
-/// auto-detects the source volume from; `row_name` is the report row this
+/// auto-detects the source volume from, and — since it is also the
+/// directory this site's plan was walked from — what the run journal
+/// records as its source root for
+/// [`crate::ingest::ingest_unfinished`] to name later; `row_name` is the report row this
 /// run belongs to (a contribution/folder name, or [`LOOSE_FILES_ROW`]),
 /// used to prefix each per-file failure line in [`report_failure_detail`]
 /// so two folders that each have a bad `clip.mov` print two attributed
@@ -791,12 +794,17 @@ fn run_shared_ingest(
         ctx.catalog,
         &ExecuteIngest {
             plan: ingest_plan,
+            source: site.probe_dir,
             dest: &ctx.req.dest,
             subdir: &subdir,
             node_id: &node_id,
             source_volume: (&vol_id, &vol_label),
             jobs: None,
             resume: None,
+            // This pass renders one row per contribution when it's done, not
+            // a live feed, and offers no way to interrupt it — so nothing
+            // here has a use for either control.
+            control: &crate::ingest::silent_control(),
         },
         // No-op: this runs once per contribution, so the `--resume` advice
         // line would print once per contribution too — and `--resume`

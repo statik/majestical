@@ -10,10 +10,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "rec", rename_all = "snake_case")]
 pub enum Record {
+    /// Written once before any file record. `planned` is the whole run's
+    /// intended file count ([`crate::plan::IngestPlan::copyable_files`]),
+    /// which nothing else in the journal can reconstruct: `FilePlanned`
+    /// only ever covers files a worker actually picked up, so a run
+    /// cancelled with entries still queued would otherwise look complete.
     RunStarted {
         run: String,
         source: String,
         dests: Vec<String>,
+        planned: u64,
     },
     FilePlanned {
         file: PlannedFile,
@@ -33,12 +39,29 @@ pub enum Record {
     },
 }
 
+/// A run's identity as its `RunStarted` record recorded it: what it was
+/// copying and where to. The only place a journal keeps either — every
+/// other record is per-file — so a later listing of unfinished runs
+/// (`majestical_services::ingest::ingest_unfinished`) can name a run's
+/// source and destinations without re-deriving them from file paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStart {
+    pub run: String,
+    pub source: String,
+    pub dests: Vec<String>,
+    /// Files the run set out to copy — see [`Record::RunStarted`].
+    pub planned: u64,
+}
+
 /// Folded view of a journal: what a resume needs to know.
 #[derive(Debug, Default)]
 pub struct Folded {
     pub planned: BTreeMap<String, PlannedFile>,
     pub placed: BTreeSet<String>,
     pub failed: BTreeMap<String, String>,
+    /// The run's own metadata, from the first `RunStarted` record — `None`
+    /// for a journal whose writer never recorded one.
+    pub started: Option<RunStart>,
 }
 
 /// A resumable, append-only JSONL log of file-transfer state transitions.
@@ -203,8 +226,25 @@ fn repair_torn_tail(file: &mut std::fs::File, path: &Path) -> Result<(), IngestE
 /// only ever consults `placed`, the stale entry there is the one that
 /// matters: it would make resume skip re-copying a file the journal itself
 /// says is missing.
+///
+/// `started` keeps the *first* `RunStarted` instead: resuming a run appends
+/// a second one for the same run id, and the run as originally started is
+/// the description worth surviving.
 fn fold_one(folded: &mut Folded, record: Record) {
     match record {
+        Record::RunStarted {
+            run,
+            source,
+            dests,
+            planned,
+        } => {
+            folded.started.get_or_insert(RunStart {
+                run,
+                source,
+                dests,
+                planned,
+            });
+        }
         Record::FilePlanned { file } => {
             folded.planned.insert(file.rel.clone(), file);
         }
@@ -216,7 +256,7 @@ fn fold_one(folded: &mut Folded, record: Record) {
             folded.placed.remove(&rel);
             folded.failed.insert(rel, reason);
         }
-        Record::RunStarted { .. } | Record::FileCopied { .. } | Record::FileVerified { .. } => {}
+        Record::FileCopied { .. } | Record::FileVerified { .. } => {}
     }
 }
 
@@ -268,6 +308,62 @@ mod tests {
         assert!(!folded.placed.contains("b"));
         assert_eq!(folded.failed.get("b"), Some(&"verify mismatch".to_string()));
         assert_eq!(folded.planned.len(), 2);
+    }
+
+    /// A run's source and destinations live nowhere but its `RunStarted`
+    /// record, and a resumed run appends a second one — the first must win,
+    /// or a listing of unfinished runs would describe a resume's arguments
+    /// as if they were the original run's.
+    #[test]
+    fn run_metadata_folds_from_the_first_run_started_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.jsonl");
+        let mut journal = Journal::open_append(&path).expect("open_append");
+        journal
+            .append(&Record::RunStarted {
+                run: "01RUN".into(),
+                source: "/Volumes/card".into(),
+                dests: vec!["/Volumes/one".into(), "/Volumes/two".into()],
+                planned: 12,
+            })
+            .expect("append started");
+        journal
+            .append(&Record::FilePlanned { file: planned("a") })
+            .expect("append a planned");
+        journal
+            .append(&Record::RunStarted {
+                run: "01RUN".into(),
+                source: "/Volumes/somewhere-else".into(),
+                dests: vec!["/Volumes/one".into()],
+                planned: 3,
+            })
+            .expect("append the resume's started");
+
+        let folded = Journal::load(&path).expect("load");
+        assert_eq!(
+            folded.started,
+            Some(RunStart {
+                run: "01RUN".into(),
+                source: "/Volumes/card".into(),
+                dests: vec!["/Volumes/one".into(), "/Volumes/two".into()],
+                planned: 12,
+            }),
+            "the original RunStarted describes the run, not the resume's"
+        );
+    }
+
+    /// Every journal written before `RunStarted` was ever appended folds to
+    /// `started: None` rather than an empty-stringed placeholder, so a
+    /// consumer can tell "not recorded" from "recorded as empty".
+    #[test]
+    fn a_journal_without_a_run_started_record_folds_to_no_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.jsonl");
+        let mut journal = Journal::open_append(&path).expect("open_append");
+        journal
+            .append(&Record::FilePlanned { file: planned("a") })
+            .expect("append a planned");
+        assert_eq!(Journal::load(&path).expect("load").started, None);
     }
 
     /// `load`'s `NotFound` guard exists to distinguish "no journal written

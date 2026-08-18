@@ -400,7 +400,10 @@ fn assert_placed_trace(found: &FileTrace, size: u64, roots: &[String]) {
     let mut want_roots = roots.to_vec();
     want_roots.sort();
     assert_eq!(verified, want_roots, "one FileVerified per destination");
-    assert_eq!(found.placed, 1);
+    assert_eq!(
+        found.placed, 1,
+        "exactly one FilePlaced per placed file — not one per destination"
+    );
     assert!(found.failed.is_empty(), "{:?}", found.failed);
     assert_eq!(found.order.first(), Some(&"started"));
     assert_eq!(found.order.last(), Some(&"placed"));
@@ -564,16 +567,31 @@ fn a_failing_file_emits_file_failed_without_disturbing_the_others() {
     );
 }
 
-#[test]
-fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
-    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB"), ("c.mov", b"CCC")]);
+/// The arrange every cancellation test below shares: one worker over
+/// `files`, cancelled from inside the first `FilePlaced` emission, so the
+/// queue entries nobody popped are left behind. Holds the temp dirs (and
+/// the plan, for a resume) alive for the assertions that follow.
+#[cfg(test)]
+struct CancelledRun {
+    outcome: majestical_ingest::engine::Outcome,
+    events: Vec<ProgressEvent>,
+    plan: majestical_ingest::plan::IngestPlan,
+    /// Never read — kept only so the copied-from directory outlives the
+    /// run, which a resume still needs to read.
+    _src: tempfile::TempDir,
+    d1: tempfile::TempDir,
+    d2: tempfile::TempDir,
+    journal_path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+fn run_cancelling_on_first_placed(files: &[(&str, &[u8])]) -> CancelledRun {
+    let (src, d1, d2) = setup(files);
     let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
-    let jpath = d1.path().join("run.jsonl");
-    let mut journal = Journal::open_append(&jpath).expect("journal");
+    let journal_path = d1.path().join("run.jsonl");
+    let mut journal = Journal::open_append(&journal_path).expect("journal");
     let events = Mutex::new(Vec::new());
     let cancel = CancelFlag::new(false);
-    // One worker, cancelled from inside the first FilePlaced emission: the
-    // remaining two queue entries are never popped.
     let progress = |event: ProgressEvent| {
         if let ProgressEvent::FilePlaced { .. } = &event {
             cancel.store(true, Ordering::Relaxed);
@@ -593,10 +611,26 @@ fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
         },
     )
     .expect("run");
-    assert_eq!(outcome.placed.len(), 1, "the in-flight file finishes");
-    assert!(outcome.failed.is_empty(), "cancelling is not failing");
+    CancelledRun {
+        outcome,
+        events: events.into_inner().expect("events"),
+        plan,
+        _src: src,
+        d1,
+        d2,
+        journal_path,
+    }
+}
 
-    let events = events.into_inner().expect("events");
+#[test]
+fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
+    let run_1 =
+        run_cancelling_on_first_placed(&[("a.mov", b"AAAA"), ("b.mov", b"BB"), ("c.mov", b"CCC")]);
+    let (d1, d2) = (run_1.d1.path(), run_1.d2.path());
+    assert_eq!(run_1.outcome.placed.len(), 1, "the in-flight file finishes");
+    assert!(run_1.outcome.failed.is_empty(), "cancelling is not failing");
+
+    let events = run_1.events;
     assert_eq!(
         events.last(),
         Some(&ProgressEvent::RunStopped { cancelled: true })
@@ -609,12 +643,12 @@ fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
 
     // The journal is consistent: a resumed run finishes exactly the two
     // files cancellation left behind.
-    let folded = Journal::load(&jpath).expect("fold");
+    let folded = Journal::load(&run_1.journal_path).expect("fold");
     assert_eq!(folded.placed.len(), 1);
-    let mut journal = Journal::open_append(&jpath).expect("reopen appends");
+    let mut journal = Journal::open_append(&run_1.journal_path).expect("reopen appends");
     let outcome = run(
-        &plan,
-        &dests(d1.path(), d2.path()),
+        &run_1.plan,
+        &dests(d1, d2),
         &folded.placed,
         &mut journal,
         &RealSinks,
@@ -624,7 +658,7 @@ fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
     .expect("resume");
     assert_eq!(outcome.placed.len(), 2);
     assert_eq!(outcome.skipped_resumed, 1);
-    for d in [d1.path(), d2.path()] {
+    for d in [d1, d2] {
         for rel in ["a.mov", "b.mov", "c.mov"] {
             assert!(
                 d.join("Projects/x/day1").join(rel).is_file(),
@@ -638,34 +672,10 @@ fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
 fn a_flag_set_after_the_last_file_reports_an_uncancelled_stop() {
     // The flag is set, but the queue drained anyway: no work was left
     // undone, so the run did not stop *because* of the cancellation.
-    let (src, d1, d2) = setup(&[("a.mov", b"AAAA")]);
-    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
-    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
-    let events = Mutex::new(Vec::new());
-    let cancel = CancelFlag::new(false);
-    let progress = |event: ProgressEvent| {
-        if let ProgressEvent::FilePlaced { .. } = &event {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        events.lock().expect("events lock").push(event);
-    };
-    let outcome = run(
-        &plan,
-        &dests(d1.path(), d2.path()),
-        &fresh(),
-        &mut journal,
-        &RealSinks,
-        &EngineConfig { jobs: 1 },
-        &RunControl {
-            progress: &progress,
-            cancel: &cancel,
-        },
-    )
-    .expect("run");
-    assert_eq!(outcome.placed.len(), 1);
-    let events = events.into_inner().expect("events");
+    let only_file = run_cancelling_on_first_placed(&[("a.mov", b"AAAA")]);
+    assert_eq!(only_file.outcome.placed.len(), 1);
     assert_eq!(
-        events.last(),
+        only_file.events.last(),
         Some(&ProgressEvent::RunStopped { cancelled: false })
     );
 }
@@ -678,39 +688,15 @@ fn the_last_queued_file_survives_a_cancel_raised_while_its_predecessor_ran() {
     // is what makes the stop a cancellation. Reading the flag after the pop
     // would consume that entry and discard it, reporting a drained queue
     // and an uncancelled stop while a planned file silently went nowhere.
-    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
-    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
-    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
-    let events = Mutex::new(Vec::new());
-    let cancel = CancelFlag::new(false);
-    let progress = |event: ProgressEvent| {
-        if let ProgressEvent::FilePlaced { .. } = &event {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        events.lock().expect("events lock").push(event);
-    };
-    let outcome = run(
-        &plan,
-        &dests(d1.path(), d2.path()),
-        &fresh(),
-        &mut journal,
-        &RealSinks,
-        &EngineConfig { jobs: 1 },
-        &RunControl {
-            progress: &progress,
-            cancel: &cancel,
-        },
-    )
-    .expect("run");
-    assert_eq!(outcome.placed.len(), 1);
-    let events = events.into_inner().expect("events");
+    let two_files = run_cancelling_on_first_placed(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
+    assert_eq!(two_files.outcome.placed.len(), 1);
     assert_eq!(
-        events.last(),
+        two_files.events.last(),
         Some(&ProgressEvent::RunStopped { cancelled: true }),
         "one file of two is left queued, so the flag really did cut the run short"
     );
     assert!(
-        !d2.path().join("Projects/x/day1/b.mov").exists(),
+        !two_files.d2.path().join("Projects/x/day1/b.mov").exists(),
         "the queued file must not have been copied"
     );
 }

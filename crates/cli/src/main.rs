@@ -8,7 +8,7 @@ mod search;
 mod sync_cmd;
 mod tags_cmd;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use majestical_ingest::plan::DedupeMode;
 use majestical_services::app::FsApp;
@@ -139,16 +139,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Verified copy from a source directory into PARA-routed destinations.
+    /// Verified copy from a source directory into PARA-routed destinations,
+    /// or `maj ingest unfinished` to list the runs a `--resume` could still
+    /// finish.
+    ///
+    /// A source directory actually named `unfinished` reads as the listing
+    /// verb; pass it as `./unfinished`.
+    // The listing verb sits beside the copy's own arguments rather than
+    // renaming the copy into `maj ingest run <source>`: `maj ingest
+    // <source>` is the surface every existing script, doc, and resume hint
+    // already names.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Ingest {
-        source: PathBuf,
+        #[command(subcommand)]
+        cmd: Option<IngestCmd>,
+        /// Directory to copy from (the card, the shuttle drive).
+        #[arg(required = true)]
+        source: Option<PathBuf>,
         /// Destination root(s); each gets an independently verified copy
         /// and its own ASC MHL history.
         #[arg(long, required = true)]
         dest: Vec<PathBuf>,
         /// Target PARA node (<kind>/<name> or node id).
-        #[arg(long)]
-        para: String,
+        // `Option` + `required = true` rather than a bare `String`: the
+        // `unfinished` subcommand negates the copy's requirements at the
+        // clap level, but a non-`Option` field would still be extracted
+        // unconditionally by the derive and fail there instead. Same for
+        // `source` above.
+        #[arg(long, required = true)]
+        para: Option<String>,
         /// Layout inside the node. Tokens: {date}, {source-label}.
         #[arg(long, default_value = "{date}/{source-label}")]
         template: String,
@@ -168,6 +187,16 @@ enum Cmd {
     },
     /// Serve the catalog to MCP clients over stdio.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum IngestCmd {
+    /// List runs whose journal still has planned files that never landed —
+    /// newest first, each resumable with `maj ingest <source> --resume <id>`.
+    Unfinished {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `maj ingest --dedupe` surface: only `skip` and `copy` are exposed this
@@ -766,7 +795,15 @@ fn main() -> Result<()> {
         // in Task 6's report rather than restructured, since every other
         // subcommand does need them.
         Cmd::Verify { dir, json } => commands::cmd_verify(&dir, json)?,
+        // Like `Verify` above, the listing verb deliberately does not open a
+        // catalog: run journals live in this machine's state dir, not the
+        // event log.
         Cmd::Ingest {
+            cmd: Some(IngestCmd::Unfinished { json }),
+            ..
+        } => commands::cmd_ingest_unfinished(&cli.catalog, json)?,
+        Cmd::Ingest {
+            cmd: None,
             source,
             dest,
             para,
@@ -777,6 +814,11 @@ fn main() -> Result<()> {
             resume,
             json,
         } => {
+            // clap enforces both (`required = true`), except when the
+            // `unfinished` subcommand negates them — which the arm above has
+            // already taken by then.
+            let source = source.context("maj ingest needs a source directory")?;
+            let para = para.context("maj ingest needs --para")?;
             let args = commands::IngestArgs {
                 source,
                 dest,
@@ -803,6 +845,84 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `maj ingest` carries both a copy's arguments and a listing
+    /// subcommand, so both spellings must keep parsing: the bare source
+    /// form every script and resume hint uses, and `unfinished` routing to
+    /// the listing instead of being swallowed as a source path.
+    #[test]
+    fn ingest_parses_both_a_source_copy_and_the_unfinished_listing() {
+        let copy = Cli::try_parse_from([
+            "maj",
+            "--catalog",
+            "/c",
+            "--machine-id",
+            "m1",
+            "ingest",
+            "/media/card",
+            "--dest",
+            "/d1",
+            "--para",
+            "project/x",
+        ])
+        .expect("the copy form still parses");
+        match copy.cmd {
+            Cmd::Ingest { cmd, source, .. } => {
+                assert!(cmd.is_none(), "no subcommand was named");
+                assert_eq!(source, Some(PathBuf::from("/media/card")));
+            }
+            _ => panic!("expected the copy form to parse as Cmd::Ingest"),
+        }
+
+        let listing = Cli::try_parse_from([
+            "maj",
+            "--catalog",
+            "/c",
+            "--machine-id",
+            "m1",
+            "ingest",
+            "unfinished",
+            "--json",
+        ])
+        .expect("the listing form parses without --dest/--para");
+        match listing.cmd {
+            Cmd::Ingest {
+                cmd: Some(IngestCmd::Unfinished { json }),
+                source,
+                ..
+            } => {
+                assert!(json);
+                assert_eq!(source, None, "'unfinished' is the verb, not the source");
+            }
+            _ => panic!("expected `ingest unfinished` to parse as the listing subcommand"),
+        }
+
+        // The two forms are alternatives, not a copy that can also list:
+        // asking for both is a clap error, not a silently ignored half.
+        let both = Cli::try_parse_from([
+            "maj",
+            "--catalog",
+            "/c",
+            "--machine-id",
+            "m1",
+            "ingest",
+            "/media/card",
+            "--dest",
+            "/d1",
+            "--para",
+            "project/x",
+            "unfinished",
+        ]);
+        // `Cli` has no `Debug`, so match rather than `expect_err`.
+        let Err(both) = both else {
+            panic!("a copy cannot also be a listing");
+        };
+        assert_eq!(
+            both.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "the copy's arguments and the listing verb are alternatives: {both}"
+        );
+    }
 
     #[test]
     fn surface_err_notices_unwraps_the_carrier_to_its_inner_error() {

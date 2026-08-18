@@ -44,6 +44,48 @@
       }
     },
     {
+      // `IngestView.svelte` is the surface with three states rather than
+      // one — a setup board, a live run, and a completion card — plus the
+      // resume banner, and the run is the only thing in the app whose
+      // state lives in the backend and has to be rejoined on mount. All of
+      // its arithmetic is already out of the file: `ingest-progress.ts`
+      // (the event accumulator, the bar, the estimate) and
+      // `ingest-plan.ts` (the plan's five counters). What is left is the
+      // orchestration and the declared wire-gap ledger, which is what a
+      // surface is. The cap sits three lines above where the script block
+      // is today (oxlint counts the script block, 530 lines), so nearly
+      // any growth forces the next split: lifting the run panel — the
+      // preparing/running/finishing states, the progress subscription and
+      // the outcome poll — into a component of its own.
+      "files": ["src/lib/IngestView.svelte"],
+      "rules": {
+        "max-lines": ["warn", { "max": 533 }]
+      }
+    },
+    {
+      // The shell mounts one component per surface, so its import count is
+      // the number of surfaces plus the handful of shared pieces — the
+      // measure this rule is for (incidental coupling) is not what it is
+      // counting here.
+      "files": ["src/App.svelte"],
+      "rules": {
+        "import/max-dependencies": ["warn", { "max": 12 }]
+      }
+    },
+    {
+      // A suite's length tracks how many behaviours it pins, not how
+      // complicated any of them is, and both of these are already split by
+      // subject: the shell (322 lines) and the Ingest setup board (350),
+      // beside a live-run suite (225) and an outcome suite (243) that are
+      // under the default and stay there. The cap sits just above the
+      // larger of the two, so the next subject gets its own file — which
+      // is what keeps them findable — rather than being folded in here.
+      "files": ["src/App.test.ts", "src/lib/IngestView.test.ts"],
+      "rules": {
+        "max-lines": ["warn", { "max": 360 }]
+      }
+    },
+    {
       // `fixtures.test.ts` assigns one committed fixture per pinned outcome
       // struct (see its own header comment) — its import count tracks the
       // number of Tauri commands, not incidental coupling.

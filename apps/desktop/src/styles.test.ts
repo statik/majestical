@@ -1,11 +1,18 @@
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
-import { render, screen } from "@testing-library/svelte";
+import { cleanup, render, screen } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import "./app.css";
 import BrowseView from "./lib/BrowseView.svelte";
 import SearchView from "./lib/SearchView.svelte";
 import { mockBrowse, oneClip } from "./lib/browse-test-support";
+import {
+  emitProgress,
+  mockIngest,
+  renderIngest,
+  RUN,
+  runStarted,
+} from "./lib/ingest-test-support";
 import { mockCommands, stubMatchMedia } from "./lib/test-support";
 import VolumesView from "./lib/VolumesView.svelte";
 
@@ -29,6 +36,9 @@ beforeAll(() => {
   expect(rules.map((rule) => rule.cssText).join("")).toContain(".volume-table");
 });
 afterEach(() => {
+  // Unmounted first: a surface's `listen` handle unregisters on destroy,
+  // and `clearMocks` takes the registry it unregisters from away.
+  cleanup();
   clearMocks();
   vi.unstubAllGlobals();
 });
@@ -110,4 +120,43 @@ test("a search card's volume badges still sit in a row", async () => {
   await screen.findByText("sunset.mov");
   const badges = container.querySelector(".card .volumes") as HTMLElement;
   expect(globalThis.getComputedStyle(badges).display).toBe("flex");
+});
+
+/** The ingest board is two columns of equal width — source beside
+ *  destinations, "where from, where to" read across rather than down. Only
+ *  the sheet says so, so only this suite can see it. */
+test("the ingest board is two equal columns", async () => {
+  mockIngest();
+  const { container } = renderIngest();
+
+  await screen.findByRole("group", { name: "Setup" });
+  const board = container.querySelector(".ingest-board") as HTMLElement;
+  expect(globalThis.getComputedStyle(board).display).toBe("grid");
+  expect(globalThis.getComputedStyle(board).gridTemplateColumns).toBe("1fr 1fr");
+});
+
+/** The progress bar is a track with a fill positioned inside it. Both halves
+ *  live only in the sheet: the markup is a div with an empty `<i>`, which
+ *  every markup query in the other suites reads as nothing at all. */
+test("the progress bar is a clipped track with an absolutely positioned fill", async () => {
+  mockIngest({ ingest_state: () => ({ busy: true, running: RUN }) });
+  const { container } = renderIngest();
+
+  await screen.findByRole("group", { name: "Run" });
+  await runStarted(2, 1000);
+  await emitProgress(RUN, { type: "file_started", rel: "a.mov", size: 1000 });
+  await emitProgress(RUN, { type: "bytes_copied", rel: "a.mov", bytes_done: 500 });
+
+  const bar = await screen.findByRole("progressbar");
+  const track = globalThis.getComputedStyle(bar);
+  expect(track.position).toBe("relative");
+  // Clipped, so the fill's rounded ends cannot escape the track it is in.
+  expect(track.overflow).toBe("hidden");
+  expect(track.height).toBe("8px");
+
+  const fill = container.querySelector(".ingest-bar i") as HTMLElement;
+  expect(globalThis.getComputedStyle(fill).position).toBe("absolute");
+  // The width rides a custom property the markup sets per repaint; the
+  // sheet's job is only to make it the thing that is positioned.
+  expect(bar.getAttribute("aria-valuenow")).toBe("50");
 });

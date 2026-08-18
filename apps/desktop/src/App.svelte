@@ -1,7 +1,11 @@
 <script lang="ts">
-  import { api, errorMessage, errorNotices } from "./lib/api";
-  import type { AppStatus } from "./lib/api";
+  import { onDestroy } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import type { UnlistenFn } from "@tauri-apps/api/event";
+  import { api, errorMessage, errorNotices, INGEST_PROGRESS_EVENT } from "./lib/api";
+  import type { AppStatus, IngestProgress } from "./lib/api";
   import BrowseView from "./lib/BrowseView.svelte";
+  import IngestView from "./lib/IngestView.svelte";
   import Inspector from "./lib/Inspector.svelte";
   import Notices from "./lib/Notices.svelte";
   import OrganizeView from "./lib/OrganizeView.svelte";
@@ -10,17 +14,96 @@
   import VolumesView from "./lib/VolumesView.svelte";
   import Welcome from "./lib/Welcome.svelte";
 
-  type Surface = "search" | "browse" | "organize" | "volumes";
+  type Surface = "search" | "browse" | "ingest" | "organize" | "volumes";
+
+  /** How often the shell re-asks whether a stopped run has finished
+   *  finishing — the sweep and the MHL generations land after the copy
+   *  loop ends, and the marker stays lit until they have. */
+  const INGEST_POLL_MS = 200;
 
   let status = $state<AppStatus | null>(null);
   let error = $state<string | null>(null);
   let failureNotices = $state<string[]>([]);
   let selected = $state<string | null>(null);
   let surface = $state<Surface>("search");
+  /**
+   * Whether an ingest run is going, for the sidebar's marker. Learned from
+   * the progress stream rather than a read on mount, because the run
+   * outlives this webview and the stream is what says it still exists:
+   * a shell that opened mid-run lights the marker on the next event, which
+   * on a live copy is within a fraction of a second.
+   */
+  let ingestBusy = $state(false);
+  /** False once the shell is gone, so the poll below stops. Its own
+   *  `onDestroy` rather than a line in the subscription effect's teardown,
+   *  which would start running between re-runs the day that effect gains a
+   *  reactive read. */
+  let shellAlive = true;
+
+  onDestroy(() => {
+    shellAlive = false;
+  });
+  /** One settle loop at a time, however many `run_stopped`s arrive. */
+  let settling = false;
 
   $effect(() => {
     void loadStatus();
   });
+
+  /**
+   * The same progress stream the Ingest surface reads, listened to here as
+   * well: the surface unmounts when you leave it, and the marker's whole
+   * job is to be visible while you are somewhere else.
+   */
+  $effect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let gone = false;
+    void listen<IngestProgress>(INGEST_PROGRESS_EVENT, (event) => {
+      if (event.payload.event.type === "run_stopped") {
+        void settleIngest();
+        return;
+      }
+      ingestBusy = true;
+    }).then((off) => {
+      if (gone) {
+        void off();
+        return;
+      }
+      unlisten = off;
+    });
+    return () => {
+      gone = true;
+      if (unlisten !== null) void unlisten();
+    };
+  });
+
+  /**
+   * `run_stopped` is the copy loop ending, not the run: the marker goes out
+   * when `ingest_state` says the job slot is free. A failed read puts it
+   * out too — the Ingest surface is where that failure is reported, and a
+   * marker stuck on forever is the worse of the two lies.
+   */
+  async function settleIngest() {
+    if (settling) return;
+    settling = true;
+    try {
+      // `for (;;)` with the guard inside: the shell can go away across
+      // either await, so the check belongs after them, not only at the top.
+      for (;;) {
+        if (!shellAlive) break;
+        const state = await api.ingestState();
+        if (!state.busy) break;
+        await new Promise((resolve) => {
+          setTimeout(resolve, INGEST_POLL_MS);
+        });
+      }
+    } catch {
+      // Deliberately not surfaced here; see the comment above.
+    } finally {
+      ingestBusy = false;
+      settling = false;
+    }
+  }
 
   async function loadStatus() {
     try {
@@ -85,6 +168,20 @@
             >
           </li>
           <li>
+            <!-- The running marker: a run outlives this surface, so the
+                 sidebar is where it stays visible. The dot is the mockup's,
+                 and it is drawn only — what a screen reader gets is the
+                 label, because "Ingest black circle" is not a sentence. -->
+            <button
+              aria-current={surface === "ingest" ? "page" : undefined}
+              aria-label={ingestBusy ? "Ingest — a run is going" : undefined}
+              onclick={() => show("ingest")}
+              >Ingest{#if ingestBusy}<span class="ingest-mark" aria-hidden="true"
+                  >●</span
+                >{/if}</button
+            >
+          </li>
+          <li>
             <button
               aria-current={surface === "organize" ? "page" : undefined}
               onclick={() => show("organize")}>Organize</button
@@ -108,6 +205,10 @@
           onselect={(asset) => (selected = asset)}
           inspectorOpen={selected !== null}
         />
+      {:else if surface === "ingest"}
+        <!-- No `onselect`: an ingest names files that are not in the
+             catalog yet, so nothing on it can open the inspector. -->
+        <IngestView />
       {:else if surface === "organize"}
         <!-- No `onselect`: Organize manages the taxonomy, and nothing on it
              addresses an asset, so it never opens the inspector. -->

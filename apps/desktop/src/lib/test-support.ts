@@ -16,15 +16,24 @@ export type CommandHandler = (args?: InvokeArgs) => unknown;
  * Answers exactly the commands named and nothing else: an invoke this test did
  * not plan for throws by name instead of resolving to `undefined` and leaving
  * the surface to fail somewhere further along.
+ *
+ * `shouldMockEvents` is the one exception, and it is not a handler this file
+ * writes: it hands `plugin:event|listen`/`|emit`/`|unlisten` to the mock's own
+ * in-memory registry, so a suite can drive a surface's `listen` callback by
+ * calling `emit` — which is how the Ingest surface's progress stream is
+ * tested. Nothing else in the app emits, so this is inert everywhere else.
  */
 export function mockCommands(handlers: Record<string, CommandHandler>): void {
-  mockIPC((cmd, args) => {
-    const handler = handlers[cmd];
-    if (handler === undefined) {
-      throw new Error(`unexpected command ${cmd}`);
-    }
-    return handler(args);
-  });
+  mockIPC(
+    (cmd, args) => {
+      const handler = handlers[cmd];
+      if (handler === undefined) {
+        throw new Error(`unexpected command ${cmd}`);
+      }
+      return handler(args);
+    },
+    { shouldMockEvents: true },
+  );
 }
 
 /**

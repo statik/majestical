@@ -14,9 +14,14 @@ use majestical_desktop::commands::{
     rename_para_node_impl, rename_tag_impl, run_saved_search_impl, search_assets_impl,
     use_existing_catalog_impl,
 };
+use majestical_desktop::ingest::{
+    DEFAULT_INGEST_TEMPLATE, FinishedIngest, IngestJob, IngestProgress, IngestState, ProgressSink,
+    StartIngest, cancel_ingest_impl, ingest_state_impl, list_unfinished_ingests_impl,
+    plan_ingest_impl, start_ingest_impl,
+};
 use majestical_desktop::thumb_protocol;
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 // `#[cfg(test)]` on the helpers below is not redundant despite this file
 // already building with `--cfg test`: clippy's in-test detection for
@@ -1337,4 +1342,636 @@ fn command_error_splits_a_notices_carrier() {
         wire.get("notices").is_none(),
         "empty notices must be absent from the wire, not []"
     );
+}
+
+// --- ingest -----------------------------------------------------------
+//
+// The run lives in the backend, on its own thread, so these tests drive the
+// same three-part seam the commands do: a `CatalogCfg`, an `IngestState`
+// the job publishes itself into, and a `ProgressSink` standing in for the
+// webview's event bridge.
+
+/// A catalog with one active PARA node, a source directory holding
+/// `files`, one destination root, and an empty ingest slot.
+#[cfg(test)]
+struct IngestFixture {
+    cfg: CatalogCfg,
+    source: tempfile::TempDir,
+    dest: tempfile::TempDir,
+    state: Arc<IngestState>,
+}
+
+#[cfg(test)]
+fn ingest_fixture(dir: &Path, files: &[(String, Vec<u8>)]) -> IngestFixture {
+    let cfg = cfg_for(dir);
+    initialize_catalog_impl(&cfg).expect("init");
+    add_para_node_impl(&cfg, "project", "client-x").expect("para add");
+    let source = tempfile::tempdir().expect("source dir");
+    for (name, bytes) in files {
+        std::fs::write(source.path().join(name), bytes).expect("write source file");
+    }
+    IngestFixture {
+        cfg,
+        source,
+        dest: tempfile::tempdir().expect("dest dir"),
+        state: Arc::new(IngestState(RwLock::new(None))),
+    }
+}
+
+/// `count` one-line files, each with distinct bytes so nothing dedupes
+/// against anything else.
+#[cfg(test)]
+fn tiny_files(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|n| {
+            (
+                format!("clip-{n}.mov"),
+                format!("bytes for {n}").into_bytes(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+impl IngestFixture {
+    /// A start request for this fixture's source and destination. The
+    /// template is a literal so the rendered subdir is stable in
+    /// assertions — the real default (`{date}/{source-label}`) renders
+    /// today's date and the source volume's label.
+    fn request(&self, resume: Option<String>) -> StartIngest {
+        StartIngest {
+            source: self.source.path().to_path_buf(),
+            dests: vec![self.dest.path().to_path_buf()],
+            para: "project/client-x".to_string(),
+            template: Some("raw".to_string()),
+            resume,
+        }
+    }
+
+    /// Blocks until the job's thread publishes its outcome. Polls rather
+    /// than joins: the thread handle is the backend's, not the caller's —
+    /// `ingest_state` is the only way the GUI learns a run ended, so it is
+    /// the only way this suite learns it either.
+    fn await_finished(&self) -> Arc<FinishedIngest> {
+        for _ in 0..2000 {
+            if let Some(finished) = ingest_state_impl(&self.state).finished {
+                return finished;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the ingest run never finished");
+    }
+
+    /// The run this fixture just finished, or a panic naming the failure.
+    fn finished_run(&self) -> Arc<FinishedIngest> {
+        let finished = self.await_finished();
+        if let FinishedIngest::Failed { error } = finished.as_ref() {
+            panic!("the run failed: {}", error.message);
+        }
+        finished
+    }
+}
+
+/// The placed count of a finished run.
+#[cfg(test)]
+fn placed_count(finished: &FinishedIngest) -> usize {
+    match finished {
+        FinishedIngest::Done { run } => run.outcome.placed.len(),
+        FinishedIngest::Failed { error } => panic!("the run failed: {}", error.message),
+    }
+}
+
+/// A sink that records every forwarded notification, the stand-in for the
+/// webview's `ingest-progress` listener.
+#[cfg(test)]
+fn collecting_sink(into: &Arc<Mutex<Vec<IngestProgress>>>) -> ProgressSink {
+    let into = Arc::clone(into);
+    Arc::new(move |progress| {
+        into.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(progress);
+    })
+}
+
+#[cfg(test)]
+fn collected(events: &Arc<Mutex<Vec<IngestProgress>>>) -> Vec<IngestProgress> {
+    events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The run journal `run_id` must have written under this machine's state
+/// directory — the on-disk proof that the id the command returned is the
+/// id the run really used.
+#[cfg(test)]
+fn journal_path(cfg: &CatalogCfg, run_id: &str) -> std::path::PathBuf {
+    let notices = majestical_services::notices::Notices::new();
+    majestical_services::state_dir::catalog_paths(&cfg.catalog, &notices)
+        .expect("catalog paths")
+        .runs_dir
+        .join(format!("{run_id}.jsonl"))
+}
+
+#[test]
+fn plan_ingest_counts_every_file_it_walked() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(3));
+        let planned = plan_ingest_impl(
+            &fixture.cfg,
+            fixture.source.path(),
+            "project/client-x",
+            Some("raw".to_string()),
+        )
+        .expect("plan_ingest");
+        assert_eq!(planned.plan.files.len(), 3);
+        assert_eq!(planned.subdir, "Projects/client-x/raw");
+        assert!(!planned.node_id.is_empty());
+    });
+}
+
+/// The default template is the one every other head applies when its own
+/// flag is omitted, so an unconfigured GUI ingest lands where an
+/// unconfigured `maj ingest` would.
+#[test]
+fn plan_ingest_without_a_template_uses_the_shared_default() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let planned = plan_ingest_impl(
+            &fixture.cfg,
+            fixture.source.path(),
+            "project/client-x",
+            None,
+        )
+        .expect("plan_ingest");
+        let with_default = plan_ingest_impl(
+            &fixture.cfg,
+            fixture.source.path(),
+            "project/client-x",
+            Some(DEFAULT_INGEST_TEMPLATE.to_string()),
+        )
+        .expect("plan_ingest");
+        assert_eq!(planned.subdir, with_default.subdir);
+        assert_ne!(planned.subdir, "Projects/client-x/");
+    });
+}
+
+#[test]
+fn plan_ingest_of_an_unknown_para_target_names_it() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let Err(err) = plan_ingest_impl(&fixture.cfg, fixture.source.path(), "project/nope", None)
+        else {
+            panic!("an unknown PARA target must fail");
+        };
+        assert!(err.message.contains("nope"), "{}", err.message);
+    });
+}
+
+#[test]
+fn start_ingest_places_every_file_and_forwards_the_run_id_with_each_event() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let run_id = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            collecting_sink(&events),
+        )
+        .expect("start_ingest");
+
+        assert_eq!(run_id.len(), 26, "a ULID run id: {run_id}");
+        assert!(
+            run_id
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()),
+            "a ULID run id: {run_id}"
+        );
+        let finished = fixture.finished_run();
+        assert_eq!(placed_count(&finished), 2);
+        assert!(
+            journal_path(&fixture.cfg, &run_id).is_file(),
+            "the returned id must be the id the run journaled under"
+        );
+
+        let events = collected(&events);
+        assert!(
+            events.iter().all(|p| p.run_id == run_id),
+            "every forwarded event carries the run it belongs to: {events:?}"
+        );
+        let kinds: Vec<&majestical_ingest::engine::ProgressEvent> =
+            events.iter().map(|p| &p.event).collect();
+        assert!(
+            matches!(
+                kinds.first(),
+                Some(majestical_ingest::engine::ProgressEvent::RunStarted { files_total: 2, .. })
+            ),
+            "{kinds:?}"
+        );
+        assert!(
+            matches!(
+                kinds.last(),
+                Some(majestical_ingest::engine::ProgressEvent::RunStopped { cancelled: false })
+            ),
+            "{kinds:?}"
+        );
+        let mut placed: Vec<&str> = kinds
+            .iter()
+            .filter_map(|event| match event {
+                majestical_ingest::engine::ProgressEvent::FilePlaced { rel } => Some(rel.as_str()),
+                _ => None,
+            })
+            .collect();
+        placed.sort_unstable();
+        assert_eq!(placed, vec!["clip-0.mov", "clip-1.mov"]);
+    });
+}
+
+/// The engine emits one `BytesCopied` per 1 MiB buffer and leaves
+/// coalescing to whoever renders them. This head coalesces: a file copied
+/// in four chunks inside one throttle window forwards its first and its
+/// last, not all four.
+#[test]
+fn start_ingest_coalesces_the_bytes_copied_firehose() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let size = 4 * 1024 * 1024;
+        let fixture = ingest_fixture(dir.path(), &[("big.mov".to_string(), vec![7u8; size])]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            collecting_sink(&events),
+        )
+        .expect("start_ingest");
+        assert_eq!(placed_count(&fixture.finished_run()), 1);
+
+        let bytes: Vec<u64> = collected(&events)
+            .iter()
+            .filter_map(|p| match p.event {
+                majestical_ingest::engine::ProgressEvent::BytesCopied { bytes_done, .. } => {
+                    Some(bytes_done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bytes.len() < 4,
+            "four 1 MiB chunks copied inside one throttle window must not forward four \
+             events: {bytes:?}"
+        );
+        assert_eq!(
+            bytes.last().copied(),
+            Some(size as u64),
+            "the final byte count always lands, however tight the window: {bytes:?}"
+        );
+    });
+}
+
+/// One job at a time: a second start while a run is live is refused, and
+/// the refusal names the run holding the slot so the surface can say which.
+#[test]
+fn start_ingest_refuses_a_second_run_and_names_the_live_one() {
+    let refusal = refused_start_message(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    assert!(refusal.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{refusal}");
+}
+
+/// The same refusal in the window before the run has named itself — a job
+/// holds the slot from the moment `start_ingest` claims it, so the check
+/// has to answer with something honest rather than skip a nameless run.
+#[test]
+fn start_ingest_refuses_a_run_that_has_not_named_itself_yet() {
+    let refusal = refused_start_message(None);
+    assert!(
+        refusal.contains("(starting)"),
+        "a claimed but unnamed run still refuses the next one: {refusal}"
+    );
+}
+
+/// Plants a live job (finished: none) carrying `run_id`, tries to start
+/// another, and hands back the refusal's message.
+#[cfg(test)]
+fn refused_start_message(run_id: Option<&str>) -> String {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let named = Arc::new(std::sync::OnceLock::new());
+        if let Some(run_id) = run_id {
+            named.set(run_id.to_string()).expect("a fresh OnceLock");
+        }
+        let live = IngestJob {
+            run_id: named,
+            cancel: Arc::new(majestical_ingest::engine::CancelFlag::new(false)),
+            finished: Arc::new(Mutex::new(None)),
+        };
+        *fixture
+            .state
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let Err(err) = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            collecting_sink(&events),
+        ) else {
+            panic!("a second run must be refused while one is live");
+        };
+        assert!(
+            collected(&events).is_empty(),
+            "the refused start must not have run anything"
+        );
+        err.message
+    })
+}
+
+/// Cancelling between files leaves the queue unplaced and the run
+/// resumable — and the run that comes back is listed by
+/// `list_unfinished_ingests` under the same id.
+#[test]
+fn cancel_ingest_stops_the_run_and_leaves_it_resumable() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(24));
+        let events: Arc<Mutex<Vec<IngestProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let into = Arc::clone(&events);
+            let state = Arc::clone(&fixture.state);
+            let sink: ProgressSink = Arc::new(move |progress: IngestProgress| {
+                if matches!(
+                    progress.event,
+                    majestical_ingest::engine::ProgressEvent::FilePlaced { .. }
+                ) {
+                    cancel_ingest_impl(&state);
+                }
+                into.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(progress);
+            });
+            sink
+        };
+        let run_id = start_ingest_impl(&fixture.cfg, &fixture.state, fixture.request(None), sink)
+            .expect("start_ingest");
+        let placed = placed_count(&fixture.finished_run());
+        assert!(
+            placed < 24,
+            "cancelling after the first placed file must leave work queued, placed {placed}"
+        );
+        assert!(
+            collected(&events).iter().any(|p| matches!(
+                p.event,
+                majestical_ingest::engine::ProgressEvent::RunStopped { cancelled: true }
+            )),
+            "the run must report itself cancelled"
+        );
+
+        let unfinished =
+            list_unfinished_ingests_impl(&fixture.cfg).expect("list_unfinished_ingests");
+        let listed = unfinished
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap_or_else(|| panic!("the cancelled run must be resumable: {unfinished:?}"));
+        assert_eq!(listed.planned, 24);
+        assert_eq!(
+            usize::try_from(listed.placed).expect("a placed count fits a usize"),
+            placed
+        );
+        assert_eq!(listed.source, fixture.source.path().display().to_string());
+
+        // Resuming finishes it under its own id, and nothing is left over.
+        let resumed = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(Some(run_id.clone())),
+            collecting_sink(&events),
+        )
+        .expect("resume");
+        assert_eq!(resumed, run_id, "a resume keeps the original run's id");
+        assert_eq!(placed_count(&fixture.finished_run()), 24 - placed);
+        assert!(
+            list_unfinished_ingests_impl(&fixture.cfg)
+                .expect("list_unfinished_ingests")
+                .runs
+                .iter()
+                .all(|run| run.run_id != run_id),
+            "a resumed run that placed everything is finished"
+        );
+    });
+}
+
+/// Cancelling with nothing running is a no-op, not an error — the surface
+/// can wire Stop unconditionally.
+#[test]
+fn cancel_ingest_with_nothing_running_does_nothing() {
+    let state = IngestState(RwLock::new(None));
+    cancel_ingest_impl(&state);
+    cancel_ingest_impl(&state);
+    let wire = ingest_state_impl(&state);
+    assert!(!wire.busy);
+    assert!(wire.running.is_none());
+    assert!(wire.finished.is_none());
+}
+
+/// The run outlives the webview: a reload throws away every event the
+/// surface accumulated, so `ingest_state` must keep answering with the
+/// finished run — as many times as it is asked.
+#[test]
+fn ingest_state_keeps_reporting_the_finished_run() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let run_id = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            collecting_sink(&events),
+        )
+        .expect("start_ingest");
+        assert_eq!(placed_count(&fixture.finished_run()), 2);
+
+        for _ in 0..2 {
+            let wire = ingest_state_impl(&fixture.state);
+            assert!(!wire.busy, "the run is over");
+            assert!(wire.running.is_none());
+            let Some(FinishedIngest::Done { run }) = wire.finished.as_deref() else {
+                panic!("a reloaded surface must still find the finished run");
+            };
+            assert_eq!(run.run_id, run_id);
+            assert_eq!(run.outcome.placed.len(), 2);
+            assert_eq!(run.generations.len(), 1, "one ASC MHL generation per dest");
+        }
+    });
+}
+
+/// A run that fails before it is ever named answers the caller AND lands in
+/// the state, so a surface that reloaded mid-failure still renders it.
+#[test]
+fn a_run_that_fails_before_it_starts_lands_in_the_state() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let mut req = fixture.request(None);
+        req.para = "project/nope".to_string();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let Err(err) =
+            start_ingest_impl(&fixture.cfg, &fixture.state, req, collecting_sink(&events))
+        else {
+            panic!("an unknown PARA target must fail the start");
+        };
+        assert!(err.message.contains("nope"), "{}", err.message);
+
+        let finished = fixture.await_finished();
+        let FinishedIngest::Failed { error } = finished.as_ref() else {
+            panic!("the failure must be what the state reports");
+        };
+        assert_eq!(error.message, err.message);
+        assert!(!ingest_state_impl(&fixture.state).busy);
+    });
+}
+
+/// An unknown `--resume` id is the CLI's own guard reaching the GUI: the
+/// error names the remedy, and the slot is free again afterwards.
+#[test]
+fn start_ingest_with_an_unknown_resume_id_reports_the_remedy() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let Err(err) = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string())),
+            collecting_sink(&events),
+        ) else {
+            panic!("an unknown resume id must fail");
+        };
+        assert!(
+            err.message.contains("no journal for run"),
+            "{}",
+            err.message
+        );
+        fixture.await_finished();
+        assert!(!ingest_state_impl(&fixture.state).busy);
+    });
+}
+
+#[test]
+fn list_unfinished_ingests_on_a_fresh_catalog_is_empty() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let outcome = list_unfinished_ingests_impl(&fixture.cfg).expect("list_unfinished_ingests");
+        assert!(outcome.runs.is_empty(), "{outcome:?}");
+    });
+}
+
+/// A panicking run must fail like any other failed run, not wedge the app:
+/// without the thread's `catch_unwind` the unwind skips the publish, the
+/// slot reads `busy` forever, and every later start is refused with "is
+/// still going" for a run that died minutes ago. The panic is injected
+/// where a real one is most plausible — our own progress sink, which the
+/// engine calls on a worker thread.
+#[test]
+fn a_run_whose_progress_sink_panics_fails_and_frees_the_slot() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(2));
+        let exploding: ProgressSink = Arc::new(|progress: IngestProgress| {
+            assert!(
+                !matches!(
+                    progress.event,
+                    majestical_ingest::engine::ProgressEvent::FilePlaced { .. }
+                ),
+                "boom in the progress sink"
+            );
+        });
+        let run_id = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            exploding,
+        )
+        .expect("the run is named before anything can panic");
+        assert_eq!(run_id.len(), 26);
+
+        let finished = fixture.await_finished();
+        let FinishedIngest::Failed { error } = finished.as_ref() else {
+            panic!("a panicked run is a failed run");
+        };
+        assert!(
+            error.message.contains("the ingest run panicked"),
+            "{}",
+            error.message
+        );
+
+        // The whole point: the slot is free again.
+        let wire = ingest_state_impl(&fixture.state);
+        assert!(!wire.busy, "a panicked run must not hold the slot");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let next = start_ingest_impl(
+            &fixture.cfg,
+            &fixture.state,
+            fixture.request(None),
+            collecting_sink(&events),
+        )
+        .expect("a new run is accepted after a panicked one");
+        assert_ne!(next, run_id);
+        fixture.await_finished();
+    });
+}
+
+/// `maj ingest`'s own guard, on both ingest paths: a file is not a source
+/// tree, and walking one would plan a single-entry copy to a destination
+/// nobody chose.
+#[test]
+fn a_source_that_is_not_a_directory_is_refused_by_both_ingest_paths() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = ingest_fixture(dir.path(), &tiny_files(1));
+        let file = fixture.source.path().join("clip-0.mov");
+
+        let Err(planned) =
+            plan_ingest_impl(&fixture.cfg, &file, "project/client-x", Some("raw".into()))
+        else {
+            panic!("planning a file must fail");
+        };
+        assert!(
+            planned.message.contains("source must be a directory"),
+            "{}",
+            planned.message
+        );
+        assert!(
+            planned.message.contains("clip-0.mov"),
+            "{}",
+            planned.message
+        );
+
+        let mut req = fixture.request(None);
+        req.source = file;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let Err(started) =
+            start_ingest_impl(&fixture.cfg, &fixture.state, req, collecting_sink(&events))
+        else {
+            panic!("starting from a file must fail");
+        };
+        assert!(
+            started.message.contains("source must be a directory"),
+            "{}",
+            started.message
+        );
+        assert!(
+            !ingest_state_impl(&fixture.state).busy,
+            "a refused source must not leave the slot held"
+        );
+    });
 }

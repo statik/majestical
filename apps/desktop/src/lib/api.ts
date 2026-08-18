@@ -261,6 +261,182 @@ export interface MountedRoot {
 }
 
 /**
+ * `majestical_ingest::plan::Decision` — serde tag `decision`, snake_case.
+ * `duplicate.action` is `plan::DedupeMode`; this head always plans and
+ * copies with `skip` (`commands::INGEST_DEDUPE`), but the other two spellings
+ * are part of the type a plan can carry.
+ */
+export type IngestDecision =
+  | { decision: "copy" }
+  | {
+      decision: "duplicate";
+      asset: string;
+      action: "skip" | "copy_anyway" | "link";
+    }
+  | { decision: "rejected"; reason: string };
+
+/**
+ * `majestical_ingest::plan::PlannedFile`. `prehash` is `null` — not absent —
+ * for a file the planner never hashed (its size matched nothing the catalog
+ * knows, so no dedupe check was needed).
+ */
+export interface PlannedFile {
+  source: string;
+  rel: string;
+  size: number;
+  prehash: string | null;
+  decision: IngestDecision;
+}
+
+/** `majestical_ingest::plan::IngestPlan` */
+export interface IngestPlan {
+  files: PlannedFile[];
+}
+
+/**
+ * `majestical_services::ingest::IngestPlanOutcome` — what `plan_ingest`
+ * returns. `subdir` is the layout template already rendered
+ * (`<KindDir>/<name>/<template>`), relative to each destination root.
+ */
+export interface IngestPlanOutcome {
+  plan: IngestPlan;
+  subdir: string;
+  node_id: string;
+  source_volume_id: string;
+  source_volume_label: string;
+  notices?: string[];
+}
+
+/** `majestical_ingest::engine::PlacedFile` */
+export interface PlacedFile {
+  rel: string;
+  size: number;
+  xxh3: string;
+  xxh64: string;
+  /** Final path under every destination root, `/`-separated. */
+  dest_rel: string;
+}
+
+/** `majestical_ingest::engine::FailedFile` — `failed` and `rejected` rows. */
+export interface FailedFile {
+  rel: string;
+  reason: string;
+}
+
+/**
+ * `majestical_ingest::engine::Outcome`. `diagnostics` are engine-internal
+ * notes about no particular file (recovered lock poisoning), kept apart from
+ * `failed` so a per-file list never shows one.
+ */
+export interface IngestOutcome {
+  placed: PlacedFile[];
+  failed: FailedFile[];
+  skipped_duplicates: string[];
+  rejected: FailedFile[];
+  skipped_resumed: number;
+  diagnostics: string[];
+}
+
+/** `majestical_ingest::mhl::WrittenGeneration` */
+export interface WrittenGeneration {
+  path: string;
+  generation: number;
+  /** c4 hash of the manifest's own bytes, as recorded in the ASC MHL chain. */
+  roothash: string;
+}
+
+/**
+ * `majestical_services::ingest::IngestRun` — a finished run. `generations`
+ * is a `Vec<(PathBuf, WrittenGeneration)>` in Rust, so it arrives as pairs of
+ * [destination root, generation]: one per destination that got new files.
+ *
+ * This — not the accumulated progress events — is the authority on what a
+ * run placed: the engine's end-of-run sweep can demote a file it already
+ * announced as `file_placed`, and that demotion appears only here.
+ */
+export interface IngestRun {
+  run_id: string;
+  outcome: IngestOutcome;
+  generations: [string, WrittenGeneration][];
+  notices?: string[];
+}
+
+/** `majestical_services::ingest::UnfinishedRun` — a resume candidate. */
+export interface UnfinishedRun {
+  run_id: string;
+  placed: number;
+  planned: number;
+  source: string;
+  destinations: string[];
+}
+
+/** `majestical_services::ingest::UnfinishedRunsOutcome`, newest run first. */
+export interface UnfinishedRunsOutcome {
+  runs: UnfinishedRun[];
+  notices?: string[];
+}
+
+/**
+ * `majestical_ingest::engine::ProgressEvent` — serde tag `type`, snake_case.
+ *
+ * Ordered within one file: `file_started`, then its `bytes_copied` (this head
+ * coalesces them — see `ingest::BytesThrottle`), then one `file_verified`
+ * per destination, then exactly one `file_placed` or `file_failed`. Files
+ * interleave freely; several workers copy at once.
+ *
+ * `run_stopped` means the copy loop ended, NOT that the outcome is ready:
+ * the engine's missing-file sweep, the ASC MHL generation per destination,
+ * and the catalog events all land after it — seconds later on a big run.
+ * A surface that saw it polls `ingestState()` until `busy` is false and
+ * renders `finished` then, rather than treating `run_stopped` as the end.
+ */
+export type ProgressEvent =
+  | { type: "run_started"; files_total: number; bytes_total: number }
+  | { type: "file_started"; rel: string; size: number }
+  | { type: "bytes_copied"; rel: string; bytes_done: number }
+  | { type: "file_verified"; rel: string; dest_root: string }
+  | { type: "file_placed"; rel: string }
+  | { type: "file_failed"; rel: string; reason: string }
+  | { type: "run_stopped"; cancelled: boolean };
+
+/**
+ * `commands::IngestProgress` — the payload of every
+ * [`INGEST_PROGRESS_EVENT`]. The run id rides the envelope because the event
+ * itself carries none, and a surface that mounted mid-run has to know which
+ * run it is watching.
+ */
+export interface IngestProgress {
+  run_id: string;
+  event: ProgressEvent;
+}
+
+/** The Tauri event name `start_ingest` forwards progress under. */
+export const INGEST_PROGRESS_EVENT = "ingest-progress";
+
+/**
+ * `commands::FinishedIngest` — how the last run ended. A failure is a value
+ * the state keeps, not a lost promise: the run outlives the webview, so the
+ * error that ended it survives a reload too.
+ */
+export type FinishedIngest =
+  | { status: "done"; run: IngestRun }
+  | { status: "failed"; error: CommandError };
+
+/**
+ * `commands::IngestStateWire` — what the Ingest surface reads on mount.
+ *
+ * `busy`, not `running`, is the authority on whether Start can be offered:
+ * `running` names the in-flight run and is absent both when nothing runs and
+ * for the instant between `start_ingest` claiming the job slot and the run
+ * naming itself.
+ */
+export interface IngestState {
+  running?: string;
+  busy: boolean;
+  finished?: FinishedIngest;
+}
+
+/**
  * Argument names are camelCase because `#[tauri::command]` defaults to
  * `rename_all = "camelCase"` — Rust's `asset_id` is looked up as `assetId`.
  *
@@ -312,6 +488,30 @@ export const api = {
   archiveNode: (node: string, roots: string[], dryRun: boolean) =>
     invoke<ArchiveOutcome>("archive_node", { node, roots, dryRun }),
   listMountedRoots: () => invoke<MountedRoot[]>("list_mounted_roots"),
+  // Ingest. `planIngest` takes no destinations: the plan is a diff of the
+  // source against the catalog, so it doesn't depend on where the bytes
+  // will land — only `startIngest` does. Both default `template` to
+  // `commands::DEFAULT_INGEST_TEMPLATE` when it is left out, the same
+  // string `maj ingest` and MCP's `ingest_source` default to.
+  planIngest: (req: {
+    source: string;
+    para: string;
+    template?: string | undefined;
+  }) => invoke<IngestPlanOutcome>("plan_ingest", req),
+  // Resolves with the run id once the run has one — after its planning
+  // pass, before its first byte. The copy itself keeps going on the
+  // backend's own thread; progress arrives as INGEST_PROGRESS_EVENT.
+  startIngest: (req: {
+    source: string;
+    dests: string[];
+    para: string;
+    template?: string | undefined;
+    resume?: string | undefined;
+  }) => invoke<string>("start_ingest", req),
+  cancelIngest: () => invoke<void>("cancel_ingest"),
+  ingestState: () => invoke<IngestState>("ingest_state"),
+  listUnfinishedIngests: () =>
+    invoke<UnfinishedRunsOutcome>("list_unfinished_ingests"),
 };
 
 /**

@@ -18,10 +18,13 @@
       // organize/ingest surfaces land (phase 7C's watchlist already tracks
       // "api.ts codegen" as the eventual fix for this file's size). Default
       // 300 is the wrong gate for a file whose length tracks the command
-      // count, not its complexity.
+      // count, not its complexity. Raised for the ingest surface, which
+      // mirrors the deepest outcome in the app: a run carries the engine's
+      // whole `Outcome` (five per-file lists) plus a seven-variant progress
+      // union.
       "files": ["src/lib/api.ts"],
       "rules": {
-        "max-lines": ["warn", { "max": 400 }]
+        "max-lines": ["warn", { "max": 560 }]
       }
     },
     {
@@ -46,7 +49,7 @@
       // number of Tauri commands, not incidental coupling.
       "files": ["src/lib/fixtures.test.ts"],
       "rules": {
-        "import/max-dependencies": ["warn", { "max": 20 }]
+        "import/max-dependencies": ["warn", { "max": 26 }]
       }
     }
   ]

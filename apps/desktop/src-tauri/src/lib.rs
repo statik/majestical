@@ -3,6 +3,7 @@
 //! construction, same rule as `maj mcp`).
 pub mod commands;
 pub mod config;
+pub mod ingest;
 pub mod thumb_protocol;
 
 /// Builds and runs the Tauri app.
@@ -32,6 +33,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(commands::AppState(std::sync::RwLock::new(None)))
+        // The one in-flight ingest run. Managed state, not webview state:
+        // the run is a plain OS thread that keeps copying across a reload,
+        // and `ingest_state` is how the surface finds it again.
+        .manage(ingest::IngestState(std::sync::RwLock::new(None)))
         .setup(|app| Ok(commands::restore_persisted_catalog(app.handle())?))
         .register_uri_scheme_protocol("thumb", |ctx, request| {
             thumb_protocol::respond(ctx.app_handle(), &request.uri().to_string())
@@ -55,6 +60,11 @@ pub fn run() {
             commands::rename_para_node,
             commands::archive_node,
             commands::list_mounted_roots,
+            commands::plan_ingest,
+            commands::start_ingest,
+            commands::cancel_ingest,
+            commands::ingest_state,
+            commands::list_unfinished_ingests,
             commands::initialize_catalog,
             commands::use_existing_catalog,
         ])

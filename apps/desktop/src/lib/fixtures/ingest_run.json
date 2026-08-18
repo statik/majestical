@@ -1,0 +1,46 @@
+{
+  "generations": [
+    [
+      "/Volumes/SSD-A",
+      {
+        "generation": 1,
+        "path": "/Volumes/SSD-A/ascmhl/0001_SSD-A_2026-08-12_101500.mhl",
+        "roothash": "c43MDX3ScQKZk8MRLZfXmqcbSjqQPmhpqFrLzCkFvNhBAd"
+      }
+    ]
+  ],
+  "notices": [
+    "a warning the ingest run collected"
+  ],
+  "outcome": {
+    "diagnostics": [
+      "queue lock poisoned — continuing with recovered state"
+    ],
+    "failed": [
+      {
+        "reason": "/Volumes/SSD-A: read-back mismatch",
+        "rel": "DCIM/d.mov"
+      }
+    ],
+    "placed": [
+      {
+        "dest_rel": "Projects/client-x/2026-08-12/A7IV-CARD/DCIM/a.mov",
+        "rel": "DCIM/a.mov",
+        "size": 1024,
+        "xxh3": "0123456789abcdef0123456789abcdef",
+        "xxh64": "0123456789abcdef"
+      }
+    ],
+    "rejected": [
+      {
+        "reason": "unreadable: permission denied",
+        "rel": "DCIM/c.mov"
+      }
+    ],
+    "skipped_duplicates": [
+      "DCIM/b.mov"
+    ],
+    "skipped_resumed": 2
+  },
+  "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+}

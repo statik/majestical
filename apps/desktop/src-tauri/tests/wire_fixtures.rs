@@ -8,12 +8,19 @@
 //! plain struct literal rather than a real catalog driven through
 //! `*_impl` (the path `tests/commands.rs` uses) — there is nothing private
 //! to round-trip through a service call for.
-use majestical_core::event::VerifyOutcome;
+use majestical_core::event::{AssetId, VerifyOutcome};
 use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
+use majestical_desktop::ingest::{FinishedIngest, IngestProgress, IngestStateWire};
+use majestical_ingest::engine::{FailedFile, Outcome, PlacedFile, ProgressEvent};
+use majestical_ingest::mhl::WrittenGeneration;
+use majestical_ingest::plan::{Decision, DedupeMode, IngestPlan, PlannedFile};
 use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
 use majestical_services::catalog::{AssetDetail, AssetInstance, AssetVerification};
+use majestical_services::ingest::{
+    IngestPlanOutcome, IngestRun, UnfinishedRun, UnfinishedRunsOutcome,
+};
 use majestical_services::para::{
     ArchiveMove, ArchiveOutcome, MoveStatus, ParaNodeRow, ParaOutcome,
 };
@@ -394,5 +401,224 @@ fn command_error_fixture() {
     check_or_update(
         "command_error",
         &serde_json::to_value(&command_error).expect("serialize"),
+    );
+}
+
+/// synthetic-maximal: `PlannedFile.prehash` is `Some` on all three files so
+/// the fixture never carries a `null` (the planner fills it only when the
+/// size prefilter matched), and all three `Decision` variants appear at
+/// once so the TS union is pinned in one place. A real plan is mostly
+/// `copy` rows with no prehash.
+#[test]
+fn ingest_plan_fixture() {
+    let ingest_plan_outcome = IngestPlanOutcome {
+        plan: IngestPlan {
+            files: vec![
+                PlannedFile {
+                    source: PathBuf::from("/Volumes/card/DCIM/a.mov"),
+                    rel: "DCIM/a.mov".to_string(),
+                    size: 1024,
+                    prehash: Some("0123456789abcdef0123456789abcdef".to_string()),
+                    decision: Decision::Copy,
+                },
+                PlannedFile {
+                    source: PathBuf::from("/Volumes/card/DCIM/b.mov"),
+                    rel: "DCIM/b.mov".to_string(),
+                    size: 2048,
+                    prehash: Some("89abcdef0123456789abcdef01234567".to_string()),
+                    decision: Decision::Duplicate {
+                        asset: AssetId("xxh3:89abcdef0123456789abcdef01234567".to_string()),
+                        action: DedupeMode::Skip,
+                    },
+                },
+                PlannedFile {
+                    source: PathBuf::from("/Volumes/card/DCIM/c.mov"),
+                    rel: "DCIM/c.mov".to_string(),
+                    size: 4096,
+                    prehash: Some("fedcba9876543210fedcba9876543210".to_string()),
+                    decision: Decision::Rejected {
+                        reason: "unreadable: permission denied".to_string(),
+                    },
+                },
+            ],
+        },
+        subdir: "Projects/client-x/2026-08-12/A7IV-CARD".to_string(),
+        node_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        source_volume_id: "uuid:9E1F0C7A-0B4E-4C1D-9A2B-6D5E4F3C2B1A".to_string(),
+        source_volume_label: "A7IV-CARD".to_string(),
+        notices: vec!["a warning the plan_ingest call collected".to_string()],
+    };
+    check_or_update(
+        "ingest_plan",
+        &serde_json::to_value(&ingest_plan_outcome).expect("serialize"),
+    );
+}
+
+/// The run both `ingest_run` and `ingest_state_done` pin — one literal, so
+/// the outcome the completion card renders can never drift between the two
+/// fixtures that carry it.
+///
+/// synthetic-maximal: one real run rarely places, fails, dedupes, rejects,
+/// AND resumes, but every list is populated here so the TS side type-checks
+/// the whole `Outcome`.
+#[cfg(test)]
+fn sample_ingest_run() -> IngestRun {
+    IngestRun {
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        outcome: Outcome {
+            placed: vec![PlacedFile {
+                rel: "DCIM/a.mov".to_string(),
+                size: 1024,
+                xxh3: "0123456789abcdef0123456789abcdef".to_string(),
+                xxh64: "0123456789abcdef".to_string(),
+                dest_rel: "Projects/client-x/2026-08-12/A7IV-CARD/DCIM/a.mov".to_string(),
+            }],
+            failed: vec![FailedFile {
+                rel: "DCIM/d.mov".to_string(),
+                reason: "/Volumes/SSD-A: read-back mismatch".to_string(),
+            }],
+            skipped_duplicates: vec!["DCIM/b.mov".to_string()],
+            rejected: vec![FailedFile {
+                rel: "DCIM/c.mov".to_string(),
+                reason: "unreadable: permission denied".to_string(),
+            }],
+            skipped_resumed: 2,
+            diagnostics: vec!["queue lock poisoned — continuing with recovered state".to_string()],
+        },
+        generations: vec![(
+            PathBuf::from("/Volumes/SSD-A"),
+            WrittenGeneration {
+                path: PathBuf::from("/Volumes/SSD-A/ascmhl/0001_SSD-A_2026-08-12_101500.mhl"),
+                generation: 1,
+                roothash: "c43MDX3ScQKZk8MRLZfXmqcbSjqQPmhpqFrLzCkFvNhBAd".to_string(),
+            },
+        )],
+        notices: vec!["a warning the ingest run collected".to_string()],
+    }
+}
+
+#[test]
+fn ingest_run_fixture() {
+    check_or_update(
+        "ingest_run",
+        &serde_json::to_value(sample_ingest_run()).expect("serialize"),
+    );
+}
+
+#[test]
+fn unfinished_runs_fixture() {
+    let unfinished_runs = UnfinishedRunsOutcome {
+        runs: vec![UnfinishedRun {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            placed: 37,
+            planned: 214,
+            source: "/Volumes/A7IV-CARD".to_string(),
+            destinations: vec!["/Volumes/SSD-A".to_string(), "/Volumes/NAS-1".to_string()],
+        }],
+        notices: vec!["a warning the list_unfinished_ingests call collected".to_string()],
+    };
+    check_or_update(
+        "unfinished_runs",
+        &serde_json::to_value(&unfinished_runs).expect("serialize"),
+    );
+}
+
+/// A run in flight: named, `busy`, nothing finished yet.
+#[test]
+fn ingest_state_running_fixture() {
+    let ingest_state = IngestStateWire {
+        running: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+        busy: true,
+        finished: None,
+    };
+    check_or_update(
+        "ingest_state_running",
+        &serde_json::to_value(&ingest_state).expect("serialize"),
+    );
+}
+
+/// The same slot after the run failed before it could copy anything —
+/// pins `FinishedIngest`'s `failed` arm and its embedded `CommandError`.
+/// The `done` arm is pinned by `ingest_state_done`.
+#[test]
+fn ingest_state_failed_fixture() {
+    let ingest_state = IngestStateWire {
+        running: None,
+        busy: false,
+        finished: Some(std::sync::Arc::new(FinishedIngest::Failed {
+            error: CommandError::from(anyhow::anyhow!(
+                "no active PARA node matches 'project/nope'"
+            )),
+        })),
+    };
+    check_or_update(
+        "ingest_state_failed",
+        &serde_json::to_value(&ingest_state).expect("serialize"),
+    );
+}
+
+/// The slot after a run finished, which is what a reloaded surface renders
+/// its completion card from — never the events it accumulated, since the
+/// engine's end-of-run sweep can demote an already-announced `FilePlaced`.
+#[test]
+fn ingest_state_done_fixture() {
+    let ingest_state = IngestStateWire {
+        running: None,
+        busy: false,
+        finished: Some(std::sync::Arc::new(FinishedIngest::Done {
+            run: sample_ingest_run(),
+        })),
+    };
+    check_or_update(
+        "ingest_state_done",
+        &serde_json::to_value(&ingest_state).expect("serialize"),
+    );
+}
+
+/// One of every `ProgressEvent` variant, each wrapped in the `{ run_id,
+/// event }` envelope the `ingest-progress` Tauri event actually carries —
+/// so the TS union's seven discriminants and the envelope are pinned
+/// together. Not a sequence a real run emits (a run has one `RunStarted`
+/// and one `RunStopped`, and never a `FilePlaced` and a `FileFailed` for
+/// the same file).
+#[test]
+fn ingest_progress_fixture() {
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let events = vec![
+        ProgressEvent::RunStarted {
+            files_total: 214,
+            bytes_total: 96_400_000_000,
+        },
+        ProgressEvent::FileStarted {
+            rel: "DCIM/a.mov".to_string(),
+            size: 1024,
+        },
+        ProgressEvent::BytesCopied {
+            rel: "DCIM/a.mov".to_string(),
+            bytes_done: 512,
+        },
+        ProgressEvent::FileVerified {
+            rel: "DCIM/a.mov".to_string(),
+            dest_root: "/Volumes/SSD-A".to_string(),
+        },
+        ProgressEvent::FilePlaced {
+            rel: "DCIM/a.mov".to_string(),
+        },
+        ProgressEvent::FileFailed {
+            rel: "DCIM/d.mov".to_string(),
+            reason: "/Volumes/SSD-A: read-back mismatch".to_string(),
+        },
+        ProgressEvent::RunStopped { cancelled: true },
+    ];
+    let progress: Vec<IngestProgress> = events
+        .into_iter()
+        .map(|event| IngestProgress {
+            run_id: run_id.to_string(),
+            event,
+        })
+        .collect();
+    check_or_update(
+        "ingest_progress",
+        &serde_json::to_value(&progress).expect("serialize"),
     );
 }

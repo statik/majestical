@@ -8,26 +8,36 @@
 //! function. The impls are what `tests/commands.rs` drives directly, and
 //! keeping the command layer free of logic also keeps `lib.rs`'s blanket
 //! `expect_used`/`exit` expectations (which the Tauri macros need) from
-//! covering any code of ours.
+//! covering any code of ours. The five ingest commands follow the same
+//! rule over [`crate::ingest`], which holds the one thing in this head
+//! that is not a wrapper: a run that outlives its call.
 //!
-//! Only the two search commands are `async`: `search::search`'s semantic
-//! layer opens a Lance vector store, which must run off any tokio runtime
-//! (see [`majestical_services::runtime`]), and a search is the one call
-//! slow enough to be worth handing to the blocking pool as well. The rest
-//! read the projection and return promptly.
+//! The `async` commands are the ones that must not hold an async worker:
+//! the two searches (`search::search`'s semantic layer opens a Lance vector
+//! store, which must run off any tokio runtime — see
+//! [`majestical_services::runtime`] — and a search is slow enough to be
+//! worth the blocking pool anyway), the mount-table listing, and the two
+//! ingest calls that walk and hash a whole source directory. The rest read
+//! the projection and return promptly.
 use crate::config::{self, GuiConfig};
+use crate::ingest::{
+    INGEST_PROGRESS_EVENT, IngestProgress, IngestState, IngestStateWire, ProgressSink, StartIngest,
+    cancel_ingest_impl, ingest_state_impl, list_unfinished_ingests_impl, plan_ingest_impl,
+    start_ingest_impl,
+};
 use majestical_services::app::FsApp;
 use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseTreeOutcome};
 use majestical_services::catalog::AssetDetail;
 use majestical_services::error::ServiceError;
+use majestical_services::ingest::{IngestPlanOutcome, UnfinishedRunsOutcome};
 use majestical_services::para::{self, ArchiveOutcome, ParaOutcome};
 use majestical_services::search::{SavedSearch, SearchOutcome, SearchRequest};
 use majestical_services::tags::{self, AssignOutcome, TagRenameOutcome, TagsListOutcome};
 use majestical_services::volumes::VolumesOutcome;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
-use tauri::{AppHandle, Manager, State};
+use std::sync::{Arc, PoisonError, RwLock};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// The page size a caller gets when it omits `limit`. Applied inside the
 /// impls, not the command wrappers, so it is reachable from a test.
@@ -50,7 +60,11 @@ pub struct AppState(pub RwLock<Option<CatalogCfg>>);
 /// `maj mcp`'s `tool_error`), plus any notices the failing call collected —
 /// the failure-path counterpart of the outcome structs' `notices` field,
 /// with the same absent-when-empty wire contract.
-#[derive(Debug, Serialize)]
+/// `Clone` for the one caller that needs the same failure twice: a failed
+/// ingest run answers the `start_ingest` still waiting for its run id AND
+/// stays in the managed state for a reloaded surface to read (see
+/// [`crate::ingest::FinishedIngest`]).
+#[derive(Debug, Clone, Serialize)]
 pub struct CommandError {
     pub message: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -58,7 +72,7 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             notices: Vec::new(),
@@ -162,7 +176,7 @@ pub fn machine_identity() -> String {
     )
 }
 
-fn open_app(cfg: &CatalogCfg) -> Result<FsApp, CommandError> {
+pub(crate) fn open_app(cfg: &CatalogCfg) -> Result<FsApp, CommandError> {
     Ok(FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)?)
 }
 
@@ -939,6 +953,115 @@ pub fn use_existing_catalog(
         PathBuf::from(path),
         use_existing_catalog_impl,
     )
+}
+
+/// Plans an ingest: what would be copied, skipped as a known duplicate, or
+/// rejected, and the destination subdir the layout template renders to.
+/// Copies nothing and writes nothing. `template` defaults to
+/// [`crate::ingest::DEFAULT_INGEST_TEMPLATE`].
+///
+/// `async`, and on the blocking pool: planning walks the whole source and
+/// hashes every file whose size matches something the catalog already knows.
+///
+/// # Errors
+/// Returns an error if no catalog is selected, `para` doesn't resolve to an
+/// active PARA node, or the source walk or the template fails.
+#[tauri::command]
+pub async fn plan_ingest(
+    state: State<'_, AppState>,
+    source: String,
+    para: String,
+    template: Option<String>,
+) -> Result<IngestPlanOutcome, CommandError> {
+    let cfg = require_catalog(&state)?;
+    blocking(move || plan_ingest_impl(&cfg, Path::new(&source), &para, template)).await
+}
+
+/// Starts the verified copy and returns the run's id. One run at a time:
+/// while one is in flight this refuses, naming the run holding the slot.
+///
+/// Progress is forwarded to the webview as [`INGEST_PROGRESS_EVENT`] events
+/// carrying [`IngestProgress`]; `BytesCopied` is coalesced on the way (see
+/// `ingest::BytesThrottle`). The run itself lives on its own thread and outlives
+/// the webview — a surface that reloads mid-run reads [`ingest_state`] and
+/// re-subscribes.
+///
+/// # Errors
+/// Returns an error if no catalog is selected, a run is already in flight,
+/// or this one failed before it was named (see [`crate::ingest::start_ingest_impl`]).
+#[tauri::command]
+pub async fn start_ingest(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source: String,
+    dests: Vec<String>,
+    para: String,
+    template: Option<String>,
+    resume: Option<String>,
+) -> Result<String, CommandError> {
+    let cfg = require_catalog(&state)?;
+    let req = StartIngest {
+        source: PathBuf::from(source),
+        dests: dests.into_iter().map(PathBuf::from).collect(),
+        para,
+        template,
+        resume,
+    };
+    let emitter = app.clone();
+    let emit: ProgressSink = Arc::new(move |progress: IngestProgress| {
+        // A webview that is reloading, hidden, or gone is not a run
+        // failure: the run keeps copying and `ingest_state` re-answers for
+        // whoever comes back.
+        let _ = emitter.emit(INGEST_PROGRESS_EVENT, progress);
+    });
+    blocking(move || {
+        let ingest = app
+            .try_state::<IngestState>()
+            .ok_or_else(|| CommandError::new("the ingest job state is not managed"))?;
+        start_ingest_impl(&cfg, &ingest, req, emit)
+    })
+    .await
+}
+
+/// Asks the in-flight run to stop after the files already in flight. A
+/// no-op when nothing is running, so the surface can wire Stop
+/// unconditionally; the stopped run stays resumable by its id.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn cancel_ingest(ingest: State<'_, IngestState>) {
+    cancel_ingest_impl(&ingest);
+}
+
+/// The in-flight run, or the last one to finish — what the Ingest surface
+/// reads on mount so a webview reload never loses a running copy. The
+/// finished run's outcome, not the events, is the authority on what landed.
+#[must_use]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn ingest_state(ingest: State<'_, IngestState>) -> IngestStateWire {
+    ingest_state_impl(&ingest)
+}
+
+/// Every run a `resume` could still finish, newest first.
+///
+/// # Errors
+/// Returns an error if no catalog is selected or this machine's run
+/// journals can't be listed.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn list_unfinished_ingests(
+    state: State<'_, AppState>,
+) -> Result<UnfinishedRunsOutcome, CommandError> {
+    list_unfinished_ingests_impl(&require_catalog(&state)?)
 }
 
 /// The two functions here that `tests/commands.rs` cannot reach: it drives

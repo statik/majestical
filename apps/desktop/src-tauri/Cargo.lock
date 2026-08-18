@@ -4945,6 +4945,7 @@ dependencies = [
  "hostname",
  "majestical-core",
  "majestical-index",
+ "majestical-ingest",
  "majestical-services",
  "percent-encoding",
  "serde",

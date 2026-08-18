@@ -24,7 +24,15 @@ tauri-plugin-updater = "2.10.1"
 # this plugin takes no configuration and so cannot fail to initialize.
 tauri-plugin-process = "2.3.1"
 majestical-services = { path = "../../../crates/services" }
-serde = { version = "1", features = ["derive"] }
+# The GUI owns the one cancellable ingest run: `engine::{RunControl,
+# CancelFlag, ProgressEvent}` is the seam `services::ingest::run_ingest`
+# takes, and `majestical-services` re-exports none of it.
+majestical-ingest = { path = "../../../crates/ingest" }
+# `rc`: `ingest_state` hands out the finished run behind the `Arc` the job
+# thread published it under. `IngestRun` is not `Clone` (it carries
+# `engine::Outcome`), so an owned wire struct either shares the `Arc` or
+# re-serializes the whole outcome on every poll.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 anyhow = "1"
 # The machine id and author every event this app writes is stamped with.

@@ -1,12 +1,17 @@
 //! Engine acceptance: real files in temp dirs, fault injection via `SinkFactory`.
 mod common;
 
-use common::CorruptingSinks;
-use majestical_ingest::engine::{DestSpec, EngineConfig, RealSinks, Sink, SinkFactory, run};
+use common::{CorruptingSinks, silent_control};
+use majestical_ingest::engine::{
+    CancelFlag, DestSpec, EngineConfig, ProgressEvent, RealSinks, RunControl, Sink, SinkFactory,
+    run,
+};
 use majestical_ingest::journal::Journal;
 use majestical_ingest::plan::{DedupeMode, KnownAssets, plan_source};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 // These helpers need `#[cfg(test)]` even though this whole file only ever
 // compiles as a test binary: clippy's expect/unwrap-in-tests exemption
@@ -66,6 +71,7 @@ fn copies_verifies_and_places_to_every_destination() {
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 2 },
+        &silent_control(),
     )
     .expect("run");
     assert_eq!(outcome.placed.len(), 2);
@@ -113,6 +119,7 @@ fn corrupted_destination_fails_verification_and_stays_quarantined() {
             target: d1.path().to_string_lossy().into_owned(),
         },
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("run");
     assert_eq!(outcome.failed.len(), 1, "corrupted dest fails the file");
@@ -147,6 +154,7 @@ fn resume_skips_placed_files() {
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("first run");
     let folded = Journal::load(&jpath).expect("fold");
@@ -159,6 +167,7 @@ fn resume_skips_placed_files() {
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("resume");
     assert!(outcome.placed.is_empty(), "everything already placed");
@@ -206,6 +215,7 @@ fn sweep_missing_demotes_a_placed_file_that_vanished_before_the_sweep() {
         &mut journal,
         &sinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("run");
     assert_eq!(outcome.placed.len(), 1, "only b survives the sweep");
@@ -252,6 +262,7 @@ fn duplicate_skip_does_not_copy() {
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("run");
     assert!(outcome.placed.is_empty());
@@ -293,6 +304,7 @@ fn a_correctly_predicted_prehash_does_not_block_the_copy() {
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .expect("run");
     assert_eq!(
@@ -302,4 +314,444 @@ fn a_correctly_predicted_prehash_does_not_block_the_copy() {
         outcome.failed
     );
     assert!(outcome.failed.is_empty());
+}
+
+/// One file's slice of a run's event stream. Workers race globally, so a
+/// run's events only interleave *between* files — everything asserted here
+/// is filtered down to a single `rel` first.
+#[cfg(test)]
+#[derive(Default)]
+struct FileTrace {
+    /// `FileStarted` sizes: exactly one per attempted file.
+    started: Vec<u64>,
+    /// Cumulative source bytes carried by each `BytesCopied`.
+    bytes: Vec<u64>,
+    /// Destination roots that passed read-back verification.
+    verified: Vec<String>,
+    placed: usize,
+    /// `FileFailed` reasons.
+    failed: Vec<String>,
+    /// Each event's variant, in emission order, for the ordering assertions.
+    order: Vec<&'static str>,
+}
+
+#[cfg(test)]
+fn trace(events: &[ProgressEvent], want: &str) -> FileTrace {
+    let mut found = FileTrace::default();
+    for event in events {
+        match event {
+            ProgressEvent::RunStarted { .. } | ProgressEvent::RunStopped { .. } => {}
+            ProgressEvent::FileStarted { rel, size } => {
+                if rel == want {
+                    found.started.push(*size);
+                    found.order.push("started");
+                }
+            }
+            ProgressEvent::BytesCopied { rel, bytes_done } => {
+                if rel == want {
+                    found.bytes.push(*bytes_done);
+                    found.order.push("bytes");
+                }
+            }
+            ProgressEvent::FileVerified { rel, dest_root } => {
+                if rel == want {
+                    found.verified.push(dest_root.clone());
+                    found.order.push("verified");
+                }
+            }
+            ProgressEvent::FilePlaced { rel } => {
+                if rel == want {
+                    found.placed += 1;
+                    found.order.push("placed");
+                }
+            }
+            ProgressEvent::FileFailed { rel, reason } => {
+                if rel == want {
+                    found.failed.push(reason.clone());
+                    found.order.push("failed");
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Asserts the per-file ordering guarantee for a file that was placed:
+/// `FileStarted` first, every `BytesCopied` before every `FileVerified`,
+/// `FilePlaced` last, and the byte counts cumulative up to `size`.
+#[cfg(test)]
+fn assert_placed_trace(found: &FileTrace, size: u64, roots: &[String]) {
+    assert_eq!(found.started, vec![size], "one FileStarted with the size");
+    assert!(!found.bytes.is_empty(), "at least one BytesCopied");
+    assert!(
+        found.bytes.windows(2).all(|w| w[0] < w[1]),
+        "BytesCopied must be cumulative and strictly increasing: {:?}",
+        found.bytes
+    );
+    assert_eq!(
+        found.bytes.last().copied(),
+        Some(size),
+        "the last BytesCopied is the whole file, counted once — not once \
+         per destination: {:?}",
+        found.bytes
+    );
+    let mut verified = found.verified.clone();
+    verified.sort();
+    let mut want_roots = roots.to_vec();
+    want_roots.sort();
+    assert_eq!(verified, want_roots, "one FileVerified per destination");
+    assert_eq!(found.placed, 1);
+    assert!(found.failed.is_empty(), "{:?}", found.failed);
+    assert_eq!(found.order.first(), Some(&"started"));
+    assert_eq!(found.order.last(), Some(&"placed"));
+    let last_bytes = found
+        .order
+        .iter()
+        .rposition(|label| *label == "bytes")
+        .expect("a bytes event");
+    let first_verified = found
+        .order
+        .iter()
+        .position(|label| *label == "verified")
+        .expect("a verified event");
+    assert!(
+        last_bytes < first_verified,
+        "every BytesCopied precedes every FileVerified: {:?}",
+        found.order
+    );
+}
+
+#[cfg(test)]
+fn root_names(d1: &Path, d2: &Path) -> Vec<String> {
+    vec![
+        d1.to_string_lossy().into_owned(),
+        d2.to_string_lossy().into_owned(),
+    ]
+}
+
+#[test]
+fn progress_events_bracket_the_run_and_narrate_every_copied_file() {
+    // `already.mov` is resumed and `empty.mov` is rejected by planning, so
+    // neither may show up in the RunStarted totals: 3 files, 4+6+2 bytes.
+    let (src, d1, d2) = setup(&[
+        ("clips/a.mov", b"AAAA"),
+        ("b.wav", b"BBBBBB"),
+        ("c.mov", b"CC"),
+        ("already.mov", b"DDDDDDDD"),
+        ("empty.mov", b""),
+    ]);
+    // Bigger than the engine's 1 MiB copy buffer, so this one file spans
+    // three chunks and its BytesCopied really do have to accumulate.
+    let big = vec![7u8; 2_500_000];
+    write(src.path(), "big.mov", &big);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let mut resume = BTreeSet::new();
+    resume.insert("already.mov".to_string());
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
+    let events = Mutex::new(Vec::new());
+    let cancel = CancelFlag::new(false);
+    let progress = |event: ProgressEvent| events.lock().expect("events lock").push(event);
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &resume,
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 2 },
+        &RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+    .expect("run");
+    assert_eq!(outcome.placed.len(), 4);
+    assert_eq!(outcome.skipped_resumed, 1);
+    assert_eq!(outcome.rejected.len(), 1);
+
+    let events = events.into_inner().expect("events");
+    let started = ProgressEvent::RunStarted {
+        files_total: 4,
+        bytes_total: 12 + 2_500_000,
+    };
+    let stopped = ProgressEvent::RunStopped { cancelled: false };
+    assert_eq!(
+        events.first(),
+        Some(&started),
+        "totals cover queued work only"
+    );
+    assert_eq!(events.iter().filter(|e| **e == started).count(), 1);
+    assert_eq!(events.last(), Some(&stopped));
+    assert_eq!(events.iter().filter(|e| **e == stopped).count(), 1);
+
+    let roots = root_names(d1.path(), d2.path());
+    for (rel, size) in [
+        ("clips/a.mov", 4u64),
+        ("b.wav", 6),
+        ("c.mov", 2),
+        ("big.mov", 2_500_000),
+    ] {
+        assert_placed_trace(&trace(&events, rel), size, &roots);
+    }
+    // Cumulative source bytes, one buffer at a time — not per destination,
+    // which with two destinations would double every number here.
+    assert_eq!(
+        trace(&events, "big.mov").bytes,
+        vec![1_048_576, 2_097_152, 2_500_000]
+    );
+}
+
+/// Fails to open any temp sink whose name contains `filename`, so exactly
+/// one file of a multi-file run fails while the rest place normally.
+struct FailingOpenSinks {
+    filename: &'static str,
+}
+
+impl SinkFactory for FailingOpenSinks {
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Sink>> {
+        if path.to_string_lossy().contains(self.filename) {
+            return Err(std::io::Error::other("injected open failure"));
+        }
+        RealSinks.open(path)
+    }
+}
+
+#[test]
+fn a_failing_file_emits_file_failed_without_disturbing_the_others() {
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB"), ("c.mov", b"CCC")]);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
+    let events = Mutex::new(Vec::new());
+    let cancel = CancelFlag::new(false);
+    let progress = |event: ProgressEvent| events.lock().expect("events lock").push(event);
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &FailingOpenSinks { filename: "b.mov" },
+        &EngineConfig { jobs: 2 },
+        &RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+    .expect("run");
+    assert_eq!(outcome.failed.len(), 1);
+    assert_eq!(outcome.failed[0].rel, "b.mov");
+
+    let events = events.into_inner().expect("events");
+    let failed = trace(&events, "b.mov");
+    assert_eq!(failed.placed, 0);
+    assert_eq!(failed.failed.len(), 1);
+    assert!(
+        failed.failed[0].contains("injected open failure"),
+        "the event carries the real reason: {}",
+        failed.failed[0]
+    );
+    assert_eq!(failed.order.first(), Some(&"started"));
+    assert_eq!(failed.order.last(), Some(&"failed"));
+
+    let roots = root_names(d1.path(), d2.path());
+    assert_placed_trace(&trace(&events, "a.mov"), 4, &roots);
+    assert_placed_trace(&trace(&events, "c.mov"), 3, &roots);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == ProgressEvent::RunStopped { cancelled: false })
+            .count(),
+        1,
+        "a per-file failure is not a cancellation"
+    );
+}
+
+#[test]
+fn cancelling_mid_run_stops_between_files_and_leaves_the_rest_resumable() {
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB"), ("c.mov", b"CCC")]);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let jpath = d1.path().join("run.jsonl");
+    let mut journal = Journal::open_append(&jpath).expect("journal");
+    let events = Mutex::new(Vec::new());
+    let cancel = CancelFlag::new(false);
+    // One worker, cancelled from inside the first FilePlaced emission: the
+    // remaining two queue entries are never popped.
+    let progress = |event: ProgressEvent| {
+        if let ProgressEvent::FilePlaced { .. } = &event {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        events.lock().expect("events lock").push(event);
+    };
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 1 },
+        &RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+    .expect("run");
+    assert_eq!(outcome.placed.len(), 1, "the in-flight file finishes");
+    assert!(outcome.failed.is_empty(), "cancelling is not failing");
+
+    let events = events.into_inner().expect("events");
+    assert_eq!(
+        events.last(),
+        Some(&ProgressEvent::RunStopped { cancelled: true })
+    );
+    assert_eq!(
+        trace(&events, "b.mov").order,
+        Vec::<&str>::new(),
+        "a queue entry left unpopped emits nothing"
+    );
+
+    // The journal is consistent: a resumed run finishes exactly the two
+    // files cancellation left behind.
+    let folded = Journal::load(&jpath).expect("fold");
+    assert_eq!(folded.placed.len(), 1);
+    let mut journal = Journal::open_append(&jpath).expect("reopen appends");
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &folded.placed,
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 1 },
+        &silent_control(),
+    )
+    .expect("resume");
+    assert_eq!(outcome.placed.len(), 2);
+    assert_eq!(outcome.skipped_resumed, 1);
+    for d in [d1.path(), d2.path()] {
+        for rel in ["a.mov", "b.mov", "c.mov"] {
+            assert!(
+                d.join("Projects/x/day1").join(rel).is_file(),
+                "resume must complete {rel}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_flag_set_after_the_last_file_reports_an_uncancelled_stop() {
+    // The flag is set, but the queue drained anyway: no work was left
+    // undone, so the run did not stop *because* of the cancellation.
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA")]);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
+    let events = Mutex::new(Vec::new());
+    let cancel = CancelFlag::new(false);
+    let progress = |event: ProgressEvent| {
+        if let ProgressEvent::FilePlaced { .. } = &event {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        events.lock().expect("events lock").push(event);
+    };
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 1 },
+        &RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+    .expect("run");
+    assert_eq!(outcome.placed.len(), 1);
+    let events = events.into_inner().expect("events");
+    assert_eq!(
+        events.last(),
+        Some(&ProgressEvent::RunStopped { cancelled: false })
+    );
+}
+
+#[test]
+fn the_last_queued_file_survives_a_cancel_raised_while_its_predecessor_ran() {
+    // Pins *where* the flag is read: before a queue entry is taken, not
+    // after. With two files and one worker, cancelling from the first
+    // FilePlaced must leave the second still sitting in the queue — which
+    // is what makes the stop a cancellation. Reading the flag after the pop
+    // would consume that entry and discard it, reporting a drained queue
+    // and an uncancelled stop while a planned file silently went nowhere.
+    let (src, d1, d2) = setup(&[("a.mov", b"AAAA"), ("b.mov", b"BB")]);
+    let plan = plan_source(src.path(), &KnownAssets::default(), DedupeMode::Skip).expect("plan");
+    let mut journal = Journal::open_append(&d1.path().join("run.jsonl")).expect("journal");
+    let events = Mutex::new(Vec::new());
+    let cancel = CancelFlag::new(false);
+    let progress = |event: ProgressEvent| {
+        if let ProgressEvent::FilePlaced { .. } = &event {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        events.lock().expect("events lock").push(event);
+    };
+    let outcome = run(
+        &plan,
+        &dests(d1.path(), d2.path()),
+        &fresh(),
+        &mut journal,
+        &RealSinks,
+        &EngineConfig { jobs: 1 },
+        &RunControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+    .expect("run");
+    assert_eq!(outcome.placed.len(), 1);
+    let events = events.into_inner().expect("events");
+    assert_eq!(
+        events.last(),
+        Some(&ProgressEvent::RunStopped { cancelled: true }),
+        "one file of two is left queued, so the flag really did cut the run short"
+    );
+    assert!(
+        !d2.path().join("Projects/x/day1/b.mov").exists(),
+        "the queued file must not have been copied"
+    );
+}
+
+#[test]
+fn progress_events_round_trip_through_their_json_wire_form() {
+    // The heads receive these as JSON, so the tag name and the snake_case
+    // variant names are a contract, not an implementation detail.
+    let events = [
+        ProgressEvent::RunStarted {
+            files_total: 3,
+            bytes_total: 12,
+        },
+        ProgressEvent::FileStarted {
+            rel: "clips/a.mov".to_string(),
+            size: 4,
+        },
+        ProgressEvent::BytesCopied {
+            rel: "clips/a.mov".to_string(),
+            bytes_done: 4,
+        },
+        ProgressEvent::FileVerified {
+            rel: "clips/a.mov".to_string(),
+            dest_root: "/Volumes/one".to_string(),
+        },
+        ProgressEvent::FilePlaced {
+            rel: "clips/a.mov".to_string(),
+        },
+        ProgressEvent::FileFailed {
+            rel: "b.mov".to_string(),
+            reason: "injected open failure".to_string(),
+        },
+        ProgressEvent::RunStopped { cancelled: true },
+    ];
+    for event in &events {
+        let json = serde_json::to_string(event).expect("serialize");
+        let back: ProgressEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(&back, event, "{json}");
+    }
+    assert_eq!(
+        serde_json::to_string(&events[3]).expect("serialize"),
+        r#"{"type":"file_verified","rel":"clips/a.mov","dest_root":"/Volumes/one"}"#
+    );
 }

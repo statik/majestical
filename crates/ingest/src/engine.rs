@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 /// One verified destination: files land under `root/subdir/<rel>`.
 #[derive(Debug, Clone)]
@@ -110,8 +111,88 @@ pub struct Outcome {
     pub diagnostics: Vec<String>,
 }
 
+/// One observable moment in a run. Workers emit from their own threads, so
+/// the callback must be `Sync` (wrap a channel sender or a `Mutex`).
+///
+/// Per-file events are ordered *within* a file: `FileStarted`, then every
+/// `BytesCopied`, then one `FileVerified` per destination that passed
+/// read-back, then exactly one `FilePlaced` or `FileFailed`. Files
+/// interleave freely — with more than one worker, two files' event runs
+/// arrive arbitrarily shuffled against each other.
+///
+/// The end-of-run missing-file sweep can still demote an already-announced
+/// `FilePlaced` file to failed; that demotion appears in the returned
+/// `Outcome` rather than as a second event, so `Outcome` — not the event
+/// stream — is the authority on what a finished run placed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProgressEvent {
+    /// Once, before any copying: totals from the plan partition. Counts
+    /// only the files this run will actually copy — resumed, deduplicated,
+    /// and rejected files are excluded.
+    RunStarted {
+        files_total: u64,
+        bytes_total: u64,
+    },
+    FileStarted {
+        rel: String,
+        size: u64,
+    },
+    /// Cumulative bytes read from the source for `rel`, one event per
+    /// copy-buffer chunk. The source is read once and fanned out to every
+    /// destination, so a byte is counted once no matter how many
+    /// destinations it was written to.
+    BytesCopied {
+        rel: String,
+        bytes_done: u64,
+    },
+    /// `rel`'s copy at `dest_root` passed read-back verification, emitted
+    /// just before that destination's temp file is renamed into place — a
+    /// rename that then fails still fails the file.
+    FileVerified {
+        rel: String,
+        dest_root: String,
+    },
+    FilePlaced {
+        rel: String,
+    },
+    FileFailed {
+        rel: String,
+        reason: String,
+    },
+    /// After the queue drains or cancellation: why the loop ended.
+    /// `cancelled` is true only when the flag genuinely cut the run short —
+    /// it was set *and* queue entries were left unpopped. A flag set while
+    /// the last file was in flight leaves no work undone and so reports
+    /// `false`. A journal write that aborts the worker pool skips this
+    /// event entirely and returns `Err`; one that fails in the later
+    /// missing-file sweep still returns `Err`, but only after this event
+    /// has already gone out.
+    RunStopped {
+        cancelled: bool,
+    },
+}
+
+/// Checked between files by every worker. Cancellation is cooperative and
+/// file-granular: the in-flight file finishes (so the journal stays
+/// consistent), and the queue entries nobody popped are left unplaced —
+/// resumable by run id.
+pub type CancelFlag = std::sync::atomic::AtomicBool;
+
+/// A run's live controls: where progress goes, and the flag that asks the
+/// workers to stop. Bundled into one parameter rather than passed as two so
+/// `run` stays inside the argument budget — flat, the two would put it at
+/// eight and trip `clippy::too_many_arguments`. The same move the services
+/// layer already makes with `RunEngineArgs`.
+pub struct RunControl<'a> {
+    pub progress: &'a (dyn Fn(ProgressEvent) + Sync),
+    pub cancel: &'a CancelFlag,
+}
+
 /// Runs the copy/verify/place pipeline for every file in `plan` not already
 /// resumed or skipped, fanning each source read to every destination.
+/// `control.progress` narrates the run (see [`ProgressEvent`]) and
+/// `control.cancel` stops it between files.
 ///
 /// # Errors
 /// Returns `IngestError` only for journal I/O failures — a checkpoint that
@@ -125,18 +206,25 @@ pub fn run(
     journal: &mut Journal,
     sinks: &dyn SinkFactory,
     config: &EngineConfig,
+    control: &RunControl<'_>,
 ) -> Result<Outcome, IngestError> {
     check_at_least_one_dest(dests)?;
     check_shared_subdir(dests)?;
     let (queue, mut outcome) = partition_plan(plan, resume);
-    let (mut placed, mut failed, diagnostics) =
-        run_workers(queue, dests, journal, sinks, config.jobs)?;
-    sweep_missing(dests, &mut placed, &mut failed, journal)?;
-    placed.sort_by(|a, b| a.rel.cmp(&b.rel));
-    failed.sort_by(|a, b| a.rel.cmp(&b.rel));
-    outcome.placed = placed;
-    outcome.failed = failed;
-    outcome.diagnostics = diagnostics;
+    (control.progress)(ProgressEvent::RunStarted {
+        files_total: queue.len() as u64,
+        bytes_total: queue.iter().map(|pf| pf.size).sum(),
+    });
+    let mut work = run_workers(queue, dests, journal, sinks, config.jobs, control)?;
+    (control.progress)(ProgressEvent::RunStopped {
+        cancelled: work.cancelled,
+    });
+    sweep_missing(dests, &mut work.placed, &mut work.failed, journal)?;
+    work.placed.sort_by(|a, b| a.rel.cmp(&b.rel));
+    work.failed.sort_by(|a, b| a.rel.cmp(&b.rel));
+    outcome.placed = work.placed;
+    outcome.failed = work.failed;
+    outcome.diagnostics = work.diagnostics;
     Ok(outcome)
 }
 
@@ -322,21 +410,32 @@ struct WorkerContext<'a> {
     sinks: &'a dyn SinkFactory,
     diagnostics: &'a LockDiagnostics,
     abort: &'a Mutex<Option<IngestError>>,
+    progress: &'a (dyn Fn(ProgressEvent) + Sync),
+    cancel: &'a CancelFlag,
 }
 
-/// What the worker pool produced: placed files, failed files, and any
+/// What the worker pool produced: placed files, failed files, any
 /// lock-poisoning diagnostics (kept separate from `failed` — see
-/// `Outcome::diagnostics`).
-type WorkerOutput = (Vec<PlacedFile>, Vec<FailedFile>, Vec<String>);
+/// `Outcome::diagnostics`), and whether cancellation is what ended it.
+struct WorkerOutput {
+    placed: Vec<PlacedFile>,
+    failed: Vec<FailedFile>,
+    diagnostics: Vec<String>,
+    /// True only when the cancel flag stopped the pool with entries still
+    /// queued — see `ProgressEvent::RunStopped`.
+    cancelled: bool,
+}
 
 /// Runs `jobs` worker threads over `queue`, each pulling one file at a time
-/// until the queue is empty or a journal I/O error asks everyone to stop.
+/// until the queue is empty, the cancel flag is set, or a journal I/O error
+/// asks everyone to stop.
 fn run_workers(
     queue: VecDeque<PlannedFile>,
     dests: &[DestSpec],
     journal: &mut Journal,
     sinks: &dyn SinkFactory,
     jobs: usize,
+    control: &RunControl<'_>,
 ) -> Result<WorkerOutput, IngestError> {
     let queue = Mutex::new(queue);
     let results: Mutex<(Vec<PlacedFile>, Vec<FailedFile>)> = Mutex::new((Vec::new(), Vec::new()));
@@ -351,6 +450,8 @@ fn run_workers(
         sinks,
         diagnostics: &diagnostics,
         abort: &abort,
+        progress: control.progress,
+        cancel: control.cancel,
     };
 
     std::thread::scope(|scope| {
@@ -368,12 +469,29 @@ fn run_workers(
     let (placed, failed) = results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok((placed, failed, diagnostics.drain()))
+    // Entries nobody popped are what makes a cancellation a cancellation:
+    // a flag set while the last file was in flight leaves the queue empty
+    // and no work undone, so it is not reported as one.
+    let unfinished = queue
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(WorkerOutput {
+        placed,
+        failed,
+        diagnostics: diagnostics.drain(),
+        cancelled: control.cancel.load(Ordering::Relaxed) && !unfinished.is_empty(),
+    })
 }
 
 fn worker_loop(ctx: &WorkerContext<'_>) {
     loop {
         if lock_or_note(ctx.abort, ctx.diagnostics, "abort").is_some() {
+            break;
+        }
+        // Cancellation is checked here, between files: whatever this worker
+        // already has in flight finishes so its journal records stay
+        // consistent, and everything still queued is left for a resume.
+        if ctx.cancel.load(Ordering::Relaxed) {
             break;
         }
         let next = {
@@ -424,10 +542,51 @@ fn fail(ctx: &WorkerContext<'_>, rel: &str, reason: String) -> Result<PlacedFile
             reason: reason.clone(),
         },
     )?;
+    (ctx.progress)(ProgressEvent::FileFailed {
+        rel: rel.to_string(),
+        reason: reason.clone(),
+    });
     Err(CopyOutcome::Failed(FailedFile {
         rel: rel.to_string(),
         reason,
     }))
+}
+
+/// The run's progress callback bound to one file, so the copy and verify
+/// helpers emit without threading both the callback and the file's `rel`
+/// through every signature.
+struct FileProgress<'a> {
+    emit: &'a (dyn Fn(ProgressEvent) + Sync),
+    rel: &'a str,
+}
+
+impl FileProgress<'_> {
+    fn started(&self, size: u64) {
+        (self.emit)(ProgressEvent::FileStarted {
+            rel: self.rel.to_string(),
+            size,
+        });
+    }
+
+    fn bytes_copied(&self, bytes_done: u64) {
+        (self.emit)(ProgressEvent::BytesCopied {
+            rel: self.rel.to_string(),
+            bytes_done,
+        });
+    }
+
+    fn verified(&self, dest_root: &Path) {
+        (self.emit)(ProgressEvent::FileVerified {
+            rel: self.rel.to_string(),
+            dest_root: dest_root.display().to_string(),
+        });
+    }
+
+    fn placed(&self) {
+        (self.emit)(ProgressEvent::FilePlaced {
+            rel: self.rel.to_string(),
+        });
+    }
 }
 
 /// Copies one file: journal the plan, stream the source once into every
@@ -436,11 +595,16 @@ fn fail(ctx: &WorkerContext<'_>, rel: &str, reason: String) -> Result<PlacedFile
 /// `verify_and_place`; only a journal I/O error escalates to `Abort`.
 fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, CopyOutcome> {
     append_or_abort(ctx, &Record::FilePlanned { file: pf.clone() })?;
+    let progress = FileProgress {
+        emit: ctx.progress,
+        rel: &pf.rel,
+    };
+    progress.started(pf.size);
 
     let token = ulid::Ulid::generate().to_string();
     let mut attempts = open_sinks(ctx.dests, &pf.rel, &token, ctx.sinks);
 
-    let stream = match stream_to_sinks(&pf.source, &mut attempts) {
+    let stream = match stream_to_sinks(&pf.source, &mut attempts, &progress) {
         Ok(stream) => stream,
         Err(reason) => return fail(ctx, &pf.rel, reason),
     };
@@ -465,7 +629,7 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
         },
     )?;
 
-    let failures = verify_and_place(&mut attempts, &stream.xxh64_hex);
+    let failures = verify_and_place(&mut attempts, &stream.xxh64_hex, &progress);
     if failures.is_empty() {
         append_or_abort(
             ctx,
@@ -479,6 +643,7 @@ fn copy_one(pf: &PlannedFile, ctx: &WorkerContext<'_>) -> Result<PlacedFile, Cop
                 rel: pf.rel.clone(),
             },
         )?;
+        progress.placed();
         return Ok(PlacedFile {
             rel: pf.rel.clone(),
             size: stream.size,
@@ -570,8 +735,14 @@ struct StreamResult {
 /// every still-open destination sink. A write or finish failure on one
 /// destination marks that destination failed and stops writing to it, but
 /// does not stop the source read — the other destinations still need the
-/// rest of the bytes.
-fn stream_to_sinks(source: &Path, attempts: &mut [DestAttempt]) -> Result<StreamResult, String> {
+/// rest of the bytes. Each chunk read reports the run's cumulative
+/// source-byte count for this file — one `BytesCopied` per buffer, counting
+/// each source byte once however many destinations it was fanned to.
+fn stream_to_sinks(
+    source: &Path,
+    attempts: &mut [DestAttempt],
+    progress: &FileProgress<'_>,
+) -> Result<StreamResult, String> {
     let file = std::fs::File::open(source)
         .map_err(|err| format!("reading {}: {err}", source.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -590,6 +761,7 @@ fn stream_to_sinks(source: &Path, attempts: &mut [DestAttempt]) -> Result<Stream
         xxh3.update(&buf[..n]);
         size += n as u64;
         write_chunk_to_open_sinks(attempts, &buf[..n]);
+        progress.bytes_copied(size);
     }
     finish_open_sinks(attempts);
     Ok(StreamResult {
@@ -626,7 +798,13 @@ fn finish_open_sinks(attempts: &mut [DestAttempt]) {
 /// renamed into place; a mismatch or read-back error is recorded as that
 /// destination's failure and its temp file is left quarantined under its
 /// partial name. One destination's failure never blocks another's rename.
-fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> Vec<String> {
+/// Every destination whose bytes match emits `FileVerified` before its
+/// rename is attempted — a rename that then fails still fails the file.
+fn verify_and_place(
+    attempts: &mut [DestAttempt],
+    expected_xxh64_hex: &str,
+    progress: &FileProgress<'_>,
+) -> Vec<String> {
     let mut failures = Vec::new();
     for attempt in attempts.iter_mut() {
         if attempt.sink.is_none() {
@@ -637,6 +815,7 @@ fn verify_and_place(attempts: &mut [DestAttempt], expected_xxh64_hex: &str) -> V
         }
         match crate::hashing::xxh64_file(&attempt.temp_path) {
             Ok(hex) if hex == expected_xxh64_hex => {
+                progress.verified(&attempt.root);
                 if let Err(err) = std::fs::rename(&attempt.temp_path, &attempt.final_path) {
                     failures.push(format!(
                         "{}: renaming into place: {err}",

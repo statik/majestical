@@ -382,6 +382,11 @@ fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
     let config = engine::EngineConfig {
         jobs: jobs.unwrap_or_else(default_jobs),
     };
+    // Task 18 threads a real progress sink and a caller-owned cancel flag
+    // through this layer; until then every run here is uninterruptible and
+    // its events go nowhere.
+    let discard = |_event: engine::ProgressEvent| {};
+    let cancel = engine::CancelFlag::new(false);
     engine::run(
         ingest_plan,
         dests,
@@ -389,6 +394,10 @@ fn run_ingest_engine(args: &RunEngineArgs<'_>) -> Result<engine::Outcome> {
         &mut journal,
         &engine::RealSinks,
         &config,
+        &engine::RunControl {
+            progress: &discard,
+            cancel: &cancel,
+        },
     )
     .context("running ingest engine")
 }

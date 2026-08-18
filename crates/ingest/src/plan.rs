@@ -62,6 +62,38 @@ pub struct IngestPlan {
     pub files: Vec<PlannedFile>,
 }
 
+impl IngestPlan {
+    /// How many of these files a fresh run will actually copy bytes for:
+    /// rejects and skipped duplicates are excluded, everything else counted.
+    ///
+    /// Recorded in the journal's `RunStarted` record so a run that stopped
+    /// with files still queued can be recognized as unfinished later — the
+    /// per-file `FilePlanned` records only ever cover files a worker
+    /// actually picked up, so a cancelled run would otherwise look complete.
+    /// This must agree with `engine::partition_plan`, which makes the same
+    /// split when it builds the queue; both are exhaustive matches over
+    /// `Decision`, so a new variant forces both to be revisited.
+    #[must_use]
+    pub fn copyable_files(&self) -> u64 {
+        let mut count = 0;
+        for file in &self.files {
+            match &file.decision {
+                Decision::Copy
+                | Decision::Duplicate {
+                    action: DedupeMode::CopyAnyway | DedupeMode::Link,
+                    ..
+                } => count += 1,
+                Decision::Rejected { .. }
+                | Decision::Duplicate {
+                    action: DedupeMode::Skip,
+                    ..
+                } => {}
+            }
+        }
+        count
+    }
+}
+
 /// Streams an xxh3-128 hash over `path`. Media files are large and read
 /// sequentially, so a bigger buffer than `cmd_scan`'s 64 KiB pays off here.
 fn hash_file(path: &Path) -> Result<String, IngestError> {
@@ -284,6 +316,29 @@ mod tests {
         // b: size matched but hash differs -> copies (prehash retained).
         assert!(matches!(by_rel["clips/b.mov"].decision, Decision::Copy));
         assert!(by_rel["clips/b.mov"].prehash.is_some());
+    }
+
+    /// `copyable_files` is what the journal records as a run's total, so it
+    /// must count exactly what the engine will queue: two copies out of four
+    /// planned files here — the skipped duplicate and the rejected empty
+    /// file are not work the run can ever finish.
+    #[test]
+    fn copyable_files_counts_only_the_files_a_run_will_copy() {
+        let src = tempfile::tempdir().expect("tempdir");
+        write(src.path(), "new.mov", b"NEW");
+        write(src.path(), "also-new.mov", b"ALSONEW");
+        write(src.path(), "dup.mov", b"AAAA");
+        write(src.path(), "empty.mov", b"");
+        let known = KnownAssets::from_pairs(vec![(hash_bytes(b"AAAA"), 4)]);
+
+        let skipping = plan_source(src.path(), &known, DedupeMode::Skip).expect("plan skip");
+        assert_eq!(skipping.files.len(), 4, "all four are planned");
+        assert_eq!(skipping.copyable_files(), 2);
+
+        // The same duplicate under `copy` is work the run will do, so it
+        // counts — three of the four.
+        let copying = plan_source(src.path(), &known, DedupeMode::CopyAnyway).expect("plan copy");
+        assert_eq!(copying.copyable_files(), 3);
     }
 
     #[test]

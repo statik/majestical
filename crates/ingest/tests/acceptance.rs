@@ -8,7 +8,7 @@
 //! are, and the workspace denies `panic`/`unwrap_used` outside test code.
 mod common;
 
-use common::CorruptingSinks;
+use common::{CorruptingSinks, silent_control};
 use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 use majestical_ingest::engine::{self, DestSpec, EngineConfig, RealSinks};
@@ -157,6 +157,7 @@ fn previous_run_placed(world: &mut IngestWorld, rel: String) -> Result<(), Strin
         &mut journal,
         &RealSinks,
         &EngineConfig { jobs: 1 },
+        &silent_control(),
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -195,6 +196,7 @@ fn ingest_card(world: &mut IngestWorld, subdir: String) -> Result<(), String> {
             &mut journal,
             &sinks,
             &config,
+            &silent_control(),
         )
     } else {
         engine::run(
@@ -204,6 +206,7 @@ fn ingest_card(world: &mut IngestWorld, subdir: String) -> Result<(), String> {
             &mut journal,
             &RealSinks,
             &config,
+            &silent_control(),
         )
     }
     .map_err(|e| e.to_string())?;

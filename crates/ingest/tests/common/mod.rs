@@ -7,9 +7,22 @@
 //! `mod common;` in each file pulls this in; cargo does not treat a
 //! subdirectory under `tests/` as its own test binary, so this file is never
 //! itself discovered as a separate target.
-use majestical_ingest::engine::{RealSinks, Sink, SinkFactory};
+use majestical_ingest::engine::{
+    CancelFlag, ProgressEvent, RealSinks, RunControl, Sink, SinkFactory,
+};
 use std::io::Write;
 use std::path::Path;
+
+/// A `RunControl` that discards every progress event and never cancels —
+/// for the tests whose subject is the copy result, not the event stream.
+pub fn silent_control() -> RunControl<'static> {
+    static PROGRESS: fn(ProgressEvent) = |_event| {};
+    static NEVER: CancelFlag = CancelFlag::new(false);
+    RunControl {
+        progress: &PROGRESS,
+        cancel: &NEVER,
+    }
+}
 
 /// A `SinkFactory` that flips the first byte it writes for any path whose
 /// name contains `target`, corrupting the destination between write and

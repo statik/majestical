@@ -886,6 +886,17 @@ pub type CancelFlag = std::sync::atomic::AtomicBool;
 
 `run()` gains two parameters: `progress: &(dyn Fn(ProgressEvent) + Sync)` and `cancel: &CancelFlag`. Replace, don't deprecate: update every existing caller (services `run_ingest_engine`, engine unit tests) with a no-op `&|_| {}` and a fresh `AtomicBool::new(false)` in the same commit.
 
+**AMENDED — the two controls arrive as one `RunControl` parameter, not two flat ones.** `run()` already takes six arguments; passing `progress` and `cancel` separately puts it at eight and trips `clippy::too_many_arguments` (threshold 7), which under the workspace's `-D warnings` can only be landed with an `#[expect]` on a public API. Bundled instead, following the `RunEngineArgs` precedent one layer up in `crates/services/src/ingest.rs`:
+
+```rust
+pub struct RunControl<'a> {
+    pub progress: &'a (dyn Fn(ProgressEvent) + Sync),
+    pub cancel: &'a CancelFlag,
+}
+```
+
+So the real signature is `run(plan, dests, resume, journal, sinks, config, control: &RunControl<'_>)`, and Task 18 threads a `RunControl` — not two arguments — through `run_ingest_engine`. Two further divergences as built: `ProgressEvent` also derives `Deserialize` (Task 19's wire fixtures need the round-trip), and no crate-root re-export was added to `lib.rs` — nothing consumes one yet, so `engine::{ProgressEvent, CancelFlag, RunControl}` is the only path in. The tests live in `crates/ingest/tests/engine.rs` (the crate's integration suite, alongside the existing engine tests and the shared `tests/common/mod.rs` fixtures), not an in-file `#[cfg(test)]` mod, so Step 2's red run is `cargo test -p majestical-ingest --test engine`.
+
 - [ ] **Step 1: failing engine tests** (in `engine.rs`'s test mod, which already has fake sinks and plans):
   - a 3-file, 2-destination run emits: one `RunStarted { files_total: 3, .. }`; per file `FileStarted` → ≥1 `BytesCopied` (monotonic per rel) → 2 `FileVerified` (one per dest_root) → `FilePlaced`; one `RunStopped { cancelled: false }`. Collect via a `Mutex<Vec<ProgressEvent>>` closure; assert per-file ordering (filter by rel) rather than global interleaving (workers race).
   - a run whose second file's sink fails emits `FileFailed` with the reason, and the other files still place.

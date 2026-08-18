@@ -594,12 +594,18 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         catalog_dir,
         &majestical_services::ingest::ExecuteIngest {
             plan: &planned.plan,
+            source: &args.source,
             dest: &args.dest,
             subdir: &planned.subdir,
             node_id: &planned.node_id,
             source_volume: (&planned.source_volume_id, &planned.source_volume_label),
             jobs: args.jobs,
             resume: args.resume.as_deref(),
+            // No progress rendering and no cancel affordance on this head
+            // yet: a `maj ingest` progress line is a deferred nicety (see
+            // the watchlist), and Ctrl-C already ends the process — a run
+            // stopped that way is resumable by its run id all the same.
+            control: &majestical_services::ingest::silent_control(),
         },
         &mut |line: &str| eprintln!("{line}"),
     )?;
@@ -616,6 +622,43 @@ pub(crate) fn cmd_ingest(app: &mut FsApp, catalog_dir: &Path, args: &IngestArgs)
         run.outcome.diagnostics.len()
     );
     Ok(())
+}
+
+/// `maj ingest unfinished`: the runs a `--resume` could still finish,
+/// newest first. Deliberately does not open a catalog — the answer comes
+/// from the run journals in this machine's state dir, not the event log,
+/// same as `maj verify`.
+///
+/// # Errors
+/// Returns an error if the catalog's state directory can't be resolved or
+/// its run journals can't be listed.
+pub(crate) fn cmd_ingest_unfinished(catalog_dir: &Path, json: bool) -> Result<()> {
+    let outcome = majestical_services::ingest::ingest_unfinished(catalog_dir)?;
+    crate::print_notices(&outcome.notices);
+    if json {
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
+    }
+    if outcome.runs.is_empty() {
+        println!("no unfinished ingest runs");
+        return Ok(());
+    }
+    for run in &outcome.runs {
+        println!("{}", unfinished_run_line(run));
+    }
+    Ok(())
+}
+
+/// One `maj ingest unfinished` row. The source is omitted entirely when the
+/// journal never recorded one (a run written before `RunStarted` existed),
+/// rather than trailing a dangling `from ` with nothing after it.
+fn unfinished_run_line(run: &majestical_services::ingest::UnfinishedRun) -> String {
+    let counts = format!("{} {}/{} placed", run.run_id, run.placed, run.planned);
+    if run.source.is_empty() {
+        counts
+    } else {
+        format!("{counts} from {}", run.source)
+    }
 }
 
 fn decision_label(decision: &plan::Decision) -> &'static str {
@@ -729,5 +772,37 @@ fn print_ingest_outcome_text(
     }
     for (root, w) in generations {
         println!("generation {} at {}", w.generation, root.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majestical_services::ingest::UnfinishedRun;
+
+    fn run_row(source: &str) -> UnfinishedRun {
+        UnfinishedRun {
+            run_id: "01RUN".to_string(),
+            placed: 1,
+            planned: 3,
+            source: source.to_string(),
+            destinations: vec!["/Volumes/one".to_string()],
+        }
+    }
+
+    #[test]
+    fn an_unfinished_row_names_its_counts_and_source() {
+        assert_eq!(
+            unfinished_run_line(&run_row("/Volumes/card")),
+            "01RUN 1/3 placed from /Volumes/card"
+        );
+    }
+
+    /// A journal from before runs recorded their own metadata has no source
+    /// to name; the row must end after the counts rather than trailing an
+    /// empty `from `.
+    #[test]
+    fn an_unfinished_row_without_a_recorded_source_omits_the_from_clause() {
+        assert_eq!(unfinished_run_line(&run_row("")), "01RUN 1/3 placed");
     }
 }

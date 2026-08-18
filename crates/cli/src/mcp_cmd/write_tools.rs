@@ -747,12 +747,16 @@ fn ingest_source_result(
         catalog,
         &majestical_services::ingest::ExecuteIngest {
             plan: &planned.plan,
+            source: &args.source,
             dest: &args.dest,
             subdir: &planned.subdir,
             node_id: &planned.node_id,
             source_volume: (&planned.source_volume_id, &planned.source_volume_label),
             jobs: args.jobs,
             resume: None,
+            // One request, one reply: this tool has nowhere to stream
+            // progress to and no second call that could cancel the run.
+            control: &majestical_services::ingest::silent_control(),
         },
         &mut |_line: &str| {},
     )?;

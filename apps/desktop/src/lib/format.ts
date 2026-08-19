@@ -15,6 +15,19 @@ export function timecode(ms: number): string {
   return `@${minutes}m${String(seconds).padStart(2, "0")}s`;
 }
 
+/**
+ * `MM:SS`, and `H:MM:SS` once a run passes the hour — how long a copy has
+ * been going and how much longer it is estimated to take, spelled the same
+ * way for both so the two halves of that line cannot disagree.
+ */
+export function duration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = String(Math.floor(total / 60) % 60).padStart(2, "0");
+  const seconds = String(total % 60).padStart(2, "0");
+  const hours = Math.floor(total / 3600);
+  return hours > 0 ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
+}
+
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
 /** Binary units, one decimal place above bytes — the inspector's header and

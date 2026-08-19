@@ -1,9 +1,10 @@
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
+import { emitProgress, RUN } from "./lib/ingest-test-support";
 import {
   mockCommands,
   rejectCommand,
@@ -20,6 +21,7 @@ beforeEach(() => {
   stubManifest(404, "no keyframe manifest");
 });
 afterEach(() => {
+  cleanup();
   clearMocks();
   vi.unstubAllGlobals();
 });
@@ -95,6 +97,8 @@ function mockCatalog(volumeLabels: string[]) {
     list_tags: () => ({
       tags: [{ tag: "b-roll", count: 412, last_used_ms: 1_754_000_000_000 }],
     }),
+    ingest_state: () => ({ busy: false }),
+    list_unfinished_ingests: () => ({ runs: [] }),
     list_volumes: () => ({
       volumes: volumeLabels.map((label) => ({
         id: `label:${label}`,
@@ -182,8 +186,54 @@ test("the sidebar offers exactly the surfaces this phase ships, in order", async
   const surfaces = [...container.querySelectorAll(".surfaces button")].map(
     (button) => button.textContent,
   );
-  // No dead buttons: Ingest arrives with its own surface.
-  expect(surfaces).toEqual(["Search", "Browse", "Organize", "Volumes"]);
+  expect(surfaces).toEqual([
+    "Search",
+    "Browse",
+    "Ingest",
+    "Organize",
+    "Volumes",
+  ]);
+});
+
+test("the ingest surface swaps in with its setup board", async () => {
+  mockCatalog(["Card"]);
+  render(App);
+
+  const ingest = await screen.findByRole("button", { name: "Ingest" });
+  await userEvent.click(ingest);
+
+  expect(await screen.findByRole("group", { name: "Setup" })).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "Start verified copy" }),
+  ).toBeTruthy();
+  expect(screen.queryByRole("searchbox")).toBeNull();
+  expect(ingest.getAttribute("aria-current")).toBe("page");
+});
+
+test("a run going anywhere marks the sidebar, and stops marking it when the run has finished finishing", async () => {
+  mockCatalog(["Card"]);
+  render(App);
+
+  // Still on Search: the marker's whole job is to be visible from another
+  // surface, and the run belongs to the backend, not to `IngestView`.
+  await screen.findByRole("searchbox");
+  await emitProgress(RUN, {
+    type: "run_started",
+    files_total: 2,
+    bytes_total: 1000,
+  });
+
+  expect(
+    await screen.findByRole("button", { name: "Ingest — a run is going" }),
+  ).toBeTruthy();
+
+  // `run_stopped` is the copy loop ending; the marker goes out only once
+  // `ingest_state` says the job slot is free.
+  await emitProgress(RUN, { type: "run_stopped", cancelled: false });
+
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Ingest" })).toBeTruthy(),
+  );
 });
 
 test("the browse surface swaps in, and takes the inspector's selection with it", async () => {

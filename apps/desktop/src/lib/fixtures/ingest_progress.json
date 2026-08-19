@@ -1,0 +1,56 @@
+[
+  {
+    "event": {
+      "bytes_total": 96400000000,
+      "files_total": 214,
+      "type": "run_started"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "rel": "DCIM/a.mov",
+      "size": 1024,
+      "type": "file_started"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "bytes_done": 512,
+      "rel": "DCIM/a.mov",
+      "type": "bytes_copied"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "dest_root": "/Volumes/SSD-A",
+      "rel": "DCIM/a.mov",
+      "type": "file_verified"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "rel": "DCIM/a.mov",
+      "type": "file_placed"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "reason": "/Volumes/SSD-A: read-back mismatch",
+      "rel": "DCIM/d.mov",
+      "type": "file_failed"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  {
+    "event": {
+      "cancelled": true,
+      "type": "run_stopped"
+    },
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  }
+]

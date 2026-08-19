@@ -1,0 +1,43 @@
+{
+  "node_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "notices": [
+    "a warning the plan_ingest call collected"
+  ],
+  "plan": {
+    "files": [
+      {
+        "decision": {
+          "decision": "copy"
+        },
+        "prehash": "0123456789abcdef0123456789abcdef",
+        "rel": "DCIM/a.mov",
+        "size": 1024,
+        "source": "/Volumes/card/DCIM/a.mov"
+      },
+      {
+        "decision": {
+          "action": "skip",
+          "asset": "xxh3:89abcdef0123456789abcdef01234567",
+          "decision": "duplicate"
+        },
+        "prehash": "89abcdef0123456789abcdef01234567",
+        "rel": "DCIM/b.mov",
+        "size": 2048,
+        "source": "/Volumes/card/DCIM/b.mov"
+      },
+      {
+        "decision": {
+          "decision": "rejected",
+          "reason": "unreadable: permission denied"
+        },
+        "prehash": "fedcba9876543210fedcba9876543210",
+        "rel": "DCIM/c.mov",
+        "size": 4096,
+        "source": "/Volumes/card/DCIM/c.mov"
+      }
+    ]
+  },
+  "source_volume_id": "uuid:9E1F0C7A-0B4E-4C1D-9A2B-6D5E4F3C2B1A",
+  "source_volume_label": "A7IV-CARD",
+  "subdir": "Projects/client-x/2026-08-12/A7IV-CARD"
+}

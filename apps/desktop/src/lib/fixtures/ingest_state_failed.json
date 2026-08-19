@@ -1,0 +1,9 @@
+{
+  "busy": false,
+  "finished": {
+    "error": {
+      "message": "no active PARA node matches 'project/nope'"
+    },
+    "status": "failed"
+  }
+}

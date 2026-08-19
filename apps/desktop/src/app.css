@@ -10,6 +10,12 @@
   --sunken: color-mix(in srgb, currentcolor 6%, transparent);
   --muted: color-mix(in srgb, currentcolor 60%, transparent);
   --alert: light-dark(#b3261e, #f2b8b5);
+  /* A count that is genuinely good news (files verified into place), and the
+     one colour that asks to be dealt with before anything new is started
+     (an unfinished run, a copy still going). Both are named here rather
+     than spelled at each use, the same way `--alert` is. */
+  --ok: light-dark(#1a7f37, #6fce8a);
+  --attention: light-dark(#b45309, #e8a33d);
 }
 
 body {
@@ -737,6 +743,174 @@ main > .error {
   color: var(--alert);
   font-size: 0.8rem;
   list-style: none;
+}
+
+/* Ingest. A single column of panels the eye walks down — source and
+   destinations side by side, then the node, then the plan, then the run —
+   using the `ctl-` controls above for every button and box (mockup:
+   ingest.html). Everything only this surface draws is `ingest-`. */
+.ingest-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 60rem;
+}
+
+/* Source and destinations, the two halves of "where from, where to". */
+.ingest-board {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+/* `min-width: 0`: a grid item's automatic minimum is its content, and one
+   long card path would push its column past its share. */
+.ingest-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+}
+
+.ingest-title {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.ingest-sub {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ingest-rows {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ingest-rows li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.ingest-path {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+/* Pushed to the right edge of its row and never wrapped: the tallies read
+   as a column even though every path beside them is a different width. */
+.ingest-stat,
+.ingest-reason {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ingest-reason {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+/* One line of numbers about a plan or a run. Tabular figures so a counter
+   ticking up does not shuffle everything after it sideways. */
+.ingest-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.ingest-counts b {
+  color: CanvasText;
+}
+
+.ingest-ok {
+  color: var(--ok);
+}
+
+.ingest-bad {
+  color: var(--alert);
+}
+
+.ingest-stale {
+  margin: 0;
+  color: var(--alert);
+  font-size: 0.8rem;
+}
+
+.ingest-bar {
+  position: relative;
+  overflow: hidden;
+  height: 8px;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+}
+
+.ingest-bar i {
+  position: absolute;
+  inset: 0;
+  width: var(--w, 0%);
+  background: color-mix(in srgb, currentcolor 55%, transparent);
+}
+
+/* The crash-recovery banner: an amber edge, because it is the one thing on
+   this surface asking to be dealt with before anything new is started. */
+.ingest-resumes {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ingest-resume {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--attention);
+  border-radius: 6px;
+}
+
+.ingest-resume p {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.ctl-btn.ingest-primary {
+  border-color: currentcolor;
+  font-weight: 600;
+}
+
+.ctl-btn.ingest-quiet {
+  border: 0;
+  color: var(--muted);
+}
+
+/* The sidebar's running marker. Drawn only — the button carries an
+   `aria-label` while a run is going, so nothing has to announce a dot. */
+.ingest-mark {
+  margin-left: 0.35rem;
+  color: var(--attention);
 }
 
 /* A card in the multi-selection. Both grids draw it, so it sits with the

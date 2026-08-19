@@ -1,0 +1,17 @@
+{
+  "notices": [
+    "a warning the list_unfinished_ingests call collected"
+  ],
+  "runs": [
+    {
+      "destinations": [
+        "/Volumes/SSD-A",
+        "/Volumes/NAS-1"
+      ],
+      "placed": 37,
+      "planned": 214,
+      "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "source": "/Volumes/A7IV-CARD"
+    }
+  ]
+}

@@ -818,6 +818,15 @@ mod tests {
     /// list's `count`: both dedupe by asset id, so a folder with one asset
     /// in two instances reads as ONE asset from either verb — that agreement
     /// is the whole point of the sidebar badge predicting the grid.
+    ///
+    /// The newer instance is deliberately the lexicographically LATER path.
+    /// Instances arrive in path order (`AssetState::instances` is a
+    /// `BTreeMap` keyed by `(volume, path)`), so a fixture whose newest
+    /// instance also sorts first cannot tell the pick rule from "keep
+    /// whichever arrived first" — which is exactly what phase 7D's mutation
+    /// run caught: four mutants of `is_better`/`dedupe_by_asset`'s guard all
+    /// survived an earlier version of this test that used `E/newer.mov` and
+    /// `E/older.mov`.
     #[test]
     fn browse_tree_and_list_agree_on_asset_count_for_two_instances_of_one_asset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -832,14 +841,14 @@ mod tests {
             Op::AssetSeen {
                 asset: shared.clone(),
                 volume: online_volume_id().into(),
-                path: "E/older.mov".into(),
+                path: "E/a-older.mov".into(),
                 size: 100,
                 mtime_ms: 500,
             },
             Op::AssetSeen {
                 asset: shared,
                 volume: online_volume_id().into(),
-                path: "E/newer.mov".into(),
+                path: "E/z-newer.mov".into(),
                 size: 200,
                 mtime_ms: 900,
             },
@@ -851,10 +860,14 @@ mod tests {
             list.count, 1,
             "one asset, two instances — deduped to one row"
         );
+        // `size`/`mtime_ms`/`kind` come from the representative instance;
+        // `name` does NOT — it comes from the asset's catalog summary,
+        // which is one row per asset regardless of how many instances it
+        // has. Asserting the representative through `name` would be
+        // asserting the summary instead.
         let hit = &list.results[0];
-        assert_eq!(hit.name, "newer.mov", "the newer-mtime instance wins");
-        assert_eq!(hit.size, Some(200));
-        assert_eq!(hit.mtime_ms, Some(900));
+        assert_eq!(hit.size, Some(200), "the newer-mtime instance wins");
+        assert_eq!(hit.mtime_ms, Some(900), "the newer-mtime instance wins");
 
         let tree = browse_tree(&app, &root).expect("browse_tree");
         let v = tree
@@ -872,6 +885,47 @@ mod tests {
             folder(v, "").recursive_count,
             1,
             "same asset, counted once at the root too"
+        );
+    }
+
+    /// The other half of the representative rule: equal `mtime_ms` breaks
+    /// toward the lexicographically smaller path. The two instances carry
+    /// different sizes because `size` is the only field on the row that
+    /// distinguishes them — see the test above on why `name` cannot.
+    #[test]
+    fn two_instances_with_the_same_mtime_pick_the_smaller_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let shared = asset_id("tied");
+        app.emit(vec![
+            Op::VolumeSeen {
+                volume: online_volume_id().into(),
+                label: online_volume_label().into(),
+            },
+            Op::AssetSeen {
+                asset: shared.clone(),
+                volume: online_volume_id().into(),
+                path: "F/a.mov".into(),
+                size: 10,
+                mtime_ms: 700,
+            },
+            Op::AssetSeen {
+                asset: shared,
+                volume: online_volume_id().into(),
+                path: "F/b.mov".into(),
+                size: 20,
+                mtime_ms: 700,
+            },
+        ])
+        .expect("emit");
+
+        let list = browse_list(&app, &root, &req("")).expect("browse_list");
+        assert_eq!(list.count, 1, "one asset, two instances");
+        assert_eq!(
+            list.results[0].size,
+            Some(10),
+            "the smaller path breaks the tie — a.mov's size, not b.mov's"
         );
     }
 

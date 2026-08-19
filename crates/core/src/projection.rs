@@ -1696,6 +1696,41 @@ mod tests {
         assert_eq!(p.saved_searches().count(), 0);
     }
 
+    /// The listing itself, not just the per-name lookup: two live searches
+    /// (so a listing that yields only its first row is distinguishable from
+    /// a correct one) in name order, with a tombstoned third excluded. The
+    /// test above asserts only `count() == 0`, which an always-empty
+    /// listing satisfies — `cargo mutants` proved that by surviving
+    /// `saved_searches -> ::std::iter::empty()` in phase 7D's triage.
+    #[test]
+    fn saved_searches_lists_every_live_search_in_name_order() {
+        let mut p = Projection::default();
+        for (id, name, query) in [
+            (1, "b-roll", "kind:video"),
+            (2, "aerials", "tag:drone"),
+            (3, "dropped", "tag:old"),
+        ] {
+            p.apply(&test_event(
+                id,
+                Op::SavedSearchSet {
+                    name: name.into(),
+                    query: query.into(),
+                },
+            ));
+        }
+        p.apply(&test_event(
+            4,
+            Op::SavedSearchRemove {
+                name: "dropped".into(),
+            },
+        ));
+        assert_eq!(
+            p.saved_searches().collect::<Vec<_>>(),
+            vec![("aerials", "tag:drone"), ("b-roll", "kind:video")],
+            "every live search, name-ordered, tombstones excluded"
+        );
+    }
+
     fn tagset(tags: &[&str]) -> BTreeSet<String> {
         tags.iter().map(|t| (*t).to_string()).collect()
     }

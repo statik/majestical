@@ -1650,4 +1650,98 @@ mod tests {
         let outcome = suggestions(&app, &root).expect("suggestions");
         assert!(outcome.pending.is_empty());
     }
+
+    /// Plants a `tags.json.zst` suggestion blob for `asset_hex`, exactly
+    /// where the caption runner writes one.
+    fn plant_suggestions(root: &Path, asset_hex: &str, tags: &[&str]) {
+        let blobs = BlobStore::new(root);
+        let path = blobs.path_for(
+            asset_hex,
+            &majestical_index::blob::Derivation::Tags {
+                model_tag: "test-model",
+            },
+        );
+        let rows: Vec<TagSuggestion> = tags
+            .iter()
+            .map(|tag| TagSuggestion {
+                tag: (*tag).to_string(),
+                confidence: 0.5,
+                in_vocab: false,
+                model_tag: "test-model".into(),
+            })
+            .collect();
+        let json = serde_json::to_vec(&rows).expect("serialize suggestions");
+        let bytes = zstd::encode_all(json.as_slice(), 0).expect("compress");
+        blobs.write_atomic(&path, &bytes).expect("write blob");
+    }
+
+    /// A rejection hides that one pair and nothing else. Two suggestions,
+    /// so an implementation that loses the whole listing (or the whole
+    /// rejection set) is distinguishable from one that filters exactly one
+    /// row — phase 7D's mutation run found five `load_rejections` mutants
+    /// surviving, including "always return no rejections", because nothing
+    /// in this crate's own tests ever rejected anything.
+    #[test]
+    fn suggestions_hides_exactly_the_rejected_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let app = FsApp::init(&root, "m1", "m1").expect("init");
+        let asset_hex = "aa00000000000000000000000000000b";
+        plant_suggestions(&root, asset_hex, &["beach", "sunset"]);
+
+        let before = suggestions(&app, &root).expect("suggestions");
+        assert_eq!(
+            before
+                .pending
+                .iter()
+                .map(|r| r.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beach", "sunset"],
+            "both suggestions are pending before anything is rejected"
+        );
+
+        let notices = crate::notices::Notices::new();
+        reject(
+            &root,
+            &format!("xxh3:{asset_hex}"),
+            &["sunset".to_string()],
+            &notices,
+        )
+        .expect("reject");
+
+        let after = suggestions(&app, &root).expect("suggestions");
+        assert_eq!(
+            after
+                .pending
+                .iter()
+                .map(|r| r.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beach"],
+            "the rejected pair is gone and the other one stays"
+        );
+    }
+
+    /// A missing rejection log means "nothing rejected yet"; a log that
+    /// exists and cannot be read means something corrupted it, and
+    /// answering "nothing rejected" there would resurface tags the user
+    /// already dismissed. A directory planted at the log's path is the
+    /// portable way to produce a non-`NotFound` read error.
+    #[test]
+    fn a_rejection_log_that_cannot_be_read_fails_instead_of_reading_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let app = FsApp::init(&root, "m1", "m1").expect("init");
+        plant_suggestions(&root, "aa00000000000000000000000000000c", &["beach"]);
+        let notices = crate::notices::Notices::new();
+        let path = rejections_path(&root, &notices).expect("rejections path");
+        std::fs::create_dir_all(&path).expect("plant a directory where the log belongs");
+
+        let Err(error) = suggestions(&app, &root) else {
+            panic!("an unreadable rejection log must fail the listing");
+        };
+        assert!(
+            format!("{error:#}").contains("tag-rejections.jsonl"),
+            "the error must name the file it could not read: {error:#}"
+        );
+    }
 }

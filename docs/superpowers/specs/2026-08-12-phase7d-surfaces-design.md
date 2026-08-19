@@ -266,3 +266,135 @@ phase pins:
   part).
 - Hover-scrub frame prefetch tuning (first paint uses whatever blobs
   exist; no speculative extraction on hover).
+
+## As-built (phase 7D)
+
+What shipped, where it differs from the design above. Written as what IS,
+not as a change log. Six PRs squash-merged after green CI on both matrix
+legs, plus this closing one.
+
+**PR #97 — keyframe images** (26 files, +4828/-142). `Derivation::
+KeyframeImage { model_tag, timestamp_ms }` and `KeyframeImagesComplete`
+join the blob layout; `extract_keyframe_webp` pulls one frame at
+thumb scale; `plan_keyframe_images` is a planner pass of its own with its
+own `index status` line and `--kinds keyframe-images` name; the MCP
+resource returns image blocks, the `thumb://` protocol routes keyframe
+blobs, and the Inspector strip renders them. The phase-7A watchlist
+deferral this closes is marked closed there.
+
+**PR #98 — Browse** (35 files, +4387/-71). `services::browse` with
+`browse_tree` (every volume's folder tree, recursive per-folder asset
+counts, offline volumes named in one collapsed notice) and `browse_list`
+(scope, `kind:` filter, three sorts, limit/offset), rendered through
+`search.rs`'s own `SearchHit` row so the GUI grid is shared. `maj browse
+tree|list`, two MCP read tools, four wire fixtures, and `BrowseView` +
+`Filmstrip` with hover-scrub over the keyframe images PR #97 made real.
+
+**PR #99 — the tag CRDT op** (20 files, +3551/-104). `Op::TagRenamed` is
+the phase's one new op variant — `sample_ops()` enumerates it and the
+proptest generator produces it, per the standing absence assertion. The
+projection folds renames into an alias map with a resolve rule (chains
+collapse to their final target; the verbs refuse to create a cycle at
+emit time, and the read path's bounded walk terminates on any cycle a
+concurrent merge constructs anyway). On top of it: `tags_list`, `tag_rename`, `tag_merge`,
+`tags_assign`, `para_file`, each at all three heads.
+
+**PR #100 — Organize** (39 files, +4747/-59). Two columns (PARA tree,
+tag vocabulary), the archive dry-run modal, and `SelectionBar` in Browse
+and Search so a grid selection can be tagged or filed in one call.
+
+**PR #101 — the progress seam** (15 files, +1700/-43). `ProgressEvent`
+(seven variants) and a cancel flag reach the engine as one `RunControl`
+parameter; `ingest_unfinished` reads this machine's run journals and
+lists resume candidates newest-first.
+
+**PR #102 — the Ingest surface** (33 files, +5182/-32). Three states
+(setup board, live run, completion card) plus the resume banner, with the
+run owned by the backend and rejoined on mount. Manual smoke passed
+2026-08-19 and is recorded on the PR — the standing rule that a GUI
+surface is not done until a human has driven it.
+
+**Closing PR** — parity rows for the phase's verbs in both harnesses, the
+scheduled deletion of Task 4's keyframe-images normalization, four scoped
+`cargo-mutants` runs with every survivor triaged, and this section.
+
+### Deviations from the design above
+
+**`Touched::Tag` carries no payload, and a tag rename rewrites the whole
+table** (PR #99, plan Tasks 10-11). The plan's Task 11 recipe was a
+targeted refresh of the affected rows. A rename can move every asset's
+effective tags at once, so the invalidation payload would have been "all
+of them" in the general case; `Touched::Tag` triggers `rebuild_tags` —
+one whole-table rewrite — instead, which is simpler and, at catalog
+sizes this phase targets, faster than computing the affected set.
+
+**The bulk-assign verb is `assign_tags`, not `tag_assets`** (plan's own
+AMENDED note, Task 12). `tag_assets` already names the single-asset
+op-dispatch tool (`add`/`rm`/`confirm_suggestion`/`reject_suggestion`), a
+different parameter shape entirely.
+
+**The engine takes one `RunControl`, not two flat parameters** (PR #101,
+plan's AMENDED note on Task 17). `run()` already took six arguments;
+`progress` and `cancel` as separate parameters would trip
+`clippy::too_many_arguments` on a public API, landable only behind an
+`#[expect]`. Bundled instead, following the `RunEngineArgs` precedent one
+layer up.
+
+**`plan_ingest` takes no destinations** (PR #102). The planner needs the
+source and the dedupe mode; destinations are a run-time concern, and
+asking the preview for them made the setup board demand a destination
+before it could show the user what was on the card.
+
+**The journal gained a `RunStarted` record, and the snapshot version went
+to 8** (PRs #101, #102). Nothing else in a journal knows how big a run
+set out to be — `FilePlanned` only covers files a worker reached, so a
+run cancelled with entries still queued looked complete. `RunStarted`
+records the run id, source, destinations and intended file count; the
+fold keeps the FIRST one, so a resume's own record does not overwrite the
+original run's identity. `SNAPSHOT_VERSION` is 8
+(`crates/catalog-sqlite/src/lib.rs:75`): the tag-alias projection changes
+what a snapshot means, and a stale snapshot is rebuilt rather than
+migrated.
+
+**Mounted roots come from a new `list_mounted_roots` command, not from
+the archive dry run** (PR #100, plan's AMENDED note on Task 15). Deriving
+them from the dry run is circular — the dry run takes roots as its input
+— and nothing in the catalog records where a node was materialized. The
+new read command answers from `volume_identity::mounted_volumes()`, so
+the modal previews against what is mounted right now.
+
+**Resume re-asks for the PARA node** (PR #102). `UnfinishedRun` carries
+run id, counts, source and destinations, all from `RunStarted` — not the
+node the run was filing into. One-click resume needs that field on the
+journal record first; it is on the watchlist.
+
+**`migrate_legacy` runs on read paths too** (PR #101). Resolving a
+catalog's state dir migrates pre-phase-4 derived files out of the sync
+root, and `ingest_unfinished` resolves the state dir like every other
+verb — so a read verb can perform a one-time move. That is deliberate
+(the migration must happen before anything reads `runs/`), and it is why
+`catalog_paths` takes a notices sink: the move announces itself.
+
+**The GUI captures a run id by parsing a notice line** (PR #102). The
+engine reports its run id in a notice of the form `run <id> …`;
+`run_id_from_notice` (`apps/desktop/src-tauri/src/ingest.rs:270`) strips
+that prefix. This makes the notice's leading token a wire contract, not
+just prose — a test pins it, and the format must not be reworded without
+updating both.
+
+**`run_stopped` is not the outcome** (PR #102). The progress stream's
+terminal event says the run thread finished; what it finished WITH comes
+from a separate `ingest_state` poll that hands out the finished
+`Outcome`. Treating the event as the result was the bug the review
+caught: a cancelled run and a completed one both emit it.
+
+### Review-loop shape
+
+The plan carries five in-place AMENDED notes (Tasks 10/11, 12, 15, 17,
+and the Task 11 reduction), each written where the task lives rather than
+appended as errata. That convention worked: an implementer reading the
+task read the correction first, and the closing agent could reconstruct
+every deviation from the plan alone. Reviewer mutation probes — applying
+a hand-written mutant and watching the test still pass — caught two
+generator-lucky tests during the phase; the same technique found four
+more survivors in this PR's `cargo-mutants` triage.

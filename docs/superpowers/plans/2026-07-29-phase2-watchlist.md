@@ -1037,14 +1037,20 @@ Recorded during the phase 7A PR chain (#64-#69) and this closing task. Items
 marked "(phase 7 spec)" come from that spec's own Deferred list; the rest
 were found during execution.
 
-- **Keyframe-image extraction is deferred** — keyframe *images* are never
-  stored as blobs, only the detected-timestamp manifest is
+- **CLOSED IN PHASE 7D (#97): Keyframe-image extraction is deferred** —
+  keyframe *images* were never stored as blobs, only the
+  detected-timestamp manifest was
   (`majestical_index::blob::Derivation::KeyframeManifest`). The
   `majestical://keyframes/{asset_id}` MCP resource
-  (`crates/cli/src/mcp_cmd/resources.rs`) serves that manifest, not an
+  (`crates/cli/src/mcp_cmd/resources.rs`) served that manifest, not an
   image; on-demand frame extraction from the source video whenever an
-  agent wants to actually SEE a keyframe is unbuilt (Task 7, restated at
-  closing; also recorded in the spec's as-built section).
+  agent wanted to actually SEE a keyframe was unbuilt (Task 7, restated at
+  closing; also recorded in the spec's as-built section). PR #97 added
+  `Derivation::KeyframeImage`/`KeyframeImagesComplete`, the
+  `extract_keyframe_webp` extractor, the `plan_keyframe_images` planner
+  pass with its own `index status` counts, and serving at every head (the
+  MCP resource returns image blocks, `thumb://` routes keyframe blobs,
+  and the Inspector strip renders them).
 - **`maj sync location list` and its MCP tool disagree on a missing
   catalog.** `services::sync::locations_list`
   (`crates/services/src/sync.rs:383-393`) reads `sync.toml` from the state
@@ -1547,10 +1553,11 @@ Recorded during the phase 7B PR chain (#71, #72, #75, #76, #77, #80, #81,
 - **The GUI's sync commands rebuild the projection per call on the dispatch
   thread** (Task 7). Only the two search commands go through `blocking`.
   Escalate the others if the UI is ever seen to hitch.
-- **Keyframe-image extraction is still deferred** (carried unchanged from
-  phase 7A — see that section's first item). Nothing in 7B touched it: the
-  GUI's inspector renders the manifest's timestamps as timecodes, which is
-  the same manifest the MCP resource serves, and still not an image.
+- **CLOSED IN PHASE 7D (#97): Keyframe-image extraction is still
+  deferred** (carried unchanged from phase 7A — see that section's first
+  item, which carries the closure detail). Nothing in 7B touched it: the
+  GUI's inspector rendered the manifest's timestamps as timecodes, which
+  was the same manifest the MCP resource serves, and still not an image.
 - **arrow 59 is blocked on lancedb** (dependabot triage, 2026-08-09).
   Dependabot PRs #74 and #79 bumped `arrow-array`/`arrow-schema` to 59.1.0
   against lancedb 0.33.0's arrow-58 API and failed to compile
@@ -1779,6 +1786,228 @@ site and both caption-offline sites) was applied to the source, the named
 test run and watched fail, and the source reverted — 19 edit/run/revert
 cycles across the two files. The off-macOS branches are the one part
 taken on inspection; they run only on the ubuntu leg.
+
+## Phase 7D deferrals
+
+Recorded during the phase 7D PR chain (#97, #98, #99, #100, #101, #102)
+and this closing PR. Items marked "(spec)" come from
+`docs/superpowers/specs/2026-08-12-phase7d-surfaces-design.md`'s own
+Deferred list; the rest were found during execution. "Wire gap" means the
+mockup asks for a field no Rust row carries yet — the surface renders
+without it rather than inventing one.
+
+- **The ingest queue** (spec; #102). One run at a time is the whole
+  design: `IngestState` holds a single job, and `start_ingest` refuses
+  while one is busy. Multiple pending jobs, reordering and persistence
+  across restarts are a phase of their own.
+- **CLI ingest progress rendering** (spec; #101). The seam exists —
+  `RunControl { progress, cancel }` — and the CLI passes a no-op
+  progress sink, so `maj ingest` still prints only its summary. The GUI
+  is the only head that draws the live run.
+- **MCP long-running-tool progress notifications** (spec, carried from
+  phase 7). Same seam, same reason: no MCP tool streams progress yet.
+- **Menu-bar indicator with indexing throttle** (spec, carried from phase
+  7). Nothing in 7D touched it.
+- **PARA-count click-through from Organize to a `para:`-filtered Search**
+  (spec; #100). The counts are rendered; clicking one does nothing.
+- **Grid virtualization for very large flattened subtrees** (spec; #99,
+  #100). `browse_list` paginates and the GUI loads incrementally; a
+  windowed DOM is the deferred part.
+- **Hover-scrub frame prefetch tuning** (spec; #98). The filmstrip paints
+  whatever keyframe-image blobs exist; hovering never triggers
+  speculative extraction.
+- **A duration field on browse rows — WIRE GAP** (#98). The mockup's grid
+  card carries a `.dur` chip; `SearchHit` has no duration, and nothing in
+  the catalog records one. The card renders without the chip.
+- **`UnfinishedRun` carries no `para` — WIRE GAP** (#101, #102). The
+  resume banner can name a run's source and destinations from its
+  `RunStarted` record but not the PARA node it was filing into, so
+  resuming re-asks for the node instead of offering one-click resume.
+  The field belongs on the journal record first.
+- **`FileFailed` carries no `dest_root` — WIRE GAP** (#101). A failure
+  names the file and the reason but not which destination it failed
+  against, so per-destination failure tallies cannot be drawn.
+- **`ParaNodeRow` carries no per-node asset count and no materialized
+  roots — WIRE GAP** (#100, the task's own AMENDED note). The mockup's
+  "1,204" badge and its "materialized at …" line both need fields the row
+  does not have; the rows and the detail card render without them.
+- **`ParaArchivePartial` has no `notices` field** (#100). The archive
+  modal surfaces the dry run's moves and the partial-failure rows, but a
+  notice raised while planning the archive has nowhere to land in that
+  outcome.
+- **`para add`/`para rename` have no notices path** (#99). Both return
+  bare values (`NodeId`, `()`), so a diagnostic raised on the way through
+  is dropped rather than attached — unlike every other organize verb,
+  which returns an outcome struct with a `notices` field.
+- **Two `sync` verbs still build their own sink instead of taking a
+  caller-supplied one** (#99's review; carried). `location_add`/
+  `location_rm` construct `Notices::new()` internally, so a caller
+  cannot collect their diagnostics alongside its own.
+- **`search.rs` has its own online predicate** (#98). `browse.rs` calls
+  `volumes::volume_is_online`; `search.rs` still answers the same
+  question its own way. Two implementations of "is this volume mounted"
+  can drift.
+- **The MCP `ingest_source` parameter has no is-dir guard** (#101). A
+  file path reaches the planner and fails there rather than being
+  refused at the tool boundary with a preview that names the problem.
+- **The run thread discards the plan pass's notices** (#102). The GUI's
+  `start_ingest` plans and then runs; notices raised during planning are
+  drained by the planner's own outcome, which the run path does not
+  forward to the webview.
+- **The rust CI job has no ffmpeg** (#97). The keyframe-image tests are
+  gated on ffmpeg's presence and silently return on the runners, so the
+  extractor's real-video path is proved locally and not in CI. Same
+  shape as 7C's cfg-gated smoke tests: the gate and the coverage gap are
+  recorded together.
+- **The pre-commit hook does not cover the desktop workspace's `cargo
+  fmt`** (#102). `apps/desktop/src-tauri` is a standalone workspace; the
+  hook formats the headless one only, so a desktop-only formatting slip
+  reaches CI.
+- **`api.ts` codegen from Rust** (carried from 7C; #98, #100, #102). The
+  hand-written wire contract grew with every surface this phase and its
+  oxlint `max-lines` cap was ratcheted three times (to 560 for
+  `api.ts`, and separately to 310 for `BrowseView.svelte` and 533 for
+  `IngestView.svelte`). Each cap sits two or three lines above the file
+  as it stands and names the next split in its comment
+  (`apps/desktop/.oxlintrc.json`), so the caps are ratchets, not
+  permission to grow.
+- **`list_volumes`/`browse_tree` are sync commands on the dispatch
+  thread** (carried from 7B's "sync commands rebuild the projection per
+  call"; #98 added `browse_tree` to the list). Only the search commands
+  go through `blocking`. Escalate if the UI is ever seen to hitch on a
+  large catalog.
+- **The services ingest tests write into the real per-machine state dir**
+  (#101). They use unique temp catalog roots, so the directories they
+  create are unique and harmless, but they are not cleaned up: the state
+  dir is keyed by a hash of the canonical catalog path, and nothing in
+  the test drops it afterwards.
+- **Destination free space, run duration, and the now-row's target/verb
+  are WIRE GAPS** (#102). The setup board cannot show how much room a
+  destination has, the completion card cannot show how long the run
+  took, and the now-row names the file but not what is being done to it
+  or where — three fields no outcome or progress event carries.
+
+### cargo-mutants triage (phase 7D)
+
+Four scoped runs, foreground, one at a time (the standing mandate). Each
+ran against a copied tree rather than `--in-place`, so no run could leave
+a mutation behind; `git status` was checked clean afterwards. Runs 2-4
+were split into shards (`--shard k/n`) purely to fit each invocation
+inside a ten-minute call budget — every shard of a run completed, so each
+run's numbers below are the whole file's.
+
+```bash
+cargo mutants --iterate --package majestical-core --file crates/core/src/projection.rs -- --lib
+cargo mutants --shard k/5 --package majestical-services --file crates/services/src/browse.rs --file crates/services/src/tags.rs -- --lib
+cargo mutants --shard k/3 --package majestical-ingest --file crates/ingest/src/engine.rs
+cargo mutants --shard k/5 --package majestical-index --file crates/index/src/work.rs -- --lib
+```
+
+**Test-scope note (the 7C lesson applied).** Three of the four runs scope
+their test command to `--lib`, which can overstate misses — a survivor
+there may be killed by tests outside the scope. Every survivor below was
+checked against that caveat before being chased, and in run 1 the caveat
+was live: one survivor was already killed by an out-of-lib test. The
+ingest run deliberately drops `-- --lib`: `engine.rs`'s real coverage is
+`crates/ingest/tests/engine.rs` (743 lines, an integration target), so a
+lib-only scope would have reported nearly every mutant as missed. It runs
+the package's whole test suite instead.
+
+**`crates/core/src/projection.rs`**: 103 mutants tested (`--iterate`
+excluded 95 already known caught or unviable), **76 caught, 24 unviable,
+3 missed**.
+
+- *`tag_add_ids -> vec![]`* — NOT a gap. Re-running the same mutant with
+  the package's full test set (dropping `-- --lib`) kills it:
+  `crates/core/tests/acceptance.rs` exercises it. The `--lib` caveat,
+  live.
+- *`saved_searches -> ::std::iter::empty()`* — genuine gap, closed. The
+  only assertion on the listing was `count() == 0` inside the LWW test,
+  which an always-empty listing satisfies. Closed with
+  `saved_searches_lists_every_live_search_in_name_order`: two live
+  searches (so a listing that yields only its first row is
+  distinguishable) in name order, with a tombstoned third excluded.
+  Verified: all five `saved_searches` mutants now caught.
+- *`apply_asset_seen`'s `>` -> `>=`* — equivalent mutant, no test
+  possible. `InstanceInfo` derives `Ord` over all three of its fields, so
+  the two operators differ only when candidate equals current, where the
+  mutant re-inserts a byte-identical value.
+
+**`crates/services/src/browse.rs` + `tags.rs`**: 111 mutants, **76
+caught, 23 unviable, 12 missed — 9 closed with new tests, 3 equivalent**.
+
+- *`dedupe_by_asset`'s match guard and `is_better` (4 mutants)* — genuine
+  gap, closed. The representative-instance test was generator-lucky: its
+  two instances were `E/newer.mov` (newer) and `E/older.mov`, and
+  instances arrive in path order (`AssetState::instances` is a `BTreeMap`
+  keyed by `(volume, path)`), so the newest instance was also the
+  first-seen one and "keep the first" passed every assertion. The fixture
+  now opposes the two orderings (`E/a-older.mov`, `E/z-newer.mov`), and a
+  second test pins the documented tie-break
+  (`two_instances_with_the_same_mtime_pick_the_smaller_path`). Both
+  assert `size`, not `name`: `name` comes from the asset's catalog
+  summary, one row per asset, so asserting the representative through it
+  asserts the wrong thing — which is why the old test read as if it
+  covered this. Verified: all four now caught.
+- *`load_rejections`'s five return-value mutants* — genuine gap, closed.
+  Nothing in this crate's own tests had ever rejected anything, so
+  "always return no rejections" passed. Closed with
+  `suggestions_hides_exactly_the_rejected_pair`: two planted suggestions,
+  one rejected, exact assertions on the pending list before and after.
+  Verified: all five now caught.
+- *`load_rejections`'s `NotFound` match guard -> `true`* — found by that
+  verification run, genuine, closed with
+  `a_rejection_log_that_cannot_be_read_fails_instead_of_reading_empty`
+  (a directory planted at the log's path is a portable non-`NotFound`
+  read error). A missing log means "nothing rejected yet"; an unreadable
+  one must not read as the same thing.
+- *`is_better`'s `>` -> `>=` and the path compare's `<` -> `==`/`<=` (3
+  mutants)* — equivalent under the caller's invariants. The `>` is only
+  reached after `candidate.mtime_ms != current.mtime_ms`, and the path
+  compare only ever sees distinct paths arriving in ascending order, so
+  the mutated operators return exactly what the original does. Killing
+  them would need a direct call with a hand-built out-of-order vector —
+  a state `dedupe_by_asset`'s only caller cannot produce. NOTE the
+  load-bearing invariant: ascending distinct paths hold only because
+  `matching_instances` filters to the request's single volume before the
+  `BTreeMap`-ordered `(volume, path)` keys reach the dedupe — if
+  `browse_list` ever widens to multi-volume scopes, this equivalence
+  claim dies with the invariant and these three need real kills.
+
+**`crates/ingest/src/engine.rs`**: 57 mutants, **36 caught, 14 unviable,
+7 missed — 0 closed, all deferred with reasons**.
+
+- *`FileSink::flush -> Ok(())`* — equivalent. `std::fs::File`'s `Write::
+  flush` is itself a no-op; there is no user-space buffer to drop.
+- *`FileSink::finish -> Ok(())` and `finish_open_sinks -> ()` (2)* —
+  durability, not behavior. `finish` is `flush` + `sync_all`; skipping
+  the fsync changes only what survives a power loss, which no in-process
+  test can observe. Killing them needs crash injection.
+- *`LockDiagnostics::record`/`drain` (4)* — reachable only through a
+  poisoned mutex, i.e. only if a worker thread panics while holding one
+  of the engine's locks. The engine's critical sections never panic by
+  construction and there is no fault-injection seam to make one, so
+  these are untestable as the code stands. A `SinkFactory` that panics
+  inside a critical section would be the seam; adding one for four
+  diagnostic mutants was not worth the surface.
+
+**`crates/index/src/work.rs`**: 136 mutants, **130 caught, 0 unviable, 6
+missed — all 6 platform-conditional, none a gap**. Every one is a `+=` on
+`ocr_unavailable`/`pdf_unavailable` behind `!ocr::AVAILABLE` /
+`!pdf::AVAILABLE` (`plan_ocr_image:515`, `plan_ocr_keyframes:634`,
+`plan_pdf_text:672`) — the exact three sites 7C left open for the same
+reason. Those consts are `cfg!(target_os = "macos")`, so the branch is
+dead code on the machine that ran this run; on the ubuntu leg the
+existing exact assertions kill both mutants at each site — the off-macOS
+counter-summation tests at `work.rs:2279` (`ocr_unavailable == 2`),
+`:2335` (the `plan_ocr_keyframes` sibling), and `:2395`
+(`pdf_unavailable == 2`), plus the off-macOS shape pins at `:2527`/`:2531`
+— `-=` underflow-panics from 0 and `*=` diverges from the exact count.
+(The macOS-only zero-assertions at `:2157` prove nothing here: they are
+`cfg(target_os = "macos")` and assert `== 0`, which `*=` satisfies.) 7C's
+counter-mutant family is otherwise gone: the two-asset rule held, and
+this phase's new planner pass (`plan_keyframe_images`) shipped with the
+same shape of test, so it contributed no survivors.
 
 ## Done in phase 6
 

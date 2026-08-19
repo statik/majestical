@@ -1042,8 +1042,10 @@ git commit -m "feat: Ingest surface — plan, run with live progress, resume ban
 - Modify: `docs/superpowers/specs/2026-08-12-phase7d-surfaces-design.md` (As-built section)
 - Create: `docs/superpowers/HANDOFF-phase7E.md` (supersedes 7D handoff, same skeleton: state, architecture pointers for the new seams, backlog pointer, 7E recommendation, process conventions carried verbatim — including the FOREGROUND mutants mandate in position 10)
 
-- [ ] **Step 1: parity rows** — add the new verbs to both harnesses following their existing row pattern; run them. ALSO delete Task 4's temporary keyframe-images normalization in `crates/cli/tests/services_parity.rs` (`without_keyframe_images`, `strip_keyframe_images_member`, `diff_against_ref_normalized`) and point the four index rows — `index_status_output_is_byte_identical`, `index_run_empty_pass_output_is_byte_identical`, `index_run_kinds_thumbs_on_a_text_only_catalog_is_byte_identical`, `index_run_invalid_kinds_output_is_byte_identical` — back at plain `diff_against_ref`. It was only ever needed while the reference binary (built at the merge-base with `main`) predated the kind; PR 1 having landed, the reference renders those rows itself, and leaving the strip in place would keep those four rows permanently blind to `keyframe-images`.
-- [ ] **Step 2: mutants, FOREGROUND, one at a time** (each command completes before the next starts, no background):
+**STATUS: DONE.** Step 1: the normalization is deleted and the four index rows point back at `diff_against_ref`; the reference binary was rebuilt at the current merge-base (dc36277 — the previous `/tmp/maj-ref` predated PR 1's merge and would have made the deletion fail); `services_parity` runs 52 tests, all real, none skipped. Seven new CLI rows (browse, `tags list`, `tag rename` + its refusals, `tag merge`, `tag assign`, `para file`, `ingest unfinished`) and four new Tauri rows (`browse_tree`, `browse_list`, `list_tags`, `list_unfinished_ingests`, all whole-document comparisons). Step 2: four scoped runs, foreground, sharded to fit the call budget; 407 mutants, 28 survivors, 10 closed with new tests in `projection.rs`, `browse.rs` and `tags.rs`, the rest triaged as equivalent, platform-conditional, or untestable-without-fault-injection — every disposition recorded in the watchlist's "cargo-mutants triage (phase 7D)" section. Step 3: watchlist (keyframe deferral closed, 23 deferrals, triage), spec as-built, `HANDOFF-phase7E.md`.
+
+- [x] **Step 1: parity rows** — add the new verbs to both harnesses following their existing row pattern; run them. ALSO delete Task 4's temporary keyframe-images normalization in `crates/cli/tests/services_parity.rs` (`without_keyframe_images`, `strip_keyframe_images_member`, `diff_against_ref_normalized`) and point the four index rows — `index_status_output_is_byte_identical`, `index_run_empty_pass_output_is_byte_identical`, `index_run_kinds_thumbs_on_a_text_only_catalog_is_byte_identical`, `index_run_invalid_kinds_output_is_byte_identical` — back at plain `diff_against_ref`. It was only ever needed while the reference binary (built at the merge-base with `main`) predated the kind; PR 1 having landed, the reference renders those rows itself, and leaving the strip in place would keep those four rows permanently blind to `keyframe-images`.
+- [x] **Step 2: mutants, FOREGROUND, one at a time** (each command completes before the next starts, no background):
 
 ```bash
 cargo mutants --package majestical-core --file crates/core/src/projection.rs -- --lib
@@ -1053,9 +1055,11 @@ cargo mutants --package majestical-index --file crates/index/src/work.rs -- --li
 ```
 
 Triage every survivor against the `--lib`-scoping caveat (a survivor may be killed by tests outside the scope — check before chasing); genuine gaps get tests in this PR; each disposition recorded in the watchlist's 7D triage section.
-- [ ] **Step 3: docs** — as-built, watchlist, handoff.
-- [ ] **Step 4: full local CI** `just ci` (the recipe CI runs) green.
-- [ ] **Step 5: Commit; open PR 7** (`ci/docs: phase 7D close — parity rows, mutants triage, handoff`).
+- [x] **Step 3: docs** — as-built, watchlist, handoff.
+- [x] **Step 4: full local CI** `just ci` green — PLUS `just gui-test` /
+  `gui-lint`: `just ci` covers only the headless workspace, so the Tauri
+  parity rows never run under it; the GUI workspace needs its own recipes.
+- [ ] **Step 5: Commit; open PR 7** (`ci/docs: phase 7D close — parity rows, mutants triage, handoff`). Committed on `phase7d-pr7`; NOT pushed — the closing brief withheld the push.
 
 ```bash
 git add crates/cli/tests/services_parity.rs apps/desktop/src-tauri/tests/tauri_parity.rs docs/superpowers/plans/2026-07-29-phase2-watchlist.md docs/superpowers/specs/2026-08-12-phase7d-surfaces-design.md docs/superpowers/HANDOFF-phase7E.md

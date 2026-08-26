@@ -32,7 +32,7 @@ fast_image_resize = "6.1.0"
 zstd = "0.13.3"
 ort = "=2.0.0-rc.13"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
-lancedb = "=0.33.0"      # build requires protoc: brew install protobuf
+lancedb = "=0.37.1"      # build requires protoc: brew install protobuf
 arrow-array = "=58.3.0"  # lockstep with lancedb — do not bump independently
 arrow-schema = "=58.3.0"
 # Only "rt": the sync VectorStore wrapper drives everything through one
@@ -45,7 +45,7 @@ futures = "0.3"
 # `maj mcp`: stdio JSON-RPC server over the services layer. Default features
 # (base64, macros, server) pull in the `#[tool_router]`/`#[tool]` proc
 # macros, `ServerHandler`, and the stdio-capable transport.
-rmcp = "=3.1.0"
+rmcp = "=3.1.3"
 schemars = "=1.2.2"
 ureq = { version = "3.3.0", features = ["json"] }
 base64 = "0.23.0"

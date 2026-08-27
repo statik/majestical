@@ -2004,6 +2004,28 @@ fn search_query_and_saved_together_is_a_clap_conflict_not_a_panic() {
         .stderr(predicates::str::contains("panicked").not());
 }
 
+/// Every verb but `doctor` requires a resolved catalog and machine id
+/// (`--catalog`/`MAJ_CATALOG`, `--machine-id`/`MAJ_MACHINE_ID`) — but as a
+/// dispatch-time check now, not clap's own "required argument" usage error
+/// (exit code 2): a fresh install with neither configured must still be
+/// able to run `maj doctor` to find that out (see `doctor_smoke.rs`'s
+/// `doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all`),
+/// which means both fields parse as optional at the clap level for every
+/// verb. This pins the OTHER half: a normal verb still refuses to run
+/// without them, just with an actionable message instead of a usage error.
+#[test]
+fn volumes_list_without_catalog_or_machine_id_names_the_remedy() {
+    assert_cmd::Command::cargo_bin("maj")
+        .expect("bin")
+        .env_remove("MAJ_CATALOG")
+        .env_remove("MAJ_MACHINE_ID")
+        .args(["volumes", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("--catalog"))
+        .stderr(contains("MAJ_CATALOG"));
+}
+
 /// A `--save` on a query that fails to parse must not append anything to
 /// the event log: `searches list` afterward must show no saved search, not
 /// one pointing at an invalid query.

@@ -1836,3 +1836,67 @@ fn ingest_unfinished_output_is_byte_identical() {
         diff_against_ref(&root, &state, args);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7E: `doctor`.
+// ---------------------------------------------------------------------------
+
+/// True when `help_text` (a `--help` invocation's stdout) advertises `name`
+/// as a subcommand, matched by first-token equality — not `starts_with`, so
+/// a future `tag` probe can't false-positive on `tags`. Pure string
+/// matching, no I/O and nothing that can panic, so — unlike every helper in
+/// this file that shells out — this one needs no `#[cfg(test)]` for
+/// clippy's `allow-expect-in-tests`: there's no `.expect`/`.unwrap` in it to
+/// exempt. The caller does the actual `--help` invocation (and the
+/// missing-binary check before that) — see
+/// [`doctor_output_is_byte_identical`].
+fn reference_knows_subcommand(help_text: &str, name: &str) -> bool {
+    help_text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(name))
+}
+
+/// `doctor` is read-only, so a shared root serves both binaries (same
+/// reasoning as `browse_output_is_byte_identical`). Constrained to `--json`
+/// against an already-initialized fixture catalog, passed via doctor's own
+/// `--catalog` flag: both binaries run on the SAME machine in this one test
+/// process, so an environment-dependent row (e.g. whether `ffmpeg` is on
+/// `PATH`) reads identically on both sides regardless — what this row
+/// actually needs pinned is that the catalog-dependent rows (`catalog`,
+/// `state_dir`, `blob_residue`) agree once a real catalog is in play, not
+/// just the environment-only ones.
+///
+/// Two independent skip reasons, checked in order: the reference binary may
+/// be missing entirely (same as every other row in this file), or it may be
+/// present but predate `doctor` — this row's own parity test was added in
+/// the SAME PR chunk that introduces the verb (unlike the
+/// browse/`tags list`/`tag rename`+`merge`/`para file`/`ingest unfinished`
+/// rows above, whose verbs had already merged to `main` — see PR #98, #99,
+/// #101/#102 — before their parity tests were written, so `/tmp/maj-ref`,
+/// built in CI from `git merge-base origin/main HEAD`, already knew every
+/// one of them). Both skips are loud; the second becomes a real comparison
+/// like every other row above once the reference catches up post-merge.
+#[test]
+fn doctor_output_is_byte_identical() {
+    let reference = std::path::Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(doctor): /tmp/maj-ref missing — build it first");
+        return;
+    }
+    let help = Command::new(reference)
+        .arg("--help")
+        .output()
+        .expect("run ref --help");
+    if !reference_knows_subcommand(&String::from_utf8_lossy(&help.stdout), "doctor") {
+        eprintln!("SKIP parity(doctor): /tmp/maj-ref predates the `doctor` verb");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let catalog_arg = root.to_str().expect("utf8");
+    diff_against_ref(
+        &root,
+        &state,
+        &["doctor", "--catalog", catalog_arg, "--json"],
+    );
+}

@@ -19,12 +19,16 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(name = "maj", version, about = "Majestical media catalog")]
 struct Cli {
-    /// Catalog directory (env `MAJ_CATALOG`).
+    /// Catalog directory (env `MAJ_CATALOG`). Optional at parse time — every
+    /// verb but `doctor` requires one, enforced at dispatch by
+    /// `require_catalog_and_machine_id` rather than by clap, so `doctor` can
+    /// still run with neither configured (see its own module doc).
     #[arg(long, env = "MAJ_CATALOG", help = "Catalog directory")]
-    catalog: PathBuf,
-    /// Stable machine identity (env `MAJ_MACHINE_ID`).
+    catalog: Option<PathBuf>,
+    /// Stable machine identity (env `MAJ_MACHINE_ID`). Optional at parse
+    /// time for the same reason `catalog` is — see that field's doc.
     #[arg(long, env = "MAJ_MACHINE_ID", help = "Stable machine identity")]
-    machine_id: String,
+    machine_id: Option<String>,
     /// Human/service identity recorded on emitted events (env `MAJ_AUTHOR`).
     /// Defaults to the machine id when omitted.
     #[arg(long, env = "MAJ_AUTHOR", help = "Author identity for emitted events")]
@@ -182,6 +186,21 @@ enum Cmd {
         /// Resume a previous run's journal (run id printed at start).
         #[arg(long)]
         resume: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnostic sweep of the environment and (optionally) one catalog:
+    /// ffmpeg/imagemagick/model presence, catalog and state-dir health,
+    /// orphaned temp files, platform capabilities.
+    Doctor {
+        /// Catalog to health-check. Independent of the top-level
+        /// `--catalog`/`MAJ_CATALOG` — doctor is the one verb exempt from
+        /// `require_catalog_and_machine_id`'s dispatch-time requirement, so
+        /// omitting this is how a caller expresses "check the environment
+        /// only," and a bare `maj doctor` with neither configured at all
+        /// still runs.
+        #[arg(long)]
+        catalog: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -698,6 +717,57 @@ pub(crate) fn surface_err_notices<T>(result: Result<T, ServiceError>) -> Result<
     })
 }
 
+/// `Cmd::Ingest { cmd: None, .. }`'s fields (the copy form), bundled so
+/// [`dispatch_ingest_copy`] takes one struct instead of nine positional
+/// arguments.
+struct IngestCopyFields {
+    source: Option<PathBuf>,
+    dest: Vec<PathBuf>,
+    para: Option<String>,
+    template: String,
+    dedupe: DedupeArg,
+    jobs: Option<usize>,
+    dry_run: bool,
+    resume: Option<String>,
+    json: bool,
+}
+
+/// Dispatches `maj ingest <source> --dest .. --para ..` (the copy form).
+/// Split out of `main` purely to stay under the crate's max-function-length
+/// lint, matching [`dispatch_inbox`]. Resolves `source`/`para` — `required =
+/// true` in clap, except when the `unfinished` subcommand negates them,
+/// which `main`'s arm above this one already took by the time this runs —
+/// before running the copy. Takes `catalog`/`machine_id` as their own
+/// borrows rather than `&Cli`: by the time this runs, `main`'s `match
+/// cli.cmd` has already partially moved `cli`, so only per-field borrows
+/// (the same ones every other arm passes) are available, not the whole
+/// struct.
+fn dispatch_ingest_copy(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    fields: IngestCopyFields,
+) -> Result<()> {
+    let source = fields
+        .source
+        .context("maj ingest needs a source directory")?;
+    let para = fields.para.context("maj ingest needs --para")?;
+    let args = commands::IngestArgs {
+        source,
+        dest: fields.dest,
+        para,
+        template: fields.template,
+        dedupe: fields.dedupe.into(),
+        jobs: fields.jobs,
+        dry_run: fields.dry_run,
+        resume: fields.resume,
+        json: fields.json,
+    };
+    with_app(catalog, machine_id, author, |app| {
+        commands::cmd_ingest(app, catalog, &args)
+    })
+}
+
 /// Opens the catalog, runs one command against it, then drains the app's
 /// notices — on the error path too, so a warning collected before a failure
 /// still reaches the user.
@@ -713,21 +783,46 @@ fn with_app(
     result
 }
 
+/// Resolves the `--catalog`/`MAJ_CATALOG` and `--machine-id`/
+/// `MAJ_MACHINE_ID` every verb but `doctor` requires. Enforced here, at
+/// dispatch, rather than by clap's own "required" flag: both fields parse as
+/// optional on `Cli` so a bare `maj doctor` still runs with neither
+/// configured (see `Cmd::Doctor`'s own doc — diagnosing exactly that state
+/// is the verb's purpose). Errors name both the flag and the env var, so a
+/// caller with neither set knows exactly what to supply.
+fn require_catalog_and_machine_id(cli: &Cli) -> Result<(PathBuf, String)> {
+    let catalog = cli
+        .catalog
+        .clone()
+        .context("--catalog <dir> or MAJ_CATALOG is required for this command")?;
+    let machine_id = cli
+        .machine_id
+        .clone()
+        .context("--machine-id <id> or MAJ_MACHINE_ID is required for this command")?;
+    Ok((catalog, machine_id))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let author = cli.author.clone().unwrap_or_else(|| cli.machine_id.clone());
+    // `doctor` is the one verb exempt from `require_catalog_and_machine_id`
+    // below, so it's dispatched first, before that resolution can fail.
+    if let Cmd::Doctor { catalog, json } = cli.cmd {
+        return commands::cmd_doctor(catalog, json);
+    }
+    let (catalog, machine_id) = require_catalog_and_machine_id(&cli)?;
+    let author = cli.author.clone().unwrap_or_else(|| machine_id.clone());
     match cli.cmd {
         Cmd::Catalog {
             cmd: CatalogCmd::Init,
-        } => commands::cmd_catalog_init(&cli.catalog, &cli.machine_id, &author)?,
-        Cmd::Scan { dir, volume } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+        } => commands::cmd_catalog_init(&catalog, &machine_id, &author)?,
+        Cmd::Scan { dir, volume } => with_app(&catalog, &machine_id, &author, |app| {
             commands::cmd_scan(app, &dir, volume)
         })?,
-        Cmd::Tag { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+        Cmd::Tag { cmd } => with_app(&catalog, &machine_id, &author, |app| {
             commands::cmd_tag(app, cmd)
         })?,
-        Cmd::Tags { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-            dispatch_tags(app, &cli.catalog, cmd)
+        Cmd::Tags { cmd } => with_app(&catalog, &machine_id, &author, |app| {
+            dispatch_tags(app, &catalog, cmd)
         })?,
         Cmd::Search {
             query,
@@ -735,7 +830,7 @@ fn main() -> Result<()> {
             json,
             save,
             saved,
-        } => {
+        } => with_app(&catalog, &machine_id, &author, |app| {
             let args = search::SearchArgs {
                 query,
                 limit,
@@ -743,57 +838,52 @@ fn main() -> Result<()> {
                 save,
                 saved,
             };
-            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-                search::cmd_search(app, &cli.catalog, &args)
-            })?;
-        }
-        Cmd::Searches { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+            search::cmd_search(app, &catalog, &args)
+        })?,
+        Cmd::Searches { cmd } => with_app(&catalog, &machine_id, &author, |app| {
             search::cmd_searches(app, cmd)
         })?,
-        Cmd::Index { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-            dispatch_index(app, &cli.catalog, cmd)
+        Cmd::Index { cmd } => with_app(&catalog, &machine_id, &author, |app| {
+            dispatch_index(app, &catalog, cmd)
         })?,
         // Deliberately does not open a catalog: fetching the encoder model
         // is a machine-local cache operation, unrelated to any one
-        // catalog's event log. `--catalog`/`--machine-id` are still
-        // required by clap here (they're top-level, non-Option args with
-        // no default) — the same accepted wart as `Verify` above.
+        // catalog's event log — `catalog`/`machine_id` above were still
+        // resolved (and could have failed) for this arm, the same accepted
+        // wart `Verify` below carries.
         Cmd::Model {
             cmd: ModelCmd::Fetch { verify, only },
         } => index_cmd::cmd_model_fetch(verify, &only)?,
         // Deliberately does not open a catalog: describer config lives in
         // the per-machine state dir, not the event log.
-        Cmd::Describer { cmd } => dispatch_describer(&cli.catalog, cmd)?,
+        Cmd::Describer { cmd } => dispatch_describer(&catalog, cmd)?,
         // Deliberately does not open the catalog itself here: sync location
         // config lives in the per-machine state dir, not the event log —
         // `Pull` opens the catalog internally, once it needs to apply.
-        Cmd::Sync { cmd } => dispatch_sync(&cli.catalog, &cli.machine_id, &author, cmd)?,
-        Cmd::Inbox { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-            dispatch_inbox(app, &cli.catalog, cmd)
+        Cmd::Sync { cmd } => dispatch_sync(&catalog, &machine_id, &author, cmd)?,
+        Cmd::Inbox { cmd } => with_app(&catalog, &machine_id, &author, |app| {
+            dispatch_inbox(app, &catalog, cmd)
         })?,
         Cmd::Volumes {
             cmd: VolumesCmd::List { json },
-        } => {
-            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-                commands::cmd_volumes_list(app, &cli.catalog, json)
-            })?;
-        }
-        Cmd::Meta { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
+        } => with_app(&catalog, &machine_id, &author, |app| {
+            commands::cmd_volumes_list(app, &catalog, json)
+        })?,
+        Cmd::Meta { cmd } => with_app(&catalog, &machine_id, &author, |app| {
             commands::cmd_meta(app, cmd)
         })?,
-        Cmd::Para { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-            commands::cmd_para(app, &cli.catalog, cmd)
+        Cmd::Para { cmd } => with_app(&catalog, &machine_id, &author, |app| {
+            commands::cmd_para(app, &catalog, cmd)
         })?,
-        Cmd::Browse { cmd } => with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-            commands::cmd_browse(app, &cli.catalog, cmd)
+        Cmd::Browse { cmd } => with_app(&catalog, &machine_id, &author, |app| {
+            commands::cmd_browse(app, &catalog, cmd)
         })?,
         // Deliberately does not open a catalog: `verify` re-checks a
         // destination directory against its own ASC MHL history, which
-        // needs neither the event log nor a machine identity. `--catalog`/
-        // `--machine-id` are still required by clap here (they're
-        // top-level, non-Option args with no default) — a wart documented
-        // in Task 6's report rather than restructured, since every other
-        // subcommand does need them.
+        // needs neither the event log nor a machine identity — `catalog`/
+        // `machine_id` above were still resolved (and could have failed)
+        // for this arm, a wart documented in Task 6's report rather than
+        // restructured, since every other subcommand does need them.
         Cmd::Verify { dir, json } => commands::cmd_verify(&dir, json)?,
         // Like `Verify` above, the listing verb deliberately does not open a
         // catalog: run journals live in this machine's state dir, not the
@@ -801,7 +891,7 @@ fn main() -> Result<()> {
         Cmd::Ingest {
             cmd: Some(IngestCmd::Unfinished { json }),
             ..
-        } => commands::cmd_ingest_unfinished(&cli.catalog, json)?,
+        } => commands::cmd_ingest_unfinished(&catalog, json)?,
         Cmd::Ingest {
             cmd: None,
             source,
@@ -813,31 +903,30 @@ fn main() -> Result<()> {
             dry_run,
             resume,
             json,
-        } => {
-            // clap enforces both (`required = true`), except when the
-            // `unfinished` subcommand negates them — which the arm above has
-            // already taken by then.
-            let source = source.context("maj ingest needs a source directory")?;
-            let para = para.context("maj ingest needs --para")?;
-            let args = commands::IngestArgs {
+        } => dispatch_ingest_copy(
+            &catalog,
+            &machine_id,
+            &author,
+            IngestCopyFields {
                 source,
                 dest,
                 para,
                 template,
-                dedupe: dedupe.into(),
+                dedupe,
                 jobs,
                 dry_run,
                 resume,
                 json,
-            };
-            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-                commands::cmd_ingest(app, &cli.catalog, &args)
-            })?;
-        }
+            },
+        )?,
+        // Unreachable: the `if let Cmd::Doctor { .. }` above already
+        // returned for this variant, before `catalog`/`machine_id` were
+        // even resolved. Kept only so this match stays exhaustive over `Cmd`.
+        Cmd::Doctor { .. } => unreachable!("handled by the if-let above"),
         // Deliberately does not open a catalog here: `mcp_cmd::serve` opens
         // (and re-opens) it per tool call, not at startup — see its own
         // module doc for why, mirroring `Verify`/`Model` above.
-        Cmd::Mcp => mcp_cmd::serve(&cli.catalog, &cli.machine_id, &author)?,
+        Cmd::Mcp => mcp_cmd::serve(&catalog, &machine_id, &author)?,
     }
     Ok(())
 }

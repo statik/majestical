@@ -163,6 +163,13 @@ impl BlobStore {
         }
     }
 
+    /// The store's root directory, so read-only diagnostics (`maj doctor`) can
+    /// walk it without re-deriving the `<sync-root>/blobs` layout themselves.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     #[must_use]
     pub fn path_for(&self, asset_hex: &str, derivation: &Derivation<'_>) -> PathBuf {
         let prefix = asset_hex.get(..2).unwrap_or("xx");

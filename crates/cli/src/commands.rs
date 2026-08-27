@@ -775,6 +775,46 @@ fn print_ingest_outcome_text(
     }
 }
 
+/// `maj doctor`: unlike every other verb in this file, never opens an
+/// `FsApp` here — doctor is the one verb that must still run with no
+/// catalog at all, or one that fails to open, so `catalog` is handed
+/// straight to the service, which opens (or reports the absence of) one
+/// internally, per check. See `majestical_services::doctor`'s module doc for
+/// the polarity rule this leans on: `doctor()` returns `Ok` once the checks
+/// ran, even when every row is Fail, so `?` here never turns a bad
+/// environment into a nonzero exit — findings are rows, not CLI errors.
+pub(crate) fn cmd_doctor(catalog: Option<PathBuf>, json: bool) -> Result<()> {
+    let req = majestical_services::doctor::DoctorRequest { catalog };
+    let outcome = majestical_services::doctor::doctor(&req)?;
+    crate::print_notices(&outcome.notices);
+    if json {
+        println!("{}", serde_json::to_string(&outcome)?);
+    } else {
+        print_doctor(&outcome.checks);
+    }
+    Ok(())
+}
+
+/// Renders one line per check: right-aligned status word, left-aligned
+/// name, then the detail — `{status:>4}  {name:<14} {detail}` — followed by
+/// an indented `remedy: …` line when the check carried one. The indent
+/// (21 columns) lines the remedy up under the detail column above it.
+fn print_doctor(checks: &[majestical_services::doctor::DoctorCheck]) {
+    use majestical_services::doctor::CheckStatus;
+
+    for check in checks {
+        let status = match check.status {
+            CheckStatus::Ok => "OK",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+        };
+        println!("{status:>4}  {:<14} {}", check.name, check.detail);
+        if let Some(remedy) = &check.remedy {
+            println!("{:21}remedy: {remedy}", "");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

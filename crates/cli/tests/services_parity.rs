@@ -1836,3 +1836,64 @@ fn ingest_unfinished_output_is_byte_identical() {
         diff_against_ref(&root, &state, args);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7E: `doctor`.
+// ---------------------------------------------------------------------------
+
+/// True once `/tmp/maj-ref` itself advertises `name` as a subcommand (parsed
+/// from its own `--help`, which — unlike every other invocation here — needs
+/// neither `--catalog` nor `--machine-id`: clap prints help before checking
+/// required args). Every OTHER row in this file compares a verb the
+/// reference binary already had before its own parity test was written: the
+/// browse/`tags list`/`tag rename`+`merge`/`para file`/`ingest unfinished`
+/// rows above all landed only once their verbs had already merged to `main`
+/// (see PR #98, #99, #101/#102), so `/tmp/maj-ref` — built in CI from `git
+/// merge-base origin/main HEAD` — already knew every one of them by the time
+/// its row was written. `doctor` breaks that pattern: its row is added in
+/// the SAME PR chunk that introduces the verb, so before this PR merges, the
+/// reference binary genuinely predates it and would reject `doctor` as an
+/// unrecognized subcommand — a real, expected difference, not a regression.
+/// This predicate lets [`doctor_output_is_byte_identical`] skip loudly (the
+/// same shape `diff_against_ref`'s own missing-binary skip already uses)
+/// until the reference catches up post-merge, at which point the row
+/// becomes a real comparison like every other one above.
+#[cfg(test)]
+fn reference_knows_subcommand(name: &str) -> bool {
+    let reference = std::path::Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        return false;
+    }
+    let output = Command::new(reference)
+        .arg("--help")
+        .output()
+        .expect("run ref --help");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim_start().starts_with(name))
+}
+
+/// `doctor` is read-only, so a shared root serves both binaries (same
+/// reasoning as `browse_output_is_byte_identical`). Constrained to `--json`
+/// against an already-initialized fixture catalog, passed via doctor's own
+/// `--catalog` flag: both binaries run on the SAME machine in this one test
+/// process, so an environment-dependent row (e.g. whether `ffmpeg` is on
+/// `PATH`) reads identically on both sides regardless — what this row
+/// actually needs pinned is that the catalog-dependent rows (`catalog`,
+/// `state_dir`, `blob_residue`) agree once a real catalog is in play, not
+/// just the environment-only ones.
+#[test]
+fn doctor_output_is_byte_identical() {
+    if !reference_knows_subcommand("doctor") {
+        eprintln!("SKIP parity(doctor): /tmp/maj-ref predates the `doctor` verb");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let catalog_arg = root.to_str().expect("utf8");
+    diff_against_ref(
+        &root,
+        &state,
+        &["doctor", "--catalog", catalog_arg, "--json"],
+    );
+}

@@ -185,6 +185,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnostic sweep of the environment and (optionally) one catalog:
+    /// ffmpeg/imagemagick/model presence, catalog and state-dir health,
+    /// orphaned temp files, platform capabilities.
+    Doctor {
+        /// Catalog to health-check. Independent of the top-level
+        /// `--catalog` (still required by clap for every verb, doctor
+        /// included — the same accepted wart `Verify`/`Model Fetch` carry):
+        /// doctor is the one verb that must run even with none configured,
+        /// so omitting this is how a caller expresses that.
+        #[arg(long)]
+        catalog: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve the catalog to MCP clients over stdio.
     Mcp,
 }
@@ -698,6 +712,57 @@ pub(crate) fn surface_err_notices<T>(result: Result<T, ServiceError>) -> Result<
     })
 }
 
+/// `Cmd::Ingest { cmd: None, .. }`'s fields (the copy form), bundled so
+/// [`dispatch_ingest_copy`] takes one struct instead of nine positional
+/// arguments.
+struct IngestCopyFields {
+    source: Option<PathBuf>,
+    dest: Vec<PathBuf>,
+    para: Option<String>,
+    template: String,
+    dedupe: DedupeArg,
+    jobs: Option<usize>,
+    dry_run: bool,
+    resume: Option<String>,
+    json: bool,
+}
+
+/// Dispatches `maj ingest <source> --dest .. --para ..` (the copy form).
+/// Split out of `main` purely to stay under the crate's max-function-length
+/// lint, matching [`dispatch_inbox`]. Resolves `source`/`para` — `required =
+/// true` in clap, except when the `unfinished` subcommand negates them,
+/// which `main`'s arm above this one already took by the time this runs —
+/// before running the copy. Takes `catalog`/`machine_id` as their own
+/// borrows rather than `&Cli`: by the time this runs, `main`'s `match
+/// cli.cmd` has already partially moved `cli`, so only per-field borrows
+/// (the same ones every other arm passes) are available, not the whole
+/// struct.
+fn dispatch_ingest_copy(
+    catalog: &Path,
+    machine_id: &str,
+    author: &str,
+    fields: IngestCopyFields,
+) -> Result<()> {
+    let source = fields
+        .source
+        .context("maj ingest needs a source directory")?;
+    let para = fields.para.context("maj ingest needs --para")?;
+    let args = commands::IngestArgs {
+        source,
+        dest: fields.dest,
+        para,
+        template: fields.template,
+        dedupe: fields.dedupe.into(),
+        jobs: fields.jobs,
+        dry_run: fields.dry_run,
+        resume: fields.resume,
+        json: fields.json,
+    };
+    with_app(catalog, machine_id, author, |app| {
+        commands::cmd_ingest(app, catalog, &args)
+    })
+}
+
 /// Opens the catalog, runs one command against it, then drains the app's
 /// notices — on the error path too, so a warning collected before a failure
 /// still reaches the user.
@@ -813,27 +878,24 @@ fn main() -> Result<()> {
             dry_run,
             resume,
             json,
-        } => {
-            // clap enforces both (`required = true`), except when the
-            // `unfinished` subcommand negates them — which the arm above has
-            // already taken by then.
-            let source = source.context("maj ingest needs a source directory")?;
-            let para = para.context("maj ingest needs --para")?;
-            let args = commands::IngestArgs {
+        } => dispatch_ingest_copy(
+            &cli.catalog,
+            &cli.machine_id,
+            &author,
+            IngestCopyFields {
                 source,
                 dest,
                 para,
                 template,
-                dedupe: dedupe.into(),
+                dedupe,
                 jobs,
                 dry_run,
                 resume,
                 json,
-            };
-            with_app(&cli.catalog, &cli.machine_id, &author, |app| {
-                commands::cmd_ingest(app, &cli.catalog, &args)
-            })?;
-        }
+            },
+        )?,
+        // Deliberately skips `with_app`: see `cmd_doctor`'s own doc for why.
+        Cmd::Doctor { catalog, json } => commands::cmd_doctor(catalog, json)?,
         // Deliberately does not open a catalog here: `mcp_cmd::serve` opens
         // (and re-opens) it per tool call, not at startup — see its own
         // module doc for why, mirroring `Verify`/`Model` above.

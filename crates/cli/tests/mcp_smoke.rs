@@ -146,6 +146,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "browse_assets",
     "browse_tree",
     "catalog_init",
+    "doctor",
     "file_assets",
     "get_asset",
     "get_describer",
@@ -472,6 +473,57 @@ fn list_volumes_matches() {
     assert_eq!(volumes[0]["asset_count"], serde_json::json!(2));
 }
 
+/// `doctor` with no `catalog` arg: an environment-only sweep — the
+/// `catalog` row must Warn ("no catalog selected") rather than reporting on
+/// `self.catalog` (the server's own session catalog), since the tool takes
+/// its own independent, optional param.
+#[test]
+fn doctor_with_no_catalog_arg_warns_the_catalog_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool("doctor", &serde_json::json!({}));
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let checks = resp["result"]["structuredContent"]["checks"]
+        .as_array()
+        .expect("checks array");
+    let catalog_row = checks
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("catalog"))
+        .expect("catalog row present");
+    assert_eq!(
+        catalog_row["status"],
+        serde_json::json!("warn"),
+        "{catalog_row}"
+    );
+}
+
+/// `doctor` with `catalog` set to a real, initialized catalog: the
+/// `catalog` row reports Ok.
+#[test]
+fn doctor_with_catalog_arg_checks_that_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "doctor",
+        &serde_json::json!({"catalog": root.to_str().expect("utf8")}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let checks = resp["result"]["structuredContent"]["checks"]
+        .as_array()
+        .expect("checks array");
+    let catalog_row = checks
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("catalog"))
+        .expect("catalog row present");
+    assert_eq!(
+        catalog_row["status"],
+        serde_json::json!("ok"),
+        "{catalog_row}"
+    );
+}
+
 #[test]
 fn browse_tree_matches() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -529,9 +581,9 @@ fn browse_assets_unknown_volume_is_a_tool_error() {
     assert!(text.contains("maj volumes list"), "{text}");
 }
 
-/// `browse_tree`/`browse_assets`/`list_unfinished_ingests` are read tools,
-/// so — unlike every tool in `MUTATING_TOOLS` — their `inputSchema` must
-/// carry no `confirm` property at all.
+/// `browse_tree`/`browse_assets`/`list_unfinished_ingests`/`doctor` are read
+/// tools, so — unlike every tool in `MUTATING_TOOLS` — their `inputSchema`
+/// must carry no `confirm` property at all.
 #[test]
 fn browse_tools_carry_no_confirm_param() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -539,7 +591,12 @@ fn browse_tools_carry_no_confirm_param() {
     let mut mcp = Mcp::spawn(&root, &state);
     let resp = mcp.request("tools/list", &serde_json::json!({}));
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    for name in ["browse_tree", "browse_assets", "list_unfinished_ingests"] {
+    for name in [
+        "browse_tree",
+        "browse_assets",
+        "list_unfinished_ingests",
+        "doctor",
+    ] {
         let tool = tools
             .iter()
             .find(|t| t["name"] == serde_json::json!(name))

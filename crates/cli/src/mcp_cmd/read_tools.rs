@@ -1,7 +1,9 @@
-//! The 14 read-only MCP tools: each opens (or, for the three that never
+//! The 15 read-only MCP tools: each opens (or, for the three that never
 //! touch the event log, guards) a fresh catalog handle and serializes the
 //! matching `majestical_services` outcome straight through — see `super`'s
-//! module doc for the shared wire contract.
+//! module doc for the shared wire contract. `doctor` is the one exception:
+//! it neither opens nor guards `self.catalog`, taking its own optional
+//! `catalog` param instead (see that tool's own doc for why).
 use super::MajServer;
 use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
@@ -106,6 +108,18 @@ struct SavedSearchesResult {
     /// from the wire when empty, matching every outcome struct's own field.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     notices: Vec<String>,
+}
+
+/// Params for `doctor`. `catalog` is independent of the server's own
+/// `self.catalog` (set once, at `maj mcp` startup) — omit it for an
+/// environment-only sweep, or pass a different path to health-check a
+/// catalog other than the one this server session is bound to.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DoctorArgs {
+    /// Catalog directory to health-check (omit to skip catalog-dependent
+    /// checks).
+    #[serde(default)]
+    catalog: Option<String>,
 }
 
 /// Runs `req` on a plain OS thread, off this server's own tokio runtime —
@@ -366,6 +380,30 @@ impl MajServer {
             Err(result) => return result,
         };
         match majestical_services::tags::suggestions(&app, &self.catalog) {
+            Ok(outcome) => super::structured_ok(&outcome),
+            Err(err) => super::tool_error(err),
+        }
+    }
+
+    /// Diagnostic sweep of the environment and (optionally) one catalog:
+    /// ffmpeg/imagemagick/model presence, catalog and state-dir health,
+    /// orphaned temp files, platform capabilities. Unlike every other tool
+    /// here, never opens `self.catalog` — `catalog` names a path to
+    /// health-check independent of this server's own session catalog, and
+    /// omitting it runs the environment-only checks. Never a tool error in
+    /// practice: findings are rows on the returned `DoctorOutcome`, not a
+    /// failure — see `majestical_services::doctor`'s module doc.
+    // `#[tool]`/`#[tool_router]` dispatch through `&self` for every tool in
+    // this impl block, including this one — even though its body never
+    // reads `self` — so `&self` stays part of the signature the macro
+    // expects rather than an associated function clippy would accept.
+    #[expect(clippy::unused_self, reason = "required by the #[tool] dispatch shape")]
+    #[tool]
+    fn doctor(&self, Parameters(args): Parameters<DoctorArgs>) -> CallToolResult {
+        let req = majestical_services::doctor::DoctorRequest {
+            catalog: args.catalog.map(std::path::PathBuf::from),
+        };
+        match majestical_services::doctor::doctor(&req) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }

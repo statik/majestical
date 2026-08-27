@@ -38,7 +38,12 @@ pub fn run() {
     // debug-only dependency section), but gating *registration* behind
     // `debug_assertions` means a release binary never starts the embedded
     // WebDriver server or the execute/mock bridge — no listening server
-    // ships in the product build.
+    // ships in the product build. `withGlobalTauri`, which the wdio execute
+    // bridge needs but the embedded WebDriver server does not, stays out of
+    // this base `tauri.conf.json` for the same reason — the e2e harness
+    // supplies it as a `--config '{"app":{"withGlobalTauri":true}}'` overlay
+    // (Tauri merges `--config` over the base file per RFC 7396) rather than
+    // widening the production webview's API surface.
     #[cfg(debug_assertions)]
     {
         builder = builder

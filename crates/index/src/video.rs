@@ -353,8 +353,8 @@ pub fn extract_audio_pcm(path: &Path, duration_ms: u64) -> Result<Vec<f32>, Inde
     }
 
     let mut pcm = Vec::with_capacity(output.stdout.len() / 4);
-    for chunk in output.stdout.chunks_exact(4) {
-        pcm.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in output.stdout.as_chunks::<4>().0 {
+        pcm.push(f32::from_le_bytes(*chunk));
     }
     Ok(pcm)
 }

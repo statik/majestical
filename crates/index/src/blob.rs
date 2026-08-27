@@ -344,11 +344,10 @@ impl BlobStore {
             });
         }
         let vector = raw
-            .chunks_exact(4)
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                f32::from_le_bytes(bytes)
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         Ok(vector)
     }

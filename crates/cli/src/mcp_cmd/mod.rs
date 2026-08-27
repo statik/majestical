@@ -164,6 +164,11 @@ impl MajServer {
 }
 
 #[tool_handler(router = (Self::read_tool_router() + Self::write_tool_router()))]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the #[tool_handler] macro generates async trait fns with no awaits; \
+              the expansion is rmcp's to shape, not ours"
+)]
 impl ServerHandler for MajServer {
     /// Overrides the `#[tool_handler]`-generated default (which only ever
     /// enables the tools capability) so the resources capability is
@@ -183,24 +188,25 @@ impl ServerHandler for MajServer {
     /// Advertises the `majestical://thumb/{asset_id}` and
     /// `majestical://keyframes/{asset_id}` URI templates — see
     /// `resources::templates` for what each hands back.
-    async fn list_resource_templates(
+    fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>>
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
             resources::templates(),
-        ))
+        )))
     }
 
     /// Reads one `majestical://` resource — see `resources::read` for the
     /// URI dispatch, catalog guard, and blob lookup.
-    async fn read_resource(
+    fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
-        resources::read(self, &request.uri).map(Into::into)
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> {
+        std::future::ready(resources::read(self, &request.uri).map(Into::into))
     }
 }
 

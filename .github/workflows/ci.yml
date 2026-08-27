@@ -230,6 +230,55 @@ jobs:
       # runs locally through `just gui-test`.
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
         if: runner.os == 'macOS'
+  gui-e2e:
+    name: GUI e2e (WebDriver smoke)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+      - name: Install protoc (lance build dependency, via services)
+        run: brew install protobuf
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          version: 11
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            apps/desktop/pnpm-lock.yaml
+            apps/desktop/e2e/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: apps/desktop
+      - run: pnpm install --frozen-lockfile
+        working-directory: apps/desktop/e2e
+      - run: pnpm lint
+        working-directory: apps/desktop/e2e
+      # The debug `maj` binary the fixture-catalog setup shells out to
+      # (crates/cli, the other cargo workspace) — separate from the GUI's
+      # own src-tauri build below.
+      - run: cargo build -p majestical-cli
+      # Bundles the frontend (running `pnpm build` via `beforeBuildCommand`)
+      # and the debug binary into a `.app`, the same artifact wdio.conf.ts
+      # points the tauri-service at. `-b app`: no `.dmg`, which this suite
+      # never needs and which only costs build time. The overlay config
+      # turns off `createUpdaterArtifacts` — with it on, bundling still
+      # succeeds but the CLI then exits non-zero trying to sign the
+      # updater tarball with a private key no debug/CI build has.
+      - run: pnpm tauri build --debug -b app --config src-tauri/tauri.e2e.conf.json
+        working-directory: apps/desktop
+      - run: pnpm test
+        working-directory: apps/desktop/e2e
   actions-lint:
     name: Workflow lint and audit
     runs-on: ubuntu-latest

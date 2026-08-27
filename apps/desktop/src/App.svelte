@@ -157,12 +157,14 @@
         <ul class="surfaces">
           <li>
             <button
+              data-e2e="nav-search"
               aria-current={surface === "search" ? "page" : undefined}
               onclick={() => show("search")}>Search</button
             >
           </li>
           <li>
             <button
+              data-e2e="nav-browse"
               aria-current={surface === "browse" ? "page" : undefined}
               onclick={() => show("browse")}>Browse</button
             >
@@ -173,6 +175,7 @@
                  and it is drawn only — what a screen reader gets is the
                  label, because "Ingest black circle" is not a sentence. -->
             <button
+              data-e2e="nav-ingest"
               aria-current={surface === "ingest" ? "page" : undefined}
               aria-label={ingestBusy ? "Ingest — a run is going" : undefined}
               onclick={() => show("ingest")}
@@ -183,12 +186,14 @@
           </li>
           <li>
             <button
+              data-e2e="nav-organize"
               aria-current={surface === "organize" ? "page" : undefined}
               onclick={() => show("organize")}>Organize</button
             >
           </li>
           <li>
             <button
+              data-e2e="nav-volumes"
               aria-current={surface === "volumes" ? "page" : undefined}
               onclick={() => show("volumes")}>Volumes</button
             >

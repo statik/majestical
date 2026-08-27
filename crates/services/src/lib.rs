@@ -6,6 +6,7 @@ pub mod browse;
 pub mod capability;
 pub mod catalog;
 pub mod describer_config;
+pub mod doctor;
 pub mod error;
 pub mod inbox;
 pub mod inbox_manifest;

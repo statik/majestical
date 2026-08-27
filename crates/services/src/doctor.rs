@@ -212,15 +212,20 @@ fn check_state_dir(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
     };
     let probe = dir.join(".doctor-probe");
     match std::fs::write(&probe, b"doctor probe") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            DoctorCheck {
+        Ok(()) => match std::fs::remove_file(&probe) {
+            Ok(()) => DoctorCheck {
                 name: "state_dir".to_string(),
                 status: CheckStatus::Ok,
                 detail: format!("writable at {}", dir.display()),
                 remedy: None,
-            }
-        }
+            },
+            Err(err) => DoctorCheck {
+                name: "state_dir".to_string(),
+                status: CheckStatus::Fail,
+                detail: format!("wrote {} but could not delete it: {err}", probe.display()),
+                remedy: Some(format!("check permissions on {}", dir.display())),
+            },
+        },
         Err(err) => DoctorCheck {
             name: "state_dir".to_string(),
             status: CheckStatus::Fail,
@@ -326,6 +331,11 @@ fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck 
     let blob_root = majestical_index::blob::BlobStore::new(catalog)
         .root()
         .to_path_buf();
+    // `catalog_paths` isn't strictly side-effect-free — it can create the
+    // runs dir and migrate legacy journals into it — but it's the resolver
+    // `check_state_dir` already calls with this same catalog, and the spec
+    // forbids re-deriving paths a resolver already owns, so reusing it here
+    // (rather than hand-rolling the runs-dir path) is accepted.
     let runs_dir = match crate::state_dir::catalog_paths(catalog, notices) {
         Ok(paths) => paths.runs_dir,
         Err(err) => {
@@ -428,6 +438,28 @@ mod tests {
         );
         // The row must exist; the machine may or may not actually have ffmpeg.
         let _ = find(&outcome.checks, "ffmpeg");
+    }
+
+    /// Pins the full emission sequence, not just individual rows' presence —
+    /// a mutation that swaps two checks' order (e.g. `ffmpeg`/`imagemagick`)
+    /// would still pass every other test here, since none of them assert
+    /// order.
+    #[test]
+    fn doctor_emits_checks_in_documented_order() {
+        let outcome = doctor(&DoctorRequest::default()).expect("doctor");
+        let names: Vec<&str> = outcome.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "ffmpeg",
+                "imagemagick",
+                "models",
+                "state_dir",
+                "catalog",
+                "blob_residue",
+                "platform",
+            ]
+        );
     }
 
     #[test]

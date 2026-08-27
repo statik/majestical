@@ -42,7 +42,7 @@ gui-lint:
 gui-e2e:
     cargo build -p majestical-cli
     cd apps/desktop && pnpm tauri build --debug -b app --config src-tauri/tauri.e2e.conf.json
-    cd apps/desktop/e2e && pnpm install --frozen-lockfile && pnpm test
+    cd apps/desktop/e2e && pnpm install --frozen-lockfile && pnpm check && pnpm test
 
 version-sync:
     ./scripts/version-sync.sh

@@ -1,5 +1,9 @@
+import { rm } from "node:fs/promises";
 import path from "node:path";
-import { setupFixtureCatalog, type FixtureCatalog } from "./setup/fixture-catalog.ts";
+import {
+  FIXTURE_ENV_VAR,
+  setupFixtureCatalog,
+} from "./setup/fixture-catalog.ts";
 
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
 
@@ -13,8 +17,6 @@ const appBundlePath = path.join(
   repoRoot,
   "apps/desktop/src-tauri/target/debug/bundle/macos/Majestical.app/Contents/MacOS/majestical-desktop",
 );
-
-let fixture: FixtureCatalog;
 
 /**
  * `@wdio/tauri-service` doesn't augment `WebdriverIO.Capabilities` with its
@@ -80,9 +82,13 @@ export const config: Config = {
   // Seeds the fixture catalog once, in the launcher process, before any
   // worker (and so the app under test) spawns — then hands the app its
   // `MAJ_DESKTOP_CONFIG_DIR`/`MAJ_STATE_DIR` via the tauri-service's
-  // per-capability `env` override.
+  // per-capability `env` override, and hands the fixture's own details to
+  // the spec via `FIXTURE_ENV_VAR` (the local runner's workers inherit the
+  // launcher's env, so this needs no file or capability round-trip).
   onPrepare: async (_wdioConfig, capabilities) => {
-    fixture = await setupFixtureCatalog(repoRoot);
+    const fixture = await setupFixtureCatalog(repoRoot);
+    process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
+
     const [capability] = capabilities as TauriCapability[];
     if (capability === undefined) {
       throw new Error("expected exactly one capability");
@@ -93,5 +99,14 @@ export const config: Config = {
         MAJ_STATE_DIR: fixture.stateDir,
       },
     };
+  },
+  // Removes the fixture's mkdtemp tree (catalog, state dir, GUI config) —
+  // by now the service has already torn down the app and its embedded
+  // driver, so nothing still holds these files open.
+  onComplete: async () => {
+    const raw = process.env[FIXTURE_ENV_VAR];
+    if (raw === undefined) return;
+    const fixture = JSON.parse(raw) as { configDir: string };
+    await rm(path.dirname(fixture.configDir), { recursive: true, force: true });
   },
 };

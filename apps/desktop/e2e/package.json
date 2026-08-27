@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "test": "wdio run ./wdio.conf.ts",
-    "lint": "oxlint . --deny-warnings"
+    "lint": "oxlint . --deny-warnings",
+    "check": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

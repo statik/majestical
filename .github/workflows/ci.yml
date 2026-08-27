@@ -264,6 +264,8 @@ jobs:
         working-directory: apps/desktop/e2e
       - run: pnpm lint
         working-directory: apps/desktop/e2e
+      - run: pnpm check
+        working-directory: apps/desktop/e2e
       # The debug `maj` binary the fixture-catalog setup shells out to
       # (crates/cli, the other cargo workspace) — separate from the GUI's
       # own src-tauri build below.

@@ -366,8 +366,13 @@ git commit -m "feat: WebDriver e2e harness + launch smoke + gui-e2e CI job"
 - [ ] **Step 1 (failing specs):**
   - search: type the fixture jpg's filename into the search input, submit,
     assert a result card with that name renders.
-  - volumes: assert the fixture volume row shows `online` state and an
-    asset count of 3 (the three fixture files).
+  - volumes: **AMENDED (Task 5 execution):** the fixture volume is
+    necessarily OFFLINE — `volume_is_online`
+    (`crates/services/src/volumes.rs`) reads a `--volume`-labeled id as
+    online only when `/Volumes/<label>` is a real mount, which a scanned
+    temp dir never is, in every environment including CI. Assert the
+    offline badge (the real behavior), plus the label and an asset count
+    of 3 (the three fixture files).
   - browse: click the fixture volume in the tree, assert the grid shows 3
     cards; click a folder if the fixture has one (put the jpg under
     `media/sub/` when Task 4 lands to make this real — if Task 4 shipped

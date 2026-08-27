@@ -31,6 +31,10 @@ export interface FixtureCatalog {
   stateDir: string;
   volumeLabel: string;
   tagName: string;
+  /** The tagged fixture asset's on-disk name (`PHOTO_NAME` + its real
+   *  extension) — what `SearchHit.name`/`BrowseVolume`'s listing report for
+   *  it, and so what the search and browse specs assert cards show. */
+  photoFileName: string;
 }
 
 function runMaj(bin: string, args: string[], env: NodeJS.ProcessEnv): string {
@@ -97,6 +101,7 @@ export async function setupFixtureCatalog(repoRoot: string): Promise<FixtureCata
     stateDir,
     volumeLabel: VOLUME_LABEL,
     tagName: TAG_NAME,
+    photoFileName: `${PHOTO_NAME}.jpg`,
   };
 }
 

@@ -166,7 +166,14 @@ fn check_models() -> DoctorCheck {
         }
     }
 
-    if missing_files.is_empty() {
+    // Gate on both vectors, not just `missing_files`: they're built from two
+    // separate predicates (`model_dir_for`'s success and `model_present_for`'s
+    // result) over the same loop, and should always agree — but if presence
+    // ever gains a criterion this check's own file-by-file re-derivation
+    // doesn't cover, `missing_tags` could end up non-empty while
+    // `missing_files` stays empty. Checking both keeps that drift from
+    // reporting `Ok`.
+    if missing_files.is_empty() && missing_tags.is_empty() {
         return DoctorCheck {
             name: "models".to_string(),
             status: CheckStatus::Ok,
@@ -520,7 +527,7 @@ mod tests {
         let row = find(&outcome.checks, "blob_residue");
         assert_eq!(row.status, CheckStatus::Warn);
         assert!(
-            row.detail.contains('1') && row.detail.contains(".tmp-1234-0"),
+            row.detail.contains("1 orphaned") && row.detail.contains(".tmp-1234-0"),
             "detail must name the count and the orphaned file: {}",
             row.detail
         );

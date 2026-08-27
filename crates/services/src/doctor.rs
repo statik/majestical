@@ -65,7 +65,7 @@ pub fn doctor(req: &DoctorRequest) -> Result<DoctorOutcome, ServiceError> {
         check_models(),
         check_state_dir(catalog, &notices),
         check_catalog(catalog, &notices),
-        check_blob_residue(catalog),
+        check_blob_residue(catalog, &notices),
         check_platform(),
     ];
     Ok(DoctorOutcome {
@@ -276,33 +276,96 @@ fn check_catalog(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
     }
 }
 
-/// Whether the blob↔`text_fts` diff reports any residue — always `Warn`
-/// rather than a real detection, and worth flagging: `crate::index::heal`
-/// is a private submodule (`mod heal;`, not `pub` or `pub(crate) mod`), so
-/// its `heal_text_fts` isn't reachable from this module at all without
-/// changing that visibility, and even then it takes `&mut SqliteCatalog`
-/// and unconditionally upserts `text_fts` rows — it heals, it doesn't just
-/// report. There is no read-only entry point today that would let this
-/// check count residue without also fixing it as a side effect. Rather than
-/// force that refactor, this row names the gap; see the implementer's
-/// report for what a real report-only entry point would need.
-fn check_blob_residue(catalog: Option<&Path>) -> DoctorCheck {
-    if catalog.is_none() {
+/// Recursively collects every file under `root` whose name satisfies
+/// `matches` — used for both halves of [`check_blob_residue`]'s scan. A
+/// missing or unreadable directory yields no entries rather than an error:
+/// a blob store or runs dir that doesn't exist yet legitimately has zero
+/// residue, and this check is read-only by design (it never creates one).
+fn collect_matching_files(root: &Path, matches: &dyn Fn(&str) -> bool, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_matching_files(&path, matches, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(matches)
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Interrupted-write orphans: leftover temp files a crash can strand mid
+/// write. The blob store writes via `.tmp-{pid}-{seq}` names renamed into
+/// place ([`majestical_index::blob::BlobStore::write_atomic`]); a killed
+/// process leaves the temp file behind. Legacy journal migration in
+/// `crate::state_dir` does the same with `<name>.partial` files under the
+/// state dir's runs directory before renaming them into place. Both are
+/// read-only scans: this check never deletes what it finds. `BlobStore`
+/// exposes no accessor for its root path, so the blob store root is derived
+/// the same way `crates/services/src/sync.rs`'s own location check already
+/// does (`<catalog_root>/blobs`) rather than through `BlobStore` itself.
+fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
+    let Some(catalog) = catalog else {
         return DoctorCheck {
             name: "blob_residue".to_string(),
             status: CheckStatus::Warn,
             detail: "no catalog selected".to_string(),
             remedy: None,
         };
+    };
+
+    let blob_root = catalog.join("blobs");
+    let runs_dir = match crate::state_dir::catalog_paths(catalog, notices) {
+        Ok(paths) => paths.runs_dir,
+        Err(err) => {
+            return DoctorCheck {
+                name: "blob_residue".to_string(),
+                status: CheckStatus::Warn,
+                detail: format!("could not resolve the state dir to scan: {err:#}"),
+                remedy: None,
+            };
+        }
+    };
+
+    let mut orphans = Vec::new();
+    collect_matching_files(&blob_root, &|name| name.starts_with(".tmp-"), &mut orphans);
+    collect_matching_files(&runs_dir, &|name| name.ends_with(".partial"), &mut orphans);
+
+    if orphans.is_empty() {
+        return DoctorCheck {
+            name: "blob_residue".to_string(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "no orphaned temp files under {} or {}",
+                blob_root.display(),
+                runs_dir.display()
+            ),
+            remedy: None,
+        };
     }
+
+    let samples: Vec<String> = orphans
+        .iter()
+        .take(3)
+        .map(|p| p.display().to_string())
+        .collect();
     DoctorCheck {
         name: "blob_residue".to_string(),
         status: CheckStatus::Warn,
-        detail: "not checked — heal.rs's blob/text_fts heal is private to crate::index and \
-                 mutates the catalog rather than only detecting; no read-only entry point \
-                 exists yet"
-            .to_string(),
-        remedy: Some("run `maj index run` — its heal pass fixes any decodable residue".to_string()),
+        detail: format!(
+            "{} orphaned temp file(s), e.g. {}",
+            orphans.len(),
+            samples.join(", ")
+        ),
+        remedy: Some(
+            "delete the leftover temp files (safe while nothing is indexing or syncing)"
+                .to_string(),
+        ),
     }
 }
 
@@ -386,6 +449,44 @@ mod tests {
             catalog_row.remedy.is_some(),
             "a Fail row must carry a remedy"
         );
+    }
+
+    #[test]
+    fn blob_residue_clean_catalog_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        std::fs::create_dir_all(root.join("blobs")).expect("mkdir blobs");
+        let req = DoctorRequest {
+            catalog: Some(root),
+        };
+        let outcome = doctor(&req).expect("doctor");
+        assert_eq!(
+            find(&outcome.checks, "blob_residue").status,
+            CheckStatus::Ok
+        );
+    }
+
+    #[test]
+    fn blob_residue_counts_orphaned_tmp_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        let blobs = root.join("blobs").join("ab").join("abc123");
+        std::fs::create_dir_all(&blobs).expect("mkdir blobs asset dir");
+        std::fs::write(blobs.join(".tmp-1234-0"), b"orphaned").expect("plant orphan");
+        let req = DoctorRequest {
+            catalog: Some(root),
+        };
+        let outcome = doctor(&req).expect("doctor");
+        let row = find(&outcome.checks, "blob_residue");
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.detail.contains('1') && row.detail.contains(".tmp-1234-0"),
+            "detail must name the count and the orphaned file: {}",
+            row.detail
+        );
+        assert!(row.remedy.is_some());
     }
 
     #[test]

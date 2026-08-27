@@ -277,10 +277,14 @@ fn check_catalog(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
 }
 
 /// Recursively collects every file under `root` whose name satisfies
-/// `matches` — used for both halves of [`check_blob_residue`]'s scan. A
-/// missing or unreadable directory yields no entries rather than an error:
-/// a blob store or runs dir that doesn't exist yet legitimately has zero
-/// residue, and this check is read-only by design (it never creates one).
+/// `matches` — used for both halves of [`check_blob_residue`]'s scan. Must
+/// walk every level, not just a fixed depth: most derivations write under
+/// `<hex>/<model_tag>/`, but [`majestical_index::blob::Derivation::Thumb`]
+/// writes directly at `<hex>/` with no `model_tag` subdir, so a temp file
+/// stranded there would sit one level shallower than the rest. A missing or
+/// unreadable directory yields no entries rather than an error: a blob store
+/// or runs dir that doesn't exist yet legitimately has zero residue, and
+/// this check is read-only by design (it never creates one).
 fn collect_matching_files(root: &Path, matches: &dyn Fn(&str) -> bool, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -305,10 +309,10 @@ fn collect_matching_files(root: &Path, matches: &dyn Fn(&str) -> bool, out: &mut
 /// process leaves the temp file behind. Legacy journal migration in
 /// `crate::state_dir` does the same with `<name>.partial` files under the
 /// state dir's runs directory before renaming them into place. Both are
-/// read-only scans: this check never deletes what it finds. `BlobStore`
-/// exposes no accessor for its root path, so the blob store root is derived
-/// the same way `crates/services/src/sync.rs`'s own location check already
-/// does (`<catalog_root>/blobs`) rather than through `BlobStore` itself.
+/// read-only scans: this check never deletes what it finds. The blob store
+/// root comes from [`majestical_index::blob::BlobStore::root`] rather than
+/// a re-derived `<catalog>/blobs` join, so this can never drift from the
+/// layout the store itself uses.
 fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
     let Some(catalog) = catalog else {
         return DoctorCheck {
@@ -319,7 +323,9 @@ fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck 
         };
     };
 
-    let blob_root = catalog.join("blobs");
+    let blob_root = majestical_index::blob::BlobStore::new(catalog)
+        .root()
+        .to_path_buf();
     let runs_dir = match crate::state_dir::catalog_paths(catalog, notices) {
         Ok(paths) => paths.runs_dir,
         Err(err) => {

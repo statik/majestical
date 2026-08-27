@@ -533,6 +533,25 @@ pub fn adopt_catalog(
     Ok(status)
 }
 
+/// Env var an e2e harness sets to point this app at a fixture catalog's
+/// config directory instead of the real platform one.
+const CONFIG_DIR_ENV: &str = "MAJ_DESKTOP_CONFIG_DIR";
+
+/// Resolves the directory [`GuiConfig`] lives in: the platform's app-config
+/// dir, or `MAJ_DESKTOP_CONFIG_DIR` when set. The override is the seam an
+/// e2e harness uses to run the real app against a fixture catalog without
+/// touching the user's real config directory.
+///
+/// # Errors
+/// Returns an error if the platform has no config directory (and the env
+/// var override is unset).
+pub fn resolve_config_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, tauri::Error> {
+    match std::env::var_os(CONFIG_DIR_ENV) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => app.path().app_config_dir(),
+    }
+}
+
 /// Startup: republishes the catalog the user picked last run. A config
 /// naming a catalog that has since disappeared is not an error here — the
 /// state carries it and `app_status` reports `catalog_ready: false`, which
@@ -541,7 +560,7 @@ pub fn adopt_catalog(
 /// # Errors
 /// Returns an error if the platform has no config directory.
 pub fn restore_persisted_catalog(app: &AppHandle) -> Result<(), tauri::Error> {
-    let config_dir = app.path().app_config_dir()?;
+    let config_dir = resolve_config_dir(app)?;
     let Some(catalog) = config::load(&config_dir).catalog else {
         return Ok(());
     };
@@ -925,7 +944,7 @@ pub fn initialize_catalog(
     path: String,
 ) -> Result<AppStatus, CommandError> {
     adopt_catalog(
-        &app.path().app_config_dir()?,
+        &resolve_config_dir(&app)?,
         &state,
         PathBuf::from(path),
         initialize_catalog_impl,
@@ -948,7 +967,7 @@ pub fn use_existing_catalog(
     path: String,
 ) -> Result<AppStatus, CommandError> {
     adopt_catalog(
-        &app.path().app_config_dir()?,
+        &resolve_config_dir(&app)?,
         &state,
         PathBuf::from(path),
         use_existing_catalog_impl,
@@ -1069,9 +1088,49 @@ pub fn list_unfinished_ingests(
 /// resolves this machine's identity or reads the managed state back out.
 #[cfg(test)]
 mod tests {
-    use super::{AppState, CatalogCfg, machine_identity, selected_catalog};
+    use super::{
+        AppState, CONFIG_DIR_ENV, CatalogCfg, machine_identity, resolve_config_dir,
+        selected_catalog,
+    };
     use std::path::PathBuf;
     use std::sync::RwLock;
+
+    /// Restores `MAJ_DESKTOP_CONFIG_DIR` to whatever it held before the test
+    /// set it, including when the test panics — so one test's override can
+    /// never leak into another.
+    struct EnvVarRestore(Option<std::ffi::OsString>);
+
+    impl EnvVarRestore {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os(CONFIG_DIR_ENV);
+            // SAFETY: test-only; `EnvVarRestore` scopes the mutation to one
+            // test and restores the prior value (or absence) on drop.
+            unsafe { std::env::set_var(CONFIG_DIR_ENV, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(CONFIG_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_config_dir_honors_the_env_override_when_set() {
+        let _restore = EnvVarRestore::set("/fixture/config");
+
+        let app = tauri::test::mock_app();
+        let resolved = resolve_config_dir(app.handle()).expect("env override resolves");
+
+        assert_eq!(resolved, PathBuf::from("/fixture/config"));
+    }
 
     /// Events this app authors are stamped with the hostname, so a `maj` user
     /// on the same machine passing `--machine-id $(hostname)` writes events

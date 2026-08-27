@@ -6,6 +6,8 @@
     "core:default",
     "dialog:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "wdio:default",
+    "wdio-webdriver:default"
   ]
 }

@@ -1,0 +1,10 @@
+# A single-package "workspace of one" — pnpm 11 stores its per-project
+# ignore-scripts allowlist here now, not in .npmrc/package.json. esbuild's
+# postinstall fetches its native binary, which `tsx` (the TS loader for
+# wdio.conf.ts and the specs) needs. edgedriver/geckodriver manage Windows
+# Edge and Firefox WebDriver binaries this suite never uses (the embedded
+# provider, macOS-only here) — denied rather than left pending.
+allowBuilds:
+  edgedriver: false
+  esbuild: true
+  geckodriver: false

@@ -1,6 +1,12 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["typescript", "import", "unicorn"],
+  // The e2e project (apps/desktop/e2e) is its own standalone package with
+  // its own lockfile and its own .oxlintrc.json/lint script (run by the
+  // gui-e2e CI job after that package's own `pnpm install`) — linting it
+  // from here would report unresolved imports on every OS in the `gui`
+  // matrix, since only the gui-e2e job (macOS-only) ever installs its deps.
+  "ignorePatterns": ["e2e/**"],
   "categories": {
     "correctness": "error",
     "suspicious": "warn",

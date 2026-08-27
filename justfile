@@ -36,6 +36,14 @@ gui-lint:
     cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
     cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
+# WebDriver launch smoke, against a debug .app bundle. macOS only (the
+# embedded WebDriver provider's native support). Builds `maj` (the fixture
+# catalog setup shells out to it) and the debug bundle before running.
+gui-e2e:
+    cargo build -p majestical-cli
+    cd apps/desktop && pnpm tauri build --debug -b app --config src-tauri/tauri.e2e.conf.json
+    cd apps/desktop/e2e && pnpm install --frozen-lockfile && pnpm check && pnpm test
+
 version-sync:
     ./scripts/version-sync.sh
 

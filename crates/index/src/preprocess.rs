@@ -24,7 +24,7 @@ pub fn preprocess_rgb(rgb: &image::RgbImage) -> Result<Vec<f32>, IndexError> {
     let raw = resized.into_raw(); // HWC, RGB
     let plane = EDGE_USIZE * EDGE_USIZE;
     let mut out = vec![0f32; 3 * plane];
-    for (i, px) in raw.chunks_exact(3).enumerate() {
+    for (i, px) in raw.as_chunks::<3>().0.iter().enumerate() {
         out[i] = f32::from(px[0]) / 127.5 - 1.0;
         out[plane + i] = f32::from(px[1]) / 127.5 - 1.0;
         out[2 * plane + i] = f32::from(px[2]) / 127.5 - 1.0;

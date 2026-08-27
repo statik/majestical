@@ -49,7 +49,38 @@ fn doctor_human_shows_a_stable_warn_line_for_no_catalog() {
         .assert()
         .success()
         .stdout(contains("catalog"))
-        .stdout(contains("WARN"));
+        .stdout(contains("WARN"))
+        .stdout(contains("remedy:"));
+}
+
+/// A completely bare invocation — neither `--catalog`/`--machine-id` nor
+/// their `MAJ_CATALOG`/`MAJ_MACHINE_ID` env vars set at all — is exactly
+/// what a fresh install with no configured catalog looks like. Doctor's
+/// whole purpose is diagnosing that state, so unlike every other verb (see
+/// `volumes_list_without_catalog_or_machine_id_names_the_remedy` in
+/// `cli_smoke.rs`), it must still run rather than fail at dispatch.
+#[test]
+fn doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all() {
+    let out = assert_cmd::Command::cargo_bin("maj")
+        .expect("bin")
+        .env_remove("MAJ_CATALOG")
+        .env_remove("MAJ_MACHINE_ID")
+        .arg("doctor")
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("WARN"),
+        "{out:?}"
+    );
+
+    assert_cmd::Command::cargo_bin("maj")
+        .expect("bin")
+        .env_remove("MAJ_CATALOG")
+        .env_remove("MAJ_MACHINE_ID")
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
 }
 
 /// Exit-code polarity pin: every row can warn (or fail) and the process

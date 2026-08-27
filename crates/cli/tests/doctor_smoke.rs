@@ -10,13 +10,15 @@ mod common;
 use common::maj;
 use predicates::str::contains;
 
-/// `maj doctor` takes its own local, optional `--catalog` — independent of
-/// the top-level `--catalog`/`MAJ_CATALOG` every verb's `Cli` struct still
-/// requires (an accepted wart doctor shares with `Verify`/`Model Fetch`).
-/// `maj()` sets `MAJ_CATALOG` to a path that is never created or read —
-/// satisfying that unrelated requirement without it mattering, since no
-/// test in this file passes doctor's own `--catalog` flag.
-fn maj_doctor_ignoring_the_required_top_level_catalog() -> assert_cmd::Command {
+/// A `maj doctor` invocation built through `common::maj`'s helper, purely to
+/// reuse its `Command`-building convenience. `maj()`'s env vars
+/// (`MAJ_CATALOG`/`MAJ_MACHINE_ID`/`MAJ_STATE_DIR`) are set but ignored here:
+/// doctor takes its own local, optional `--catalog`, independent of those
+/// top-level ones, and no test in this file passes it — nothing below
+/// actually reads what `maj()` set. For the case where those vars are
+/// genuinely absent rather than merely set-and-ignored, see
+/// `doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all`.
+fn maj_doctor() -> assert_cmd::Command {
     use std::path::Path;
     let mut cmd = maj(
         Path::new("/never/touched/catalog"),
@@ -28,10 +30,7 @@ fn maj_doctor_ignoring_the_required_top_level_catalog() -> assert_cmd::Command {
 
 #[test]
 fn doctor_json_prints_a_nonempty_checks_array_with_the_wire_fields() {
-    let out = maj_doctor_ignoring_the_required_top_level_catalog()
-        .arg("--json")
-        .output()
-        .expect("run");
+    let out = maj_doctor().arg("--json").output().expect("run");
     assert!(out.status.success(), "{out:?}");
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
     let checks = parsed["checks"].as_array().expect("checks array");
@@ -45,7 +44,7 @@ fn doctor_json_prints_a_nonempty_checks_array_with_the_wire_fields() {
 
 #[test]
 fn doctor_human_shows_a_stable_warn_line_for_no_catalog() {
-    maj_doctor_ignoring_the_required_top_level_catalog()
+    maj_doctor()
         .assert()
         .success()
         .stdout(contains("catalog"))
@@ -89,13 +88,8 @@ fn doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all() {
 /// in `commands::cmd_doctor`.
 #[test]
 fn doctor_exits_zero_even_though_the_catalog_row_warns() {
-    maj_doctor_ignoring_the_required_top_level_catalog()
-        .assert()
-        .success();
-    maj_doctor_ignoring_the_required_top_level_catalog()
-        .arg("--json")
-        .assert()
-        .success();
+    maj_doctor().assert().success();
+    maj_doctor().arg("--json").assert().success();
 }
 
 #[test]

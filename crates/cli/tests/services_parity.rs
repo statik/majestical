@@ -1841,36 +1841,19 @@ fn ingest_unfinished_output_is_byte_identical() {
 // Phase 7E: `doctor`.
 // ---------------------------------------------------------------------------
 
-/// True once `/tmp/maj-ref` itself advertises `name` as a subcommand (parsed
-/// from its own `--help`, which — unlike every other invocation here — needs
-/// neither `--catalog` nor `--machine-id`: clap prints help before checking
-/// required args). Every OTHER row in this file compares a verb the
-/// reference binary already had before its own parity test was written: the
-/// browse/`tags list`/`tag rename`+`merge`/`para file`/`ingest unfinished`
-/// rows above all landed only once their verbs had already merged to `main`
-/// (see PR #98, #99, #101/#102), so `/tmp/maj-ref` — built in CI from `git
-/// merge-base origin/main HEAD` — already knew every one of them by the time
-/// its row was written. `doctor` breaks that pattern: its row is added in
-/// the SAME PR chunk that introduces the verb, so before this PR merges, the
-/// reference binary genuinely predates it and would reject `doctor` as an
-/// unrecognized subcommand — a real, expected difference, not a regression.
-/// This predicate lets [`doctor_output_is_byte_identical`] skip loudly (the
-/// same shape `diff_against_ref`'s own missing-binary skip already uses)
-/// until the reference catches up post-merge, at which point the row
-/// becomes a real comparison like every other one above.
-#[cfg(test)]
-fn reference_knows_subcommand(name: &str) -> bool {
-    let reference = std::path::Path::new("/tmp/maj-ref");
-    if !reference.is_file() {
-        return false;
-    }
-    let output = Command::new(reference)
-        .arg("--help")
-        .output()
-        .expect("run ref --help");
-    String::from_utf8_lossy(&output.stdout)
+/// True when `help_text` (a `--help` invocation's stdout) advertises `name`
+/// as a subcommand, matched by first-token equality — not `starts_with`, so
+/// a future `tag` probe can't false-positive on `tags`. Pure string
+/// matching, no I/O and nothing that can panic, so — unlike every helper in
+/// this file that shells out — this one needs no `#[cfg(test)]` for
+/// clippy's `allow-expect-in-tests`: there's no `.expect`/`.unwrap` in it to
+/// exempt. The caller does the actual `--help` invocation (and the
+/// missing-binary check before that) — see
+/// [`doctor_output_is_byte_identical`].
+fn reference_knows_subcommand(help_text: &str, name: &str) -> bool {
+    help_text
         .lines()
-        .any(|line| line.trim_start().starts_with(name))
+        .any(|line| line.split_whitespace().next() == Some(name))
 }
 
 /// `doctor` is read-only, so a shared root serves both binaries (same
@@ -1882,9 +1865,29 @@ fn reference_knows_subcommand(name: &str) -> bool {
 /// actually needs pinned is that the catalog-dependent rows (`catalog`,
 /// `state_dir`, `blob_residue`) agree once a real catalog is in play, not
 /// just the environment-only ones.
+///
+/// Two independent skip reasons, checked in order: the reference binary may
+/// be missing entirely (same as every other row in this file), or it may be
+/// present but predate `doctor` — this row's own parity test was added in
+/// the SAME PR chunk that introduces the verb (unlike the
+/// browse/`tags list`/`tag rename`+`merge`/`para file`/`ingest unfinished`
+/// rows above, whose verbs had already merged to `main` — see PR #98, #99,
+/// #101/#102 — before their parity tests were written, so `/tmp/maj-ref`,
+/// built in CI from `git merge-base origin/main HEAD`, already knew every
+/// one of them). Both skips are loud; the second becomes a real comparison
+/// like every other row above once the reference catches up post-merge.
 #[test]
 fn doctor_output_is_byte_identical() {
-    if !reference_knows_subcommand("doctor") {
+    let reference = std::path::Path::new("/tmp/maj-ref");
+    if !reference.is_file() {
+        eprintln!("SKIP parity(doctor): /tmp/maj-ref missing — build it first");
+        return;
+    }
+    let help = Command::new(reference)
+        .arg("--help")
+        .output()
+        .expect("run ref --help");
+    if !reference_knows_subcommand(&String::from_utf8_lossy(&help.stdout), "doctor") {
         eprintln!("SKIP parity(doctor): /tmp/maj-ref predates the `doctor` verb");
         return;
     }

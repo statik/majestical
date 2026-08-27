@@ -802,25 +802,12 @@ fn require_catalog_and_machine_id(cli: &Cli) -> Result<(PathBuf, String)> {
     Ok((catalog, machine_id))
 }
 
-/// Runs `doctor` — called only once `cli.cmd` is already known to be
-/// `Cmd::Doctor` (see `main`'s own `matches!` guard). Split out purely to
-/// keep `main` under the crate's max-function-length lint.
-fn dispatch_doctor(cmd: Cmd) -> Result<()> {
-    let Cmd::Doctor { catalog, json } = cmd else {
-        unreachable!("dispatch_doctor is only called when cmd is already Cmd::Doctor")
-    };
-    commands::cmd_doctor(catalog, json)
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `doctor` is the one verb exempt from `require_catalog_and_machine_id`
     // below, so it's dispatched first, before that resolution can fail.
-    // `matches!` here binds nothing (`..`), so it only inspects the
-    // discriminant — `cli.cmd` stays unmoved for the real match below on
-    // every other path.
-    if matches!(cli.cmd, Cmd::Doctor { .. }) {
-        return dispatch_doctor(cli.cmd);
+    if let Cmd::Doctor { catalog, json } = cli.cmd {
+        return commands::cmd_doctor(catalog, json);
     }
     let (catalog, machine_id) = require_catalog_and_machine_id(&cli)?;
     let author = cli.author.clone().unwrap_or_else(|| machine_id.clone());
@@ -932,7 +919,10 @@ fn main() -> Result<()> {
                 json,
             },
         )?,
-        Cmd::Doctor { .. } => unreachable!("handled above, before catalog/machine-id resolution"),
+        // Unreachable: the `if let Cmd::Doctor { .. }` above already
+        // returned for this variant, before `catalog`/`machine_id` were
+        // even resolved. Kept only so this match stays exhaustive over `Cmd`.
+        Cmd::Doctor { .. } => unreachable!("handled by the if-let above"),
         // Deliberately does not open a catalog here: `mcp_cmd::serve` opens
         // (and re-opens) it per tool call, not at startup — see its own
         // module doc for why, mirroring `Verify`/`Model` above.

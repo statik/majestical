@@ -12,16 +12,17 @@ pub mod thumb_protocol;
 /// Panics only if the Tauri runtime itself fails to start — there is no
 /// meaningful recovery for a desktop app that cannot open a window.
 pub fn run() {
-    #[expect(
-        clippy::expect_used,
-        reason = "no recovery exists if the shell cannot start"
+    // `mut` is only exercised by the `#[cfg(debug_assertions)]` block below;
+    // a release build never reassigns `builder`, so only there does the
+    // compiler have grounds to flag it as unused.
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            unused_mut,
+            reason = "reassigned only by the debug-only plugin block below"
+        )
     )]
-    #[expect(
-        clippy::exit,
-        reason = "tauri::generate_context! expands to a process::exit for a malformed \
-                  context; the call is inside the macro, not ours to restructure"
-    )]
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Paired with the `plugins.updater` block in tauri.conf.json, and it
         // must stay paired: the updater's `Config::pubkey` has no serde
@@ -31,7 +32,30 @@ pub fn run() {
         // app cannot start through. Removing one without the other does not
         // degrade the update check, it stops the app from opening a window.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+
+    // e2e harness only: both crates are plain `[dependencies]` (Cargo has no
+    // debug-only dependency section), but gating *registration* behind
+    // `debug_assertions` means a release binary never starts the embedded
+    // WebDriver server or the execute/mock bridge — no listening server
+    // ships in the product build.
+    #[cfg(debug_assertions)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_wdio::init())
+            .plugin(tauri_plugin_wdio_webdriver::init());
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "no recovery exists if the shell cannot start"
+    )]
+    #[expect(
+        clippy::exit,
+        reason = "tauri::generate_context! expands to a process::exit for a malformed \
+                  context; the call is inside the macro, not ours to restructure"
+    )]
+    builder
         .manage(commands::AppState(std::sync::RwLock::new(None)))
         // The one in-flight ingest run. Managed state, not webview state:
         // the run is a plain OS thread that keeps copying across a reload,

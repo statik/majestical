@@ -13,7 +13,8 @@
     "windows": [{ "title": "Majestical", "width": 1280, "height": 820 }],
     "security": {
       "csp": "default-src 'self'; img-src 'self' thumb: asset: data:; style-src 'self' 'unsafe-inline'"
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

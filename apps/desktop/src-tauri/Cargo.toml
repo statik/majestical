@@ -40,9 +40,20 @@ hostname = "0.4"
 # `thumb://` asset ids arrive percent-encoded (`convertFileSrc` runs
 # `encodeURIComponent`), so the protocol handler decodes the path segment.
 percent-encoding = "2"
+# e2e-only, registered in `lib.rs` behind `#[cfg(debug_assertions)]`: no
+# debug-only dependency section exists in Cargo, so these ship in every
+# build, but only a debug build ever calls their `init()`. Execute/mock/log
+# bridge for WebdriverIO (`browser.tauri.*`) and the embedded W3C WebDriver
+# server WebdriverIO's `embedded` driver provider connects to.
+tauri-plugin-wdio = "1.3.0"
+tauri-plugin-wdio-webdriver = "1.3.0"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds the mock `AppHandle` the config-dir env-seam test resolves against
+# (`tauri::test::mock_app`) — a dev-only feature of the crate already in
+# `[dependencies]`, not a new dependency.
+tauri = { version = "2.11.5", features = ["test"] }
 # The command tests seed real catalogs: `majestical-core` builds the `Op`
 # literals to emit, and `majestical-index` computes the exact `BlobStore`
 # paths the thumb tests plant blobs at (rather than hand-deriving the layout

@@ -13,16 +13,8 @@
 import { $, $$, browser, expect } from "@wdio/globals";
 import { readFixtureCatalog } from "../setup/fixture-catalog.ts";
 import type { FixtureCatalog } from "../setup/fixture-catalog.ts";
+import { openSurface } from "../setup/surfaces.ts";
 import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
-
-/** Clicks a sidebar nav entry and waits for that surface's own container to
- *  render, so every `it` below asserts against a surface that has actually
- *  mounted rather than racing its own load. */
-async function openSurface(nav: string, container: string): Promise<void> {
-  await $(nav).click();
-  const el = await $(container);
-  await el.waitForDisplayed({ timeout: 10_000 });
-}
 
 describe("Majestical desktop — launch smoke", () => {
   let fixture: FixtureCatalog;
@@ -41,7 +33,7 @@ describe("Majestical desktop — launch smoke", () => {
   });
 
   it("finds the tagged fixture asset from Search", async () => {
-    await $('[data-e2e="nav-search"]').click();
+    await openSurface('[data-e2e="nav-search"]', ".omnibox");
     const omnibox = await $(".omnibox");
     await omnibox.setValue(`tag:${fixture.tagName}`);
 

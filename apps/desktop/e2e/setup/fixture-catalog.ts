@@ -29,8 +29,23 @@ export interface FixtureCatalog {
    *  disposable and rebuilds from the catalog's event log either way), but
    *  reusing it skips a redundant rebuild on first launch. */
   stateDir: string;
+  /** The catalog's own event-log directory (what `config.json`'s `catalog`
+   *  field also points at) — exposed so a spec that mutates the catalog
+   *  through the GUI (organize.e2e.ts) can shell back out to `maj` to undo
+   *  it afterward. `onPrepare` seeds this catalog once for the whole `wdio
+   *  run`, not once per spec file, so a mutation left standing here would
+   *  leak into every file that runs after it in the same invocation. */
+  catalogDir: string;
+  /** The debug `maj` binary this fixture was seeded with — so a spec that
+   *  needs its own follow-up `maj` call (organize.e2e.ts's cleanup) doesn't
+   *  re-derive the repo root and rebuild this path itself. */
+  majBin: string;
   volumeLabel: string;
   tagName: string;
+  /** The tagged fixture asset's on-disk name (`PHOTO_NAME` + its real
+   *  extension) — what `SearchHit.name`/`BrowseVolume`'s listing report for
+   *  it, and so what the search and browse specs assert cards show. */
+  photoFileName: string;
 }
 
 function runMaj(bin: string, args: string[], env: NodeJS.ProcessEnv): string {
@@ -95,8 +110,11 @@ export async function setupFixtureCatalog(repoRoot: string): Promise<FixtureCata
   return {
     configDir,
     stateDir,
+    catalogDir,
+    majBin,
     volumeLabel: VOLUME_LABEL,
     tagName: TAG_NAME,
+    photoFileName: `${PHOTO_NAME}.jpg`,
   };
 }
 
@@ -107,4 +125,33 @@ export function readFixtureCatalog(): FixtureCatalog {
     throw new Error(`${FIXTURE_ENV_VAR} is not set — onPrepare must run before this reads it`);
   }
   return JSON.parse(raw) as FixtureCatalog;
+}
+
+/** The env every `maj` call against this fixture's catalog needs — the same
+ *  three vars `setupFixtureCatalog` built by hand, reusable by a spec that
+ *  needs its own follow-up call rather than the one-shot setup pass. */
+function fixtureEnv(fixture: FixtureCatalog): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    MAJ_CATALOG: fixture.catalogDir,
+    MAJ_MACHINE_ID: MACHINE_ID,
+    MAJ_STATE_DIR: fixture.stateDir,
+  };
+}
+
+/**
+ * Removes `tag` from every asset that carries it. For a spec that assigns a
+ * tag through the GUI as its own mutation (organize.e2e.ts) and then needs
+ * the shared catalog back the way every other spec file in the same `wdio
+ * run` still assumes it — this fixture is seeded once in `onPrepare`, not
+ * once per file, so a tag left standing here is visible to every spec that
+ * runs after it.
+ */
+export function removeTag(fixture: FixtureCatalog, tag: string): void {
+  const env = fixtureEnv(fixture);
+  const searchJson = runMaj(fixture.majBin, ["search", `tag:${tag}`, "--json"], env);
+  const hits = JSON.parse(searchJson) as { results: { asset: string }[] };
+  for (const hit of hits.results) {
+    runMaj(fixture.majBin, ["tag", "rm", hit.asset, tag], env);
+  }
 }

@@ -366,8 +366,13 @@ git commit -m "feat: WebDriver e2e harness + launch smoke + gui-e2e CI job"
 - [ ] **Step 1 (failing specs):**
   - search: type the fixture jpg's filename into the search input, submit,
     assert a result card with that name renders.
-  - volumes: assert the fixture volume row shows `online` state and an
-    asset count of 3 (the three fixture files).
+  - volumes: **AMENDED (Task 5 execution):** the fixture volume is
+    necessarily OFFLINE — `volume_is_online`
+    (`crates/services/src/volumes.rs`) reads a `--volume`-labeled id as
+    online only when `/Volumes/<label>` is a real mount, which a scanned
+    temp dir never is, in every environment including CI. Assert the
+    offline badge (the real behavior), plus the label and an asset count
+    of 3 (the three fixture files).
   - browse: click the fixture volume in the tree, assert the grid shows 3
     cards; click a folder if the fixture has one (put the jpg under
     `media/sub/` when Task 4 lands to make this real — if Task 4 shipped
@@ -393,10 +398,19 @@ git commit -m "test: e2e flows for search, volumes, browse"
     assert Organize now lists it (a REAL mutation against the throwaway
     fixture catalog — each wdio run builds a fresh one, so mutation is
     safe).
-  - ingest: open Ingest, point the source picker at a second small fixture
-    dir (`e2e/fixtures/ingest-src/`, create with one txt file), a temp
-    destination, run the PLAN step only; assert the plan preview lists 1
-    file and no run is started (the dry-run stops at the setup board).
+  - ingest: **AMENDED (Task 6 execution) — flow DROPPED, gap declared.**
+    IngestView's source and destination pickers go straight through
+    `@tauri-apps/plugin-dialog`'s native OS folder dialog with no text
+    fallback, and the e2e suite deliberately has no guest bridge to
+    inject dialog answers. The three exits were: a test-only backdoor
+    (rejected — invents an affordance), the wdio guest bridge (rejected —
+    reverses the suite's documented no-bridge design), or declaring the
+    gap. Declared: smoke.e2e.ts's setup-board render stays the only
+    Ingest e2e coverage; watchlist entry at phase close. A REAL
+    type-a-path affordance on IngestView (agent-native: an agent or
+    power user typing a path is a legitimate product feature, and it
+    would incidentally unblock this flow) is a 7F candidate, to be
+    designed with a mockup, not slipped in mid-chunk.
 - [ ] **Step 2:** run locally until green; commit.
 
 ```bash

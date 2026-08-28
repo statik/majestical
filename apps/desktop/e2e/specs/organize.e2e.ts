@@ -37,14 +37,12 @@
 // Organize assertion caught exactly that the first time this spec ran
 // without cleanup).
 import { $, $$, browser, expect } from "@wdio/globals";
-import path from "node:path";
 import { readFixtureCatalog, removeTag } from "../setup/fixture-catalog.ts";
 import type { FixtureCatalog } from "../setup/fixture-catalog.ts";
 import { openSurface } from "../setup/surfaces.ts";
 import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
 
 const NEW_TAG = "e2e-added";
-const repoRoot = path.resolve(import.meta.dirname, "../../../..");
 
 /** Safe indexing into a list already size-checked at runtime — a plain
  *  generic `T[]` doesn't unify with `WebdriverIO.ElementArray` (it overrides
@@ -118,7 +116,7 @@ describe("Majestical desktop — Organize flow", () => {
   });
 
   after(() => {
-    removeTag(repoRoot, fixture, NEW_TAG);
+    removeTag(fixture, NEW_TAG);
   });
 
   it("lists the fixture tag with its real count, before any mutation", async () => {

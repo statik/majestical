@@ -36,6 +36,10 @@ export interface FixtureCatalog {
    *  run`, not once per spec file, so a mutation left standing here would
    *  leak into every file that runs after it in the same invocation. */
   catalogDir: string;
+  /** The debug `maj` binary this fixture was seeded with — so a spec that
+   *  needs its own follow-up `maj` call (organize.e2e.ts's cleanup) doesn't
+   *  re-derive the repo root and rebuild this path itself. */
+  majBin: string;
   volumeLabel: string;
   tagName: string;
   /** The tagged fixture asset's on-disk name (`PHOTO_NAME` + its real
@@ -44,7 +48,7 @@ export interface FixtureCatalog {
   photoFileName: string;
 }
 
-export function runMaj(bin: string, args: string[], env: NodeJS.ProcessEnv): string {
+function runMaj(bin: string, args: string[], env: NodeJS.ProcessEnv): string {
   const result = spawnSync(bin, args, { env, encoding: "utf8" });
   if (result.error) {
     throw new Error(
@@ -107,6 +111,7 @@ export async function setupFixtureCatalog(repoRoot: string): Promise<FixtureCata
     configDir,
     stateDir,
     catalogDir,
+    majBin,
     volumeLabel: VOLUME_LABEL,
     tagName: TAG_NAME,
     photoFileName: `${PHOTO_NAME}.jpg`,
@@ -142,12 +147,11 @@ function fixtureEnv(fixture: FixtureCatalog): NodeJS.ProcessEnv {
  * once per file, so a tag left standing here is visible to every spec that
  * runs after it.
  */
-export function removeTag(repoRoot: string, fixture: FixtureCatalog, tag: string): void {
-  const majBin = path.join(repoRoot, "target/debug/maj");
+export function removeTag(fixture: FixtureCatalog, tag: string): void {
   const env = fixtureEnv(fixture);
-  const searchJson = runMaj(majBin, ["search", `tag:${tag}`, "--json"], env);
+  const searchJson = runMaj(fixture.majBin, ["search", `tag:${tag}`, "--json"], env);
   const hits = JSON.parse(searchJson) as { results: { asset: string }[] };
   for (const hit of hits.results) {
-    runMaj(majBin, ["tag", "rm", hit.asset, tag], env);
+    runMaj(fixture.majBin, ["tag", "rm", hit.asset, tag], env);
   }
 }

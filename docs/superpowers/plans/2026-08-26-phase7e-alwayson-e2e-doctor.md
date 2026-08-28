@@ -398,10 +398,19 @@ git commit -m "test: e2e flows for search, volumes, browse"
     assert Organize now lists it (a REAL mutation against the throwaway
     fixture catalog — each wdio run builds a fresh one, so mutation is
     safe).
-  - ingest: open Ingest, point the source picker at a second small fixture
-    dir (`e2e/fixtures/ingest-src/`, create with one txt file), a temp
-    destination, run the PLAN step only; assert the plan preview lists 1
-    file and no run is started (the dry-run stops at the setup board).
+  - ingest: **AMENDED (Task 6 execution) — flow DROPPED, gap declared.**
+    IngestView's source and destination pickers go straight through
+    `@tauri-apps/plugin-dialog`'s native OS folder dialog with no text
+    fallback, and the e2e suite deliberately has no guest bridge to
+    inject dialog answers. The three exits were: a test-only backdoor
+    (rejected — invents an affordance), the wdio guest bridge (rejected —
+    reverses the suite's documented no-bridge design), or declaring the
+    gap. Declared: smoke.e2e.ts's setup-board render stays the only
+    Ingest e2e coverage; watchlist entry at phase close. A REAL
+    type-a-path affordance on IngestView (agent-native: an agent or
+    power user typing a path is a legitimate product feature, and it
+    would incidentally unblock this flow) is a 7F candidate, to be
+    designed with a mockup, not slipped in mid-chunk.
 - [ ] **Step 2:** run locally until green; commit.
 
 ```bash

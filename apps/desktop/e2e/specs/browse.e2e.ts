@@ -7,6 +7,7 @@
 import { $, $$, browser, expect } from "@wdio/globals";
 import { readFixtureCatalog } from "../setup/fixture-catalog.ts";
 import type { FixtureCatalog } from "../setup/fixture-catalog.ts";
+import { openSurface } from "../setup/surfaces.ts";
 import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
 
 describe("Majestical desktop — Browse flow", () => {
@@ -16,8 +17,7 @@ describe("Majestical desktop — Browse flow", () => {
     fixture = readFixtureCatalog();
     await suppressAutoFocusRecovery(browser);
     await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
-    await $('[data-e2e="nav-browse"]').click();
-    await $(".browse-tree").waitForDisplayed({ timeout: 10_000 });
+    await openSurface('[data-e2e="nav-browse"]', ".browse-tree");
   });
 
   it("lists the whole fixture volume, then narrows to one folder", async () => {

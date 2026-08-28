@@ -4,6 +4,7 @@
 import { $, browser, expect } from "@wdio/globals";
 import { readFixtureCatalog } from "../setup/fixture-catalog.ts";
 import type { FixtureCatalog } from "../setup/fixture-catalog.ts";
+import { openSurface } from "../setup/surfaces.ts";
 import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
 
 describe("Majestical desktop — Search flow", () => {
@@ -13,7 +14,7 @@ describe("Majestical desktop — Search flow", () => {
     fixture = readFixtureCatalog();
     await suppressAutoFocusRecovery(browser);
     await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
-    await $('[data-e2e="nav-search"]').click();
+    await openSurface('[data-e2e="nav-search"]', ".omnibox");
   });
 
   it("finds the fixture photo by its own file name", async () => {

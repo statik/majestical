@@ -5,6 +5,7 @@
 import { $, $$, browser, expect } from "@wdio/globals";
 import { readFixtureCatalog } from "../setup/fixture-catalog.ts";
 import type { FixtureCatalog } from "../setup/fixture-catalog.ts";
+import { openSurface } from "../setup/surfaces.ts";
 import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
 
 describe("Majestical desktop — Volumes flow", () => {
@@ -14,8 +15,7 @@ describe("Majestical desktop — Volumes flow", () => {
     fixture = readFixtureCatalog();
     await suppressAutoFocusRecovery(browser);
     await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
-    await $('[data-e2e="nav-volumes"]').click();
-    await $(".volume-table").waitForDisplayed({ timeout: 10_000 });
+    await openSurface('[data-e2e="nav-volumes"]', ".volume-table");
   });
 
   it("shows the fixture volume's real label, asset count, and online state", async () => {

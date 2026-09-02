@@ -23,7 +23,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 assert_cmd = "2"
 predicates = "3"
 plist = "1.10"
-quick-xml = "0.41"
+quick-xml = "0.42"
 hostname = "0.4"
 sha2 = "0.11"
 image = "0.25.10"
@@ -32,7 +32,7 @@ fast_image_resize = "6.1.0"
 zstd = "0.13.3"
 ort = "=2.0.0-rc.13"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
-lancedb = "=0.33.0"      # build requires protoc: brew install protobuf
+lancedb = "=0.37.1"      # build requires protoc: brew install protobuf
 arrow-array = "=58.3.0"  # lockstep with lancedb — do not bump independently
 arrow-schema = "=58.3.0"
 # Only "rt": the sync VectorStore wrapper drives everything through one

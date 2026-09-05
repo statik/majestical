@@ -1,0 +1,13 @@
+{
+  "available": true,
+  "decision": {
+    "mode": "run_full"
+  },
+  "pending_items": 42,
+  "power": {
+    "low_power_mode": false,
+    "source": "ac"
+  },
+  "running": true,
+  "throttle": "auto"
+}

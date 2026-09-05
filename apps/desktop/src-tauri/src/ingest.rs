@@ -406,6 +406,28 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     "no message"
 }
 
+/// Runs `f`, converting a panic into a `CommandError` naming `what` instead
+/// of letting it unwind past this call. Shared by [`run_ingest_job`] (a
+/// panicking progress sink) and `indexer.rs`'s scheduler loop (a panic from
+/// `index::status`/`index::run`) — both need the same "one bad file must
+/// not wedge/kill the whole background thread" outcome, just for different
+/// callers and different `what`.
+///
+/// `AssertUnwindSafe`: whether this is sound is call-site-specific, so each
+/// caller carries its own one-line justification rather than one written
+/// here for state this function never touches.
+pub(crate) fn catch_panic<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        Err(CommandError::new(format!(
+            "{what} panicked: {}",
+            panic_message(payload.as_ref())
+        )))
+    })
+}
+
 /// The body of a run's own thread: copy, then publish the outcome into the
 /// job's slot — whatever it turned out to be, so the slot always stops
 /// looking live.
@@ -421,13 +443,7 @@ fn run_ingest_job(args: &IngestJobArgs) {
     // `AssertUnwindSafe`: the shared state this closure touches is either
     // behind a `Mutex` (recovered from poisoning at every use) or write-once
     // (`OnceLock`), so a panic cannot leave a half-updated value visible.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ingest_job_result(args)));
-    let finished = match result.unwrap_or_else(|payload| {
-        Err(CommandError::new(format!(
-            "the ingest run panicked: {}",
-            panic_message(payload.as_ref())
-        )))
-    }) {
+    let finished = match catch_panic("the ingest run", || ingest_job_result(args)) {
         Ok(run) => FinishedIngest::Done { run },
         Err(error) => FinishedIngest::Failed { error },
     };
@@ -587,9 +603,21 @@ pub fn list_unfinished_ingests_impl(
 /// is driven end to end by `tests/commands.rs` against real catalogs.
 #[cfg(test)]
 mod tests {
-    use super::{BYTES_COPIED_MIN_GAP_MS, BytesThrottle, run_id_from_notice};
+    use super::{BYTES_COPIED_MIN_GAP_MS, BytesThrottle, catch_panic, run_id_from_notice};
+    use crate::commands::CommandError;
     use majestical_ingest::engine::ProgressEvent;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The panic probe both `run_ingest_job` and `indexer.rs`'s scheduler
+    /// loop rely on: a panicking closure must not unwind past `catch_panic`,
+    /// and its message must land in the `CommandError` it returns instead.
+    #[test]
+    fn catch_panic_converts_a_panic_into_a_command_error_naming_what_and_the_message() {
+        let result: Result<(), CommandError> = catch_panic("the probe", || panic!("boom"));
+        let error = result.expect_err("a panicking closure must not propagate");
+        assert!(error.message.contains("the probe"), "{}", error.message);
+        assert!(error.message.contains("boom"), "{}", error.message);
+    }
 
     /// A throttle whose clock is a counter the test moves by hand.
     fn throttle_at(clock: &std::sync::Arc<AtomicU64>) -> BytesThrottle {

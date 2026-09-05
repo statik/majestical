@@ -27,10 +27,14 @@
       // count, not its complexity. Raised for the ingest surface, which
       // mirrors the deepest outcome in the app: a run carries the engine's
       // whole `Outcome` (five per-file lists) plus a seven-variant progress
-      // union.
+      // union. Raised again for phase 7E's always-on wire (scheduler state,
+      // throttle, power) with room for the doctor report that lands next
+      // to it. The next raise is refused: the always-on/health subject
+      // (scheduler + doctor types and their wrappers) moves to a sibling
+      // module instead, the way the test files split by subject.
       "files": ["src/lib/api.ts"],
       "rules": {
-        "max-lines": ["warn", { "max": 560 }]
+        "max-lines": ["warn", { "max": 640 }]
       }
     },
     {

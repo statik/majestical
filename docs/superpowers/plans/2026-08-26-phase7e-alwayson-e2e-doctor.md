@@ -621,6 +621,33 @@ git commit -m "feat: autopilot scheduling policy (pure, exhaustive)"
 - Create: `apps/desktop/src-tauri/src/power.rs`
 - Modify: `apps/desktop/src-tauri/src/lib.rs` (`pub mod power;`)
 
+> **AMENDED (2026-09-05, Task 11 execution):** on Apple Silicon (captured on
+> macOS 26.6.2 build 25G83, Apple M1 Max) `pmset -g` has NO `lowpowermode`
+> line; the equivalent key is `powermode` (0 = automatic, 1 = low power,
+> 2 = high power). Intel Macs that support Low Power Mode print
+> `lowpowermode 0|1` instead. `parse_low_power_mode` therefore accepts
+> EITHER key: a trimmed line whose first token is `lowpowermode` or
+> `powermode` and whose last token is `1`. `powermode 2` (high power) and
+> `powermode 0` are both `false`. Tests must cover all three `powermode`
+> values plus the two `lowpowermode` values plus the absent case. The
+> `lowpowermode` literal is retained from Apple's documented Intel output;
+> the `powermode` literals are the captured `pmset -g` block below.
+
+> Captured `pmset -g batt` (AC, macOS 26.6.2):
+> ```
+> Now drawing from 'AC Power'
+>  -InternalBattery-0 (id=9240675)	100%; charged; 0:00 remaining present: true
+> ```
+> Captured `pmset -g` excerpt (macOS 26.6.2, Apple Silicon — note the key):
+> ```
+> System-wide power settings:
+> Currently in use:
+>  standby              1
+>  powernap             0
+>  powermode            0
+>  womp                 1
+> ```
+
 No new native dependencies: the probe shells out to `pmset` (present on
 every macOS since 10.4) and parses. Parsers are pure functions over
 captured strings; only the two-line `read_power_state` is cfg-gated.
@@ -635,9 +662,10 @@ pub const POWER_PROBE_AVAILABLE: bool = cfg!(target_os = "macos");
 #[must_use]
 pub fn parse_power_source(batt_output: &str) -> PowerSource { /* contains("'AC Power'") etc. */ }
 
-/// Parses `pmset -g` custom output for a `lowpowermode  1` line.
+/// Parses `pmset -g` output for a `lowpowermode  1` (Intel) or
+/// `powermode  1` (Apple Silicon; 0 automatic, 2 high power) line.
 #[must_use]
-pub fn parse_low_power_mode(pmset_output: &str) -> bool { /* line-wise: trim, starts_with("lowpowermode"), ends_with('1') */ }
+pub fn parse_low_power_mode(pmset_output: &str) -> bool { /* line-wise: split_whitespace; first token in {"lowpowermode","powermode"} and last token == "1" */ }
 
 #[cfg(target_os = "macos")]
 pub fn read_power_state() -> PowerState { /* run both pmset invocations; parse; any spawn error → Unknown/false */ }
@@ -650,8 +678,9 @@ pub fn read_power_state() -> PowerState {
 
 - [ ] **Step 1: failing parser tests** against captured literals: an AC
   `pmset -g batt` output, a battery one, a garbled one → Unknown; a
-  `pmset -g` block with `lowpowermode  1`, with `0`, and with the line
-  absent → false. (Capture real output from the dev machine for the
+  `pmset -g` block with `lowpowermode  1`, with `0`, with `powermode  1`
+  (→ true), `powermode  0` and `powermode  2` (→ false), and with both
+  lines absent → false (see the AMENDED note above). (Capture real output from the dev machine for the
   literals; note in a comment which macOS version produced them.)
 - [ ] **Step 2:** run, verify failure; **Step 3:** implement; **Step 4:**
   cfg-gated smoke test (macOS only): `read_power_state()` returns
@@ -720,6 +749,26 @@ in `last_error` and backs off to the idle tick — never a hot loop. A
 throttle change to `Paused` takes effect at the next batch boundary
 (batches are short by construction; that IS the pause latency, matching
 the ingest-cancel "between files" doctrine).
+
+> **AMENDED (2026-09-05, Task 12 spec review):** `index::run::run` returns
+> `Ok` even when every item in the batch fails (per-item failures ride
+> `outcome.*.failed`; `Err` is reserved for model-load / Lance / FTS), and
+> the status verb's `pending` comes from `plan_work`, which never reads the
+> failure report. A permanently failing item therefore stays pending, and
+> "RunFull success → immediate re-tick" would spin on it forever. Three
+> rules added to the loop: (1) a batch that made no progress
+> (`IndexRunOutcome::made_progress()` false — a new `#[must_use]` method
+> on the outcome, unit-tested per kind) holds for `TICK` and records
+> `last_error` ("batch made no progress; N item failures"); (2) after every
+> `Ok` batch the loop calls `index::update_failure_report` exactly as the
+> CLI and MCP heads do, so `failed_last_run` and doctor stay current;
+> (3) the batch runs under `catch_unwind` (ingest.rs's `panic_message`
+> made `pub(crate)`), so a panic lands in `last_error` instead of killing
+> the thread with `running` stuck true. `success_pace` gets a unit test
+> (RunFull → immediate, RunLow → `PACE_LOW`): a mutation swapping the two
+> survived the original suite. Also: `BATCH_LIMIT` caps each kind's queue
+> independently (`split_and_cap_items`), so a batch is up to 25 × kinds
+> items and pause latency is one such batch.
 
 **Commands** (one-liners over `*_impl`):
 - `scheduler_state() -> SchedulerStateOutcome`

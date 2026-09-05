@@ -1,0 +1,15 @@
+{
+  "available": true,
+  "decision": {
+    "hold_reason": "paused",
+    "mode": "hold"
+  },
+  "last_error": "index run failed: model cache directory is not writable",
+  "pending_items": 7,
+  "power": {
+    "low_power_mode": false,
+    "source": "battery"
+  },
+  "running": false,
+  "throttle": "paused"
+}

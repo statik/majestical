@@ -89,6 +89,15 @@ mod tests {
         }
     }
 
+    /// `any::<u64>()` practically never draws 0, so the zero-pending
+    /// branch would go unexercised by the properties without this bias.
+    fn pending_items() -> impl proptest::strategy::Strategy<Value = u64> {
+        proptest::prop_oneof![
+            proptest::strategy::Just(0u64),
+            proptest::arbitrary::any::<u64>(),
+        ]
+    }
+
     #[test]
     fn paused_wins_over_ac_with_pending_work() {
         let decision =
@@ -172,7 +181,7 @@ mod tests {
                 proptest::strategy::Just(PowerSource::Unknown),
             ],
             low_power_mode: bool,
-            pending_items: u64,
+            pending_items in pending_items(),
         ) {
             let decision = autopilot_decision(
                 state(source, low_power_mode),
@@ -195,7 +204,7 @@ mod tests {
                 proptest::strategy::Just(ThrottleOverride::Low),
                 proptest::strategy::Just(ThrottleOverride::Full),
             ],
-            pending_items: u64,
+            pending_items in pending_items(),
         ) {
             let decision = autopilot_decision(state(source, low_power_mode), throttle, pending_items);
             proptest::prop_assert_ne!(decision, SchedulerDecision::Hold(HoldReason::LowPowerMode));

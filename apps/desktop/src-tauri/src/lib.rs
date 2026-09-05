@@ -3,6 +3,7 @@
 //! construction, same rule as `maj mcp`).
 pub mod commands;
 pub mod config;
+pub mod indexer;
 pub mod ingest;
 pub mod power;
 pub mod thumb_protocol;
@@ -67,7 +68,17 @@ pub fn run() {
         // the run is a plain OS thread that keeps copying across a reload,
         // and `ingest_state` is how the surface finds it again.
         .manage(ingest::IngestState(std::sync::RwLock::new(None)))
-        .setup(|app| Ok(commands::restore_persisted_catalog(app.handle())?))
+        // The background index scheduler's throttle and last tick's
+        // findings. Managed for the same reason as `IngestState`: the loop
+        // is a plain OS thread that outlives any one webview.
+        .manage(indexer::SchedulerState(std::sync::RwLock::new(
+            indexer::SchedulerShared::default(),
+        )))
+        .setup(|app| {
+            commands::restore_persisted_catalog(app.handle())?;
+            indexer::spawn_loop(app.handle());
+            Ok(())
+        })
         .register_uri_scheme_protocol("thumb", |ctx, request| {
             thumb_protocol::respond(ctx.app_handle(), &request.uri().to_string())
         })
@@ -97,6 +108,8 @@ pub fn run() {
             commands::list_unfinished_ingests,
             commands::initialize_catalog,
             commands::use_existing_catalog,
+            indexer::scheduler_state,
+            indexer::set_throttle,
         ])
         .run(tauri::generate_context!())
         .expect("error while running majestical desktop");

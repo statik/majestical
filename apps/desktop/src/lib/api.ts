@@ -413,6 +413,46 @@ export interface IngestProgress {
 /** The Tauri event name `start_ingest` forwards progress under. */
 export const INGEST_PROGRESS_EVENT = "ingest-progress";
 
+/** `majestical_services::autopilot::ThrottleOverride`, serialized snake_case. */
+export type ThrottleOverride = "auto" | "paused" | "low" | "full";
+
+/** `majestical_services::autopilot::PowerSource`, serialized snake_case. */
+export type PowerSource = "ac" | "battery" | "unknown";
+
+/** `majestical_services::autopilot::PowerState` */
+export interface PowerState {
+  source: PowerSource;
+  low_power_mode: boolean;
+}
+
+/**
+ * `majestical_services::autopilot::SchedulerDecision` — serde tag `mode`,
+ * `hold_reason` only present on the `hold` arm, both snake_case.
+ */
+export type SchedulerDecision =
+  | { mode: "run_full" }
+  | { mode: "run_low" }
+  | {
+      mode: "hold";
+      hold_reason: "paused" | "low_power_mode" | "no_pending_work";
+    };
+
+/**
+ * `indexer::SchedulerStateOutcome` — what `scheduler_state`/`set_throttle`
+ * return. `decision` is `null`, not absent, before the scheduler loop's
+ * first tick has run; `last_error` is absent both before that first tick
+ * and once a later batch has succeeded.
+ */
+export interface SchedulerState {
+  available: boolean;
+  throttle: ThrottleOverride;
+  power: PowerState;
+  decision: SchedulerDecision | null;
+  pending_items: number;
+  running: boolean;
+  last_error?: string;
+}
+
 /**
  * `commands::FinishedIngest` — how the last run ended. A failure is a value
  * the state keeps, not a lost promise: the run outlives the webview, so the
@@ -512,6 +552,10 @@ export const api = {
   ingestState: () => invoke<IngestState>("ingest_state"),
   listUnfinishedIngests: () =>
     invoke<UnfinishedRunsOutcome>("list_unfinished_ingests"),
+  // Background index scheduler.
+  schedulerState: () => invoke<SchedulerState>("scheduler_state"),
+  setThrottle: (throttle: ThrottleOverride) =>
+    invoke<SchedulerState>("set_throttle", { throttle }),
 };
 
 /**

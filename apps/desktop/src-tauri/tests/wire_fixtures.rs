@@ -10,10 +10,14 @@
 //! to round-trip through a service call for.
 use majestical_core::event::{AssetId, VerifyOutcome};
 use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
+use majestical_desktop::indexer::SchedulerStateOutcome;
 use majestical_desktop::ingest::{FinishedIngest, IngestProgress, IngestStateWire};
 use majestical_ingest::engine::{FailedFile, Outcome, PlacedFile, ProgressEvent};
 use majestical_ingest::mhl::WrittenGeneration;
 use majestical_ingest::plan::{Decision, DedupeMode, IngestPlan, PlannedFile};
+use majestical_services::autopilot::{
+    HoldReason, PowerSource, PowerState, SchedulerDecision, ThrottleOverride,
+};
 use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
@@ -620,5 +624,49 @@ fn ingest_progress_fixture() {
     check_or_update(
         "ingest_progress",
         &serde_json::to_value(&progress).expect("serialize"),
+    );
+}
+
+/// A machine on AC, running full, nothing wrong yet — `last_error` absent.
+#[test]
+fn scheduler_state_fixture() {
+    let scheduler_state = SchedulerStateOutcome {
+        available: true,
+        throttle: ThrottleOverride::Auto,
+        power: PowerState {
+            source: PowerSource::Ac,
+            low_power_mode: false,
+        },
+        decision: Some(SchedulerDecision::RunFull),
+        pending_items: 42,
+        running: true,
+        last_error: None,
+    };
+    check_or_update(
+        "scheduler_state",
+        &serde_json::to_value(&scheduler_state).expect("serialize"),
+    );
+}
+
+/// Paused by the user, on battery, carrying the previous batch's failure —
+/// pins the `Hold` tagged union's `hold_reason` field and `last_error`'s
+/// presence together.
+#[test]
+fn scheduler_state_held_fixture() {
+    let scheduler_state = SchedulerStateOutcome {
+        available: true,
+        throttle: ThrottleOverride::Paused,
+        power: PowerState {
+            source: PowerSource::Battery,
+            low_power_mode: false,
+        },
+        decision: Some(SchedulerDecision::Hold(HoldReason::Paused)),
+        pending_items: 7,
+        running: false,
+        last_error: Some("index run failed: model cache directory is not writable".to_string()),
+    };
+    check_or_update(
+        "scheduler_state_held",
+        &serde_json::to_value(&scheduler_state).expect("serialize"),
     );
 }

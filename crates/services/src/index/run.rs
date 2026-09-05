@@ -1905,6 +1905,32 @@ impl IndexRunOutcome {
         merged.extend(self.transcript_embed.failed.iter().cloned());
         merged
     }
+
+    /// Whether this pass wrote anything anywhere, across every kind.
+    ///
+    /// An `Ok` outcome is not proof of progress: a per-item failure (a
+    /// corrupt file, an unreachable describer) lands in that kind's own
+    /// `failed` list, not in `run`'s `Result` — a batch whose every item
+    /// fails that way still returns `Ok` with every `written`/`*_written`/
+    /// `videos_done` counter at zero. A caller re-running the same items
+    /// forever on that `Ok` (a scheduler loop, `--watch`) needs this to
+    /// tell "nothing left to do" apart from "nothing succeeded".
+    #[must_use]
+    pub fn made_progress(&self) -> bool {
+        self.thumbs.written > 0
+            || self.embed.written > 0
+            || self.keyframes.videos_done > 0
+            || self.keyframes.keyframes_written > 0
+            || self.keyframe_images.videos_done > 0
+            || self.keyframe_images.images_written > 0
+            || self.transcribe.written > 0
+            || self.transcript_embed.chunks_written > 0
+            || self.ocr.images_written > 0
+            || self.ocr.videos_done > 0
+            || self.ocr.keyframes_written > 0
+            || self.pdf.written > 0
+            || self.captions.written > 0
+    }
 }
 
 #[cfg(test)]
@@ -2509,5 +2535,140 @@ mod tests {
         let outcome = run(&app, &root, &req).expect("run");
         assert_eq!(outcome.thumbs.written, 0);
         assert!(outcome.thumbs.failed.is_empty());
+    }
+
+    /// `ThumbOutcome`/`EmbedOutcome` don't derive `Default` (their fields
+    /// have no meaningful zero built in beyond what's spelled out here), so
+    /// every `made_progress` case below starts from this literal.
+    fn empty_run_outcome() -> IndexRunOutcome {
+        IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 0,
+                failed: Vec::new(),
+            },
+            embed: EmbedOutcome {
+                written: 0,
+                loaded: 0,
+                failed: Vec::new(),
+            },
+            keyframes: KeyframeOutcome::default(),
+            keyframe_images: KeyframeImageOutcome::default(),
+            transcribe: TranscribeOutcome::default(),
+            transcript_embed: TranscriptEmbedOutcome::default(),
+            ocr: OcrOutcome::default(),
+            pdf: PdfOutcome::default(),
+            captions: CaptionOutcome::default(),
+            notices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn made_progress_is_false_when_every_kind_wrote_nothing() {
+        assert!(!empty_run_outcome().made_progress());
+    }
+
+    /// The bug this method exists to catch: every item in the batch failed
+    /// (`run` still returns `Ok`), so nothing was written anywhere — a
+    /// caller must not read this as progress just because there is a
+    /// failure list to show for it.
+    #[test]
+    fn made_progress_ignores_a_batch_whose_every_item_failed() {
+        let mut outcome = empty_run_outcome();
+        outcome.thumbs.failed.push((
+            PathBuf::from("/media/broken.jpg"),
+            "decode failed".to_string(),
+        ));
+        assert!(!outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_thumbs_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.thumbs.written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_embeddings_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.embed.written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_keyframe_video_finished() {
+        let mut outcome = empty_run_outcome();
+        outcome.keyframes.videos_done = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_keyframe_frame_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.keyframes.keyframes_written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_keyframe_image_video_finished() {
+        let mut outcome = empty_run_outcome();
+        outcome.keyframe_images.videos_done = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_keyframe_image_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.keyframe_images.images_written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_transcript_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.transcribe.written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_transcript_chunk_embedded() {
+        let mut outcome = empty_run_outcome();
+        outcome.transcript_embed.chunks_written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_ocr_wrote_an_image() {
+        let mut outcome = empty_run_outcome();
+        outcome.ocr.images_written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_ocr_finished_a_video() {
+        let mut outcome = empty_run_outcome();
+        outcome.ocr.videos_done = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_ocr_wrote_a_keyframe() {
+        let mut outcome = empty_run_outcome();
+        outcome.ocr.keyframes_written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_pdf_text_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.pdf.written = 1;
+        assert!(outcome.made_progress());
+    }
+
+    #[test]
+    fn made_progress_is_true_when_a_caption_wrote() {
+        let mut outcome = empty_run_outcome();
+        outcome.captions.written = 1;
+        assert!(outcome.made_progress());
     }
 }

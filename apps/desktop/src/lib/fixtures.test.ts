@@ -18,7 +18,7 @@ import type {
   ProgressEvent,
   SavedSearches,
   SchedulerDecision,
-  SchedulerState,
+  SchedulerStateOutcome,
   SearchOutcome,
   TagRenameOutcome,
   TagsListOutcome,
@@ -91,13 +91,14 @@ const typedIngestPlan: IngestPlanOutcome = ingestPlan as IngestPlanOutcome;
 const typedIngestRun: IngestRun = ingestRun as IngestRun;
 const typedUnfinishedRuns: UnfinishedRunsOutcome = unfinishedRuns;
 const typedIngestProgress: IngestProgress[] = ingestProgress as IngestProgress[];
-// `SchedulerState.decision` is a tagged union (`SchedulerDecision`) whose
-// `mode` discriminant JSON module inference widens to `string`, same reason
-// as `AssetDetail` above — a cast, plus the literal array below pinning the
-// three modes and the `hold` arm's `hold_reason` values.
-const typedSchedulerState: SchedulerState = schedulerState as SchedulerState;
-const typedSchedulerStateHeld: SchedulerState =
-  schedulerStateHeld as SchedulerState;
+// `SchedulerStateOutcome.decision` is a tagged union (`SchedulerDecision`)
+// whose `mode` discriminant JSON module inference widens to `string`, same
+// reason as `AssetDetail` above — a cast, plus the literal array below
+// pinning the three modes and the `hold` arm's `hold_reason` values.
+const typedSchedulerState: SchedulerStateOutcome =
+  schedulerState as SchedulerStateOutcome;
+const typedSchedulerStateHeld: SchedulerStateOutcome =
+  schedulerStateHeld as SchedulerStateOutcome;
 const allSchedulerModes: SchedulerDecision["mode"][] = [
   "run_full",
   "run_low",

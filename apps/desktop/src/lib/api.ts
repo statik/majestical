@@ -443,7 +443,7 @@ export type SchedulerDecision =
  * first tick has run; `last_error` is absent both before that first tick
  * and once a later batch has succeeded.
  */
-export interface SchedulerState {
+export interface SchedulerStateOutcome {
   available: boolean;
   throttle: ThrottleOverride;
   power: PowerState;
@@ -553,9 +553,9 @@ export const api = {
   listUnfinishedIngests: () =>
     invoke<UnfinishedRunsOutcome>("list_unfinished_ingests"),
   // Background index scheduler.
-  schedulerState: () => invoke<SchedulerState>("scheduler_state"),
+  schedulerState: () => invoke<SchedulerStateOutcome>("scheduler_state"),
   setThrottle: (throttle: ThrottleOverride) =>
-    invoke<SchedulerState>("set_throttle", { throttle }),
+    invoke<SchedulerStateOutcome>("set_throttle", { throttle }),
 };
 
 /**

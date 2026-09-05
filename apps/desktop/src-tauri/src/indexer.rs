@@ -14,7 +14,9 @@ use crate::power::{POWER_PROBE_AVAILABLE, read_power_state};
 use majestical_services::autopilot::{
     HoldReason, PowerSource, PowerState, SchedulerDecision, ThrottleOverride, autopilot_decision,
 };
-use majestical_services::index::{self, IndexRunReq, IndexStatusOutcome, VALID_KINDS};
+use majestical_services::index::{
+    self, IndexRunOutcome, IndexRunReq, IndexStatusOutcome, VALID_KINDS,
+};
 use serde::Serialize;
 use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
@@ -24,8 +26,15 @@ use tauri::{AppHandle, Manager, State};
 /// catalog selected, a hold, or a failed batch backing off.
 const TICK: Duration = Duration::from_secs(30);
 
-/// Items per batch, under both Low and Full throttle — this pass's own item
-/// cap, independent of how many are actually pending.
+/// Cap per work kind, under both Low and Full throttle. `index::run` splits
+/// the plan by kind and caps each kind's own queue independently
+/// (`split_and_cap_items`, `crates/services/src/index/run.rs`), so one
+/// batch is up to `BATCH_LIMIT` items for EACH of the ten work kinds
+/// (thumbs, embeddings, keyframes, keyframe images, transcribe,
+/// transcript-embed, OCR stills, OCR keyframes, PDF text, captions) with
+/// pending work — not `BATCH_LIMIT` items total. The pause latency a
+/// throttle change to `Paused` waits out is however long that one
+/// per-kind-capped batch takes to run.
 const BATCH_LIMIT: usize = 25;
 
 /// Pace between Low-throttle batches, so a battery-powered Mac gets gaps to
@@ -138,6 +147,22 @@ fn success_pace(decision: SchedulerDecision) -> Duration {
     }
 }
 
+/// Runs `f`, converting a panic into a `CommandError` instead of letting it
+/// unwind past this call and kill the scheduler thread for the life of the
+/// process — the same reasoning `ingest.rs`'s `run_ingest_job` applies to a
+/// panicking progress sink. `index::status`/`index::run` reach into model
+/// loaders and native codecs (Vision, whisper.cpp, ffmpeg) this loop does
+/// not control, and any of them can panic on a bad file this pass never
+/// chose to see.
+fn catch_service_call<T>(f: impl FnOnce() -> Result<T, CommandError>) -> Result<T, CommandError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        Err(CommandError::new(format!(
+            "the scheduler panicked: {}",
+            crate::ingest::panic_message(payload.as_ref())
+        )))
+    })
+}
+
 /// Polls pending work and power, decides this tick's mode, and publishes
 /// both into `scheduler` before returning the decision and the batch it
 /// authorizes (`None` for a hold) — so a caller reading `scheduler_state`
@@ -147,8 +172,10 @@ fn poll_and_decide(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
 ) -> Result<(SchedulerDecision, Option<IndexRunReq>), CommandError> {
-    let fs_app = open_app(cfg)?;
-    let status = index::status(&fs_app, &cfg.catalog)?;
+    let status = catch_service_call(|| {
+        let fs_app = open_app(cfg)?;
+        Ok(index::status(&fs_app, &cfg.catalog)?)
+    })?;
     let pending = pending_items(&status);
     let power = read_power_state();
     let throttle = scheduler
@@ -165,10 +192,50 @@ fn poll_and_decide(
     Ok((decision, batch_request(decision)))
 }
 
+/// Every kind's `failed` list, summed — what [`batch_outcome_pace`] reports
+/// when a batch made no progress at all.
+fn total_failures(outcome: &IndexRunOutcome) -> usize {
+    outcome.thumbs.failed.len()
+        + outcome.embed.failed.len()
+        + outcome.keyframes.failed.len()
+        + outcome.keyframe_images.failed.len()
+        + outcome.transcript_failures().len()
+        + outcome.ocr.failed.len()
+        + outcome.pdf.failed.len()
+        + outcome.captions.failed.len()
+}
+
+/// Decides the next tick's pace and this batch's `last_error` from a
+/// completed run's outcome. Pure — no I/O — so it is testable without a
+/// catalog: an `Ok` outcome is not proof of progress, since a per-item
+/// failure (a corrupt file, an unreachable describer) lands in that kind's
+/// own `failed` list rather than in `run`'s `Result` — see
+/// [`IndexRunOutcome::made_progress`]'s own doc. A batch whose every item
+/// fails that way still returns `Ok`, and re-running the exact same items
+/// every `PACE_LOW`/immediately forever is the hot loop this guards
+/// against: it holds until the next full [`TICK`] instead, same as a
+/// genuine `Err`.
+fn batch_outcome_pace(
+    decision: SchedulerDecision,
+    outcome: &IndexRunOutcome,
+) -> (Option<String>, Duration) {
+    if outcome.made_progress() {
+        return (None, success_pace(decision));
+    }
+    (
+        Some(format!(
+            "batch made no progress; {} item failures",
+            total_failures(outcome)
+        )),
+        TICK,
+    )
+}
+
 /// Runs one batch — a fresh `FsApp`, same "commands open their own" rule
 /// `commands.rs` follows, since the loop's own catalog handle would
-/// otherwise go stale across ticks — and records its outcome. Returns how
-/// long to sleep before the next tick.
+/// otherwise go stale across ticks — refreshes the failure-report marker
+/// `status`/`maj doctor` read, and records the outcome. Returns how long to
+/// sleep before the next tick.
 fn run_batch(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
@@ -180,30 +247,39 @@ fn run_batch(
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .running = true;
-    let result: Result<(), CommandError> = open_app(cfg).and_then(|fs_app| {
-        index::run(&fs_app, &cfg.catalog, req)?;
-        Ok(())
+    let result: Result<IndexRunOutcome, CommandError> = catch_service_call(|| {
+        let fs_app = open_app(cfg)?;
+        Ok(index::run(&fs_app, &cfg.catalog, req)?)
     });
+    let (last_error, pace) = match result {
+        Ok(outcome) => {
+            // A fresh sink, not `fs_app.notices()`: `index::run` already
+            // drained its `FsApp`'s notices into `outcome.notices` (see
+            // `run_impl`), and that `fs_app` does not outlive the
+            // `catch_service_call` closure above. Nothing here reads this
+            // sink back out — a failure to refresh the marker is reported
+            // through `last_error` below instead.
+            let notices = majestical_services::notices::Notices::new();
+            match index::update_failure_report(&cfg.catalog, &outcome, &req.kinds, &notices) {
+                Ok(()) => batch_outcome_pace(decision, &outcome),
+                Err(err) => (Some(CommandError::from(err).message), TICK),
+            }
+        }
+        Err(err) => (Some(err.message), TICK),
+    };
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
     shared.running = false;
-    match result {
-        Ok(()) => {
-            shared.last_error = None;
-            drop(shared);
-            success_pace(decision)
-        }
-        Err(err) => {
-            shared.last_error = Some(err.message);
-            drop(shared);
-            TICK
-        }
-    }
+    shared.last_error = last_error;
+    drop(shared);
+    pace
 }
 
 /// One pass of the loop: hold when no catalog is selected, else poll,
 /// decide, and — on `RunFull`/`RunLow` — run one batch. Returns how long to
 /// sleep before the next pass. Every path sleeps at least [`PACE_LOW`]
-/// except a `RunFull` batch that just succeeded, so this never spins hot.
+/// except a `RunFull` batch that made progress, so this never spins hot —
+/// including on a batch that ran clean but wrote nothing, which holds for a
+/// full [`TICK`] rather than immediately re-running the same failing items.
 fn run_tick(app: &AppHandle) -> Duration {
     let state = app.state::<AppState>();
     let Some(cfg) = selected_catalog(&state) else {
@@ -319,10 +395,42 @@ pub fn set_throttle(
 #[cfg(test)]
 mod tests {
     use super::{
-        BATCH_LIMIT, HoldReason, IndexStatusOutcome, PowerSource, PowerState, SchedulerDecision,
-        SchedulerStateOutcome, ThrottleOverride, batch_request, pending_items,
+        BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
+        SchedulerDecision, SchedulerStateOutcome, ThrottleOverride, batch_outcome_pace,
+        batch_request, pending_items, success_pace,
     };
-    use majestical_services::index::KindStatusRow;
+    use majestical_services::index::{
+        CaptionOutcome, EmbedOutcome, IndexRunOutcome, KeyframeImageOutcome, KeyframeOutcome,
+        KindStatusRow, OcrOutcome, PdfOutcome, ThumbOutcome, TranscribeOutcome,
+        TranscriptEmbedOutcome,
+    };
+    use std::time::Duration;
+
+    /// `ThumbOutcome`/`EmbedOutcome` don't derive `Default`, so every
+    /// `batch_outcome_pace` case below starts from this literal — the same
+    /// all-zero shape `crates/services/src/index/run.rs`'s own
+    /// `made_progress` tests build.
+    fn empty_run_outcome() -> IndexRunOutcome {
+        IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 0,
+                failed: Vec::new(),
+            },
+            embed: EmbedOutcome {
+                written: 0,
+                loaded: 0,
+                failed: Vec::new(),
+            },
+            keyframes: KeyframeOutcome::default(),
+            keyframe_images: KeyframeImageOutcome::default(),
+            transcribe: TranscribeOutcome::default(),
+            transcript_embed: TranscriptEmbedOutcome::default(),
+            ocr: OcrOutcome::default(),
+            pdf: PdfOutcome::default(),
+            captions: CaptionOutcome::default(),
+            notices: Vec::new(),
+        }
+    }
 
     fn kind_row(pending: u64) -> KindStatusRow {
         KindStatusRow {
@@ -387,6 +495,51 @@ mod tests {
         ] {
             assert!(batch_request(SchedulerDecision::Hold(reason)).is_none());
         }
+    }
+
+    #[test]
+    fn success_pace_run_full_is_immediate() {
+        assert_eq!(success_pace(SchedulerDecision::RunFull), Duration::ZERO);
+    }
+
+    #[test]
+    fn success_pace_run_low_is_paced() {
+        assert_eq!(success_pace(SchedulerDecision::RunLow), PACE_LOW);
+    }
+
+    #[test]
+    fn batch_outcome_pace_paces_by_decision_when_progress_was_made() {
+        let mut outcome = empty_run_outcome();
+        outcome.thumbs.written = 1;
+        let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunFull, &outcome);
+        assert!(last_error.is_none());
+        assert_eq!(pace, Duration::ZERO);
+
+        let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunLow, &outcome);
+        assert!(last_error.is_none());
+        assert_eq!(pace, PACE_LOW);
+    }
+
+    /// The hot-loop bug this whole mechanism exists to close: `index::run`
+    /// returns `Ok` even when every item in the batch failed (the failures
+    /// live in each kind's own `failed` list, not in the `Result`), so a
+    /// naive "Ok means keep going at full pace" reading would retry the
+    /// exact same failing items forever.
+    #[test]
+    fn batch_outcome_pace_holds_and_names_the_failure_count_when_nothing_progressed() {
+        let mut outcome = empty_run_outcome();
+        outcome.thumbs.failed.push((
+            std::path::PathBuf::from("/media/broken.jpg"),
+            "decode failed".to_string(),
+        ));
+        outcome.pdf.failed.push((
+            std::path::PathBuf::from("/media/broken.pdf"),
+            "not a valid pdf".to_string(),
+        ));
+        let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunFull, &outcome);
+        assert_eq!(pace, super::TICK);
+        let message = last_error.expect("a no-progress batch must report why");
+        assert!(message.contains('2'), "{message}");
     }
 
     #[test]

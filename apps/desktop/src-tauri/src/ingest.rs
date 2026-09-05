@@ -396,7 +396,11 @@ pub fn start_ingest_impl(
 }
 
 /// A panic payload's message, for the two shapes `panic!` produces.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+///
+/// `pub(crate)`: `indexer.rs`'s scheduler loop reuses this to report a
+/// panic from `index::status`/`index::run` the same way this module
+/// reports one from a run's progress sink.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(message) = payload.downcast_ref::<&str>() {
         return message;
     }

@@ -2,6 +2,7 @@
 //! One function per verb: request in, serde-serializable outcome out.
 //! Heads render outcomes; they never re-implement operations.
 pub mod app;
+pub mod autopilot;
 pub mod browse;
 pub mod capability;
 pub mod catalog;

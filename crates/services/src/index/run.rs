@@ -128,7 +128,7 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
 /// `failed` (path, reason) — mirrors [`EmbedOutcome`]/[`KeyframeOutcome`]'s
 /// shape so every kind's executor returns one outcome value instead of a
 /// bare tuple.
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 pub struct ThumbOutcome {
     pub written: u64,
     #[serde(serialize_with = "serialize_failed_items")]
@@ -186,7 +186,7 @@ struct EmbedPaths {
 /// `loaded` vectors pulled in from blobs the local Lance store didn't have
 /// yet (the blob↔Lance diff — a teammate's synced vectors, or a lance dir
 /// just rebuilt after corruption), and per-item `failed` (path, reason).
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 pub struct EmbedOutcome {
     pub written: u64,
     pub loaded: u64,
@@ -1874,7 +1874,7 @@ fn open_and_probe_text(dir: &Path) -> Result<TextVectorStore, String> {
 
 /// Every kind's outcome for one pass, bundled so the CLI's printers and
 /// failure-report bookkeeping take one value instead of nine.
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 pub struct IndexRunOutcome {
     pub thumbs: ThumbOutcome,
     pub embed: EmbedOutcome,
@@ -1915,6 +1915,12 @@ impl IndexRunOutcome {
     /// `videos_done` counter at zero. A caller re-running the same items
     /// forever on that `Ok` (a scheduler loop, `--watch`) needs this to
     /// tell "nothing left to do" apart from "nothing succeeded".
+    ///
+    /// `transcript_embed.empty` counts too: a transcript with no chunks to
+    /// embed still gets an empty-marker blob written (`embed_transcript_
+    /// chunks`'s `ChunkEmbedResult::Empty` arm) so the item stops being
+    /// pending, which is real progress even though `chunks_written` never
+    /// moves for it.
     #[must_use]
     pub fn made_progress(&self) -> bool {
         self.thumbs.written > 0
@@ -2538,34 +2544,9 @@ mod tests {
         assert!(outcome.thumbs.failed.is_empty());
     }
 
-    /// `ThumbOutcome`/`EmbedOutcome` don't derive `Default` (their fields
-    /// have no meaningful zero built in beyond what's spelled out here), so
-    /// every `made_progress` case below starts from this literal.
-    fn empty_run_outcome() -> IndexRunOutcome {
-        IndexRunOutcome {
-            thumbs: ThumbOutcome {
-                written: 0,
-                failed: Vec::new(),
-            },
-            embed: EmbedOutcome {
-                written: 0,
-                loaded: 0,
-                failed: Vec::new(),
-            },
-            keyframes: KeyframeOutcome::default(),
-            keyframe_images: KeyframeImageOutcome::default(),
-            transcribe: TranscribeOutcome::default(),
-            transcript_embed: TranscriptEmbedOutcome::default(),
-            ocr: OcrOutcome::default(),
-            pdf: PdfOutcome::default(),
-            captions: CaptionOutcome::default(),
-            notices: Vec::new(),
-        }
-    }
-
     #[test]
     fn made_progress_is_false_when_every_kind_wrote_nothing() {
-        assert!(!empty_run_outcome().made_progress());
+        assert!(!IndexRunOutcome::default().made_progress());
     }
 
     /// The bug this method exists to catch: every item in the batch failed
@@ -2574,7 +2555,7 @@ mod tests {
     /// failure list to show for it.
     #[test]
     fn made_progress_ignores_a_batch_whose_every_item_failed() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.thumbs.failed.push((
             PathBuf::from("/media/broken.jpg"),
             "decode failed".to_string(),
@@ -2587,98 +2568,98 @@ mod tests {
     /// would — it is progress, not a stall.
     #[test]
     fn made_progress_is_true_when_an_empty_transcript_was_marked_done() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.transcript_embed.empty = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_thumbs_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.thumbs.written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_embeddings_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.embed.written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_keyframe_video_finished() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.keyframes.videos_done = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_keyframe_frame_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.keyframes.keyframes_written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_keyframe_image_video_finished() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.keyframe_images.videos_done = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_keyframe_image_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.keyframe_images.images_written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_transcript_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.transcribe.written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_transcript_chunk_embedded() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.transcript_embed.chunks_written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_ocr_wrote_an_image() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.ocr.images_written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_ocr_finished_a_video() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.ocr.videos_done = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_ocr_wrote_a_keyframe() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.ocr.keyframes_written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_pdf_text_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.pdf.written = 1;
         assert!(outcome.made_progress());
     }
 
     #[test]
     fn made_progress_is_true_when_a_caption_wrote() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.captions.written = 1;
         assert!(outcome.made_progress());
     }

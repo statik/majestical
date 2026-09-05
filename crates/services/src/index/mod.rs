@@ -778,26 +778,11 @@ mod tests {
         let root = dir.path().join("cat");
         FsApp::init(&root, "m1", "m1").expect("init");
         let outcome = IndexRunOutcome {
-            thumbs: ThumbOutcome {
-                written: 0,
-                failed: Vec::new(),
-            },
-            embed: EmbedOutcome {
-                written: 0,
-                loaded: 0,
-                failed: Vec::new(),
-            },
-            keyframes: KeyframeOutcome::default(),
-            keyframe_images: KeyframeImageOutcome::default(),
-            transcribe: TranscribeOutcome::default(),
-            transcript_embed: TranscriptEmbedOutcome::default(),
-            ocr: OcrOutcome::default(),
             pdf: PdfOutcome {
                 written: 0,
                 failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
             },
-            captions: CaptionOutcome::default(),
-            notices: Vec::new(),
+            ..IndexRunOutcome::default()
         };
         let kinds: BTreeSet<String> = ["pdf".to_string()].into();
         let notices = crate::notices::Notices::new();

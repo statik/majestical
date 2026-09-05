@@ -147,22 +147,6 @@ fn success_pace(decision: SchedulerDecision) -> Duration {
     }
 }
 
-/// Runs `f`, converting a panic into a `CommandError` instead of letting it
-/// unwind past this call and kill the scheduler thread for the life of the
-/// process — the same reasoning `ingest.rs`'s `run_ingest_job` applies to a
-/// panicking progress sink. `index::status`/`index::run` reach into model
-/// loaders and native codecs (Vision, whisper.cpp, ffmpeg) this loop does
-/// not control, and any of them can panic on a bad file this pass never
-/// chose to see.
-fn catch_service_call<T>(f: impl FnOnce() -> Result<T, CommandError>) -> Result<T, CommandError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
-        Err(CommandError::new(format!(
-            "the scheduler panicked: {}",
-            crate::ingest::panic_message(payload.as_ref())
-        )))
-    })
-}
-
 /// Polls pending work and power, decides this tick's mode, and publishes
 /// both into `scheduler` before returning the decision and the batch it
 /// authorizes (`None` for a hold) — so a caller reading `scheduler_state`
@@ -172,7 +156,10 @@ fn poll_and_decide(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
 ) -> Result<(SchedulerDecision, Option<IndexRunReq>), CommandError> {
-    let status = catch_service_call(|| {
+    // `AssertUnwindSafe` (inside `catch_panic`): the closure captures only
+    // `&CatalogCfg`, which is plain data with no interior mutability for a
+    // panic to leave half-updated.
+    let status = crate::ingest::catch_panic("the scheduler", || {
         let fs_app = open_app(cfg)?;
         Ok(index::status(&fs_app, &cfg.catalog)?)
     })?;
@@ -235,7 +222,10 @@ fn batch_outcome_pace(
 /// `commands.rs` follows, since the loop's own catalog handle would
 /// otherwise go stale across ticks — refreshes the failure-report marker
 /// `status`/`maj doctor` read, and records the outcome. Returns how long to
-/// sleep before the next tick.
+/// sleep before the next tick. The batch's own `notices` (from `run`'s
+/// `outcome.notices`) are deliberately dropped: the loop has no caller to
+/// hand them to, unlike `maj index run`/`start_ingest`, which return theirs
+/// to a command that prints or forwards them.
 fn run_batch(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
@@ -247,24 +237,21 @@ fn run_batch(
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .running = true;
-    let result: Result<IndexRunOutcome, CommandError> = catch_service_call(|| {
-        let fs_app = open_app(cfg)?;
-        Ok(index::run(&fs_app, &cfg.catalog, req)?)
-    });
+    // `AssertUnwindSafe` (inside `catch_panic`): the closure captures only
+    // `&CatalogCfg`/`&IndexRunReq`, both plain data with no interior
+    // mutability for a panic to leave half-updated. Refreshing the
+    // failure-report marker lives in here too, not after: a panic in that
+    // write must be caught the same as one from `index::run` itself, or it
+    // would still kill the thread with `running` left stuck `true`.
+    let result: Result<IndexRunOutcome, CommandError> =
+        crate::ingest::catch_panic("the scheduler", || {
+            let fs_app = open_app(cfg)?;
+            let outcome = index::run(&fs_app, &cfg.catalog, req)?;
+            index::update_failure_report(&cfg.catalog, &outcome, &req.kinds, fs_app.notices())?;
+            Ok(outcome)
+        });
     let (last_error, pace) = match result {
-        Ok(outcome) => {
-            // A fresh sink, not `fs_app.notices()`: `index::run` already
-            // drained its `FsApp`'s notices into `outcome.notices` (see
-            // `run_impl`), and that `fs_app` does not outlive the
-            // `catch_service_call` closure above. Nothing here reads this
-            // sink back out — a failure to refresh the marker is reported
-            // through `last_error` below instead.
-            let notices = majestical_services::notices::Notices::new();
-            match index::update_failure_report(&cfg.catalog, &outcome, &req.kinds, &notices) {
-                Ok(()) => batch_outcome_pace(decision, &outcome),
-                Err(err) => (Some(CommandError::from(err).message), TICK),
-            }
-        }
+        Ok(outcome) => batch_outcome_pace(decision, &outcome),
         Err(err) => (Some(err.message), TICK),
     };
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
@@ -399,38 +386,8 @@ mod tests {
         SchedulerDecision, SchedulerStateOutcome, ThrottleOverride, batch_outcome_pace,
         batch_request, pending_items, success_pace, total_failures,
     };
-    use majestical_services::index::{
-        CaptionOutcome, EmbedOutcome, IndexRunOutcome, KeyframeImageOutcome, KeyframeOutcome,
-        KindStatusRow, OcrOutcome, PdfOutcome, ThumbOutcome, TranscribeOutcome,
-        TranscriptEmbedOutcome,
-    };
+    use majestical_services::index::{IndexRunOutcome, KindStatusRow};
     use std::time::Duration;
-
-    /// `ThumbOutcome`/`EmbedOutcome` don't derive `Default`, so every
-    /// `batch_outcome_pace` case below starts from this literal — the same
-    /// all-zero shape `crates/services/src/index/run.rs`'s own
-    /// `made_progress` tests build.
-    fn empty_run_outcome() -> IndexRunOutcome {
-        IndexRunOutcome {
-            thumbs: ThumbOutcome {
-                written: 0,
-                failed: Vec::new(),
-            },
-            embed: EmbedOutcome {
-                written: 0,
-                loaded: 0,
-                failed: Vec::new(),
-            },
-            keyframes: KeyframeOutcome::default(),
-            keyframe_images: KeyframeImageOutcome::default(),
-            transcribe: TranscribeOutcome::default(),
-            transcript_embed: TranscriptEmbedOutcome::default(),
-            ocr: OcrOutcome::default(),
-            pdf: PdfOutcome::default(),
-            captions: CaptionOutcome::default(),
-            notices: Vec::new(),
-        }
-    }
 
     fn kind_row(pending: u64) -> KindStatusRow {
         KindStatusRow {
@@ -509,7 +466,7 @@ mod tests {
 
     #[test]
     fn batch_outcome_pace_paces_by_decision_when_progress_was_made() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.thumbs.written = 1;
         let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunFull, &outcome);
         assert!(last_error.is_none());
@@ -527,7 +484,7 @@ mod tests {
     /// exact same failing items forever.
     #[test]
     fn total_failures_counts_every_kind_including_both_transcript_stages() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         let failure = || (std::path::PathBuf::from("/media/x"), "failed".to_string());
         outcome.thumbs.failed.push(failure());
         outcome.embed.failed.push(failure());
@@ -543,7 +500,7 @@ mod tests {
 
     #[test]
     fn batch_outcome_pace_holds_and_names_the_failure_count_when_nothing_progressed() {
-        let mut outcome = empty_run_outcome();
+        let mut outcome = IndexRunOutcome::default();
         outcome.thumbs.failed.push((
             std::path::PathBuf::from("/media/broken.jpg"),
             "decode failed".to_string(),

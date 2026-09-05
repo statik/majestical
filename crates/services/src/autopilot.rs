@@ -81,6 +81,7 @@ pub fn autopilot_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn state(source: PowerSource, low_power_mode: bool) -> PowerState {
         PowerState {
@@ -91,10 +92,15 @@ mod tests {
 
     /// `any::<u64>()` practically never draws 0, so the zero-pending
     /// branch would go unexercised by the properties without this bias.
-    fn pending_items() -> impl proptest::strategy::Strategy<Value = u64> {
-        proptest::prop_oneof![
-            proptest::strategy::Just(0u64),
-            proptest::arbitrary::any::<u64>(),
+    fn pending_items_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![Just(0u64), any::<u64>()]
+    }
+
+    fn power_source_strategy() -> impl Strategy<Value = PowerSource> {
+        prop_oneof![
+            Just(PowerSource::Ac),
+            Just(PowerSource::Battery),
+            Just(PowerSource::Unknown),
         ]
     }
 
@@ -172,42 +178,34 @@ mod tests {
         assert_eq!(decision, SchedulerDecision::Hold(HoldReason::Paused));
     }
 
-    proptest::proptest! {
+    proptest! {
         #[test]
         fn paused_always_holds_paused(
-            source in proptest::prop_oneof![
-                proptest::strategy::Just(PowerSource::Ac),
-                proptest::strategy::Just(PowerSource::Battery),
-                proptest::strategy::Just(PowerSource::Unknown),
-            ],
+            source in power_source_strategy(),
             low_power_mode: bool,
-            pending_items in pending_items(),
+            pending_items in pending_items_strategy(),
         ) {
             let decision = autopilot_decision(
                 state(source, low_power_mode),
                 ThrottleOverride::Paused,
                 pending_items,
             );
-            proptest::prop_assert_eq!(decision, SchedulerDecision::Hold(HoldReason::Paused));
+            prop_assert_eq!(decision, SchedulerDecision::Hold(HoldReason::Paused));
         }
 
         #[test]
         fn non_auto_throttle_never_holds_for_low_power_mode(
-            source in proptest::prop_oneof![
-                proptest::strategy::Just(PowerSource::Ac),
-                proptest::strategy::Just(PowerSource::Battery),
-                proptest::strategy::Just(PowerSource::Unknown),
-            ],
+            source in power_source_strategy(),
             low_power_mode: bool,
-            throttle in proptest::prop_oneof![
-                proptest::strategy::Just(ThrottleOverride::Paused),
-                proptest::strategy::Just(ThrottleOverride::Low),
-                proptest::strategy::Just(ThrottleOverride::Full),
+            throttle in prop_oneof![
+                Just(ThrottleOverride::Paused),
+                Just(ThrottleOverride::Low),
+                Just(ThrottleOverride::Full),
             ],
-            pending_items in pending_items(),
+            pending_items in pending_items_strategy(),
         ) {
             let decision = autopilot_decision(state(source, low_power_mode), throttle, pending_items);
-            proptest::prop_assert_ne!(decision, SchedulerDecision::Hold(HoldReason::LowPowerMode));
+            prop_assert_ne!(decision, SchedulerDecision::Hold(HoldReason::LowPowerMode));
         }
     }
 

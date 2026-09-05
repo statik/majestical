@@ -209,8 +209,9 @@ mod tests {
 
     #[test]
     fn key_must_be_the_first_token_not_merely_present() {
-        let output = "Currently in use:\n hibernatefile /var/powermode 1\n";
-        assert!(!parse_low_power_mode(output));
+        assert!(!parse_low_power_mode(" hibernatefile powermode 1\n"));
+        assert!(!parse_low_power_mode(" hibernatefile lowpowermode 1\n"));
+        assert!(!parse_low_power_mode(" hibernatefile /var/powermode 1\n"));
     }
 
     #[test]

@@ -48,9 +48,9 @@ pub fn parse_low_power_mode(pmset_output: &str) -> bool {
 /// Reads the live power state by shelling out to `pmset -g batt` and
 /// `pmset -g`. Any spawn or decode failure on either call falls back to
 /// `PowerSource::Unknown` / `false` — the same conservative state a
-/// non-macOS build reports — logged via `tracing::warn!` rather than
-/// surfaced to the caller, since a scheduler tick has no user-facing error
-/// path for "couldn't read power state."
+/// non-macOS build reports. The failure is silent here: `Unknown` on the
+/// scheduler status outcome IS the signal, and this crate has no logger
+/// (diagnostics ride outcome `notices`, never a log sink).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn read_power_state() -> PowerState {
@@ -65,19 +65,11 @@ pub fn read_power_state() -> PowerState {
 
 #[cfg(target_os = "macos")]
 fn run_pmset(args: &[&str]) -> Option<String> {
-    match std::process::Command::new("pmset").args(args).output() {
-        Ok(output) => match String::from_utf8(output.stdout) {
-            Ok(text) => Some(text),
-            Err(error) => {
-                tracing::warn!(?args, %error, "pmset output was not valid UTF-8");
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(?args, %error, "failed to spawn pmset");
-            None
-        }
-    }
+    let output = std::process::Command::new("pmset")
+        .args(args)
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -213,5 +205,18 @@ mod tests {
     #[test]
     fn read_power_state_returns_a_known_source_on_macos() {
         assert_ne!(read_power_state().source, PowerSource::Unknown);
+    }
+
+    #[test]
+    fn key_must_be_the_first_token_not_merely_present() {
+        let output = "Currently in use:\n hibernatefile /var/powermode 1\n";
+        assert!(!parse_low_power_mode(output));
+    }
+
+    #[test]
+    fn value_must_equal_one_exactly() {
+        assert!(!parse_low_power_mode(" powermode            10\n"));
+        assert!(!parse_low_power_mode(" powermode            21\n"));
+        assert!(!parse_low_power_mode(" lowpowermode         10\n"));
     }
 }

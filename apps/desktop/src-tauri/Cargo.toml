@@ -37,9 +37,6 @@ serde_json = "1"
 anyhow = "1"
 # The machine id and author every event this app writes is stamped with.
 hostname = "0.4"
-# The power probe logs pmset spawn/decode failures — services never print,
-# and this crate follows the same rule.
-tracing = "0.1.44"
 # `thumb://` asset ids arrive percent-encoded (`convertFileSrc` runs
 # `encodeURIComponent`), so the protocol handler decodes the path segment.
 percent-encoding = "2"

@@ -5095,7 +5095,6 @@ dependencies = [
  "tauri-plugin-wdio",
  "tauri-plugin-wdio-webdriver",
  "tempfile",
- "tracing",
 ]
 
 [[package]]

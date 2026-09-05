@@ -10,7 +10,7 @@ use majestical_services::autopilot::{PowerSource, PowerState};
 /// [`read_power_state`] without ever spawning a process.
 pub const POWER_PROBE_AVAILABLE: bool = cfg!(target_os = "macos");
 
-/// Parses `pmset -g batt` output. The first line names the drawing source —
+/// Parses `pmset -g batt` output. The output names the drawing source —
 /// `"Now drawing from 'AC Power'"` or `"...'Battery Power'"` — anything else
 /// (a future macOS rewording, or no output at all) degrades to `Unknown`
 /// rather than guessing wrong.
@@ -48,9 +48,10 @@ pub fn parse_low_power_mode(pmset_output: &str) -> bool {
 /// Reads the live power state by shelling out to `pmset -g batt` and
 /// `pmset -g`. Any spawn or decode failure on either call falls back to
 /// `PowerSource::Unknown` / `false` — the same conservative state a
-/// non-macOS build reports. The failure is silent here: `Unknown` on the
-/// scheduler status outcome IS the signal, and this crate has no logger
-/// (diagnostics ride outcome `notices`, never a log sink).
+/// non-macOS build reports. A failed `-g batt` surfaces as `Unknown` on
+/// the scheduler status outcome's `power.source`; a failed `-g` is
+/// indistinguishable from not-low-power, which is the plan's chosen
+/// conservative default. This crate has no log sink, so nothing is logged.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn read_power_state() -> PowerState {
@@ -195,18 +196,6 @@ mod tests {
         assert!(!parse_low_power_mode(""));
     }
 
-    /// macOS-only smoke test: asserts the real probe returns a known power
-    /// source on this machine. Gated to macOS because `pmset` does not
-    /// exist elsewhere — the coverage gap this leaves is real: non-macOS
-    /// platforms exercise only the `Unknown`/`false` constant-return branch
-    /// of `read_power_state`, never a live process spawn, anywhere in this
-    /// suite (the 7C rule: gate and gap recorded together).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn read_power_state_returns_a_known_source_on_macos() {
-        assert_ne!(read_power_state().source, PowerSource::Unknown);
-    }
-
     #[test]
     fn key_must_be_the_first_token_not_merely_present() {
         assert!(!parse_low_power_mode(" hibernatefile powermode 1\n"));
@@ -219,5 +208,17 @@ mod tests {
         assert!(!parse_low_power_mode(" powermode            10\n"));
         assert!(!parse_low_power_mode(" powermode            21\n"));
         assert!(!parse_low_power_mode(" lowpowermode         10\n"));
+    }
+
+    /// macOS-only smoke test: asserts the real probe returns a known power
+    /// source on this machine. Gated to macOS because `pmset` does not
+    /// exist elsewhere — the coverage gap this leaves is real: non-macOS
+    /// platforms exercise only the `Unknown`/`false` constant-return branch
+    /// of `read_power_state`, never a live process spawn, anywhere in this
+    /// suite (the 7C rule: gate and gap recorded together).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_power_state_returns_a_known_source_on_macos() {
+        assert_ne!(read_power_state().source, PowerSource::Unknown);
     }
 }

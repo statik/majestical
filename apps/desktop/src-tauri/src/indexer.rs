@@ -397,7 +397,7 @@ mod tests {
     use super::{
         BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
         SchedulerDecision, SchedulerStateOutcome, ThrottleOverride, batch_outcome_pace,
-        batch_request, pending_items, success_pace,
+        batch_request, pending_items, success_pace, total_failures,
     };
     use majestical_services::index::{
         CaptionOutcome, EmbedOutcome, IndexRunOutcome, KeyframeImageOutcome, KeyframeOutcome,
@@ -525,6 +525,22 @@ mod tests {
     /// live in each kind's own `failed` list, not in the `Result`), so a
     /// naive "Ok means keep going at full pace" reading would retry the
     /// exact same failing items forever.
+    #[test]
+    fn total_failures_counts_every_kind_including_both_transcript_stages() {
+        let mut outcome = empty_run_outcome();
+        let failure = || (std::path::PathBuf::from("/media/x"), "failed".to_string());
+        outcome.thumbs.failed.push(failure());
+        outcome.embed.failed.push(failure());
+        outcome.keyframes.failed.push(failure());
+        outcome.keyframe_images.failed.push(failure());
+        outcome.transcribe.failed.push(failure());
+        outcome.transcript_embed.failed.push(failure());
+        outcome.ocr.failed.push(failure());
+        outcome.pdf.failed.push(failure());
+        outcome.captions.failed.push(failure());
+        assert_eq!(total_failures(&outcome), 9);
+    }
+
     #[test]
     fn batch_outcome_pace_holds_and_names_the_failure_count_when_nothing_progressed() {
         let mut outcome = empty_run_outcome();

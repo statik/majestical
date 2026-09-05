@@ -1925,6 +1925,7 @@ impl IndexRunOutcome {
             || self.keyframe_images.images_written > 0
             || self.transcribe.written > 0
             || self.transcript_embed.chunks_written > 0
+            || self.transcript_embed.empty > 0
             || self.ocr.images_written > 0
             || self.ocr.videos_done > 0
             || self.ocr.keyframes_written > 0
@@ -2579,6 +2580,16 @@ mod tests {
             "decode failed".to_string(),
         ));
         assert!(!outcome.made_progress());
+    }
+
+    /// An empty transcript writes a completion marker instead of chunks,
+    /// which clears the item from the pending set just as a written chunk
+    /// would — it is progress, not a stall.
+    #[test]
+    fn made_progress_is_true_when_an_empty_transcript_was_marked_done() {
+        let mut outcome = empty_run_outcome();
+        outcome.transcript_embed.empty = 1;
+        assert!(outcome.made_progress());
     }
 
     #[test]

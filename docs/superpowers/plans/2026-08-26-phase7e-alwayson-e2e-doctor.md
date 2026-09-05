@@ -750,6 +750,26 @@ throttle change to `Paused` takes effect at the next batch boundary
 (batches are short by construction; that IS the pause latency, matching
 the ingest-cancel "between files" doctrine).
 
+> **AMENDED (2026-09-05, Task 12 spec review):** `index::run::run` returns
+> `Ok` even when every item in the batch fails (per-item failures ride
+> `outcome.*.failed`; `Err` is reserved for model-load / Lance / FTS), and
+> the status verb's `pending` comes from `plan_work`, which never reads the
+> failure report. A permanently failing item therefore stays pending, and
+> "RunFull success → immediate re-tick" would spin on it forever. Three
+> rules added to the loop: (1) a batch that made no progress
+> (`IndexRunOutcome::made_progress()` false — a new `#[must_use]` method
+> on the outcome, unit-tested per kind) holds for `TICK` and records
+> `last_error` ("batch made no progress; N item failures"); (2) after every
+> `Ok` batch the loop calls `index::update_failure_report` exactly as the
+> CLI and MCP heads do, so `failed_last_run` and doctor stay current;
+> (3) the batch runs under `catch_unwind` (ingest.rs's `panic_message`
+> made `pub(crate)`), so a panic lands in `last_error` instead of killing
+> the thread with `running` stuck true. `success_pace` gets a unit test
+> (RunFull → immediate, RunLow → `PACE_LOW`): a mutation swapping the two
+> survived the original suite. Also: `BATCH_LIMIT` caps each kind's queue
+> independently (`split_and_cap_items`), so a batch is up to 25 × kinds
+> items and pause latency is one such batch.
+
 **Commands** (one-liners over `*_impl`):
 - `scheduler_state() -> SchedulerStateOutcome`
 - `set_throttle(throttle: ThrottleOverride) -> SchedulerStateOutcome`

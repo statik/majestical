@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod config;
 pub mod ingest;
+pub mod power;
 pub mod thumb_protocol;
 
 /// Builds and runs the Tauri app.

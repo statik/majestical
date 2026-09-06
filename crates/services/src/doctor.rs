@@ -125,7 +125,12 @@ fn check_ffmpeg() -> DoctorCheck {
 /// the binary name, so `probe_binary`'s generic result is patched rather
 /// than reused verbatim.
 fn check_imagemagick() -> DoctorCheck {
-    let mut check = probe_binary("magick", &["-version"]);
+    as_imagemagick_row(probe_binary("magick", &["-version"]))
+}
+
+/// Re-labels a `magick` probe result as the `imagemagick` row: the name
+/// always, the remedy only on failure (an `Ok` row carries none).
+fn as_imagemagick_row(mut check: DoctorCheck) -> DoctorCheck {
     "imagemagick".clone_into(&mut check.name);
     if check.status == CheckStatus::Fail {
         check.remedy = Some("brew install imagemagick".to_string());
@@ -157,13 +162,7 @@ fn check_models() -> DoctorCheck {
             continue;
         }
         missing_tags.push(spec.tag);
-        for file in spec.files {
-            let path = dir.join(file.name);
-            let present = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == file.bytes);
-            if !present {
-                missing_files.push(path.display().to_string());
-            }
-        }
+        missing_files.extend(missing_model_files(spec, &dir));
     }
 
     // Gate on both vectors, not just `missing_files`: they're built from two
@@ -192,6 +191,21 @@ fn check_models() -> DoctorCheck {
         detail: format!("missing model file(s): {}", missing_files.join(", ")),
         remedy: Some(format!("run `maj model fetch {}`", only_flags.join(" "))),
     }
+}
+
+/// The files of one model that are absent or the wrong size in `dir`, as
+/// display paths. Mirrors `model_present_for`'s criterion (exact byte
+/// length) file by file, so `detail` can name what to fetch.
+fn missing_model_files(spec: &majestical_index::model::ModelSpec, dir: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    for file in spec.files {
+        let path = dir.join(file.name);
+        let present = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == file.bytes);
+        if !present {
+            missing.push(path.display().to_string());
+        }
+    }
+    missing
 }
 
 /// The per-machine local state dir exists and is writable — resolved via
@@ -555,5 +569,95 @@ mod tests {
             serde_json::to_value(CheckStatus::Fail).expect("serialize"),
             serde_json::json!("fail")
         );
+    }
+
+    /// `true`/`false` ship with every Unix; they pin the success-status
+    /// branch of the probe without depending on ffmpeg being installed.
+    #[test]
+    fn probe_binary_reports_ok_on_zero_exit_and_fail_otherwise() {
+        let ok = probe_binary("true", &[]);
+        assert_eq!(ok.status, CheckStatus::Ok);
+        assert_eq!(ok.detail, "true ran with no output");
+        assert_eq!(ok.remedy, None);
+
+        let fail = probe_binary("false", &[]);
+        assert_eq!(fail.status, CheckStatus::Fail);
+        assert!(
+            fail.detail.starts_with("false exited with"),
+            "{}",
+            fail.detail
+        );
+        assert_eq!(fail.remedy.as_deref(), Some("brew install false"));
+    }
+
+    #[test]
+    fn probe_binary_reports_fail_when_the_binary_is_absent() {
+        let check = probe_binary("majestical-no-such-binary-2026", &[]);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.starts_with("could not run"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn imagemagick_row_is_renamed_and_only_a_failure_gets_the_remedy() {
+        let ok = as_imagemagick_row(DoctorCheck {
+            name: "magick".to_string(),
+            status: CheckStatus::Ok,
+            detail: "Version: ImageMagick 7".to_string(),
+            remedy: None,
+        });
+        assert_eq!(ok.name, "imagemagick");
+        assert_eq!(ok.remedy, None);
+
+        let fail = as_imagemagick_row(DoctorCheck {
+            name: "magick".to_string(),
+            status: CheckStatus::Fail,
+            detail: "could not run magick".to_string(),
+            remedy: Some("brew install magick".to_string()),
+        });
+        assert_eq!(fail.name, "imagemagick");
+        assert_eq!(fail.remedy.as_deref(), Some("brew install imagemagick"));
+    }
+
+    /// A file of the wrong length counts as missing, exactly as
+    /// `model_present_for` would judge it; a right-length file does not.
+    #[test]
+    fn missing_model_files_uses_exact_byte_length() {
+        use majestical_index::model::ALL_MODELS;
+        let spec = ALL_MODELS.first().expect("at least one model spec");
+        let file = spec.files.first().expect("at least one file");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let absent = missing_model_files(spec, dir.path());
+        assert_eq!(absent.len(), spec.files.len(), "{absent:?}");
+
+        std::fs::write(dir.path().join(file.name), vec![0u8; 1]).expect("write short file");
+        let short = missing_model_files(spec, dir.path());
+        assert!(
+            short.iter().any(|p| p.ends_with(file.name)),
+            "wrong-length file must be reported: {short:?}"
+        );
+
+        let len = usize::try_from(file.bytes).expect("fixture size fits usize");
+        std::fs::write(dir.path().join(file.name), vec![0u8; len]).expect("write full file");
+        let exact = missing_model_files(spec, dir.path());
+        assert!(
+            !exact.iter().any(|p| p.ends_with(file.name)),
+            "right-length file must not be reported: {exact:?}"
+        );
+    }
+
+    /// On macOS both OCR and PDF extraction are compiled in, so the platform
+    /// row is `Ok`; this pins the availability polarity. Other platforms
+    /// take the `Warn` branch, which this suite does not run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn platform_row_is_ok_on_macos() {
+        let check = check_platform();
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.remedy, None);
     }
 }

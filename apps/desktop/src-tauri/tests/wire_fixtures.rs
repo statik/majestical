@@ -22,6 +22,7 @@ use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
 use majestical_services::catalog::{AssetDetail, AssetInstance, AssetVerification};
+use majestical_services::doctor::{CheckStatus, DoctorCheck, DoctorOutcome};
 use majestical_services::ingest::{
     IngestPlanOutcome, IngestRun, UnfinishedRun, UnfinishedRunsOutcome,
 };
@@ -645,6 +646,41 @@ fn scheduler_state_fixture() {
     check_or_update(
         "scheduler_state",
         &serde_json::to_value(&scheduler_state).expect("serialize"),
+    );
+}
+
+/// One row per status — `Ok` with no remedy, `Warn` WITH a remedy (the real
+/// `check_catalog` row when no catalog is selected, verbatim), and `Fail`
+/// with a remedy — plus a notice, so every optional field on the TS side
+/// appears both present and absent in one fixture.
+#[test]
+fn doctor_outcome_fixture() {
+    let doctor_outcome = DoctorOutcome {
+        checks: vec![
+            DoctorCheck {
+                name: "ffmpeg".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ffmpeg 7.1 at /opt/homebrew/bin/ffmpeg".to_string(),
+                remedy: None,
+            },
+            DoctorCheck {
+                name: "catalog".to_string(),
+                status: CheckStatus::Warn,
+                detail: "no catalog selected".to_string(),
+                remedy: Some("pass --catalog or run `maj catalog init`".to_string()),
+            },
+            DoctorCheck {
+                name: "models".to_string(),
+                status: CheckStatus::Fail,
+                detail: "missing model file(s): /fixtures/models/clip.onnx".to_string(),
+                remedy: Some("run `maj model fetch --only clip`".to_string()),
+            },
+        ],
+        notices: vec!["a notice the doctor sweep collected".to_string()],
+    };
+    check_or_update(
+        "doctor_outcome",
+        &serde_json::to_value(&doctor_outcome).expect("serialize"),
     );
 }
 

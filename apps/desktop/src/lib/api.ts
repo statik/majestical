@@ -184,6 +184,31 @@ export interface AppStatus {
   catalog_ready: boolean;
 }
 
+/** `majestical_services::doctor::CheckStatus`, serialized snake_case. */
+export type CheckStatus = "ok" | "warn" | "fail";
+
+/**
+ * `majestical_services::doctor::DoctorCheck`. `remedy` is absent on an `Ok`
+ * row and present on `Warn`/`Fail` — though not every `Warn` row carries one
+ * (a missing catalog has nothing to remedy on its own).
+ */
+export interface DoctorCheck {
+  name: string;
+  status: CheckStatus;
+  detail: string;
+  remedy?: string;
+}
+
+/**
+ * `majestical_services::doctor::DoctorOutcome` — what `doctorReport` returns.
+ * Runs even before a catalog is chosen: the catalog-dependent checks report
+ * `Warn` rows instead of the command failing.
+ */
+export interface DoctorOutcome {
+  checks: DoctorCheck[];
+  notices?: string[];
+}
+
 /** `majestical_services::tags::TagRow` */
 export interface TagRow {
   tag: string;
@@ -487,6 +512,7 @@ export interface IngestState {
  */
 export const api = {
   appStatus: () => invoke<AppStatus>("app_status"),
+  doctorReport: () => invoke<DoctorOutcome>("doctor_report"),
   searchAssets: (query: string) =>
     invoke<SearchOutcome>("search_assets", { query }),
   runSavedSearch: (name: string) =>

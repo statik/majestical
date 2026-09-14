@@ -29,6 +29,13 @@ describe("Majestical desktop — Settings flow", () => {
   });
 
   it("reports the selected fixture catalog as Ok", async () => {
-    await expect($(".settings-check:nth-child(5) .settings-pill")).toHaveText("Ok");
+    // Looked up by name, not position, so a check services inserts ahead of
+    // it does not silently retarget this assertion.
+    const names = await $$(".settings-check-name").map((el) => el.getText());
+    const index = names.indexOf("catalog");
+    expect(index).toBeGreaterThanOrEqual(0);
+    const pill = await $$(".settings-check .settings-pill")[index];
+    if (pill === undefined) throw new Error("catalog row has no pill");
+    await expect(pill).toHaveText("Ok");
   });
 });

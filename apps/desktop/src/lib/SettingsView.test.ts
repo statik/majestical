@@ -91,10 +91,12 @@ test('"Run checks again" re-invokes doctor_report', async () => {
 
 test("a rejected command renders the error through Notices, not a blank panel", async () => {
   const message = "no catalog selected yet — initialize or choose one first";
-  mockCommands({ doctor_report: () => rejectCommand(message) });
+  const notice = "notice: the failing call still collected this";
+  mockCommands({ doctor_report: () => rejectCommand(message, [notice]) });
   render(SettingsView);
 
   const alert = await screen.findByRole("alert");
   expect(alert.textContent).toBe(message);
+  expect(await screen.findByText(notice)).toBeTruthy();
   expect(screen.queryAllByRole("listitem")).toEqual([]);
 });

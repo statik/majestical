@@ -498,6 +498,13 @@ git commit -m "feat: doctor_report command with wire fixtures and parity row"
 - [ ] **Step 3:** sidebar entry `data-e2e="nav-settings"`; extend the e2e
   smoke's surface loop with Settings (assert a check row renders — the
   real app's doctor runs against the fixture catalog).
+
+> **AMENDED (2026-09-14, Task 9 execution):** the smoke spec's `describe`
+> callback sits at the e2e project's 50-line `max-lines-per-function` cap,
+> so the Settings check lives in its own `specs/settings.e2e.ts` (the
+> chunk 3 per-surface pattern) rather than inside the smoke loop. Same
+> assertion: open Settings, at least one `.settings-check` row renders
+> against the fixture catalog. `smoke.e2e.ts` is untouched.
 - [ ] **Step 4:** run `pnpm -C apps/desktop test` + oxlint + e2e locally —
   PASS. Commit.
 
@@ -820,6 +827,23 @@ git commit -m "feat: background index scheduler with power-aware policy"
 git add docs/superpowers/specs/mockups/2026-08-26-phase7e/tray-menu.html
 git commit -m "docs: phase 7E tray menu mockup"
 ```
+
+> **AMENDED (2026-09-14, user approved the mockup as-is; these are the
+> pinned strings and decisions Task 14 implements):** status line by
+> `SchedulerStateOutcome`: `decision` null → "Starting…"; hold/no_pending_work
+> → "Idle"; run_full → "Indexing — {n} items pending"; run_low → "Indexing
+> slowly — {n} items pending" plus a second line ONLY when `throttle` is
+> auto: `power.source` battery → "On battery", unknown → "Power source
+> unknown"; hold/paused → "Paused" (no pending count); hold/low_power_mode →
+> "Paused (Low Power Mode)" plus "{n} items pending" when n > 0;
+> `last_error` present → extra clickable line "Last batch failed — open
+> Health…" (same action as Health…); no catalog selected → "No catalog
+> selected" with the radio group disabled. Pluralize: "1 item pending".
+> Items: radio Auto/Paused/Low/Full (checked = `throttle`), "Open
+> Majestical", "Health…", "Quit Majestical". Icon: idle / indexing / paused,
+> attention tint when `last_error` is present. **Wire gap resolved:** the
+> outcome does NOT gain a field; `menu_model` takes `catalog_selected: bool`
+> as a second input read from `AppState` at rebuild time.
 
 ### Task 14: `tray.rs` — icon, menu, hide-to-tray
 

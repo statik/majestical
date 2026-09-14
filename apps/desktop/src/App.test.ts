@@ -11,6 +11,7 @@ import {
   stubManifest,
   stubMatchMedia,
 } from "./lib/test-support";
+import doctorOutcome from "./lib/fixtures/doctor_outcome.json";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
@@ -89,6 +90,7 @@ function mockCatalog(volumeLabels: string[]) {
       })),
     }),
     browse_list: () => ({ count: 1, folder_count: 1, results: [hit] }),
+    doctor_report: () => doctorOutcome,
     list_para: () => ({
       nodes: [
         { id: "01PROJECT", kind: "project", name: "client-x", archived: false },
@@ -192,6 +194,7 @@ test("the sidebar offers exactly the surfaces this phase ships, in order", async
     "Ingest",
     "Organize",
     "Volumes",
+    "Settings",
   ]);
 });
 
@@ -266,6 +269,25 @@ test("a browse card opens the inspector the same way a search hit does", async (
   await waitFor(() =>
     expect(container.querySelector(".inspector")).not.toBeNull(),
   );
+});
+
+test("the settings surface swaps in with the doctor's health rows", async () => {
+  mockCatalog(["Card"]);
+  const { container } = render(App);
+
+  const settings = await screen.findByRole("button", { name: "Settings" });
+  await userEvent.click(settings);
+
+  expect(await screen.findByRole("heading", { name: "Health" })).toBeTruthy();
+  // The sidebar's own nav entries are list items too, so count check rows
+  // by their class rather than by role.
+  await waitFor(() =>
+    expect(container.querySelectorAll(".settings-check")).toHaveLength(
+      doctorOutcome.checks.length,
+    ),
+  );
+  expect(screen.queryByRole("searchbox")).toBeNull();
+  expect(settings.getAttribute("aria-current")).toBe("page");
 });
 
 test("the organize surface swaps in with both of its columns", async () => {

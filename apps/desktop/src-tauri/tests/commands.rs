@@ -498,6 +498,32 @@ fn list_saved_searches_carries_notices() {
     });
 }
 
+/// Doctor is the one command that must run before a catalog is selected:
+/// with `None` it reports rather than errors, and the catalog-dependent rows
+/// say so as `Warn`. Pins the "do not gate on `AppState`" rule.
+#[test]
+fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
+    with_state_dir(|| {
+        let outcome = majestical_desktop::commands::doctor_report_impl(None)
+            .expect("doctor must run with no catalog selected");
+        let status_of = |name: &str| {
+            outcome
+                .checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` row"))
+                .status
+        };
+        for row in ["catalog", "state_dir", "blob_residue"] {
+            assert_eq!(
+                status_of(row),
+                majestical_services::doctor::CheckStatus::Warn,
+                "{row} must warn without a catalog"
+            );
+        }
+    });
+}
+
 #[test]
 fn app_status_reports_no_catalog_then_missing_then_ready() {
     with_state_dir(|| {

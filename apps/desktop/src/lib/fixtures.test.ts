@@ -6,7 +6,9 @@ import type {
   AssignOutcome,
   BrowseListOutcome,
   BrowseTreeOutcome,
+  CheckStatus,
   CommandError,
+  DoctorOutcome,
   FinishedIngest,
   IngestPlanOutcome,
   IngestProgress,
@@ -32,6 +34,7 @@ import assignOutcome from "./fixtures/assign_outcome.json";
 import browseList from "./fixtures/browse_list.json";
 import browseTree from "./fixtures/browse_tree.json";
 import commandError from "./fixtures/command_error.json";
+import doctorOutcome from "./fixtures/doctor_outcome.json";
 import ingestPlan from "./fixtures/ingest_plan.json";
 import ingestProgress from "./fixtures/ingest_progress.json";
 import ingestRun from "./fixtures/ingest_run.json";
@@ -61,6 +64,13 @@ const typedAssetDetail: AssetDetail = assetDetail as AssetDetail;
 const typedVolumesOutcome: VolumesOutcome = volumesOutcome;
 const typedSavedSearches: SavedSearches = savedSearches;
 const typedCommandError: CommandError = commandError;
+// `DoctorCheck.status` is a string-literal union (`CheckStatus`); JSON
+// module inference widens it to `string`, same reason `AssetDetail` above
+// needs a cast rather than a plain assignment.
+const typedDoctorOutcome: DoctorOutcome = doctorOutcome as DoctorOutcome;
+// The annotation is the check: a literal the `CheckStatus` union drops fails
+// `tsc` here, which the cast above would otherwise hide.
+const allCheckStatuses: CheckStatus[] = ["ok", "warn", "fail"];
 const typedBrowseTree: BrowseTreeOutcome = browseTree;
 const typedBrowseList: BrowseListOutcome = browseList;
 const typedTagsListOutcome: TagsListOutcome = tagsListOutcome;
@@ -242,5 +252,17 @@ describe("scheduler state fixtures", () => {
     }
     expect(typedSchedulerStateHeld.decision.hold_reason).toBe("paused");
     expect(typedSchedulerStateHeld.last_error?.length).toBeGreaterThan(0);
+  });
+});
+
+describe("doctor outcome fixture", () => {
+  it("carries one row per status, a remedy on warn and fail, and a notice", () => {
+    const statuses = typedDoctorOutcome.checks.map((c) => c.status);
+    expect(statuses).toEqual(allCheckStatuses);
+    const [ok, warn, fail] = typedDoctorOutcome.checks;
+    expect(ok?.remedy).toBeUndefined();
+    expect(warn?.remedy?.length).toBeGreaterThan(0);
+    expect(fail?.remedy?.length).toBeGreaterThan(0);
+    expect(typedDoctorOutcome.notices?.length).toBeGreaterThan(0);
   });
 });

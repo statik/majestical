@@ -1,0 +1,24 @@
+{
+  "checks": [
+    {
+      "detail": "ffmpeg 7.1 at /opt/homebrew/bin/ffmpeg",
+      "name": "ffmpeg",
+      "status": "ok"
+    },
+    {
+      "detail": "no catalog selected",
+      "name": "catalog",
+      "remedy": "pass --catalog or run `maj catalog init`",
+      "status": "warn"
+    },
+    {
+      "detail": "missing model file(s): /fixtures/models/clip.onnx",
+      "name": "models",
+      "remedy": "run `maj model fetch --only clip`",
+      "status": "fail"
+    }
+  ],
+  "notices": [
+    "a notice the doctor sweep collected"
+  ]
+}

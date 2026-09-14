@@ -10,11 +10,18 @@
   import Notices from "./lib/Notices.svelte";
   import OrganizeView from "./lib/OrganizeView.svelte";
   import SearchView from "./lib/SearchView.svelte";
+  import SettingsView from "./lib/SettingsView.svelte";
   import UpdateBanner from "./lib/UpdateBanner.svelte";
   import VolumesView from "./lib/VolumesView.svelte";
   import Welcome from "./lib/Welcome.svelte";
 
-  type Surface = "search" | "browse" | "ingest" | "organize" | "volumes";
+  type Surface =
+    | "search"
+    | "browse"
+    | "ingest"
+    | "organize"
+    | "volumes"
+    | "settings";
 
   /** How often the shell re-asks whether a stopped run has finished
    *  finishing — the sweep and the MHL generations land after the copy
@@ -198,6 +205,13 @@
               onclick={() => show("volumes")}>Volumes</button
             >
           </li>
+          <li>
+            <button
+              data-e2e="nav-settings"
+              aria-current={surface === "settings" ? "page" : undefined}
+              onclick={() => show("settings")}>Settings</button
+            >
+          </li>
         </ul>
         <p class="catalog-path" title={status.catalog_path}>
           {status.catalog_path}
@@ -218,8 +232,10 @@
         <!-- No `onselect`: Organize manages the taxonomy, and nothing on it
              addresses an asset, so it never opens the inspector. -->
         <OrganizeView />
-      {:else}
+      {:else if surface === "volumes"}
         <VolumesView />
+      {:else}
+        <SettingsView />
       {/if}
       <Inspector assetId={selected} />
     </div>

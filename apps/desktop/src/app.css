@@ -1200,3 +1200,105 @@ main > .error {
   font: inherit;
   cursor: pointer;
 }
+
+/* Settings. Its own prefix, the same way ingest-/org- do for their
+   surfaces — see the naming note above `.volume-table`. `.settings-section`
+   is a wrapper the surface can hold more than one of (the doctor health
+   panel today; always-on joins it as a sibling section later), so its
+   spacing lives on the wrapper rather than the panel it currently holds
+   alone. */
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1.75rem;
+  padding-bottom: 1.75rem;
+  border-bottom: 1px solid var(--edge);
+}
+
+.settings-section:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.settings-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.settings-section-head h3 {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.settings-section-sub {
+  margin: -0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.settings-checks {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-check {
+  display: grid;
+  grid-template-columns: 4.2rem minmax(7rem, 10rem) 1fr;
+  gap: 0.3rem 0.6rem;
+  align-items: baseline;
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--edge);
+}
+
+.settings-checks li:first-child {
+  border-top: 0;
+}
+
+.settings-check-name {
+  font-weight: 600;
+}
+
+.settings-check-detail {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.settings-check-remedy {
+  grid-column: 2 / -1;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.settings-pill {
+  justify-self: start;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.settings-pill-ok {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  color: var(--ok);
+}
+
+.settings-pill-warn {
+  border-color: color-mix(in srgb, var(--attention) 45%, transparent);
+  color: var(--attention);
+}
+
+.settings-pill-fail {
+  border-color: color-mix(in srgb, var(--alert) 45%, transparent);
+  color: var(--alert);
+}

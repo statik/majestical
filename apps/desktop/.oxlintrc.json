@@ -79,7 +79,7 @@
       // counting here.
       "files": ["src/App.svelte"],
       "rules": {
-        "import/max-dependencies": ["warn", { "max": 12 }]
+        "import/max-dependencies": ["warn", { "max": 13 }]
       }
     },
     {

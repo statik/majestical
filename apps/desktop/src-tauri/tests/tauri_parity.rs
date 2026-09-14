@@ -196,6 +196,30 @@ fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("maj search --json prints one JSON object")
 }
 
+/// Runs `maj doctor --catalog <catalog> --json` and parses its one JSON
+/// line. Unlike [`cli_json`], this does NOT pass the top-level `--catalog`:
+/// `Cmd::Doctor` has its own `--catalog` flag, independent of (and parsed in
+/// a different scope from) the top-level one `require_catalog_and_machine_id`
+/// resolves for every other verb — see `Cmd::Doctor`'s own doc in
+/// `crates/cli/src/main.rs`. Passing the top-level flag here would set a
+/// field `cmd_doctor` never reads, silently comparing against a
+/// no-catalog-selected doctor run instead of `catalog`'s.
+#[cfg(test)]
+fn cli_doctor_json(maj: &Path, catalog: &Path) -> serde_json::Value {
+    let output = std::process::Command::new(maj)
+        .args(["doctor", "--catalog"])
+        .arg(catalog)
+        .arg("--json")
+        .output()
+        .expect("run maj doctor");
+    assert!(
+        output.status.success(),
+        "maj doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("maj doctor --json prints one JSON object")
+}
+
 /// Runs `maj <args>` against `cfg`'s catalog and parses its one JSON line.
 /// `MAJ_STATE_DIR` comes from the inherited environment — [`with_state_dir`]
 /// has already pointed it at this test's tempdir.
@@ -356,6 +380,28 @@ fn list_unfinished_ingests_matches_cli_json() {
             cli_json(&maj, &cfg, &["ingest", "unfinished", "--json"]),
             "list_unfinished_ingests and `maj ingest unfinished --json` must render the same \
              document"
+        );
+    });
+}
+
+/// `doctor_report` against `maj doctor --catalog <catalog> --json`: the
+/// whole payload, including the environment rows (ffmpeg/imagemagick/models/
+/// platform) that don't depend on the catalog at all — both binaries run on
+/// this machine, so those rows must agree byte for byte too.
+#[test]
+fn doctor_matches_cli_json() {
+    let Some(maj) = maj_or_skip("doctor vs `maj doctor --json`") else {
+        return;
+    };
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path().join("cat"));
+        let outcome =
+            majestical_desktop::commands::doctor_report_impl(Some(&cfg)).expect("command");
+        assert_eq!(
+            serde_json::to_value(&outcome).expect("serialize command outcome"),
+            cli_doctor_json(&maj, &cfg.catalog),
+            "doctor_report and `maj doctor --json` must render the same document"
         );
     });
 }

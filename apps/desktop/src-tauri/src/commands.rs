@@ -28,6 +28,7 @@ use crate::ingest::{
 use majestical_services::app::FsApp;
 use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseTreeOutcome};
 use majestical_services::catalog::AssetDetail;
+use majestical_services::doctor::DoctorOutcome;
 use majestical_services::error::ServiceError;
 use majestical_services::ingest::{IngestPlanOutcome, UnfinishedRunsOutcome};
 use majestical_services::para::{self, ArchiveOutcome, ParaOutcome};
@@ -195,6 +196,21 @@ pub fn app_status_impl(cfg: Option<&CatalogCfg>) -> AppStatus {
         catalog_path: cfg.catalog.display().to_string(),
         catalog_ready: majestical_services::catalog::ensure_catalog(&cfg.catalog).is_ok(),
     }
+}
+
+/// Diagnostic sweep of the environment and, if one is selected, the current
+/// catalog. `None` — no catalog chosen yet — is passed straight through to
+/// [`majestical_services::doctor::doctor`], which reports it as `Warn` rows
+/// rather than requiring one: doctor is the one command that must work
+/// before catalog selection, same as `maj doctor` at the CLI head.
+///
+/// # Errors
+/// In practice never; see the services module's own doc for why.
+pub fn doctor_report_impl(cfg: Option<&CatalogCfg>) -> Result<DoctorOutcome, CommandError> {
+    let req = majestical_services::doctor::DoctorRequest {
+        catalog: cfg.map(|c| c.catalog.clone()),
+    };
+    Ok(majestical_services::doctor::doctor(&req)?)
 }
 
 /// `limit` of `None` means [`DEFAULT_LIMIT`].
@@ -610,6 +626,21 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command]
 pub fn app_status(state: State<'_, AppState>) -> AppStatus {
     app_status_impl(selected_catalog(&state).as_ref())
+}
+
+/// Diagnostic sweep of the environment and (if selected) the current
+/// catalog. Runs even when no catalog has been chosen yet — see
+/// [`doctor_report_impl`].
+///
+/// # Errors
+/// In practice never; see [`doctor_report_impl`]'s own doc for why.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn doctor_report(state: State<'_, AppState>) -> Result<DoctorOutcome, CommandError> {
+    doctor_report_impl(selected_catalog(&state).as_ref())
 }
 
 /// Searches the catalog. `limit` defaults to 50 results.

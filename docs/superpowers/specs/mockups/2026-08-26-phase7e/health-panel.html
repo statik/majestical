@@ -1,0 +1,295 @@
+<title>Majestical — Settings (Health)</title>
+<style>
+  /* Custom properties cribbed from apps/desktop/src/app.css's :root block —
+     same names, same values, so this reads as a screenshot of the app
+     rather than a mockup with its own palette. */
+  :root {
+    color-scheme: light dark;
+    --edge: color-mix(in srgb, currentcolor 15%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --muted: color-mix(in srgb, currentcolor 60%, transparent);
+    --alert: light-dark(#b3261e, #f2b8b5);
+    --ok: light-dark(#1a7f37, #6fce8a);
+    --attention: light-dark(#b45309, #e8a33d);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: Canvas;
+    color: CanvasText;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+  }
+  /* The chrome around the screenshot itself — not part of the app, just
+     framing so the surface reads clearly against the artifact page. */
+  .frame {
+    max-width: 960px;
+    margin: 2rem auto;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 8px 28px rgb(0 0 0 / 12%);
+  }
+  .titlebar {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    padding: .5rem .75rem;
+    border-bottom: 1px solid var(--edge);
+    background: var(--sunken);
+  }
+  .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: var(--edge); }
+  .titlebar span { margin-left: .5rem; color: var(--muted); font-size: .75rem; }
+
+  /* Below this line: the real app shell/sidebar/surface classes, laid out
+     exactly as apps/desktop/src/app.css defines them. */
+  .shell { display: grid; grid-template-columns: 220px 1fr 0; height: 640px; }
+  .sidebar { display: flex; flex-direction: column; gap: 1rem; padding: 1rem; overflow: hidden; background: var(--sunken); border-right: 1px solid var(--edge); }
+  .brand { margin: 0; font-size: 1rem; letter-spacing: .04em; text-transform: uppercase; }
+  .surfaces { flex: 1; margin: 0; padding: 0; list-style: none; }
+  .surfaces button { width: 100%; padding: .35rem .5rem; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .surfaces button[aria-current] { background: var(--sunken); font-weight: 600; }
+  .catalog-path { margin: 0; overflow-wrap: anywhere; color: var(--muted); font-size: .75rem; }
+  .surface { padding: 1rem; overflow-y: auto; }
+  .surface-title { margin: 0 0 .75rem; font-size: 1rem; }
+  .notice { margin: .25rem 0 0; color: var(--muted); }
+  .ctl-btn {
+    flex: none;
+    padding: .25rem .6rem;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .8rem;
+    cursor: pointer;
+  }
+
+  /* Settings surface — new this task, so it takes its own prefix, the same
+     way ingest-/org-/browse- do for their surfaces. */
+  .settings-section {
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+    margin-bottom: 1.75rem;
+    padding-bottom: 1.75rem;
+    border-bottom: 1px solid var(--edge);
+  }
+  .settings-section:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  .settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+  .settings-section-head h3 { margin: 0; font-size: .85rem; }
+  .settings-section-sub { margin: -.25rem 0 0; color: var(--muted); font-size: .75rem; }
+
+  .settings-checks { display: flex; flex-direction: column; gap: 0; margin: 0; padding: 0; list-style: none; }
+  .settings-check {
+    display: grid;
+    grid-template-columns: 4.2rem minmax(7rem, 10rem) 1fr;
+    gap: .3rem .6rem;
+    align-items: baseline;
+    padding: .5rem 0;
+    border-top: 1px solid var(--edge);
+  }
+  .settings-checks li:first-child { border-top: 0; }
+  .settings-check-name { font-weight: 600; }
+  .settings-check-detail { overflow-wrap: anywhere; color: var(--muted); }
+  .settings-check-remedy {
+    grid-column: 2 / -1;
+    overflow-wrap: anywhere;
+    color: var(--muted);
+    font-size: .8rem;
+  }
+  .settings-check-remedy code {
+    padding: .05rem .3rem;
+    border-radius: 3px;
+    background: var(--sunken);
+    font-size: .78rem;
+  }
+
+  .settings-pill {
+    justify-self: start;
+    padding: .05rem .45rem;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+  }
+  .settings-pill-ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); color: var(--ok); }
+  .settings-pill-warn { border-color: color-mix(in srgb, var(--attention) 45%, transparent); color: var(--attention); }
+  .settings-pill-fail { border-color: color-mix(in srgb, var(--alert) 45%, transparent); color: var(--alert); }
+
+  /* The no-catalog variant: a smaller, visually subordinate panel — same
+     row shape, fewer rows, framed to read as "the other state" rather
+     than a second surface. */
+  .settings-variant {
+    margin-top: .5rem;
+    padding: .65rem .75rem;
+    border: 1px dashed var(--edge);
+    border-radius: 6px;
+  }
+  .settings-variant-label {
+    margin: 0 0 .35rem;
+    color: var(--muted);
+    font-size: .7rem;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+
+  /* Always-on placeholder — deliberately inert (disabled controls, muted
+     text) and set off with an amber edge, the same visual grammar the real
+     app already uses for "something not settled yet" (ingest-resume's
+     left border in app.css). */
+  .settings-future {
+    padding: .6rem .75rem;
+    border: 1px solid var(--edge);
+    border-left: 3px solid var(--attention);
+    border-radius: 6px;
+    background: var(--sunken);
+  }
+  .settings-future-badge {
+    display: inline-block;
+    margin-bottom: .5rem;
+    padding: .1rem .5rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--attention) 20%, transparent);
+    color: var(--attention);
+    font-size: .68rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .settings-throttle { display: flex; flex-wrap: wrap; gap: 1rem; margin: .5rem 0; }
+  .settings-radio { display: flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .85rem; }
+  .settings-toggle-row { display: flex; align-items: center; gap: .5rem; color: var(--muted); font-size: .85rem; }
+</style>
+
+<div class="frame">
+  <div class="titlebar"><i></i><i></i><i></i><span>Majestical — Settings</span></div>
+  <main class="shell">
+    <nav class="sidebar">
+      <h2 class="brand">Majestical</h2>
+      <ul class="surfaces">
+        <li><button type="button">Search</button></li>
+        <li><button type="button">Browse</button></li>
+        <li><button type="button">Ingest</button></li>
+        <li><button type="button">Organize</button></li>
+        <li><button type="button">Volumes</button></li>
+        <li><button type="button" aria-current="page">Settings</button></li>
+      </ul>
+      <p class="catalog-path">~/Catalogs/studio.maj</p>
+    </nav>
+
+    <div class="surface">
+      <h2 class="surface-title">Settings</h2>
+
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <div>
+            <h3>Health</h3>
+            <p class="settings-section-sub">
+              What <code>maj doctor</code> sees right now, in the order it checks.
+            </p>
+          </div>
+          <button type="button" class="ctl-btn">Run checks again</button>
+        </div>
+
+        <ul class="settings-checks">
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-ok">Ok</span>
+            <span class="settings-check-name">ffmpeg</span>
+            <span class="settings-check-detail">ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers</span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-ok">Ok</span>
+            <span class="settings-check-name">imagemagick</span>
+            <span class="settings-check-detail">Version: ImageMagick 7.1.1-39 Q16-HDRI aarch64 20240909</span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-fail">Fail</span>
+            <span class="settings-check-name">models</span>
+            <span class="settings-check-detail">missing model file(s): /Users/emurphy/Library/Caches/majestical/models/siglip2/model.safetensors</span>
+            <span class="settings-check-remedy">remedy: run <code>maj model fetch --only siglip2</code></span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-ok">Ok</span>
+            <span class="settings-check-name">state_dir</span>
+            <span class="settings-check-detail">writable at /Users/emurphy/Library/Application Support/majestical/state/9f2a1c</span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-ok">Ok</span>
+            <span class="settings-check-name">catalog</span>
+            <span class="settings-check-detail">opens and syncs at /Users/emurphy/Catalogs/studio.maj</span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-warn">Warn</span>
+            <span class="settings-check-name">blob_residue</span>
+            <span class="settings-check-detail">2 orphaned temp file(s), e.g. /Users/emurphy/Catalogs/studio.maj/blobs/ab/abc123/.tmp-4821-0, /Users/emurphy/Catalogs/studio.maj/blobs/cd/def456/.tmp-4821-1</span>
+            <span class="settings-check-remedy">remedy: delete the leftover temp files (safe while nothing is indexing or syncing)</span>
+          </li>
+          <li class="settings-check">
+            <span class="settings-pill settings-pill-ok">Ok</span>
+            <span class="settings-check-name">platform</span>
+            <span class="settings-check-detail">macOS — OCR and PDF text extraction available</span>
+          </li>
+        </ul>
+
+        <!-- DoctorOutcome.notices, rendered the same way every other
+             surface's Notices component draws them: muted body text, none
+             hidden or collapsed. -->
+        <p class="notice">notice: migrated a legacy run journal into runs/ on catalog open</p>
+
+        <div class="settings-variant">
+          <p class="settings-variant-label">Before a catalog is selected</p>
+          <ul class="settings-checks">
+            <li class="settings-check">
+              <span class="settings-pill settings-pill-warn">Warn</span>
+              <span class="settings-check-name">state_dir</span>
+              <span class="settings-check-detail">no catalog selected</span>
+            </li>
+            <li class="settings-check">
+              <span class="settings-pill settings-pill-warn">Warn</span>
+              <span class="settings-check-name">catalog</span>
+              <span class="settings-check-detail">no catalog selected</span>
+              <span class="settings-check-remedy">remedy: pass --catalog or run <code>maj catalog init</code></span>
+            </li>
+            <li class="settings-check">
+              <span class="settings-pill settings-pill-warn">Warn</span>
+              <span class="settings-check-name">blob_residue</span>
+              <span class="settings-check-detail">no catalog selected</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-future">
+          <span class="settings-future-badge">Arrives with chunk 6</span>
+          <div class="settings-section-head">
+            <div>
+              <h3>Always-on</h3>
+              <p class="settings-section-sub">
+                Menu-bar tray, power-aware indexing throttle, start at login. Shown
+                here for final shape only — none of this is wired up in this chunk.
+              </p>
+            </div>
+          </div>
+
+          <p class="settings-section-sub" style="margin-top: .75rem;">Indexing throttle</p>
+          <div class="settings-throttle">
+            <label class="settings-radio"><input type="radio" name="throttle" checked disabled> Auto</label>
+            <label class="settings-radio"><input type="radio" name="throttle" disabled> Paused</label>
+            <label class="settings-radio"><input type="radio" name="throttle" disabled> Low</label>
+            <label class="settings-radio"><input type="radio" name="throttle" disabled> Full</label>
+          </div>
+
+          <div class="settings-toggle-row">
+            <input type="checkbox" disabled>
+            <label>Start at login</label>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>

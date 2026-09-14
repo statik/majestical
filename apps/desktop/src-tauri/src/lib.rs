@@ -84,6 +84,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_status,
+            commands::doctor_report,
             commands::search_assets,
             commands::get_asset,
             commands::list_volumes,

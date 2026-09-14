@@ -1,0 +1,253 @@
+<title>Majestical — Tray menu states</title>
+<style>
+  /* Same custom properties as health-panel.html (cribbed from
+     apps/desktop/src/app.css) so the two mockups read as one set. */
+  :root {
+    color-scheme: light dark;
+    --edge: color-mix(in srgb, currentcolor 15%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --muted: color-mix(in srgb, currentcolor 60%, transparent);
+    --alert: light-dark(#b3261e, #f2b8b5);
+    --ok: light-dark(#1a7f37, #6fce8a);
+    --attention: light-dark(#b45309, #e8a33d);
+    --accent: light-dark(#0b57d0, #a8c7fa);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1rem 3rem;
+    background: Canvas;
+    color: CanvasText;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+  }
+  .page { max-width: 1040px; margin: 0 auto; }
+  h1 { margin: 0 0 .25rem; font-size: 1.15rem; }
+  .lede { margin: 0 0 1.5rem; color: var(--muted); max-width: 70ch; }
+  h2 { margin: 2rem 0 .75rem; font-size: .95rem; }
+
+  /* One tray menu per state, laid out side by side. This is an HTML
+     approximation of an NSMenu: the shapes and wording are the point,
+     not pixel fidelity. */
+  .states { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1.25rem; }
+  .state { display: flex; flex-direction: column; gap: .5rem; }
+  .state-label { margin: 0; color: var(--muted); font-size: .72rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+  .state-when { margin: 0; color: var(--muted); font-size: .75rem; line-height: 1.35; }
+  .state-when code { padding: .05rem .3rem; border-radius: 3px; background: var(--sunken); font-size: .72rem; }
+
+  /* The menu-bar strip with the tray icon, then the dropped-down menu. */
+  .menubar { display: flex; align-items: center; justify-content: flex-end; gap: .6rem; padding: .25rem .6rem; border: 1px solid var(--edge); border-bottom: 0; border-radius: 6px 6px 0 0; background: var(--sunken); font-size: .75rem; color: var(--muted); }
+  .tray-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 4px; font-size: .7rem; font-weight: 700; color: CanvasText; }
+  .tray-icon-idle { border: 1.5px solid currentcolor; }
+  .tray-icon-indexing { border: 1.5px solid currentcolor; background: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .tray-icon-paused { border: 1.5px dashed currentcolor; opacity: .6; }
+  .tray-icon-attention { border: 1.5px solid var(--attention); color: var(--attention); }
+
+  .menu { margin: 0; padding: .3rem 0; list-style: none; border: 1px solid var(--edge); border-radius: 0 0 8px 8px; background: Canvas; box-shadow: 0 8px 24px rgb(0 0 0 / 14%); }
+  .menu li { display: flex; align-items: center; gap: .5rem; padding: .3rem .9rem .3rem .6rem; line-height: 1.3; }
+  .menu li.status { color: var(--muted); cursor: default; }
+  .menu li.status.attention { color: var(--attention); }
+  .menu li.sep { padding: 0; margin: .3rem 0; border-top: 1px solid var(--edge); }
+  .menu li.item { cursor: default; }
+  .menu li.item:hover { background: var(--sunken); }
+  .menu li.item.disabled { color: var(--muted); }
+  .menu li .check { width: .9rem; text-align: center; font-size: .8rem; }
+  .menu li .radio { width: .9rem; text-align: center; font-size: .7rem; }
+  .menu li .label { flex: 1; }
+  .menu li .group { color: var(--muted); font-size: .72rem; }
+
+  /* Wire mapping table: every string on the menu, and the exact
+     SchedulerStateOutcome fields it is computed from. */
+  table { border-collapse: collapse; width: 100%; font-size: .8rem; }
+  th, td { padding: .4rem .5rem; border-top: 1px solid var(--edge); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .72rem; letter-spacing: .03em; text-transform: uppercase; }
+  td code { padding: .05rem .3rem; border-radius: 3px; background: var(--sunken); font-size: .75rem; white-space: nowrap; }
+  .gap { border-left: 3px solid var(--attention); padding: .5rem .75rem; margin: .75rem 0 0; background: var(--sunken); border-radius: 4px; font-size: .8rem; }
+  .gap strong { color: var(--attention); }
+  .q { border-left: 3px solid var(--accent); padding: .5rem .75rem; margin: .5rem 0 0; background: var(--sunken); border-radius: 4px; font-size: .8rem; }
+</style>
+
+<div class="page">
+  <h1>Tray menu states</h1>
+  <p class="lede">
+    One menu-bar item, always present while the app runs. The status line at the top is
+    computed from <code>SchedulerStateOutcome</code> (chunk 5's wire struct) and nothing
+    else; the radio group writes back through <code>set_throttle</code>. The icon has three
+    looks (idle, indexing, paused) plus an attention tint when the last batch failed.
+  </p>
+
+  <h2>States</h2>
+  <div class="states">
+
+    <div class="state">
+      <p class="state-label">Idle</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-idle">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Idle</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">decision <code>hold</code> / <code>no_pending_work</code>. Nothing to do; the loop re-checks every 30 s.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">Indexing (full)</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-indexing">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Indexing — 214 items pending</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">decision <code>run_full</code>, <code>pending_items</code> 214. On AC under Auto, or the Full override anywhere.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">Indexing (low)</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-indexing">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Indexing slowly — 214 items pending</span></li>
+        <li class="status"><span class="check"></span><span class="label">On battery</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">decision <code>run_low</code>. The second line names why only when Auto chose it: <code>power.source</code> <code>battery</code> → "On battery", <code>unknown</code> → "Power source unknown". Under the Low override the second line is omitted.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">Paused by you</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-paused">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Paused</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">○</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">●</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">decision <code>hold</code> / <code>paused</code>. Pending count deliberately not shown: the user asked for quiet.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">Held by Low Power Mode</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-paused">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Paused (Low Power Mode)</span></li>
+        <li class="status"><span class="check"></span><span class="label">214 items pending</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">decision <code>hold</code> / <code>low_power_mode</code>. Auto is still selected; picking Low or Full overrides the hold at the next tick.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">Last batch failed</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-attention">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">Indexing — 214 items pending</span></li>
+        <li class="status attention"><span class="check">!</span><span class="label">Last batch failed — open Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when"><code>last_error</code> present. The attention line is clickable and does the same as "Health…". The message text itself is NOT shown in the menu (it can be long); Settings → Health shows it in full. Clears when a later batch succeeds.</p>
+    </div>
+
+    <div class="state">
+      <p class="state-label">No catalog selected</p>
+      <div class="menubar"><span>Wed 14:02</span><span class="tray-icon tray-icon-idle">M</span></div>
+      <ul class="menu">
+        <li class="status"><span class="check"></span><span class="label">No catalog selected</span></li>
+        <li class="sep"></li>
+        <li class="item disabled"><span class="radio">●</span><span class="label">Auto</span></li>
+        <li class="item disabled"><span class="radio">○</span><span class="label">Paused</span></li>
+        <li class="item disabled"><span class="radio">○</span><span class="label">Low</span></li>
+        <li class="item disabled"><span class="radio">○</span><span class="label">Full</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Open Majestical</span></li>
+        <li class="item"><span class="check"></span><span class="label">Health…</span></li>
+        <li class="sep"></li>
+        <li class="item"><span class="check"></span><span class="label">Quit Majestical</span></li>
+      </ul>
+      <p class="state-when">Radio group disabled: there is nothing to throttle. See the wire gap below for how the tray learns this.</p>
+    </div>
+
+  </div>
+
+  <h2>Status line ← wire mapping</h2>
+  <table>
+    <thead><tr><th>Menu text</th><th>Computed from</th></tr></thead>
+    <tbody>
+      <tr><td>Idle</td><td><code>decision.mode = hold</code>, <code>hold_reason = no_pending_work</code></td></tr>
+      <tr><td>Indexing — {n} items pending</td><td><code>decision.mode = run_full</code>; n = <code>pending_items</code></td></tr>
+      <tr><td>Indexing slowly — {n} items pending</td><td><code>decision.mode = run_low</code>; n = <code>pending_items</code></td></tr>
+      <tr><td>On battery / Power source unknown (second line)</td><td><code>run_low</code> AND <code>throttle = auto</code>; text by <code>power.source</code>. Omitted under the Low override.</td></tr>
+      <tr><td>Paused</td><td><code>hold</code> / <code>paused</code></td></tr>
+      <tr><td>Paused (Low Power Mode)</td><td><code>hold</code> / <code>low_power_mode</code>; second line "{n} items pending" from <code>pending_items</code> when n &gt; 0</td></tr>
+      <tr><td>Last batch failed — open Health…</td><td><code>last_error</code> is present (any state above may also carry this line)</td></tr>
+      <tr><td>Starting…</td><td><code>decision</code> is null (before the first tick completes)</td></tr>
+      <tr><td>Radio checked item</td><td><code>throttle</code> (auto / paused / low / full); clicking calls <code>set_throttle</code> and rebuilds the menu from the returned state</td></tr>
+      <tr><td>Icon: idle / indexing / paused / attention</td><td>hold+no_pending_work or decision null → idle; run_* → indexing; hold+paused or hold+low_power_mode → paused; <code>last_error</code> present → attention tint on any of the three</td></tr>
+    </tbody>
+  </table>
+
+  <p class="gap"><strong>Wire gap (declared, for Task 14):</strong> <code>SchedulerStateOutcome</code> cannot distinguish "no catalog selected" from "not ticked yet": both leave <code>decision</code> null. The scheduler loop already knows which (it holds when <code>selected_catalog</code> is None). Task 14's <code>menu_model</code> therefore takes the catalog-selected flag as a second input alongside <code>SchedulerShared</code>, read from <code>AppState</code> at rebuild time, rather than adding a field to the wire struct. If you would rather see it on the wire (so Settings can show the same thing), say so and Task 14 adds <code>catalog_selected: bool</code> to the outcome with a fixture update.</p>
+
+  <p class="gap"><strong>Pluralization:</strong> "1 items pending" is the existing copy pattern in the app ("1 results", watchlisted). The tray strings are new, so they pluralize correctly from day one: "1 item pending".</p>
+
+  <h2>Behaviour agreed here, not drawn</h2>
+  <table>
+    <tbody>
+      <tr><td>Open Majestical</td><td>Shows and focuses the main window; on macOS also restores the Dock icon (activation policy Regular).</td></tr>
+      <tr><td>Health…</td><td>Same as Open Majestical, then navigates the webview to Settings (the <code>navigate-settings</code> event). Settings scrolls to the Health section.</td></tr>
+      <tr><td>Quit Majestical</td><td>The only way to exit. Waits for the current batch to finish (batches are one per-kind-capped run, seconds to a minute), then exits. No confirmation dialog.</td></tr>
+      <tr><td>Closing the window</td><td>Hides to the tray instead of quitting; on macOS the Dock icon goes away (activation policy Accessory) until Open Majestical.</td></tr>
+      <tr><td>Menu rebuild</td><td>Rebuilt whenever the scheduler state changes (each tick, and immediately after a radio click), so the status line is at most one tick stale.</td></tr>
+    </tbody>
+  </table>
+
+  <p class="q"><strong>Wording questions for review:</strong> (1) "Indexing slowly" vs "Indexing (low)" vs plain "Indexing" for the run_low line. (2) Whether Paused-by-you should still show the pending count. (3) "Quit Majestical" vs "Quit" (macOS convention is the app name). (4) Whether the "Last batch failed" line belongs in the menu at all or only as the icon tint plus Settings → Health.</p>
+</div>

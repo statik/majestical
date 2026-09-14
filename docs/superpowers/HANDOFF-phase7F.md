@@ -35,7 +35,7 @@ indexer running with no window open.
 - Repo: github.com/statik/majestical · Site: https://statik.github.io/majestical/
 - License Apache-2.0. Perpetual-vs-subscription positioning matters.
 
-## State at handoff (main after PR #122, this closing PR pending)
+## State at handoff (main at #122 plus this closing PR)
 
 **Shipped and working**:
 
@@ -48,7 +48,9 @@ indexer running with no window open.
   Svelte 5 desktop app with Search/Volumes/Browse/Organize/Ingest
   surfaces, notices rendering, an armed updater, the pinned TS wire
   layer, target-gated Apple seams with a `{macos, ubuntu}` Rust CI matrix.
-- Phase 7E, seven chunk PRs:
+- Phase 7E, six chunk PRs (#110, #112, #113, #116, #121, #122) plus three
+  non-chunk PRs (#109 spec+plan, #111 a Rust 1.98 clippy hotfix, #117
+  Task 16's doctor mutants triage shipped ahead of the close):
   - **`maj doctor`** (#110, plus its mutants-closing follow-up #117).
     `crates/services/src/doctor.rs`'s seven checks — `ffmpeg`,
     `imagemagick`, `models`, `state_dir`, `catalog`, `blob_residue`,
@@ -68,7 +70,7 @@ indexer running with no window open.
     `crates/services/src/autopilot.rs`'s pure `autopilot_decision`;
     `apps/desktop/src-tauri/src/power.rs`'s `pmset` probe; `indexer.rs`'s
     background loop with the no-progress hold rule, `update_failure_
-    report`, and `catch_unwind` guard; the `scheduler_state`/
+    report`, and the `catch_panic` guard; the `scheduler_state`/
     `set_throttle` commands.
   - **Tray, hide-to-tray, autostart, Always-on section** (#122). Menu-bar
     tray with a pure `menu_model` function; hide-to-tray on window close
@@ -112,8 +114,9 @@ the parity harnesses). What is new:
   `state_dir::catalog_paths` — never a re-derived path — and scans for
   `.tmp-*` and `*.partial` orphans read-only. Reachable at all three heads:
   `maj doctor` (`crates/cli`), the MCP `doctor` read tool, and
-  `doctor_report` (`apps/desktop/src-tauri/src/commands.rs:209`, one-liner
-  over `doctor_report_impl`), which works before any catalog is selected.
+  `doctor_report` (`apps/desktop/src-tauri/src/commands.rs:642`, one-liner
+  over `doctor_report_impl` at `:209`), which works before any catalog is
+  selected.
 - **The autopilot policy** (`crates/services/src/autopilot.rs`). The
   whole scheduling decision is one pure function,
   `autopilot_decision(power, throttle, pending_items) -> SchedulerDecision`
@@ -149,9 +152,11 @@ the parity harnesses). What is new:
   permanently failing item forever. `run_batch` (`:229`) also calls
   `index::update_failure_report` after every batch, exactly as the CLI
   and MCP heads do, so `failed_last_run`/doctor stay current; the whole
-  batch runs under `catch_unwind` (`ingest.rs`'s `panic_message`, made
-  `pub(crate)`), so a panic lands in `last_error` instead of killing the
-  thread with `running` stuck `true`. `set_throttle_impl` (`:371`)
+  batch runs through `ingest.rs`'s `pub(crate) fn catch_panic`
+  (`:419`, sharing the panic guard `run_ingest_job` uses; its private
+  `panic_message` helper is at `:399`), so a panic lands in `last_error`
+  instead of killing the thread with `running` stuck `true`.
+  `set_throttle_impl` (`:371`)
   recomputes `last_decision` immediately from the last poll's power and
   pending count, so a throttle change reflects on the tray and in
   Settings at once rather than after up to one `TICK`.
@@ -163,7 +168,7 @@ the parity harnesses). What is new:
   `commands.rs`'s `*_impl` functions follow. `catalog_selected` is a
   second input read from `AppState` at rebuild time, not a wire field —
   `SchedulerStateOutcome` cannot distinguish "no catalog" from "not
-  ticked yet" on its own. Four icon states (`TrayLook`, `:56`): Idle,
+  ticked yet" on its own. Four icon states (`TrayLook`, `:57`): Idle,
   Indexing, Paused, and Attention (a badge dot on the idle look — macOS
   template icons render alpha-only, so no tint color survives; `last_
   error.is_some()` sets it, overriding whichever of the other three a
@@ -210,10 +215,12 @@ the parity harnesses). What is new:
   tauri build --debug -b app --config src-tauri/tauri.e2e.conf.json`
   (the overlay config disables `createUpdaterArtifacts`, which otherwise
   makes the build fail trying to sign an updater tarball with no debug
-  key), then `pnpm test` — replaces the hand-run smoke rule entirely,
-  required for merge like every other job. Locally, the `tauri build
-  --debug` step is the slow part (roughly 25 minutes on a cold cache);
-  `wdio.conf.ts` points at a fixed bundle path
+  key), then `pnpm test` — replaces the hand-run smoke rule entirely.
+  Main has no branch-protection rulesets, so `gui-e2e` is watched to
+  green before merge by convention (see Process conventions), not
+  enforced by GitHub. Locally, the `tauri build --debug` step is the slow
+  part — a full cold bundle build (tens of minutes on this machine; no CI
+  duration was recorded); `wdio.conf.ts` points at a fixed bundle path
   (`src-tauri/target/debug/bundle/macos/Majestical.app/…`), so once that
   build exists, editing only spec files and re-running `pnpm test` in
   `apps/desktop/e2e` picks up the change without rebuilding the app —
@@ -291,7 +298,7 @@ Write a phase 7F spec + plan in the established format before any code.
 
 ## Process conventions (follow these — they are user-mandated)
 
-Carried verbatim from `HANDOFF-phase7E.md`:
+Carried, lightly trimmed, from `HANDOFF-phase7E.md`:
 
 1. **Workflow**: superpowers brainstorming → writing-plans →
    subagent-driven development. Plans live in
@@ -355,6 +362,13 @@ Added this phase:
     against an already-built target directory, checking `git status`
     clean after each run — faster on a warm cache, with the same
     no-leftover-mutation guarantee the copy approach gave.
+19. **`gui-e2e` (and every other CI job) is watched to green by
+    convention, not enforced.** Main carries no branch-protection
+    rulesets, so nothing stops a merge with red or pending checks —
+    "squash-merge after CI green" (item 2) is a habit, not a GitHub
+    guarantee. Turning the Rust jobs and `gui-e2e` into required checks
+    is a user action (repository settings), not something a phase's own
+    PRs can configure.
 
 ## Phase-7E lessons worth carrying
 
@@ -387,14 +401,15 @@ Added this phase:
   a comment; the Intel `lowpowermode` values are Apple's documented
   format, used because no Intel Mac was available, and that fact is on
   the watchlist rather than left to look like it was also captured.
-- **A cheap survivor found during review does not have to wait for the
-  close-of-phase triage task.** PR #117 closed a `doctor.rs` mutants
-  survivor between chunks 4 and 5, out of the plan's own Task-16-at-close
-  order, because it surfaced during #121's review and was cheaper to fix
-  immediately than to carry forward. The standing "cargo-mutants at
-  close" task is still worth doing — it caught real gaps in `power.rs`/
-  `indexer.rs` no earlier review found — but it doesn't own every mutant
-  fix in the phase.
+- **A close-of-phase task doesn't have to wait for the close of the
+  phase.** Task 16 (mutants + parity) was written as chunk 7, after every
+  feature chunk. Its doctor half shipped as PR #117 well before that —
+  between #116 and #121 in commit order — because `doctor.rs` was
+  already done and stable, so there was nothing to gain by holding its
+  mutants triage for the close. The standing "cargo-mutants at close"
+  task is still worth doing for code still under active change — it
+  caught real gaps in `power.rs`/`indexer.rs` no earlier review found —
+  but a finished file's triage can run the moment it's finished.
 - **"The e2e job is the smoke" is only true once it is green on the
   branch that changes what it covers.** The manual-smoke rule stayed in
   force through the one PR (#112) that changed `lib.rs`'s plugin
@@ -442,9 +457,9 @@ Added this phase:
   unpinned.
 - A background thread that owns mutable state must never leave that state
   stuck on a panic. `indexer.rs`'s `run_batch` wraps its batch in
-  `catch_unwind` for exactly this reason — before that guard, a panic
-  inside `index::run` would have left `running` `true` forever with
-  nothing left to flip it back.
+  `ingest.rs`'s `catch_panic` for exactly this reason — before that
+  guard, a panic inside `index::run` would have left `running` `true`
+  forever with nothing left to flip it back.
 - Never lie about data safety or completeness: counts come from real
   files/rows; degradation names the specific gap and remedy; partial
   progress is reported, never silently discarded.

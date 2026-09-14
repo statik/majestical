@@ -2091,10 +2091,11 @@ own Deferred list; the rest were found during execution.
   reproduced locally; quarantined by re-run rather than fixed blind.
   `zizmor`'s advisory-database fetch also intermittently hit network
   errors in CI during the phase, unrelated to any workflow change.
-- **`sync.rs` re-derives the blob path with a raw `join("blobs")`**
-  (#110, found while writing doctor's blob-residue check). `location_
-  matches_root`-style checks in `crates/services/src/sync.rs:1133` build
-  the blobs path by hand instead of calling
+- **`sync.rs` re-derives the blob path with a raw `join`, not
+  `BlobStore::root()`** (#110, found while writing doctor's blob-residue
+  check). `location_add`'s new-location skeleton loop, `for sub in
+  ["events", "blobs"]` (`crates/services/src/sync.rs:182`), builds the
+  blobs path by hand instead of calling
   `majestical_index::blob::BlobStore::root()`, the resolver doctor's own
   residue scan was written to use instead — the two can drift if the blob
   layout ever changes.
@@ -2111,12 +2112,12 @@ own Deferred list; the rest were found during execution.
   phase; the tray and Always-on status lines were written to pluralize
   correctly from day one instead of copying the pattern.
 - **The plan's Task 10 pointer to `crates/core/src/projection.rs` for a
-  proptest pattern to crib is stale** (#116). By phase 7E,
-  `crates/core/src/projection.rs` itself carries no `proptest!` macro
-  usage; the workspace's proptest patterns now live in
+  proptest pattern to crib was written wrong in #109; found during Task
+  10, #116**. `crates/core/src/projection.rs` has never carried a
+  `proptest!` macro; the workspace's proptest patterns live in
   `crates/core/tests/crdt_properties.rs` and similar integration-test
-  files. Task 10's autopilot proptests were written against the newer
-  location.
+  files, and have since the crate's own first commit. Task 10's autopilot
+  proptests were written against the correct, newer location instead.
 - **The `lowpowermode` (Intel) literal in `power.rs`'s parser tests is
   uncaptured** (#116, plan's Task 11 AMENDED note). The Apple Silicon
   `powermode` literals are captured from the dev machine (macOS 26.6.2,

@@ -207,9 +207,11 @@ Deferred list this phase draws from):
 
 ## As-built (phase 7E)
 
-What shipped, where it differs from the design above. Written as what IS,
-not as a change log. Seven chunk PRs squash-merged (or, for #122, pending
-merge behind this closing PR) after green CI, plus this closing one.
+What shipped, where it differs from the design above. Written for the
+state once this closing PR merges: main at #122 plus this PR. Six chunk
+PRs squash-merged (or, for #122, pending merge behind this closing PR)
+after green CI, plus three non-chunk PRs (#109 spec+plan, #111 a clippy
+hotfix, #117 Task 16's mutants triage shipped early) and this closing one.
 
 **PR #109 — spec + plan** (docs). This spec and
 `docs/superpowers/plans/2026-08-26-phase7e-alwayson-e2e-doctor.md`,
@@ -234,8 +236,10 @@ in `apps/desktop/src-tauri/src/lib.rs`, so a release binary carries no
 listening test server; the `apps/desktop/e2e/` WebdriverIO project with
 the `@wdio/tauri-service` embedded provider; a fixture catalog seeded by
 shelling out to the debug `maj` binary; the launch smoke spec; and the
-`gui-e2e` CI job, required for merge. Its green run on main retired the
-standing manual-GUI-smoke rule from `docs/superpowers/HANDOFF-phase7D.md`
+`gui-e2e` CI job — main has no branch-protection rulesets, so it is
+watched to green before merge by convention, not enforced. Its green run
+on main retired the standing manual-GUI-smoke rule from
+`docs/superpowers/HANDOFF-phase7D.md`
 — see "the e2e job is the smoke" below.
 
 **PR #113 — per-surface e2e flows** (chunk 3). Search, Volumes, Browse,
@@ -243,19 +247,6 @@ and Organize each got a spec exercising one real flow against the
 fixture catalog; the Ingest flow was dropped (native OS dialogs have no
 test bridge), a gap declared rather than worked around with an invented
 backdoor.
-
-**PR #117 — doctor mutants closed with hermetic seams**. Landed between
-chunks 4 and 5 in commit order rather than at phase close — see
-"Deviations" below for why the plan's own Task-16-at-close ordering
-did not hold in practice.
-
-**PR #121 — doctor GUI panel** (chunk 4). The `health-panel.html` mockup,
-user-reviewed before code; the `doctor_report` Tauri command
-(`doctor_report_impl` over `majestical_services::doctor::doctor`, working
-before any catalog is selected — the one command that does); wire
-fixtures and a `tauri_parity` row comparing the whole document against
-`maj doctor --json`; and `SettingsView.svelte`'s health panel, one row
-per check in the outcome's own order.
 
 **PR #116 — autopilot policy + power probe + scheduler loop** (chunk 5,
 headless). `crates/services/src/autopilot.rs`'s pure
@@ -265,9 +256,23 @@ src-tauri/src/power.rs`'s `pmset`-backed probe, parsing both the Intel
 `lowpowermode` and Apple Silicon `powermode` keys; and `indexer.rs`'s
 loop thread (`TICK` 30s, `BATCH_LIMIT` 25 items per kind, `PACE_LOW` 5s),
 plus the `scheduler_state`/`set_throttle` commands. The no-progress hold
-rule, the per-batch `update_failure_report` call, and the `catch_unwind`
+rule, the per-batch `update_failure_report` call, and the `catch_panic`
 guard (all in the Task 12 amendment below) shipped in this same PR after
 a spec review caught the hot-loop risk before merge.
+
+**PR #117 — doctor mutants closed with hermetic seams** (Task 16's
+doctor half, shipped ahead of the close). Landed between #116 and #121
+in commit order rather than waiting for phase close — see "Deviations"
+below for why the plan's own Task-16-at-close ordering did not hold in
+practice.
+
+**PR #121 — doctor GUI panel** (chunk 4). The `health-panel.html` mockup,
+user-reviewed before code; the `doctor_report` Tauri command
+(`doctor_report_impl` over `majestical_services::doctor::doctor`, working
+before any catalog is selected — the one command that does); wire
+fixtures and a `tauri_parity` row comparing the whole document against
+`maj doctor --json`; and `SettingsView.svelte`'s health panel, one row
+per check in the outcome's own order.
 
 **PR #122 — tray, hide-to-tray, autostart, Always-on section** (chunk 6;
 open, pending merge behind this closing PR). `tray.rs`'s pure `menu_model`
@@ -328,8 +333,9 @@ failure report — so "successful batch → immediate re-tick" would spin
 forever on a permanently failing item. `IndexRunOutcome::made_progress()`
 gates the pace instead: no progress holds for a full `TICK` and records
 the failure count. `update_failure_report` runs after every batch, and
-the whole batch runs under `catch_unwind`, so a panic lands in
-`last_error` instead of leaving `running` stuck `true` on a dead thread.
+the whole batch runs through `ingest.rs`'s `catch_panic`, so a panic
+lands in `last_error` instead of leaving `running` stuck `true` on a
+dead thread.
 
 **Every tray string is pinned, and `catalog_selected` is a `menu_model`
 input, not a wire field** (PR #122, plan's Task 13 AMENDED note, user-
@@ -380,10 +386,10 @@ phase's standing mandate ("no `run_in_background` for anything a
 controller must wait on; a stalled subagent gets replaced, not
 re-nudged indefinitely") reads as strongly as it does in the 7F handoff.
 `cargo-mutants`' scoped runs at close (Task 16) ran out of the plan's own
-intended order — PR #117 closed doctor's mutants between chunks 4 and 5
-rather than waiting for phase close, because a doctor survivor surfaced
-during PR #121's own review and was cheaper to close immediately than to
-carry to Task 16.
+intended order — PR #117, Task 16's doctor half, shipped ahead of the
+close: it landed between #116 and #121 in commit order, so the test
+gains it closed on `doctor.rs` were live well before phase close rather
+than held for Task 16.
 
 **"The e2e job is the smoke."** `docs/superpowers/HANDOFF-phase7D.md`'s
 standing rule — a hand-run GUI smoke recorded on the PR whenever

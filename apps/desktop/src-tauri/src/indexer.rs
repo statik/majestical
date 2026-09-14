@@ -381,6 +381,9 @@ pub(crate) fn set_throttle_impl(
             shared.pending_items,
         ));
     }
+    // Load-bearing: `scheduler_state_impl` below takes its own read lock on
+    // the same `RwLock`, which is not reentrant — holding `shared` across
+    // that call would deadlock.
     drop(shared);
     scheduler_state_impl(state)
 }

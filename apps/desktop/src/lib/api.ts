@@ -470,6 +470,14 @@ export type SchedulerDecision =
       hold_reason: "paused" | "low_power_mode" | "no_pending_work";
     };
 
+/** The `hold` arm's reason, pulled out so a `Record<HoldReason, ...>` (as
+ *  `scheduler-status.ts` builds) fails to type-check on a variant it hasn't
+ *  covered, rather than silently falling through. */
+export type HoldReason = Extract<
+  SchedulerDecision,
+  { mode: "hold" }
+>["hold_reason"];
+
 /**
  * `indexer::SchedulerStateOutcome` — what `scheduler_state`/`set_throttle`
  * return. `decision` is `null`, not absent, before the scheduler loop's

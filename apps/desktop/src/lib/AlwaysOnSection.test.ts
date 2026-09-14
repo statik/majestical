@@ -5,6 +5,7 @@ import { afterEach, expect, test } from "vitest";
 import schedulerState from "./fixtures/scheduler_state.json";
 import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
 import type { SchedulerStateOutcome } from "./api";
+import { statusLine } from "./scheduler-status";
 import { mockCommands, rejectCommand } from "./test-support";
 import AlwaysOnSection from "./AlwaysOnSection.svelte";
 
@@ -54,7 +55,12 @@ test("a different scheduler_state checks a different radio", async () => {
   expect(checked(screen.getByRole("radio", { name: "Auto" }))).toBe(false);
 });
 
-test("clicking a radio invokes set_throttle and the group reflects the response", async () => {
+test("clicking a radio invokes set_throttle, and the group reflects the RESPONSE, not the click", async () => {
+  // Answers a click on "Low" with the `held` fixture (throttle "paused"),
+  // so a component that (wrongly) checks whichever radio was clicked
+  // instead of applying `set_throttle`'s returned state cannot pass this
+  // by checking "Low" — only "Paused" being checked afterward proves the
+  // response was applied.
   const calls: unknown[] = [];
   mockCommands({
     scheduler_state: () => auto,
@@ -67,10 +73,11 @@ test("clicking a radio invokes set_throttle and the group reflects the response"
   render(AlwaysOnSection);
 
   await screen.findByRole("radio", { name: "Auto", checked: true });
-  await userEvent.click(screen.getByRole("radio", { name: "Paused" }));
+  await userEvent.click(screen.getByRole("radio", { name: "Low" }));
 
   await screen.findByRole("radio", { name: "Paused", checked: true });
-  expect(calls).toEqual([{ throttle: "paused" }]);
+  expect(checked(screen.getByRole("radio", { name: "Low" }))).toBe(false);
+  expect(calls).toEqual([{ throttle: "low" }]);
 });
 
 test("the throttle group works even when scheduler_state.available is false", async () => {
@@ -187,71 +194,19 @@ test("a rejected enable renders the error and reverts the checkbox", async () =>
   );
 });
 
-// Pinned against the `role="status"` element specifically, not a loose
-// `findByText` — a loose text query also matches the throttle radio labeled
-// "Paused", so it cannot tell "the status line says Paused" apart from "a
-// radio labeled Paused exists" (a mutant that deletes the status `<p>` or
-// reworks its text survives a `findByText` assertion for exactly that
-// reason).
-const statusCases: {
-  label: string;
-  state: SchedulerStateOutcome;
-  expected: string;
-}[] = [
-  {
-    label: "run_full with a plural pending count",
-    state: { ...auto, decision: { mode: "run_full" }, pending_items: 42 },
-    expected: "Indexing — 42 items pending",
-  },
-  {
-    label: "run_full with a singular pending count",
-    state: { ...auto, decision: { mode: "run_full" }, pending_items: 1 },
-    expected: "Indexing — 1 item pending",
-  },
-  {
-    label: "run_low",
-    state: { ...auto, decision: { mode: "run_low" }, pending_items: 3 },
-    expected: "Indexing slowly — 3 items pending",
-  },
-  {
-    label: "hold/paused",
-    state: { ...held, decision: { mode: "hold", hold_reason: "paused" } },
-    expected: "Paused",
-  },
-  {
-    label: "hold/low_power_mode",
-    state: {
-      ...auto,
-      decision: { mode: "hold", hold_reason: "low_power_mode" },
-    },
-    expected: "Paused (Low Power Mode)",
-  },
-  {
-    label: "hold/no_pending_work",
-    state: {
-      ...auto,
-      decision: { mode: "hold", hold_reason: "no_pending_work" },
-      pending_items: 0,
-    },
-    expected: "Idle",
-  },
-  {
-    label: "no decision yet",
-    state: { ...auto, decision: null },
-    expected: "Starting…",
-  },
-];
+// One test pinning the wiring — that the section renders `statusLine`'s
+// result through the `role="status"` element — not the full table of
+// decision/hold-reason cases, which belongs to `statusLine` itself and is
+// pinned directly against the function in `scheduler-status.test.ts`.
+test("the status line renders statusLine's result through role=status", async () => {
+  mockCommands({
+    scheduler_state: () => auto,
+    "plugin:autostart|is_enabled": () => false,
+  });
+  render(AlwaysOnSection);
 
-test.each(statusCases)(
-  "the status line reads $expected for $label",
-  async ({ state, expected }) => {
-    mockCommands({
-      scheduler_state: () => state,
-      "plugin:autostart|is_enabled": () => false,
-    });
-    render(AlwaysOnSection);
-
-    const status = await screen.findByRole("status");
-    await waitFor(() => expect(status.textContent).toBe(expected));
-  },
-);
+  const status = await screen.findByRole("status");
+  await waitFor(() =>
+    expect(status.textContent).toBe(statusLine(auto)),
+  );
+});

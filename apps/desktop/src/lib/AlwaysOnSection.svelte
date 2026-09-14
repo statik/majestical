@@ -3,14 +3,16 @@
   // power-aware throttle override — the same one `tray.rs::apply_throttle`
   // exposes from the menu bar, here reached through `scheduler_state`/
   // `set_throttle` instead of the tray's direct `set_throttle_impl` call —
-  // and the OS "start at login" toggle via `autostart.ts`. A sibling
-  // component to `SettingsView.svelte` rather than folded into it: the two
-  // sections poll unrelated backends (the scheduler command vs. the
-  // autostart plugin) on independent mount effects, and keeping them apart
-  // keeps each file's state readable at a glance.
+  // and the OS "start at login" toggle via `autostart.ts`. Both are read
+  // once on mount; the status line refreshes on a throttle change, not on
+  // a timer. A sibling component to `SettingsView.svelte` rather than
+  // folded into it: the scheduler command and the autostart plugin are two
+  // unrelated backends, and keeping them apart keeps each file's state
+  // readable at a glance.
   import { autostartEnabled, setAutostart } from "./autostart";
   import { api, errorMessage } from "./api";
   import type { SchedulerStateOutcome, ThrottleOverride } from "./api";
+  import { statusLine } from "./scheduler-status";
 
   const THROTTLES: { value: ThrottleOverride; label: string }[] = [
     { value: "auto", label: "Auto" },
@@ -50,35 +52,6 @@
       autostart = previous;
       autostartError = errorMessage(failure);
     }
-  }
-
-  /**
-   * The scheduler's current activity in one line, straight from the wire's
-   * own discriminants (`decision.mode`/`hold_reason` plus `pending_items`)
-   * — deliberately NOT a port of `tray.rs`'s `menu_model`: this omits the
-   * power-source-aware second line `run_low_lines` adds under Auto (it
-   * would mean re-deriving `PowerSource` branching here) and the "only
-   * show the pending count when nonzero" refinement `menu_model` applies
-   * to a Low Power Mode hold. Both are tray-only polish, not information
-   * this line claims to give.
-   */
-  function statusLine(state: SchedulerStateOutcome): string {
-    if (state.decision === null) return "Starting…";
-    if (state.decision.mode === "hold") {
-      switch (state.decision.hold_reason) {
-        case "paused":
-          return "Paused";
-        case "low_power_mode":
-          return "Paused (Low Power Mode)";
-        case "no_pending_work":
-          return "Idle";
-      }
-    }
-    const pending =
-      state.pending_items === 1 ? "1 item" : `${state.pending_items} items`;
-    return state.decision.mode === "run_full"
-      ? `Indexing — ${pending} pending`
-      : `Indexing slowly — ${pending} pending`;
   }
 </script>
 

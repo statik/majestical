@@ -1,9 +1,10 @@
 <script lang="ts">
   // The Settings surface: the health panel — what `maj doctor` sees,
   // rendered in the order it checks; services owns that order, so this
-  // view never sorts, and it is read-only the same as Volumes: nothing
-  // here fixes a check, it only reports it and offers to look again — plus
-  // the Always-on section (`AlwaysOnSection.svelte`), which is not
+  // view never sorts. It is read-only the same as Volumes: nothing here
+  // fixes a check, it only reports it and offers to look again.
+  //
+  // Plus the Always-on section (`AlwaysOnSection.svelte`), which is NOT
   // read-only: its throttle radio and "start at login" toggle both act.
   import { api, errorMessage, errorNotices } from "./api";
   import type { DoctorOutcome } from "./api";

@@ -106,6 +106,18 @@
       }
     },
     {
+      // `ALWAYS_ON`'s `scheduler_state` mock reuses `scheduler_state.json`
+      // (also imported by `AlwaysOnSection.test.ts` and `fixtures.test.ts`)
+      // rather than inlining a third copy of the wire shape, which is the
+      // one dependency over the default here. Same next-split plan as the
+      // `max-lines` override above: the two Settings-shell tests move to
+      // `src/App.settings.test.ts`, taking this import with them.
+      "files": ["src/App.test.ts"],
+      "rules": {
+        "import/max-dependencies": ["warn", { "max": 11 }]
+      }
+    },
+    {
       // `fixtures.test.ts` assigns one committed fixture per pinned outcome
       // struct (see its own header comment) — its import count tracks the
       // number of Tauri commands, not incidental coupling.

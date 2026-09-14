@@ -9,6 +9,7 @@ import { NAVIGATE_SETTINGS_EVENT } from "./lib/api";
 import { emitProgress, listenerCount, RUN } from "./lib/ingest-test-support";
 import { mockCommands, rejectCommand, stubManifest, stubMatchMedia } from "./lib/test-support";
 import doctorOutcome from "./lib/fixtures/doctor_outcome.json";
+import schedulerState from "./lib/fixtures/scheduler_state.json";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
@@ -34,18 +35,13 @@ const UPDATE_CHECK = "plugin:updater|check";
 
 /** `AlwaysOnSection` mounts alongside Settings and asks these two commands
  *  on mount; `AlwaysOnSection.test.ts` is where its own behavior is pinned.
- *  Inline rather than a fixture import — these shell tests don't care what
- *  the scheduler is doing, only that mounting it doesn't throw "unexpected
- *  command". */
+ *  These shell tests don't care what the scheduler is doing, only that
+ *  mounting it doesn't throw "unexpected command", so any fixture will do —
+ *  reusing `scheduler_state.json` rather than inlining a third copy of the
+ *  wire shape (`AlwaysOnSection.test.ts` and `fixtures.test.ts` already
+ *  import it). */
 const ALWAYS_ON = {
-  scheduler_state: () => ({
-    available: true,
-    throttle: "auto",
-    power: { source: "ac", low_power_mode: false },
-    decision: null,
-    pending_items: 0,
-    running: false,
-  }),
+  scheduler_state: () => schedulerState,
   "plugin:autostart|is_enabled": () => false,
 };
 

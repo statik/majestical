@@ -938,6 +938,22 @@ git add apps/desktop/ docs/superpowers/specs/mockups/2026-08-26-phase7e/
 git commit -m "feat: start-at-login toggle and always-on settings section"
 ```
 
+> **AMENDED (2026-09-14, Task 15 as-built):** (a) `set_throttle_impl`
+> recomputes `last_decision` immediately via `autopilot_decision` from the
+> last poll's power and pending count (staying `None` before the first
+> tick), so the Settings status line and the tray reflect a throttle
+> change at once; EXECUTION still changes only at the next batch boundary
+> — the spec's pause latency is unchanged. Before this, both read stale
+> for up to a tick. (b) The Always-on section is a sibling component
+> (`AlwaysOnSection.svelte`) with a thin `autostart.ts` wrapper; its status
+> line reads `decision`/`pending_items` off the wire and renders the
+> pinned tray strings for those cases, but deliberately omits the tray's
+> power-source second line and the Low-Power-Mode count refinement rather
+> than port `menu_model` to TypeScript. (c) A rejected `enable` renders as
+> the surface's own error line (Notices only carries notice arrays).
+> (d) The App.test.ts/IngestView.test.ts cap rose 360→385 with the next
+> split named (`App.settings.test.ts`).
+
 **Open PR (chunk 6), squash-merge when green.** Branch `phase7e-tray`.
 
 ---

@@ -27,6 +27,24 @@ const TRAY_ID: &str = "main";
 /// fired by "Health…" and the attention line.
 const NAVIGATE_SETTINGS_EVENT: &str = "navigate-settings";
 
+/// The tray's four macOS template icons (monochrome — only the alpha
+/// channel is used; RGB is ignored, per `set_icon_as_template`), generated
+/// by the `tray-icons` recipe in the root justfile and committed under
+/// `icons/tray/`. Only the `@1x` (22×22) files are loaded: `tray_icon`
+/// (the crate under Tauri's tray API) builds the underlying `NSImage` from
+/// raw pixel data sized 1:1 in points, with no `HiDPI` representation — an
+/// embedded `@2x` (44×44) file would render twice the intended size rather
+/// than sharpen on a Retina display. The `@2x` files are still generated
+/// and committed for a future `HiDPI` pass, once that plumbing exists.
+const ICON_IDLE: &[u8] = include_bytes!("../icons/tray/idle.png");
+const ICON_INDEXING: &[u8] = include_bytes!("../icons/tray/indexing.png");
+const ICON_PAUSED: &[u8] = include_bytes!("../icons/tray/paused.png");
+/// The idle look plus a small solid dot badge, standing in for the
+/// mockup's amber attention tint — a macOS template icon is rendered
+/// monochrome by the system (only its alpha channel is used), so no tint
+/// color survives from the source PNG regardless of what is drawn into it.
+const ICON_ATTENTION: &[u8] = include_bytes!("../icons/tray/attention.png");
+
 /// The three looks the tray icon can have. `MenuModel::attention_tint`
 /// layers an attention indicator over any of the three when the last batch
 /// failed — see the mockup's icon table.
@@ -35,6 +53,46 @@ pub enum TrayIcon {
     Idle,
     Indexing,
     Paused,
+}
+
+/// Which committed asset under `icons/tray/` a look renders with, by name
+/// rather than by bytes so the choice is pinned and asserted on without
+/// touching Tauri. `attention_tint` overrides whichever of the three the
+/// icon would otherwise be — see [`ICON_ATTENTION`] for why that stands in
+/// for the mockup's tint rather than coloring one of the other three.
+#[must_use]
+fn icon_asset(icon: TrayIcon, attention_tint: bool) -> &'static str {
+    if attention_tint {
+        return "attention";
+    }
+    match icon {
+        TrayIcon::Idle => "idle",
+        TrayIcon::Indexing => "indexing",
+        TrayIcon::Paused => "paused",
+    }
+}
+
+/// The asset name's embedded PNG bytes. `icon_asset` above is this
+/// module's only producer of the name, and its every output is covered
+/// here — the fallback arm is unreachable in practice, kept only because a
+/// `&str` match is never provably exhaustive to the compiler, and a silent
+/// fallback to the idle look is preferable to a panic over a tray icon.
+fn icon_bytes(name: &str) -> &'static [u8] {
+    match name {
+        "indexing" => ICON_INDEXING,
+        "paused" => ICON_PAUSED,
+        "attention" => ICON_ATTENTION,
+        _ => ICON_IDLE,
+    }
+}
+
+/// Decodes the look's embedded PNG into the `Image` `TrayIconBuilder`/
+/// `TrayIcon::set_icon` need. Thin and untested — [`icon_asset`] carries
+/// the logic; decoding an embedded, always-valid PNG cannot fail in
+/// practice, but the `?` still routes a hypothetical decode error through
+/// the same `tauri::Result` the tray's own build/refresh calls return.
+fn icon_image(icon: TrayIcon, attention_tint: bool) -> tauri::Result<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(icon_bytes(icon_asset(icon, attention_tint)))
 }
 
 /// What the tray menu shows, computed from the scheduler's shared state and
@@ -233,36 +291,24 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 
 /// Builds the tray icon and its initial menu. Called once from `setup`.
 ///
+/// No left-click handler: with `show_menu_on_left_click` at Tauri's
+/// default (true), macOS runs the menu tracking loop synchronously on
+/// mouse-down and no mouse-up event ever reaches an `on_tray_icon_event`
+/// handler here — "Open Majestical" is the only way in from the tray.
+///
 /// # Errors
-/// Returns an error if the app ships no default window icon, or if the
-/// Tauri runtime refuses to build the menu or the tray icon itself.
+/// Returns an error if the idle icon's embedded PNG fails to decode, or if
+/// the Tauri runtime refuses to build the menu or the tray icon itself.
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let model = current_model(app);
     let menu = build_menu(app, &model)?;
-    let Some(icon) = app.default_window_icon().cloned() else {
-        return Err(tauri::Error::AssetNotFound(
-            "no default window icon configured for the tray".to_string(),
-        ));
-    };
-    TrayIconBuilder::with_id(TRAY_ID)
+    let icon = icon_image(model.icon, model.attention_tint)?;
+    let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .menu(&menu)
         .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
-        // A left click already drops the menu down (Tauri's default); this
-        // also shows and focuses the main window underneath it, the same
-        // as clicking "Open Majestical" — so bringing the app forward does
-        // not require finding that item in the menu first.
-        .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click {
-                button: tauri::tray::MouseButton::Left,
-                button_state: tauri::tray::MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_window(tray.app_handle());
-            }
-        })
         .build(app)?;
+    tray.set_icon_as_template(true)?;
     Ok(())
 }
 
@@ -276,9 +322,12 @@ fn current_model(app: &AppHandle) -> MenuModel {
     menu_model(&shared, catalog_selected)
 }
 
-/// Rebuilds the tray's menu from the scheduler's current state. Called at
-/// the end of every scheduler tick and right after a throttle change, so
-/// the status line is at most one tick stale.
+/// Rebuilds the tray's menu and icon from the scheduler's current state.
+/// Called at the end of every scheduler tick and right after a throttle
+/// change, so the status line and icon look are at most one tick stale.
+/// Re-decodes the icon on every call rather than tracking whether the look
+/// changed — a 22×22 PNG is cheap enough that the tracking would cost more
+/// than it saves.
 pub fn refresh(app: &AppHandle) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
@@ -287,11 +336,18 @@ pub fn refresh(app: &AppHandle) {
     if let Ok(menu) = build_menu(app, &model) {
         let _ = tray.set_menu(Some(menu));
     }
+    if let Ok(icon) = icon_image(model.icon, model.attention_tint) {
+        // `set_icon_with_as_template`, not a plain `set_icon`: Tauri's own
+        // doc on the pair notes that `set_icon` followed by
+        // `set_icon_as_template` flickers on macOS since the icon renders
+        // twice — this sets both atomically instead, every refresh.
+        let _ = tray.set_icon_with_as_template(Some(icon), true);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuModel, SchedulerShared, TrayIcon, menu_model};
+    use super::{MenuModel, SchedulerShared, TrayIcon, icon_asset, menu_model};
     use majestical_services::autopilot::{
         HoldReason, PowerSource, PowerState, SchedulerDecision, ThrottleOverride,
     };
@@ -546,5 +602,70 @@ mod tests {
             let model: MenuModel = menu_model(&state, true);
             assert_eq!(model.throttle, throttle);
         }
+    }
+
+    #[test]
+    fn icon_asset_maps_each_look_when_attention_is_clear() {
+        assert_eq!(icon_asset(TrayIcon::Idle, false), "idle");
+        assert_eq!(icon_asset(TrayIcon::Indexing, false), "indexing");
+        assert_eq!(icon_asset(TrayIcon::Paused, false), "paused");
+    }
+
+    #[test]
+    fn icon_asset_overrides_every_look_when_attention_is_set() {
+        for icon in [TrayIcon::Idle, TrayIcon::Indexing, TrayIcon::Paused] {
+            assert_eq!(icon_asset(icon, true), "attention");
+        }
+    }
+
+    #[test]
+    fn attention_persists_alongside_an_idle_status() {
+        let state = shared(
+            ThrottleOverride::Auto,
+            Some(SchedulerDecision::Hold(HoldReason::NoPendingWork)),
+            PowerSource::Ac,
+            0,
+            Some("disk full"),
+        );
+        let model = menu_model(&state, true);
+        assert_eq!(model.status_lines, vec!["Idle".to_string()]);
+        assert_eq!(model.icon, TrayIcon::Idle);
+        assert!(model.attention_tint);
+        assert_eq!(icon_asset(model.icon, model.attention_tint), "attention");
+    }
+
+    #[test]
+    fn attention_persists_alongside_a_paused_by_you_status() {
+        let state = shared(
+            ThrottleOverride::Paused,
+            Some(SchedulerDecision::Hold(HoldReason::Paused)),
+            PowerSource::Ac,
+            0,
+            Some("disk full"),
+        );
+        let model = menu_model(&state, true);
+        assert_eq!(model.status_lines, vec!["Paused".to_string()]);
+        assert_eq!(model.icon, TrayIcon::Paused);
+        assert!(model.attention_tint);
+        assert_eq!(icon_asset(model.icon, model.attention_tint), "attention");
+    }
+
+    #[test]
+    fn attention_persists_with_no_catalog_selected() {
+        let state = shared(
+            ThrottleOverride::Auto,
+            None,
+            PowerSource::Ac,
+            0,
+            Some("disk full"),
+        );
+        let model = menu_model(&state, false);
+        assert_eq!(model.status_lines, vec!["No catalog selected".to_string()]);
+        assert!(!model.throttle_enabled);
+        assert!(model.attention_tint);
+        assert_eq!(
+            model.attention,
+            Some("Last batch failed — open Health…".to_string())
+        );
     }
 }

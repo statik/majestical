@@ -32,6 +32,23 @@ const ready: AppStatus = { catalog_path: "/catalogs/main", catalog_ready: true }
 // the offer and its failure paths are pinned.
 const UPDATE_CHECK = "plugin:updater|check";
 
+/** `AlwaysOnSection` mounts alongside Settings and asks these two commands
+ *  on mount; `AlwaysOnSection.test.ts` is where its own behavior is pinned.
+ *  Inline rather than a fixture import — these shell tests don't care what
+ *  the scheduler is doing, only that mounting it doesn't throw "unexpected
+ *  command". */
+const ALWAYS_ON = {
+  scheduler_state: () => ({
+    available: true,
+    throttle: "auto",
+    power: { source: "ac", low_power_mode: false },
+    decision: null,
+    pending_items: 0,
+    running: false,
+  }),
+  "plugin:autostart|is_enabled": () => false,
+};
+
 const hit: SearchHit = {
   asset: "xxh3:abc123",
   score: 1,
@@ -108,6 +125,7 @@ function mockCatalog(volumeLabels: string[]) {
         clock_suspect: false,
       })),
     }),
+    ...ALWAYS_ON,
   });
 }
 

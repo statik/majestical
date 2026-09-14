@@ -2,13 +2,24 @@ import { clearMocks } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
 import { afterEach, expect, test } from "vitest";
 import doctorOutcome from "./fixtures/doctor_outcome.json";
+import schedulerState from "./fixtures/scheduler_state.json";
 import { mockCommands, rejectCommand } from "./test-support";
 import SettingsView from "./SettingsView.svelte";
 
 afterEach(clearMocks);
 
+// Every test here mounts the whole Settings surface, which now also mounts
+// `AlwaysOnSection` — its own suite (`AlwaysOnSection.test.ts`) pins that
+// component's behavior; these two commands are mocked in every test below
+// only so mounting it does not throw "unexpected command" and drown an
+// unrelated assertion in a rejected promise.
+const alwaysOn = {
+  scheduler_state: () => schedulerState,
+  "plugin:autostart|is_enabled": () => false,
+};
+
 test("renders one row per check from doctor_report, in the outcome's order", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome });
+  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
   const { container } = render(SettingsView);
 
   const rows = await screen.findAllByRole("listitem");
@@ -38,7 +49,7 @@ test("renders one row per check from doctor_report, in the outcome's order", asy
 });
 
 test("the Fail row shows its remedy and the Ok row shows none", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome });
+  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
   render(SettingsView);
 
   const rows = await screen.findAllByRole("listitem");
@@ -52,7 +63,7 @@ test("the Fail row shows its remedy and the Ok row shows none", async () => {
 });
 
 test("the outcome's notices render above the rows", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome });
+  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
   render(SettingsView);
 
   expect(
@@ -67,6 +78,7 @@ test('"Run checks again" re-invokes doctor_report', async () => {
       calls += 1;
       return doctorOutcome;
     },
+    ...alwaysOn,
   });
   render(SettingsView);
 
@@ -83,7 +95,7 @@ test('"Run checks again" re-invokes doctor_report', async () => {
 test("a rejected command renders the error through Notices, not a blank panel", async () => {
   const message = "no catalog selected yet — initialize or choose one first";
   const notice = "notice: the failing call still collected this";
-  mockCommands({ doctor_report: () => rejectCommand(message, [notice]) });
+  mockCommands({ doctor_report: () => rejectCommand(message, [notice]), ...alwaysOn });
   render(SettingsView);
 
   const alert = await screen.findByRole("alert");

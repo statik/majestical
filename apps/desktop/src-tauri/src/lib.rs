@@ -37,7 +37,17 @@ pub fn run() {
         // app cannot start through. Removing one without the other does not
         // degrade the update check, it stops the app from opening a window.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        // "Start at login". Registering the plugin does not itself enable
+        // anything — `AutoLaunchManager` is built and managed, but nothing
+        // here calls `enable()`; that only ever happens from the Settings
+        // surface's "Start at login" checkbox. `LaunchAgent`, not
+        // `AppleScript`: no visible AppleScript permission prompt on
+        // first enable.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
 
     // e2e harness only: both crates are plain `[dependencies]` (Cargo has no
     // debug-only dependency section), but gating *registration* behind

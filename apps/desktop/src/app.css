@@ -1302,3 +1302,39 @@ main > .error {
   border-color: color-mix(in srgb, var(--alert) 45%, transparent);
   color: var(--alert);
 }
+
+/* Always-on (`AlwaysOnSection.svelte`): the indexing throttle radio group
+   and the "start at login" toggle. Layout lifted from the Settings
+   mockup's placeholder section, but the muted text color that section used
+   for its disabled controls does not carry over here — these are live
+   controls, so their labels read at the normal ink color. */
+.settings-status-label {
+  margin-top: 0.75rem;
+}
+
+.settings-throttle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0.5rem 0;
+}
+
+.settings-radio {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.settings-status {
+  margin: 0.25rem 0 0;
+  font-weight: 600;
+}

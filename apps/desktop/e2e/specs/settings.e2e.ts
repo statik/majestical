@@ -39,3 +39,42 @@ describe("Majestical desktop — Settings flow", () => {
     await expect(catalogRow.$(".settings-pill")).toHaveText("ok");
   });
 });
+
+// A separate `describe` (not a third `it` above) to keep both function
+// bodies under this project's line cap — see .oxlintrc.json's default.
+describe("Majestical desktop — Settings — Always-on throttle", () => {
+  before(async () => {
+    await suppressAutoFocusRecovery(browser);
+    await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
+    await openSurface('[data-e2e="nav-settings"]', ".settings-checks");
+  });
+
+  after(async () => {
+    // Restore Auto so a later spec — in this file's own session or, if
+    // sessions turn out not to be per-file, a spec sharing one — does not
+    // inherit a paused scheduler.
+    const autoRadio = await $('input[name="throttle"][value="auto"]');
+    if (!(await autoRadio.isSelected())) {
+      await autoRadio.click();
+    }
+  });
+
+  it("renders the throttle radio group with Auto checked on a fresh app", async () => {
+    await expect($('input[name="throttle"][value="auto"]')).toBeSelected();
+  });
+
+  it("switching to Paused round-trips through a real scheduler_state call", async () => {
+    // `set_throttle`'s response is immediate — this asserts on it directly,
+    // not on the scheduler's next tick (30s later): the returned throttle
+    // moves the checked radio right away, but `decision` (and so the
+    // status line, when the scheduler has one to show) is only as fresh as
+    // the last tick, so this does not assert on that line's text — doing
+    // so would mean waiting out the tick, which the plan for this spec
+    // rules out.
+    const pausedRadio = await $('input[name="throttle"][value="paused"]');
+    await pausedRadio.click();
+
+    await expect(pausedRadio).toBeSelected();
+    await expect($('input[name="throttle"][value="auto"]')).not.toBeSelected();
+  });
+});

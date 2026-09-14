@@ -1,0 +1,246 @@
+<title>Majestical — Ingest (type-a-path) and Always-on (failed items)</title>
+<style>
+  /* Custom properties cribbed from apps/desktop/src/app.css's :root block —
+     same names, same values, so this reads as a screenshot of the app
+     rather than a mockup with its own palette. */
+  :root {
+    color-scheme: light dark;
+    --edge: color-mix(in srgb, currentcolor 15%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --muted: color-mix(in srgb, currentcolor 60%, transparent);
+    --alert: light-dark(#b3261e, #f2b8b5);
+    --ok: light-dark(#1a7f37, #6fce8a);
+    --attention: light-dark(#b45309, #e8a33d);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: Canvas;
+    color: CanvasText;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+  }
+  /* The chrome around each screenshot — not part of the app, just framing
+     so the surface reads clearly against the artifact page. */
+  .frame {
+    max-width: 960px;
+    margin: 2rem auto;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 8px 28px rgb(0 0 0 / 12%);
+  }
+  .titlebar {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    padding: .5rem .75rem;
+    border-bottom: 1px solid var(--edge);
+    background: var(--sunken);
+  }
+  .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: var(--edge); }
+  .titlebar span { margin-left: .5rem; color: var(--muted); font-size: .75rem; }
+  .caption { max-width: 960px; margin: 0 auto 1rem; color: var(--muted); font-size: .85rem; }
+  .caption b { color: CanvasText; }
+  .caption code { font-size: .8rem; }
+
+  /* Below this line: the real app shell/sidebar/surface classes, laid out
+     exactly as apps/desktop/src/app.css defines them. */
+  .shell { display: grid; grid-template-columns: 220px 1fr 0; height: 560px; }
+  .sidebar { display: flex; flex-direction: column; gap: 1rem; padding: 1rem; overflow: hidden; background: var(--sunken); border-right: 1px solid var(--edge); }
+  .brand { margin: 0; font-size: 1rem; letter-spacing: .04em; text-transform: uppercase; }
+  .surfaces { flex: 1; margin: 0; padding: 0; list-style: none; }
+  .surfaces button { width: 100%; padding: .35rem .5rem; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .surfaces button[aria-current] { background: var(--sunken); font-weight: 600; }
+  .catalog-path { margin: 0; overflow-wrap: anywhere; color: var(--muted); font-size: .75rem; }
+  .surface { padding: 1rem; overflow-y: auto; }
+  .surface-title { margin: 0 0 .75rem; font-size: 1rem; }
+  .empty { color: var(--muted); }
+  .count { margin: .75rem 0 0; color: var(--muted); }
+  .error { margin: .5rem 0 0; color: var(--alert); }
+  .ctl-actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+  .ctl-input {
+    min-width: 0;
+    flex: 1;
+    padding: .25rem .45rem;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .8rem;
+  }
+  .ctl-btn {
+    flex: none;
+    padding: .25rem .6rem;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .8rem;
+    cursor: pointer;
+  }
+  .ctl-btn:disabled { opacity: .45; cursor: default; }
+  .ingest-primary { font-weight: 600; }
+  .ingest-quiet { color: var(--muted); }
+
+  .ingest-surface { display: flex; flex-direction: column; gap: .75rem; max-width: 60rem; }
+  .ingest-board { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  .ingest-panel { display: flex; flex-direction: column; gap: .4rem; min-width: 0; padding: .6rem .7rem; border: 1px solid var(--edge); border-radius: 6px; }
+  .ingest-title { margin: 0; font-size: .85rem; }
+  .ingest-rows { display: grid; gap: .15rem; margin: 0; padding: 0; list-style: none; }
+  .ingest-rows li { display: flex; gap: .5rem; align-items: baseline; }
+  .ingest-path { margin: 0; overflow-wrap: anywhere; font-size: .8rem; }
+
+  /* Settings surface classes, as app.css defines them. */
+  .settings-section { display: flex; flex-direction: column; gap: .5rem; margin-bottom: 1.75rem; padding-bottom: 1.75rem; border-bottom: 1px solid var(--edge); }
+  .settings-section:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  .settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+  .settings-section-head h3 { margin: 0; font-size: .85rem; }
+  .settings-section-sub { margin: -.25rem 0 0; color: var(--muted); font-size: .75rem; }
+  .settings-status-label { margin-top: .5rem; }
+  .settings-throttle { display: flex; gap: 1rem; }
+  .settings-radio { display: flex; gap: .35rem; align-items: center; font-size: .85rem; }
+  .settings-status { margin: 0; font-size: .85rem; }
+  .settings-toggle-row { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; font-size: .85rem; }
+  /* New this phase: the failed-items row — one status line and its action,
+     laid out with the shared `.ctl-actions` row rather than a new class. */
+  .settings-failed { color: var(--attention); }
+</style>
+
+<p class="caption">
+  <b>Frame 1 — Ingest, setup board.</b> Source and each destination can be
+  typed as well as browsed. The text field is the primary control; the
+  native folder dialog moves behind a <code>Browse…</code> button beside it.
+  A typed path is taken as-is (no client-side existence check — the plan
+  step is what validates it, and its error shows in this same panel, as
+  today). Enter in the destination field adds it; a duplicate root is
+  refused with the message shown. Everything below the board is unchanged.
+</p>
+<div class="frame">
+  <div class="titlebar"><i></i><i></i><i></i><span>Majestical</span></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <h1 class="brand">Majestical</h1>
+      <ul class="surfaces">
+        <li><button>Search</button></li>
+        <li><button>Volumes</button></li>
+        <li><button>Browse</button></li>
+        <li><button>Organize</button></li>
+        <li><button aria-current="page">Ingest</button></li>
+        <li><button>Settings</button></li>
+      </ul>
+      <p class="catalog-path">/Users/dana/Catalogs/studio</p>
+    </aside>
+    <main class="surface">
+      <div class="ingest-surface">
+        <h2 class="surface-title">Ingest</h2>
+        <div class="ingest-board" role="group" aria-label="Setup">
+          <div class="ingest-panel">
+            <h3 class="ingest-title">Source</h3>
+            <div class="ctl-actions">
+              <input class="ctl-input" type="text" aria-label="Source path"
+                     placeholder="/Volumes/CARD_01 or any folder"
+                     value="/Volumes/A7IV_CARD_2">
+              <button class="ctl-btn">Browse…</button>
+            </div>
+            <p class="count">A7IV_CARD_2 · 412 files · 38.6 GB</p>
+          </div>
+          <div class="ingest-panel">
+            <h3 class="ingest-title">Destinations</h3>
+            <ul class="ingest-rows" aria-label="Destinations">
+              <li>
+                <span class="ingest-path">/Volumes/RAID/Ingest</span>
+                <button class="ctl-btn ingest-quiet">Remove /Volumes/RAID/Ingest</button>
+              </li>
+            </ul>
+            <div class="ctl-actions">
+              <input class="ctl-input" type="text" aria-label="Destination path"
+                     placeholder="/Volumes/SHUTTLE_A"
+                     value="/Volumes/RAID/Ingest">
+              <button class="ctl-btn">Add</button>
+              <button class="ctl-btn">Browse…</button>
+            </div>
+            <p class="error" role="alert">/Volumes/RAID/Ingest is already a destination.</p>
+          </div>
+        </div>
+
+        <div class="ingest-panel">
+          <h3 class="ingest-title">File as</h3>
+          <div class="ctl-actions">
+            <select class="ctl-input" aria-label="PARA node">
+              <option>project/Spring campaign</option>
+            </select>
+            <input class="ctl-input" type="text" aria-label="Subfolder template"
+                   placeholder="{date}/{source-label}">
+          </div>
+        </div>
+
+        <div class="ingest-panel">
+          <h3 class="ingest-title">Plan</h3>
+          <div class="ctl-actions">
+            <button class="ctl-btn">Plan again</button>
+            <button class="ctl-btn ingest-primary">Start verified copy</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<p class="caption">
+  <b>Frame 2 — Settings, Always-on section.</b> One new line under the
+  throttle status, shown only when the ledger is non-empty, with its
+  action beside it. The strings are pinned: <code>1 item skipped after
+  failing</code> / <code>N items skipped after failing</code>, button
+  <code>Retry failed items</code>. Pressing it clears the ledger for every
+  kind and nudges the scheduler; the line disappears on the next poll
+  (and comes back with a fresh count if the items fail again). The Health
+  panel above this section carries the matching doctor row, so this line
+  never repeats the remedy text.
+</p>
+<div class="frame">
+  <div class="titlebar"><i></i><i></i><i></i><span>Majestical</span></div>
+  <div class="shell" style="height: 380px">
+    <aside class="sidebar">
+      <h1 class="brand">Majestical</h1>
+      <ul class="surfaces">
+        <li><button>Search</button></li>
+        <li><button>Volumes</button></li>
+        <li><button>Browse</button></li>
+        <li><button>Organize</button></li>
+        <li><button>Ingest</button></li>
+        <li><button aria-current="page">Settings</button></li>
+      </ul>
+      <p class="catalog-path">/Users/dana/Catalogs/studio</p>
+    </aside>
+    <main class="surface">
+      <h2 class="surface-title">Settings</h2>
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <div>
+            <h3>Always-on</h3>
+            <p class="settings-section-sub">Menu-bar tray, power-aware indexing throttle, start at login.</p>
+          </div>
+        </div>
+        <p class="settings-section-sub settings-status-label">Indexing throttle</p>
+        <div class="settings-throttle" role="radiogroup" aria-label="Indexing throttle">
+          <label class="settings-radio"><input type="radio" name="t" checked> Auto</label>
+          <label class="settings-radio"><input type="radio" name="t"> Low</label>
+          <label class="settings-radio"><input type="radio" name="t"> Full</label>
+          <label class="settings-radio"><input type="radio" name="t"> Paused</label>
+        </div>
+        <p class="settings-status" role="status">Indexing · 14 items pending</p>
+        <div class="ctl-actions">
+          <p class="settings-status settings-failed" role="status">3 items skipped after failing</p>
+          <button class="ctl-btn">Retry failed items</button>
+        </div>
+        <div class="settings-toggle-row">
+          <input id="start-at-login" type="checkbox">
+          <label for="start-at-login">Start at login</label>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>

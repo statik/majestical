@@ -30,12 +30,12 @@ describe("Majestical desktop — Settings flow", () => {
 
   it("reports the selected fixture catalog as Ok", async () => {
     // Looked up by name, not position, so a check services inserts ahead of
-    // it does not silently retarget this assertion.
-    const names = await $$(".settings-check-name").map((el) => el.getText());
-    const index = names.indexOf("catalog");
-    expect(index).toBeGreaterThanOrEqual(0);
-    const pill = await $$(".settings-check .settings-pill")[index];
-    if (pill === undefined) throw new Error("catalog row has no pill");
-    await expect(pill).toHaveText("Ok");
+    // it does not silently retarget this assertion. The pill's DOM text is
+    // the raw wire status; CSS uppercases it for the reader.
+    const rows = await $$(".settings-check");
+    const names = await rows.map((el) => el.$(".settings-check-name").getText());
+    const catalogRow = rows[names.indexOf("catalog")];
+    if (catalogRow === undefined) throw new Error("no catalog row");
+    await expect(catalogRow.$(".settings-pill")).toHaveText("ok");
   });
 });

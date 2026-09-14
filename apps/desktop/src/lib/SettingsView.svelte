@@ -5,7 +5,7 @@
   // nothing here fixes a check, it only reports it and offers to look
   // again.
   import { api, errorMessage, errorNotices } from "./api";
-  import type { CheckStatus, DoctorOutcome } from "./api";
+  import type { DoctorOutcome } from "./api";
   import Notices from "./Notices.svelte";
 
   let outcome = $state<DoctorOutcome | null>(null);
@@ -30,12 +30,6 @@
       loading = false;
     }
   }
-
-  /** `CheckStatus` is already the pill's lowercase suffix; only the label
-   *  shown to the reader needs capitalizing. */
-  function pillLabel(status: CheckStatus): string {
-    return status.charAt(0).toUpperCase() + status.slice(1);
-  }
 </script>
 
 <div class="surface">
@@ -57,17 +51,16 @@
       >
     </div>
 
-    <Notices notices={outcome?.notices} />
-
     {#if error}
       <Notices notices={failureNotices} />
       <p class="error" role="alert">{error}</p>
     {:else if outcome}
+      <Notices notices={outcome.notices} />
       <ul class="settings-checks">
         {#each outcome.checks as check}
           <li class="settings-check">
             <span class="settings-pill settings-pill-{check.status}"
-              >{pillLabel(check.status)}</span
+              >{check.status}</span
             >
             <span class="settings-check-name">{check.name}</span>
             <span class="settings-check-detail">{check.detail}</span>

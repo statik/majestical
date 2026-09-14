@@ -1,17 +1,15 @@
+import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
-import { emitProgress, RUN } from "./lib/ingest-test-support";
-import {
-  mockCommands,
-  rejectCommand,
-  stubManifest,
-  stubMatchMedia,
-} from "./lib/test-support";
+import { NAVIGATE_SETTINGS_EVENT } from "./lib/api";
+import { emitProgress, listenerCount, RUN } from "./lib/ingest-test-support";
+import { mockCommands, rejectCommand, stubManifest, stubMatchMedia } from "./lib/test-support";
 import doctorOutcome from "./lib/fixtures/doctor_outcome.json";
+import schedulerState from "./lib/fixtures/scheduler_state.json";
 
 beforeEach(() => {
   mockConvertFileSrc("macos");
@@ -34,6 +32,18 @@ const ready: AppStatus = { catalog_path: "/catalogs/main", catalog_ready: true }
 // with "nothing" rather than left to reject — `UpdateBanner.test.ts` is where
 // the offer and its failure paths are pinned.
 const UPDATE_CHECK = "plugin:updater|check";
+
+/** `AlwaysOnSection` mounts alongside Settings and asks these two commands
+ *  on mount; `AlwaysOnSection.test.ts` is where its own behavior is pinned.
+ *  These shell tests don't care what the scheduler is doing, only that
+ *  mounting it doesn't throw "unexpected command", so any fixture will do —
+ *  reusing `scheduler_state.json` rather than inlining a third copy of the
+ *  wire shape (`AlwaysOnSection.test.ts` and `fixtures.test.ts` already
+ *  import it). */
+const ALWAYS_ON = {
+  scheduler_state: () => schedulerState,
+  "plugin:autostart|is_enabled": () => false,
+};
 
 const hit: SearchHit = {
   asset: "xxh3:abc123",
@@ -111,6 +121,7 @@ function mockCatalog(volumeLabels: string[]) {
         clock_suspect: false,
       })),
     }),
+    ...ALWAYS_ON,
   });
 }
 
@@ -288,6 +299,23 @@ test("the settings surface swaps in with the doctor's health rows", async () => 
   );
   expect(screen.queryByRole("searchbox")).toBeNull();
   expect(settings.getAttribute("aria-current")).toBe("page");
+});
+
+test("the tray's navigate-settings event selects the Settings surface", async () => {
+  mockCatalog(["Card"]);
+  render(App);
+
+  // Still on Search: the event can arrive at any time, not only after the
+  // operator has clicked into Settings themselves. Two listeners mount with
+  // the shell (ingest progress and this one); wait for both, the same race
+  // `emitProgress` guards against.
+  await screen.findByRole("searchbox");
+  await waitFor(() => expect(listenerCount()).toBeGreaterThanOrEqual(2));
+
+  await emit(NAVIGATE_SETTINGS_EVENT, null);
+
+  expect(await screen.findByRole("heading", { name: "Health" })).toBeTruthy();
+  expect(screen.queryByRole("searchbox")).toBeNull();
 });
 
 test("the organize surface swaps in with both of its columns", async () => {

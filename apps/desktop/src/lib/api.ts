@@ -438,6 +438,14 @@ export interface IngestProgress {
 /** The Tauri event name `start_ingest` forwards progress under. */
 export const INGEST_PROGRESS_EVENT = "ingest-progress";
 
+/**
+ * The Tauri event `tray.rs` emits after showing and focusing the main
+ * window from "Health…" or the tray's attention line ("Last batch failed"),
+ * so the shell selects the Settings surface rather than wherever it was
+ * left open to.
+ */
+export const NAVIGATE_SETTINGS_EVENT = "navigate-settings";
+
 /** `majestical_services::autopilot::ThrottleOverride`, serialized snake_case. */
 export type ThrottleOverride = "auto" | "paused" | "low" | "full";
 
@@ -461,6 +469,14 @@ export type SchedulerDecision =
       mode: "hold";
       hold_reason: "paused" | "low_power_mode" | "no_pending_work";
     };
+
+/** The `hold` arm's reason, pulled out so a `Record<HoldReason, ...>` (as
+ *  `scheduler-status.ts` builds) fails to type-check on a variant it hasn't
+ *  covered, rather than silently falling through. */
+export type HoldReason = Extract<
+  SchedulerDecision,
+  { mode: "hold" }
+>["hold_reason"];
 
 /**
  * `indexer::SchedulerStateOutcome` — what `scheduler_state`/`set_throttle`

@@ -290,12 +290,19 @@ fn run_tick(app: &AppHandle) -> Duration {
     run_batch(&cfg, &scheduler, decision, &req)
 }
 
-/// The loop body: forever, run one tick and sleep for whatever it decided.
-/// Runs for the life of the process — nothing ever joins this thread, the
-/// same "outlives everything" shape `ingest.rs`'s run thread has.
+/// The loop body: forever, run one tick, refresh the tray, and sleep for
+/// whatever the tick decided. Runs for the life of the process — nothing
+/// ever joins this thread, the same "outlives everything" shape
+/// `ingest.rs`'s run thread has.
+///
+/// The refresh sits here, after every tick regardless of which of
+/// `run_tick`'s early returns fired, because every path through it changes
+/// something the tray's status line reports (the catalog selection, a
+/// poll's decision, or a batch's outcome).
 fn run_loop(app: &AppHandle) {
     loop {
         let pause = run_tick(app);
+        crate::tray::refresh(app);
         std::thread::sleep(pause);
     }
 }
@@ -346,13 +353,38 @@ fn scheduler_state_impl(state: &SchedulerState) -> SchedulerStateOutcome {
 /// batches are short by construction (`BATCH_LIMIT` items), which IS the
 /// pause latency, the same "between files" doctrine `ingest.rs`'s cancel
 /// follows.
+///
+/// `pub(crate)`, not private: `tray.rs`'s throttle-radio handler calls this
+/// same function rather than duplicating it, so a click in the tray and a
+/// call from the Settings surface change the throttle identically.
+///
+/// Also recomputes `last_decision` immediately, from the last poll's power
+/// state and pending count — without this, the tray's status line and the
+/// Settings status line would both keep showing the previous decision
+/// (e.g. "Indexing — n items pending" after clicking Paused) for up to a
+/// full [`TICK`], since the loop is otherwise the only writer of
+/// `last_decision` and it only runs once a tick. Left `None` when it was
+/// already `None` (before the loop's first tick): there is no pending
+/// count or power reading yet to decide from, so "Starting…" stays
+/// accurate rather than becoming a decision made from stale zero values.
 #[must_use]
-fn set_throttle_impl(state: &SchedulerState, throttle: ThrottleOverride) -> SchedulerStateOutcome {
-    state
-        .0
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .throttle = throttle;
+pub(crate) fn set_throttle_impl(
+    state: &SchedulerState,
+    throttle: ThrottleOverride,
+) -> SchedulerStateOutcome {
+    let mut shared = state.0.write().unwrap_or_else(PoisonError::into_inner);
+    shared.throttle = throttle;
+    if shared.last_decision.is_some() {
+        shared.last_decision = Some(autopilot_decision(
+            shared.power,
+            throttle,
+            shared.pending_items,
+        ));
+    }
+    // Load-bearing: `scheduler_state_impl` below takes its own read lock on
+    // the same `RwLock`, which is not reentrant — holding `shared` across
+    // that call would deadlock.
+    drop(shared);
     scheduler_state_impl(state)
 }
 
@@ -366,6 +398,11 @@ pub fn scheduler_state(state: State<'_, SchedulerState>) -> SchedulerStateOutcom
     scheduler_state_impl(&state)
 }
 
+/// One line more than a pure wrapper over `set_throttle_impl`: the
+/// Settings surface is the other caller that can change the throttle (the
+/// tray's own radio items call `set_throttle_impl` directly — see
+/// `tray.rs`), so this is where a Settings-driven change reaches the tray's
+/// menu, the same rebuild-on-change rule `run_tick` follows for every tick.
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
@@ -373,18 +410,22 @@ pub fn scheduler_state(state: State<'_, SchedulerState>) -> SchedulerStateOutcom
 )]
 #[tauri::command]
 pub fn set_throttle(
+    app: AppHandle,
     state: State<'_, SchedulerState>,
     throttle: ThrottleOverride,
 ) -> SchedulerStateOutcome {
-    set_throttle_impl(&state, throttle)
+    let outcome = set_throttle_impl(&state, throttle);
+    crate::tray::refresh(&app);
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
-        SchedulerDecision, SchedulerStateOutcome, ThrottleOverride, batch_outcome_pace,
-        batch_request, pending_items, success_pace, total_failures,
+        SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome,
+        ThrottleOverride, batch_outcome_pace, batch_request, pending_items, set_throttle_impl,
+        success_pace, total_failures,
     };
     use majestical_services::index::{IndexRunOutcome, KindStatusRow};
     use std::time::Duration;
@@ -570,5 +611,60 @@ mod tests {
                 "last_error": "the last batch failed: disk full",
             })
         );
+    }
+
+    /// A scheduler with a prior tick's decision already recorded, so
+    /// `set_throttle_impl` has power/pending values to recompute from.
+    fn ticked_state(
+        decision: SchedulerDecision,
+        power: PowerState,
+        pending_items: u64,
+    ) -> SchedulerState {
+        SchedulerState(std::sync::RwLock::new(SchedulerShared {
+            throttle: ThrottleOverride::Auto,
+            last_decision: Some(decision),
+            power,
+            pending_items,
+            running: false,
+            last_error: None,
+        }))
+    }
+
+    #[test]
+    fn set_throttle_recomputes_the_decision_immediately_on_pause() {
+        let state = ticked_state(
+            SchedulerDecision::RunFull,
+            PowerState {
+                source: PowerSource::Ac,
+                low_power_mode: false,
+            },
+            214,
+        );
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Paused);
+        assert_eq!(
+            outcome.decision,
+            Some(SchedulerDecision::Hold(HoldReason::Paused))
+        );
+    }
+
+    #[test]
+    fn set_throttle_recomputes_the_decision_immediately_back_to_auto() {
+        let state = ticked_state(
+            SchedulerDecision::Hold(HoldReason::Paused),
+            PowerState {
+                source: PowerSource::Ac,
+                low_power_mode: false,
+            },
+            214,
+        );
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Auto);
+        assert_eq!(outcome.decision, Some(SchedulerDecision::RunFull));
+    }
+
+    #[test]
+    fn set_throttle_before_the_first_tick_leaves_the_decision_none() {
+        let state = SchedulerState(std::sync::RwLock::new(SchedulerShared::default()));
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Paused);
+        assert_eq!(outcome.decision, None);
     }
 }

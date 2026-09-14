@@ -137,32 +137,16 @@
     text-transform: uppercase;
   }
 
-  /* Always-on placeholder — deliberately inert (disabled controls, muted
-     text) and set off with an amber edge, the same visual grammar the real
-     app already uses for "something not settled yet" (ingest-resume's
-     left border in app.css). */
-  .settings-future {
-    padding: .6rem .75rem;
-    border: 1px solid var(--edge);
-    border-left: 3px solid var(--attention);
-    border-radius: 6px;
-    background: var(--sunken);
-  }
-  .settings-future-badge {
-    display: inline-block;
-    margin-bottom: .5rem;
-    padding: .1rem .5rem;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--attention) 20%, transparent);
-    color: var(--attention);
-    font-size: .68rem;
-    font-weight: 700;
-    letter-spacing: .04em;
-    text-transform: uppercase;
-  }
+  /* Always-on (shipped, chunk 6 — `AlwaysOnSection.svelte`): the throttle
+     radio group and the "start at login" toggle are live controls now, so
+     — unlike the chunk-4 placeholder this replaces — nothing here is
+     muted or disabled; a `.settings-section` needs no amber "not settled
+     yet" edge once what it shows is real. */
+  .settings-status-label { margin-top: .75rem; }
   .settings-throttle { display: flex; flex-wrap: wrap; gap: 1rem; margin: .5rem 0; }
-  .settings-radio { display: flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .85rem; }
-  .settings-toggle-row { display: flex; align-items: center; gap: .5rem; color: var(--muted); font-size: .85rem; }
+  .settings-radio { display: flex; align-items: center; gap: .35rem; font-size: .85rem; }
+  .settings-toggle-row { display: flex; align-items: center; gap: .5rem; margin-top: .5rem; font-size: .85rem; }
+  .settings-status { margin: .25rem 0 0; font-weight: 600; }
 </style>
 
 <div class="frame">
@@ -264,30 +248,31 @@
       </section>
 
       <section class="settings-section">
-        <div class="settings-future">
-          <span class="settings-future-badge">Arrives with chunk 6</span>
-          <div class="settings-section-head">
-            <div>
-              <h3>Always-on</h3>
-              <p class="settings-section-sub">
-                Menu-bar tray, power-aware indexing throttle, start at login. Shown
-                here for final shape only — none of this is wired up in this chunk.
-              </p>
-            </div>
+        <div class="settings-section-head">
+          <div>
+            <h3>Always-on</h3>
+            <p class="settings-section-sub">
+              Menu-bar tray, power-aware indexing throttle, start at login.
+            </p>
           </div>
+        </div>
 
-          <p class="settings-section-sub" style="margin-top: .75rem;">Indexing throttle</p>
-          <div class="settings-throttle">
-            <label class="settings-radio"><input type="radio" name="throttle" checked disabled> Auto</label>
-            <label class="settings-radio"><input type="radio" name="throttle" disabled> Paused</label>
-            <label class="settings-radio"><input type="radio" name="throttle" disabled> Low</label>
-            <label class="settings-radio"><input type="radio" name="throttle" disabled> Full</label>
-          </div>
+        <p class="settings-section-sub settings-status-label">Indexing throttle</p>
+        <div class="settings-throttle">
+          <label class="settings-radio"><input type="radio" name="throttle" checked> Auto</label>
+          <label class="settings-radio"><input type="radio" name="throttle"> Paused</label>
+          <label class="settings-radio"><input type="radio" name="throttle"> Low</label>
+          <label class="settings-radio"><input type="radio" name="throttle"> Full</label>
+        </div>
+        <!-- Straight off `SchedulerStateOutcome.decision`/`pending_items` —
+             not a port of `tray.rs`'s `menu_model` (no power-source-aware
+             second line, no pending-count suppression under a hold). See
+             `AlwaysOnSection.svelte`'s `statusLine`. -->
+        <p class="settings-status">Indexing — 42 items pending</p>
 
-          <div class="settings-toggle-row">
-            <input type="checkbox" disabled>
-            <label>Start at login</label>
-          </div>
+        <div class="settings-toggle-row">
+          <input type="checkbox">
+          <label>Start at login</label>
         </div>
       </section>
     </div>

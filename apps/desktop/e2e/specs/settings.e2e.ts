@@ -39,3 +39,48 @@ describe("Majestical desktop — Settings flow", () => {
     await expect(catalogRow.$(".settings-pill")).toHaveText("ok");
   });
 });
+
+// A separate `describe` (not a third `it` above) to keep both function
+// bodies under this project's line cap — see .oxlintrc.json's default.
+describe("Majestical desktop — Settings — Always-on throttle", () => {
+  before(async () => {
+    await suppressAutoFocusRecovery(browser);
+    await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
+    await openSurface('[data-e2e="nav-settings"]', ".settings-checks");
+  });
+
+  after(async () => {
+    // Restore Auto so a later spec — in this file's own session or, if
+    // sessions turn out not to be per-file, a spec sharing one — does not
+    // inherit a paused scheduler.
+    const autoRadio = await $('input[name="throttle"][value="auto"]');
+    if (!(await autoRadio.isSelected())) {
+      await autoRadio.click();
+    }
+  });
+
+  it("renders the throttle radio group with Auto checked on a fresh app", async () => {
+    await expect($('input[name="throttle"][value="auto"]')).toBeSelected();
+  });
+
+  it("switching to Paused round-trips through a real scheduler_state call", async () => {
+    // `set_throttle`'s response is immediate, and so is the status line:
+    // `indexer.rs::set_throttle_impl` recomputes the decision from the
+    // last poll's power/pending state right away rather than waiting for
+    // the scheduler's next tick (up to 30s later), so both the radio and
+    // `.settings-status` move synchronously with the click — no tick wait
+    // needed here.
+    const pausedRadio = await $('input[name="throttle"][value="paused"]');
+    await pausedRadio.click();
+
+    await expect(pausedRadio).toBeSelected();
+    await expect($('input[name="throttle"][value="auto"]')).not.toBeSelected();
+    await expect($(".settings-status")).toHaveText("Paused");
+
+    const autoRadio = await $('input[name="throttle"][value="auto"]');
+    await autoRadio.click();
+
+    await expect(autoRadio).toBeSelected();
+    await expect($(".settings-status")).not.toHaveText("Paused");
+  });
+});

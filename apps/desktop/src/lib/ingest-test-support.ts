@@ -187,8 +187,10 @@ const TAURI_INTERNALS = "__TAURI_INTERNALS__";
 /** How many callbacks the Tauri mock has registered. A `listen` registers
  *  its handler synchronously inside the call, so this going above zero is
  *  the surface's subscription being live — which an emit has to wait for,
- *  since the subscription is made in a mount effect. */
-function listenerCount(): number {
+ *  since the subscription is made in a mount effect. Exported for
+ *  `App.test.ts`'s own `listen` calls (the tray's `navigate-settings`
+ *  event), which race the same mount effect this one does. */
+export function listenerCount(): number {
   // Reached by name rather than as a property, because the name is the
   // Tauri API's and its underscores are not ours to rename.
   const internals = (

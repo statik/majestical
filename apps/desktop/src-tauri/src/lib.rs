@@ -7,6 +7,9 @@ pub mod indexer;
 pub mod ingest;
 pub mod power;
 pub mod thumb_protocol;
+pub mod tray;
+
+use tauri::Manager;
 
 /// Builds and runs the Tauri app.
 ///
@@ -34,7 +37,17 @@ pub fn run() {
         // app cannot start through. Removing one without the other does not
         // degrade the update check, it stops the app from opening a window.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        // "Start at login". Registering the plugin does not itself enable
+        // anything — `AutoLaunchManager` is built and managed, but nothing
+        // here calls `enable()`; that only ever happens from the Settings
+        // surface's "Start at login" checkbox. `LaunchAgent`, not
+        // `AppleScript`: no visible AppleScript permission prompt on
+        // first enable.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
 
     // e2e harness only: both crates are plain `[dependencies]` (Cargo has no
     // debug-only dependency section), but gating *registration* behind
@@ -77,7 +90,35 @@ pub fn run() {
         .setup(|app| {
             commands::restore_persisted_catalog(app.handle())?;
             indexer::spawn_loop(app.handle());
+            tray::build_tray(app.handle())?;
             Ok(())
+        })
+        // Closing the window hides it to the tray instead of quitting —
+        // "Quit Majestical" on the tray menu or the system's Cmd+Q are the
+        // ways out (see `tray.rs::handle_menu_event`). On macOS the Dock
+        // icon goes away with it (`Accessory`) so a hidden app does not sit
+        // in the Dock looking quit; `tray::show_window` puts both back.
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                // A window that fails to hide here is rare (mid-teardown)
+                // and not worth surfacing: the close was already
+                // prevented, so at worst the window stays visible instead
+                // of going to the tray — a cosmetic miss, not a broken
+                // close.
+                let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                // Same rationale as `tray::show_window`'s
+                // activation-policy call: a failed switch leaves the Dock
+                // icon in its prior state, a cosmetic inconsistency rather
+                // than a broken hide.
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
         })
         .register_uri_scheme_protocol("thumb", |ctx, request| {
             thumb_protocol::respond(ctx.app_handle(), &request.uri().to_string())

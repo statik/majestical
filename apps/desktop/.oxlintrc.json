@@ -85,14 +85,36 @@
     {
       // A suite's length tracks how many behaviours it pins, not how
       // complicated any of them is, and both of these are already split by
-      // subject: the shell (322 lines) and the Ingest setup board (350),
-      // beside a live-run suite (225) and an outcome suite (243) that are
-      // under the default and stay there. The cap sits just above the
-      // larger of the two, so the next subject gets its own file — which
-      // is what keeps them findable — rather than being folded in here.
+      // subject: the shell and the Ingest setup board, beside a live-run
+      // suite (225 lines) and an outcome suite (243) that are under the
+      // default and stay there. Raised again for phase 7E: the shell suite
+      // (376 lines) picked up `ALWAYS_ON`, the two commands every Settings
+      // mount now needs mocked (`AlwaysOnSection` mounts alongside the
+      // health panel and asks `scheduler_state`/`plugin:autostart|
+      // is_enabled` on mount) — not a new subject, just the existing
+      // Settings-surface test paying for a sibling component's mount
+      // effects. The cap sits just above that, so the next subject still
+      // gets its own file — which is what keeps them findable — rather
+      // than being folded in here. Next raise is refused: the two
+      // Settings-shell tests ("the settings surface swaps in with the
+      // doctor's health rows" and "the tray's navigate-settings event
+      // selects the Settings surface") move to their own
+      // `src/App.settings.test.ts` instead.
       "files": ["src/App.test.ts", "src/lib/IngestView.test.ts"],
       "rules": {
-        "max-lines": ["warn", { "max": 360 }]
+        "max-lines": ["warn", { "max": 385 }]
+      }
+    },
+    {
+      // `ALWAYS_ON`'s `scheduler_state` mock reuses `scheduler_state.json`
+      // (also imported by `AlwaysOnSection.test.ts` and `fixtures.test.ts`)
+      // rather than inlining a third copy of the wire shape, which is the
+      // one dependency over the default here. Same next-split plan as the
+      // `max-lines` override above: the two Settings-shell tests move to
+      // `src/App.settings.test.ts`, taking this import with them.
+      "files": ["src/App.test.ts"],
+      "rules": {
+        "import/max-dependencies": ["warn", { "max": 11 }]
       }
     },
     {

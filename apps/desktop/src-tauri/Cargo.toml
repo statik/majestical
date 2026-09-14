@@ -17,12 +17,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2.11.5", features = [] }
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-updater = "2.10.1"
 # `relaunch()` after an update installs. Registered now: unlike the updater,
 # this plugin takes no configuration and so cannot fail to initialize.
 tauri-plugin-process = "2.3.1"
+# "Start at login" — registered with the OS login-item API disabled by
+# default; enabling it is only ever the user's click in Settings, never a
+# side effect of registering the plugin.
+tauri-plugin-autostart = "2.5.1"
 majestical-services = { path = "../../../crates/services" }
 # The GUI owns the one cancellable ingest run: `engine::{RunControl,
 # CancelFlag, ProgressEvent}` is the seam `services::ingest::run_ingest`

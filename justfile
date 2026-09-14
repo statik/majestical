@@ -44,6 +44,82 @@ gui-e2e:
     cd apps/desktop && pnpm tauri build --debug -b app --config src-tauri/tauri.e2e.conf.json
     cd apps/desktop/e2e && pnpm install --frozen-lockfile && pnpm check && pnpm test
 
+# Regenerates the tray's four macOS template icons (monochrome, alpha-only —
+# `tray.rs` loads them with `icon_as_template(true)`, so only the shape
+# matters and RGB is ignored). `magick` the same way `phase5_e2e.rs` and
+# `crates/index/tests/fixtures/ocr-hello.png` render text fixtures: this
+# machine's ffmpeg has no `drawtext` support. Run whenever a glyph changes;
+# the PNGs are committed, so this is not part of any build or CI job. Byte-
+# stable: `png:exclude-chunks=date,time` strips the only per-run difference
+# ImageMagick otherwise writes, so running this twice with no glyph change
+# leaves `git status` clean (verified: two runs, `cmp` identical).
+TRAY_ICON_FONT := "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+tray-icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="apps/desktop/src-tauri/icons/tray"
+    mkdir -p "$dir"
+    font="{{TRAY_ICON_FONT}}"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    strip=(-define png:exclude-chunks=date,time)
+    render() {
+        # size stroke rect_from rect_to radius pointsize outfile
+        local size=$1 stroke=$2 from=$3 to=$4 radius=$5 pointsize=$6 out=$7
+        magick -size "${size}x${size}" xc:none \
+            -fill none -stroke black -strokewidth "$stroke" \
+            -draw "roundrectangle $from $to $radius,$radius" \
+            -fill black -stroke none -font "$font" -pointsize "$pointsize" \
+            -gravity center -annotate +0+0 "M" \
+            "${strip[@]}" "$dir/$out"
+    }
+    render_dashed() {
+        local size=$1 stroke=$2 from=$3 to=$4 radius=$5 dash=$6 pointsize=$7 out=$8
+        magick -size "${size}x${size}" xc:none \
+            -fill none -stroke black -strokewidth "$stroke" \
+            -draw "stroke-dasharray $dash roundrectangle $from $to $radius,$radius" \
+            -fill black -stroke none -font "$font" -pointsize "$pointsize" \
+            -gravity center -annotate +0+0 "M" \
+            "${strip[@]}" "$dir/$out"
+    }
+    render_knockout() {
+        # A filled rounded square with the glyph cut out (`DstOut`): the
+        # glyph area is fully transparent, not just white — a template
+        # icon's RGB is ignored, only alpha marks the shape. The two
+        # intermediate layers live in $tmp, not $dir, so a failed run
+        # never leaves scratch files next to the committed PNGs.
+        local size=$1 from=$2 to=$3 radius=$4 pointsize=$5 out=$6
+        magick -size "${size}x${size}" xc:none -fill black -stroke none \
+            -draw "roundrectangle $from $to $radius,$radius" \
+            "${strip[@]}" "$tmp/shape.png"
+        magick -size "${size}x${size}" xc:none -fill black -stroke none \
+            -font "$font" -pointsize "$pointsize" -gravity center \
+            -annotate +0+0 "M" "${strip[@]}" "$tmp/glyph.png"
+        magick "$tmp/shape.png" "$tmp/glyph.png" -compose DstOut -composite \
+            "${strip[@]}" "$dir/$out"
+    }
+    render_attention() {
+        # The idle look plus a small solid dot badge at the top right —
+        # template icons are monochrome, so this stands in for the
+        # mockup's amber tint (see tray.rs's as-built note).
+        local size=$1 stroke=$2 from=$3 to=$4 radius=$5 pointsize=$6 cx=$7 cy=$8 r=$9 out=${10}
+        magick -size "${size}x${size}" xc:none \
+            -fill none -stroke black -strokewidth "$stroke" \
+            -draw "roundrectangle $from $to $radius,$radius" \
+            -fill black -stroke none -font "$font" -pointsize "$pointsize" \
+            -gravity center -annotate +0+0 "M" \
+            -fill black -stroke none -draw "circle $cx,$cy $((cx + r)),$cy" \
+            "${strip[@]}" "$dir/$out"
+    }
+    render         22 1.5 "2,2" "19,19" 4 11 idle.png
+    render         44 3   "4,4" "39,39" 8 22 idle@2x.png
+    render_dashed  22 1.5 "2,2" "19,19" 4 "2,2" 11 paused.png
+    render_dashed  44 3   "4,4" "39,39" 8 "4,4" 22 paused@2x.png
+    render_knockout 22 "2,2" "19,19" 4 11 indexing.png
+    render_knockout 44 "4,4" "39,39" 8 22 indexing@2x.png
+    render_attention 22 1.5 "2,2" "19,19" 4 11 17 4 2 attention.png
+    render_attention 44 3   "4,4" "39,39" 8 22 34 8 4 attention@2x.png
+
 version-sync:
     ./scripts/version-sync.sh
 

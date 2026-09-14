@@ -962,38 +962,38 @@ git commit -m "feat: start-at-login toggle and always-on settings section"
 
 ### Task 16: mutants + parity sweep
 
-- [ ] **Step 1:** `cargo mutants -p majestical-services -f src/doctor.rs`
+- [x] **Step 1:** `cargo mutants -p majestical-services -f src/doctor.rs`
   — FOREGROUND, wait for completion. Triage every survivor: fix the test
   or record the disposition.
-- [ ] **Step 2:** `cargo mutants -p majestical-services -f src/autopilot.rs`
+- [x] **Step 2:** `cargo mutants -p majestical-services -f src/autopilot.rs`
   — same, sequentially, only after Step 1 finishes.
-- [ ] **Step 3:** a scoped run over `apps/desktop/src-tauri/src/power.rs`
+- [x] **Step 3:** a scoped run over `apps/desktop/src-tauri/src/power.rs`
   parsers and `indexer.rs`'s pure functions if the desktop workspace's
   mutants setup permits (it is a separate workspace; if `cargo mutants`
   cannot run there cleanly, record that as the disposition — do not force
   it).
-- [ ] **Step 4:** re-run both parity harnesses end to end
+- [x] **Step 4:** re-run both parity harnesses end to end
   (`cargo test -p majestical-cli --test services_parity`,
   `cargo test --test tauri_parity` in the desktop workspace) against a
   fresh `/tmp/maj-ref`.
 
 ### Task 17: watchlist, handoff, closing PR
 
-- [ ] **Step 1:** append a "Phase 7E deferrals" section to
+- [x] **Step 1:** append a "Phase 7E deferrals" section to
   `docs/superpowers/plans/2026-07-29-phase2-watchlist.md`: every deferral
   from the spec's Deferred list plus anything reviewers deferred during
   the phase, each attributed to its PR; plus a
   "cargo-mutants triage (phase 7E)" section recording Task 16's runs and
   survivor dispositions.
-- [ ] **Step 2:** write the spec's `## As-built (phase 7E)` section
+- [x] **Step 2:** write the spec's `## As-built (phase 7E)` section
   (deviations, AMENDED notes summary, review-loop shape) — the 7D spec's
   as-built section is the template.
-- [ ] **Step 3:** write `docs/superpowers/HANDOFF-phase7F.md` in the
+- [x] **Step 3:** write `docs/superpowers/HANDOFF-phase7F.md` in the
   established format: state at handoff, new architecture pointers (doctor,
   autopilot policy + scheduler, tray, the e2e harness and its "the e2e
   job is the smoke" rule replacing the manual-smoke rule), secrets note
   (unchanged), 7F recommendations from the remaining deferred list.
-- [ ] **Step 4:** closing PR with all of the above; squash-merge when
+- [x] **Step 4:** closing PR with all of the above; squash-merge when
   green.
 
 ```bash

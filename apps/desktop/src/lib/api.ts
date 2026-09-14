@@ -189,8 +189,8 @@ export type CheckStatus = "ok" | "warn" | "fail";
 
 /**
  * `majestical_services::doctor::DoctorCheck`. `remedy` is absent on an `Ok`
- * row and present on `Warn`/`Fail` — though not every `Warn` row carries one
- * (a missing catalog has nothing to remedy on its own).
+ * row and present on `Fail`; a `Warn` row may carry one (the no-catalog
+ * `catalog` row does) or not (`blob_residue` and `platform` warnings don't).
  */
 export interface DoctorCheck {
   name: string;

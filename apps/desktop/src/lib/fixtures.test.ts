@@ -68,6 +68,8 @@ const typedCommandError: CommandError = commandError;
 // module inference widens it to `string`, same reason `AssetDetail` above
 // needs a cast rather than a plain assignment.
 const typedDoctorOutcome: DoctorOutcome = doctorOutcome as DoctorOutcome;
+// The annotation is the check: a literal the `CheckStatus` union drops fails
+// `tsc` here, which the cast above would otherwise hide.
 const allCheckStatuses: CheckStatus[] = ["ok", "warn", "fail"];
 const typedBrowseTree: BrowseTreeOutcome = browseTree;
 const typedBrowseList: BrowseListOutcome = browseList;
@@ -256,10 +258,7 @@ describe("scheduler state fixtures", () => {
 describe("doctor outcome fixture", () => {
   it("carries one row per status, a remedy on warn and fail, and a notice", () => {
     const statuses = typedDoctorOutcome.checks.map((c) => c.status);
-    expect(statuses).toEqual(["ok", "warn", "fail"]);
-    for (const status of statuses) {
-      expect(allCheckStatuses).toContain(status);
-    }
+    expect(statuses).toEqual(allCheckStatuses);
     const [ok, warn, fail] = typedDoctorOutcome.checks;
     expect(ok?.remedy).toBeUndefined();
     expect(warn?.remedy?.length).toBeGreaterThan(0);

@@ -2009,6 +2009,166 @@ counter-mutant family is otherwise gone: the two-asset rule held, and
 this phase's new planner pass (`plan_keyframe_images`) shipped with the
 same shape of test, so it contributed no survivors.
 
+## Phase 7E deferrals
+
+Recorded during the phase 7E PR chain (#109-#113, #116, #117, #121, #122)
+and this closing PR. Items marked "(spec)" come from
+`docs/superpowers/specs/2026-08-26-phase7e-alwayson-e2e-doctor-design.md`'s
+own Deferred list; the rest were found during execution.
+
+- **MCP long-running-tool progress notifications** (spec, carried again
+  from phase 7D). The tray and the Always-on section both poll
+  `scheduler_state`/`index status` instead, so 7E needed no new streaming
+  seam and still did not build one.
+- **CLI ingest progress rendering** (spec, carried again from phase 7D).
+  Unchanged this phase.
+- **The ingest queue** (spec, carried again from phase 7D). Unchanged
+  this phase.
+- **Windows/Linux release artifacts, signing, distribution; localization**
+  (spec, carried again from phase 7D). Unchanged this phase.
+- **An index-engine cancel/progress seam (`RunControl` for indexing)**
+  (spec; #116). The scheduler's batched-`limit` approach (25 items per
+  kind, per batch) made a true cancel/progress seam unnecessary this
+  phase — pausing waits out one batch instead. A future phase wanting
+  mid-batch cancellation or live progress events adds the seam then.
+- **Battery-threshold policy refinements** (spec; #116). `autopilot_decision`'s
+  shape admits a rule like "hold below 20%" (add a `battery_percent` field
+  to `PowerState` and a new `HoldReason` arm), but nothing asked for it —
+  the two-state Battery/Unknown split maps to `RunLow` uniformly.
+- **`plan_work` never consults `failed_last_run`** (#116). A permanently
+  failing item (bad codec, no describer key) re-enters the plan at every
+  head — CLI, MCP, and the scheduler tick alike — rather than being
+  skipped once it is known to fail. The scheduler's own no-progress hold
+  (`batch_outcome_pace`, `apps/desktop/src-tauri/src/indexer.rs`) keeps
+  this from hot-looping, but the item still gets re-planned and re-tried
+  every tick. Closing this means `plan_work` reading the failure report
+  before queuing — a 7F candidate.
+- **Scheduler batches pass `api_key: None`** (#116). `batch_request`
+  (`apps/desktop/src-tauri/src/indexer.rs`) builds every batch's
+  `IndexRunReq` with no API key, so a describer that needs one (a
+  configured remote captioner) fails its item every batch under the
+  scheduler specifically — the CLI and MCP heads pass a key when the
+  operator supplies one. Reports as "batch made no progress" rather than
+  naming the missing key.
+- **The ingest e2e flow, and a type-a-path affordance on `IngestView`**
+  (#113, plan's Task 6 AMENDED note). `IngestView`'s source/destination
+  pickers go through the native OS folder dialog with no text fallback,
+  and the e2e suite deliberately has no guest bridge to answer native
+  dialogs, so the flow was dropped rather than invent a test-only
+  backdoor. A real type-a-path affordance (useful to an agent or a power
+  user, independent of testing) would incidentally unblock it — a 7F
+  candidate, to be designed with a mockup rather than slipped in mid-chunk.
+- **Window-close hide-to-tray is untested by e2e** (#122, plan's Task 14
+  AMENDED note). The WebDriver session cannot survive a hidden window, so
+  `on_window_event`'s `CloseRequested` → hide path has no automated
+  coverage; it was exercised by hand during Task 14.
+- **Tray `@2x` icons committed but unused** (#122, plan's Task 14 AMENDED
+  note). `tray_icon` builds the tray's `NSImage` from raw pixel data 1:1
+  in points, with no HiDPI representation, so an embedded `@2x` file would
+  render at double the intended size rather than sharpen on Retina. The
+  `@2x` PNGs are generated and committed by the same `just tray-icons`
+  recipe as the `@1x` set, waiting for a HiDPI pass to actually load them.
+- **The Always-on status line omits the tray's power-source second line
+  and the Low-Power-Mode pending-count refinement** (#122, plan's Task 15
+  AMENDED note). `scheduler-status.ts`'s `statusLine` deliberately does
+  not port `tray.rs`'s `menu_model` — porting `PowerSource` branching to
+  TypeScript to gain one polish line was judged not worth the duplication.
+- **The root pre-commit hook does not build the desktop workspace** (#121).
+  It runs `cargo fmt`/clippy on the headless workspace only, so a broken
+  desktop test target passed the hook once during the phase before CI
+  caught it — same gap the phase 7D watchlist already named for `cargo
+  fmt`, now confirmed to extend to a compile check too.
+- **Local GUI verification must be the four-command line, not three**
+  (#116). `pnpm check && pnpm lint && pnpm test && pnpm build` — omitting
+  `pnpm lint` once let a lint-only failure reach CI instead of being
+  caught locally.
+- **`api.ts` sits at its (twice-raised) 640-line cap** (#116, the task's
+  own chore commit). The next raise is refused: the comment at the cap
+  names the always-on/health wire-type subject moving to a sibling module
+  as the next split, not another number.
+- **`whisper_gated`'s "MAJ_AUDIO fixture is silent" flake, recurring on
+  `macos-latest`** (infra; observed 2 of 3 runs during the phase). Not
+  reproduced locally; quarantined by re-run rather than fixed blind.
+  `zizmor`'s advisory-database fetch also intermittently hit network
+  errors in CI during the phase, unrelated to any workflow change.
+- **`sync.rs` re-derives the blob path with a raw `join("blobs")`**
+  (#110, found while writing doctor's blob-residue check). `location_
+  matches_root`-style checks in `crates/services/src/sync.rs:1133` build
+  the blobs path by hand instead of calling
+  `majestical_index::blob::BlobStore::root()`, the resolver doctor's own
+  residue scan was written to use instead — the two can drift if the blob
+  layout ever changes.
+- **A release-profile clippy blind spot** (#112). Registering the wdio
+  plugins behind `#[cfg(debug_assertions)]` in `apps/desktop/src-tauri/src/lib.rs`
+  made `builder`'s `mut` unused on a release build, caught only by adding
+  a `cfg_attr(not(debug_assertions), expect(unused_mut, …))` by hand —
+  nothing in CI runs `cargo clippy --release` for the desktop workspace,
+  so a lint that only fires in that profile has no automated catch.
+- **A pluralization copy bug, "1 results"** (pre-existing; noticed while
+  writing the tray's own pluralized `pending_line` during #116).
+  `crates/cli/src/search.rs:139` prints `"{} results"` unconditionally —
+  `maj search` with exactly one hit reads "1 results". Not touched this
+  phase; the tray and Always-on status lines were written to pluralize
+  correctly from day one instead of copying the pattern.
+- **The plan's Task 10 pointer to `crates/core/src/projection.rs` for a
+  proptest pattern to crib is stale** (#116). By phase 7E,
+  `crates/core/src/projection.rs` itself carries no `proptest!` macro
+  usage; the workspace's proptest patterns now live in
+  `crates/core/tests/crdt_properties.rs` and similar integration-test
+  files. Task 10's autopilot proptests were written against the newer
+  location.
+- **The `lowpowermode` (Intel) literal in `power.rs`'s parser tests is
+  uncaptured** (#116, plan's Task 11 AMENDED note). The Apple Silicon
+  `powermode` literals are captured from the dev machine (macOS 26.6.2,
+  M1 Max); the `lowpowermode` test cases are Apple's documented Intel
+  format, not output captured from a real Intel Mac, since none was
+  available during the phase.
+
+### cargo-mutants triage (phase 7E)
+
+Three scoped runs, `--in-place`, foreground, one at a time (the standing
+mandate), against `crates/services/src/autopilot.rs`,
+`crates/services/src/doctor.rs` (after #117 had already closed its first
+round of survivors), and `apps/desktop/src-tauri/src/power.rs` +
+`indexer.rs` together — the desktop workspace's `cargo-mutants` setup
+permits an in-tree run, so Task 16 Step 3 did not need to fall back to
+recording a disposition instead.
+
+```bash
+cargo mutants --in-place -p majestical-services -f src/autopilot.rs
+cargo mutants --in-place -p majestical-services -f src/doctor.rs
+cargo mutants --in-place -f apps/desktop/src-tauri/src/power.rs -f apps/desktop/src-tauri/src/indexer.rs
+```
+
+**`crates/services/src/autopilot.rs`**: 4 mutants, **3 caught, 1
+unviable, 0 missed**. The policy function shipped with no live gap.
+
+**`crates/services/src/doctor.rs`** (after #117's own mutants-closing
+pass): 21 mutants, **10 caught, 10 unviable, 1 missed**. The one
+survivor — `check_models`'s `missing_files.is_empty() && missing_tags
+.is_empty()` gate turned into `||` — is an equivalent mutant under the
+check's current predicates: the two vectors are built from the same loop
+over the same condition, so they can never disagree today. The source
+comment at the gate (`crates/services/src/doctor.rs`, `check_models`)
+already documents this and names the condition under which it would stop
+being equivalent (the two predicates diverging), so a future change there
+is warned rather than silently reintroducing a real gap.
+
+**`apps/desktop/src-tauri/src/power.rs` + `indexer.rs`**: 61 mutants,
+**47 caught, 9 unviable, 5 missed**. Every survivor is one of two known
+shapes, neither a coverage gap: (1) the loop's own I/O shims —
+`run_tick`/`run_batch`/`run_loop`/`spawn_loop`'s default-value
+replacements — are untested by design, the same "logic is pure and
+tested, the thread/IO glue is not" split `tray.rs`'s `build_menu`/
+`menu_model` follows; and (2) `power.rs`'s `#[cfg(not(target_os =
+"macos"))]` stub `read_power_state` is not compiled on the macOS host
+that ran this suite, so `cargo-mutants` cannot exercise or kill mutants
+in it from this machine.
+
+**Parity, re-run end to end against a fresh `/tmp/maj-ref`**:
+`services_parity` — 53 passed, 0 skipped; `tauri_parity` — 6 passed, 0
+skipped.
+
 ## Done in phase 6
 
 - **Segment rotation** (was Open, phase 2): landed with zero-padded `NNNN`

@@ -204,3 +204,192 @@ Deferred list this phase draws from):
   then.
 - Battery-threshold policy refinements (e.g. hold below 20%): the policy
   function's shape admits it; not built until asked for.
+
+## As-built (phase 7E)
+
+What shipped, where it differs from the design above. Written as what IS,
+not as a change log. Seven chunk PRs squash-merged (or, for #122, pending
+merge behind this closing PR) after green CI, plus this closing one.
+
+**PR #109 — spec + plan** (docs). This spec and
+`docs/superpowers/plans/2026-08-26-phase7e-alwayson-e2e-doctor.md`,
+written from `docs/superpowers/HANDOFF-phase7D.md`.
+
+**PR #110 — `maj doctor`: services verb + CLI + MCP** (chunk 1).
+`crates/services/src/doctor.rs`'s seven checks (`ffmpeg`, `imagemagick`,
+`models`, `state_dir`, `catalog`, `blob_residue`, `platform`), each a
+private `fn check_*`, emitted in one documented, test-pinned order; `maj
+doctor [--json]`, the MCP `doctor` read tool, and a `services_parity` row.
+Findings are rows — `doctor` returns `Ok` even when every check fails,
+per the phase-6 exit-code polarity doctrine.
+
+**PR #111 — Rust 1.98 clippy hotfix**. Unrelated to the phase's own
+scope: `chunks_exact` → `as_chunks` and an unused `async_trait` impl, to
+keep the workspace's zero-warnings baseline current against a toolchain
+bump that landed mid-phase.
+
+**PR #112 — WebDriver e2e harness** (chunk 2). `tauri-plugin-wdio` +
+`tauri-plugin-wdio-webdriver` registered behind `#[cfg(debug_assertions)]`
+in `apps/desktop/src-tauri/src/lib.rs`, so a release binary carries no
+listening test server; the `apps/desktop/e2e/` WebdriverIO project with
+the `@wdio/tauri-service` embedded provider; a fixture catalog seeded by
+shelling out to the debug `maj` binary; the launch smoke spec; and the
+`gui-e2e` CI job, required for merge. Its green run on main retired the
+standing manual-GUI-smoke rule from `docs/superpowers/HANDOFF-phase7D.md`
+— see "the e2e job is the smoke" below.
+
+**PR #113 — per-surface e2e flows** (chunk 3). Search, Volumes, Browse,
+and Organize each got a spec exercising one real flow against the
+fixture catalog; the Ingest flow was dropped (native OS dialogs have no
+test bridge), a gap declared rather than worked around with an invented
+backdoor.
+
+**PR #117 — doctor mutants closed with hermetic seams**. Landed between
+chunks 4 and 5 in commit order rather than at phase close — see
+"Deviations" below for why the plan's own Task-16-at-close ordering
+did not hold in practice.
+
+**PR #121 — doctor GUI panel** (chunk 4). The `health-panel.html` mockup,
+user-reviewed before code; the `doctor_report` Tauri command
+(`doctor_report_impl` over `majestical_services::doctor::doctor`, working
+before any catalog is selected — the one command that does); wire
+fixtures and a `tauri_parity` row comparing the whole document against
+`maj doctor --json`; and `SettingsView.svelte`'s health panel, one row
+per check in the outcome's own order.
+
+**PR #116 — autopilot policy + power probe + scheduler loop** (chunk 5,
+headless). `crates/services/src/autopilot.rs`'s pure
+`autopilot_decision(power, throttle, pending_items)` — the whole policy
+is the function shown in the design above, unchanged; `apps/desktop/
+src-tauri/src/power.rs`'s `pmset`-backed probe, parsing both the Intel
+`lowpowermode` and Apple Silicon `powermode` keys; and `indexer.rs`'s
+loop thread (`TICK` 30s, `BATCH_LIMIT` 25 items per kind, `PACE_LOW` 5s),
+plus the `scheduler_state`/`set_throttle` commands. The no-progress hold
+rule, the per-batch `update_failure_report` call, and the `catch_unwind`
+guard (all in the Task 12 amendment below) shipped in this same PR after
+a spec review caught the hot-loop risk before merge.
+
+**PR #122 — tray, hide-to-tray, autostart, Always-on section** (chunk 6;
+open, pending merge behind this closing PR). `tray.rs`'s pure `menu_model`
+function and its thin `build_menu`/`refresh` shim; the four `TrayLook`
+icon states; `on_window_event`'s hide-to-tray with a macOS activation-
+policy switch so no zombie Dock icon remains; `tauri-plugin-autostart`
+wired to a Settings toggle, default off; and `AlwaysOnSection.svelte` +
+`scheduler-status.ts` + `autostart.ts`.
+
+**Closing PR (this one)** — this section, the phase 7E deferrals and
+cargo-mutants triage in `docs/superpowers/plans/2026-07-29-phase2-
+watchlist.md`, and `docs/superpowers/HANDOFF-phase7F.md`.
+
+### Deviations from the design above
+
+**`blob_residue` scans interrupted-write temp files, not `heal.rs`**
+(PR #110, plan's Task 1 AMENDED note). The design's "blob-store
+truncated-tail residue check" pointed at `heal.rs`, which turned out to
+be a private, MUTATING blob↔`text_fts` healer, not a detector — doctor
+must never mutate. The real check walks the blob store root (via
+`BlobStore::root()`, never a re-derived path) for `.tmp-{pid}-{seq}`
+orphans, plus `*.partial` files under the state dir's runs directory —
+both are what a crash strands mid-write.
+
+**The volumes e2e fixture is always offline** (PR #113, plan's Task 5
+AMENDED note). `volume_is_online` reads a `--volume`-labeled id as
+online only when `/Volumes/<label>` is a real mount, which a scanned
+temp directory never is in any environment including CI. The spec
+asserts the real offline badge instead of an online one.
+
+**The ingest e2e flow was dropped, not adapted** (PR #113, plan's Task 6
+AMENDED note; see the deferrals list). `IngestView`'s pickers go through
+native OS dialogs with no text fallback and the suite has no dialog
+bridge by design; the gap is declared, and a type-a-path affordance is a
+7F candidate rather than a mid-chunk workaround.
+
+**The Settings e2e check is its own spec file** (PR #121, plan's Task 9
+AMENDED note). The smoke spec's `describe` callback sat at the e2e
+project's 50-line `max-lines-per-function` cap, so Settings coverage
+lives in `specs/settings.e2e.ts` — the same per-surface pattern chunk 3
+already used — instead of extending `smoke.e2e.ts`'s loop.
+
+**The Low Power Mode probe accepts two keys, not one** (PR #116, plan's
+Task 11 AMENDED note). `pmset -g` on Apple Silicon (captured on macOS
+26.6.2, M1 Max) has no `lowpowermode` line at all — the equivalent key is
+`powermode` (0 automatic, 1 low power, 2 high power). `parse_low_power_mode`
+accepts either key with a trailing `1`; the Intel `lowpowermode` literal
+is Apple's documented format, not machine-captured (no Intel Mac was
+available — see the deferrals list).
+
+**The scheduler holds on no-progress batches, updates the failure report,
+and survives panics — three rules the design's "small batched index run"
+sentence did not anticipate** (PR #116, plan's Task 12 AMENDED note).
+`index::run` returns `Ok` even when every item in a batch fails
+per-item — failures ride each kind's own `failed` list, and `plan_work`
+(the source of the status poll's `pending` count) never reads the
+failure report — so "successful batch → immediate re-tick" would spin
+forever on a permanently failing item. `IndexRunOutcome::made_progress()`
+gates the pace instead: no progress holds for a full `TICK` and records
+the failure count. `update_failure_report` runs after every batch, and
+the whole batch runs under `catch_unwind`, so a panic lands in
+`last_error` instead of leaving `running` stuck `true` on a dead thread.
+
+**Every tray string is pinned, and `catalog_selected` is a `menu_model`
+input, not a wire field** (PR #122, plan's Task 13 AMENDED note, user-
+approved as-is). The design's tray copy was illustrative; the mockup
+review pinned the exact strings `menu_model`'s tests assert byte-for-byte,
+including the pluralization rule ("1 item pending" / "{n} items pending").
+`SchedulerStateOutcome` does not grow a field for whether a catalog is
+selected — `menu_model(&state, catalog_selected: bool)` takes it as a
+second input, read from `AppState` at rebuild time.
+
+**Four platform-forced deviations from the approved tray mockup** (PR
+#122, plan's Task 14 AMENDED note): the attention state is a badge dot on
+the template icon, not an amber tint (macOS template icons are
+alpha-only, so no color survives); only the 22×22 `@1x` icons load at
+runtime (`tray_icon` builds the `NSImage` from raw pixels 1:1 in points,
+with no HiDPI representation — see the deferrals list for the committed,
+unused `@2x` set); Quit is an immediate `app.exit(0)`, not "waits for the
+batch" — SQLite keeps an aborted batch atomic, and Cmd+Q from the default
+macOS app menu exits the same way; and a left click on the tray icon opens
+the menu only, since macOS menu tracking swallows the mouse-up before any
+`on_tray_icon_event` handler would see it — "Open Majestical" is the only
+click-to-window path.
+
+**`set_throttle` recomputes the decision immediately, and the Always-on
+section is a sibling component, not a `SettingsView` addition** (PR #122,
+plan's Task 15 AMENDED note). Without an immediate recompute, both the
+tray and Settings would keep showing the previous decision for up to a
+full `TICK` after a throttle change. `AlwaysOnSection.svelte` +
+`scheduler-status.ts` + `autostart.ts` sit alongside `SettingsView.svelte`
+rather than inside it, and `scheduler-status.ts`'s `statusLine`
+deliberately does not port `tray.rs`'s power-source second line or its
+Low-Power-Mode pending-count refinement (see the deferrals list). A
+rejected `enable`/`disable` renders as the surface's own error line,
+since `Notices` only carries notice arrays, not command errors.
+
+### Review-loop shape
+
+Each task ran implementer → adversarial spec-compliance review (probing
+claims empirically, including hand-written mutation probes) → code-quality
+review → fix rounds until APPROVED, the process `docs/superpowers/
+HANDOFF-phase7D.md` established. Every task's reviewer-found survivors
+were closed in the same chunk rather than deferred, with two exceptions
+recorded above as accepted equivalents (doctor's `check_models` gate,
+Task 16's own triage). Task 9's implementer lost a background build to
+the subagent's turn ending twice in a row; the team lead finished Task 9
+directly rather than retry a third background run, which is why the
+phase's standing mandate ("no `run_in_background` for anything a
+controller must wait on; a stalled subagent gets replaced, not
+re-nudged indefinitely") reads as strongly as it does in the 7F handoff.
+`cargo-mutants`' scoped runs at close (Task 16) ran out of the plan's own
+intended order — PR #117 closed doctor's mutants between chunks 4 and 5
+rather than waiting for phase close, because a doctor survivor surfaced
+during PR #121's own review and was cheaper to close immediately than to
+carry to Task 16.
+
+**"The e2e job is the smoke."** `docs/superpowers/HANDOFF-phase7D.md`'s
+standing rule — a hand-run GUI smoke recorded on the PR whenever
+`lib.rs`'s plugin registration, `tauri.conf.json`, or a surface's mount
+path changes — held through PR #112's own plugin-registration change
+(its last hand-run smoke, recorded on that PR) and was retired the
+moment `gui-e2e` went green on main. Every chunk from #113 onward relied
+on the e2e job alone, including #122's tray/hide-to-tray/autostart
+changes to `lib.rs`.

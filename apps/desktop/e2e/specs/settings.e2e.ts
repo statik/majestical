@@ -64,17 +64,23 @@ describe("Majestical desktop — Settings — Always-on throttle", () => {
   });
 
   it("switching to Paused round-trips through a real scheduler_state call", async () => {
-    // `set_throttle`'s response is immediate — this asserts on it directly,
-    // not on the scheduler's next tick (30s later): the returned throttle
-    // moves the checked radio right away, but `decision` (and so the
-    // status line, when the scheduler has one to show) is only as fresh as
-    // the last tick, so this does not assert on that line's text — doing
-    // so would mean waiting out the tick, which the plan for this spec
-    // rules out.
+    // `set_throttle`'s response is immediate, and so is the status line:
+    // `indexer.rs::set_throttle_impl` recomputes the decision from the
+    // last poll's power/pending state right away rather than waiting for
+    // the scheduler's next tick (up to 30s later), so both the radio and
+    // `.settings-status` move synchronously with the click — no tick wait
+    // needed here.
     const pausedRadio = await $('input[name="throttle"][value="paused"]');
     await pausedRadio.click();
 
     await expect(pausedRadio).toBeSelected();
     await expect($('input[name="throttle"][value="auto"]')).not.toBeSelected();
+    await expect($(".settings-status")).toHaveText("Paused");
+
+    const autoRadio = await $('input[name="throttle"][value="auto"]');
+    await autoRadio.click();
+
+    await expect(autoRadio).toBeSelected();
+    await expect($(".settings-status")).not.toHaveText("Paused");
   });
 });

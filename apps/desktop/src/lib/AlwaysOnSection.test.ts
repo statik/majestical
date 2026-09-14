@@ -187,22 +187,71 @@ test("a rejected enable renders the error and reverts the checkbox", async () =>
   );
 });
 
-test("the status line reads a hold reason directly off the decision", async () => {
-  mockCommands({
-    scheduler_state: () => held,
-    "plugin:autostart|is_enabled": () => false,
-  });
-  render(AlwaysOnSection);
+// Pinned against the `role="status"` element specifically, not a loose
+// `findByText` — a loose text query also matches the throttle radio labeled
+// "Paused", so it cannot tell "the status line says Paused" apart from "a
+// radio labeled Paused exists" (a mutant that deletes the status `<p>` or
+// reworks its text survives a `findByText` assertion for exactly that
+// reason).
+const statusCases: {
+  label: string;
+  state: SchedulerStateOutcome;
+  expected: string;
+}[] = [
+  {
+    label: "run_full with a plural pending count",
+    state: { ...auto, decision: { mode: "run_full" }, pending_items: 42 },
+    expected: "Indexing — 42 items pending",
+  },
+  {
+    label: "run_full with a singular pending count",
+    state: { ...auto, decision: { mode: "run_full" }, pending_items: 1 },
+    expected: "Indexing — 1 item pending",
+  },
+  {
+    label: "run_low",
+    state: { ...auto, decision: { mode: "run_low" }, pending_items: 3 },
+    expected: "Indexing slowly — 3 items pending",
+  },
+  {
+    label: "hold/paused",
+    state: { ...held, decision: { mode: "hold", hold_reason: "paused" } },
+    expected: "Paused",
+  },
+  {
+    label: "hold/low_power_mode",
+    state: {
+      ...auto,
+      decision: { mode: "hold", hold_reason: "low_power_mode" },
+    },
+    expected: "Paused (Low Power Mode)",
+  },
+  {
+    label: "hold/no_pending_work",
+    state: {
+      ...auto,
+      decision: { mode: "hold", hold_reason: "no_pending_work" },
+      pending_items: 0,
+    },
+    expected: "Idle",
+  },
+  {
+    label: "no decision yet",
+    state: { ...auto, decision: null },
+    expected: "Starting…",
+  },
+];
 
-  expect(await screen.findByText("Paused")).toBeTruthy();
-});
+test.each(statusCases)(
+  "the status line reads $expected for $label",
+  async ({ state, expected }) => {
+    mockCommands({
+      scheduler_state: () => state,
+      "plugin:autostart|is_enabled": () => false,
+    });
+    render(AlwaysOnSection);
 
-test("the status line names the pending count while running full", async () => {
-  mockCommands({
-    scheduler_state: () => auto,
-    "plugin:autostart|is_enabled": () => false,
-  });
-  render(AlwaysOnSection);
-
-  expect(await screen.findByText("Indexing — 42 items pending")).toBeTruthy();
-});
+    const status = await screen.findByRole("status");
+    await waitFor(() => expect(status.textContent).toBe(expected));
+  },
+);

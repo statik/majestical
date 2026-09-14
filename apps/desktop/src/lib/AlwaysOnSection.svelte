@@ -108,7 +108,7 @@
     {/each}
   </div>
   {#if scheduler}
-    <p class="settings-status">{statusLine(scheduler)}</p>
+    <p class="settings-status" role="status">{statusLine(scheduler)}</p>
   {/if}
 
   <div class="settings-toggle-row">

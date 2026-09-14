@@ -95,7 +95,11 @@
       // Settings-surface test paying for a sibling component's mount
       // effects. The cap sits just above that, so the next subject still
       // gets its own file — which is what keeps them findable — rather
-      // than being folded in here.
+      // than being folded in here. Next raise is refused: the two
+      // Settings-shell tests ("the settings surface swaps in with the
+      // doctor's health rows" and "the tray's navigate-settings event
+      // selects the Settings surface") move to their own
+      // `src/App.settings.test.ts` instead.
       "files": ["src/App.test.ts", "src/lib/IngestView.test.ts"],
       "rules": {
         "max-lines": ["warn", { "max": 385 }]

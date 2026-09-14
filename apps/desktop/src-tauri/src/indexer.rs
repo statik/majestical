@@ -357,16 +357,31 @@ fn scheduler_state_impl(state: &SchedulerState) -> SchedulerStateOutcome {
 /// `pub(crate)`, not private: `tray.rs`'s throttle-radio handler calls this
 /// same function rather than duplicating it, so a click in the tray and a
 /// call from the Settings surface change the throttle identically.
+///
+/// Also recomputes `last_decision` immediately, from the last poll's power
+/// state and pending count — without this, the tray's status line and the
+/// Settings status line would both keep showing the previous decision
+/// (e.g. "Indexing — n items pending" after clicking Paused) for up to a
+/// full [`TICK`], since the loop is otherwise the only writer of
+/// `last_decision` and it only runs once a tick. Left `None` when it was
+/// already `None` (before the loop's first tick): there is no pending
+/// count or power reading yet to decide from, so "Starting…" stays
+/// accurate rather than becoming a decision made from stale zero values.
 #[must_use]
 pub(crate) fn set_throttle_impl(
     state: &SchedulerState,
     throttle: ThrottleOverride,
 ) -> SchedulerStateOutcome {
-    state
-        .0
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .throttle = throttle;
+    let mut shared = state.0.write().unwrap_or_else(PoisonError::into_inner);
+    shared.throttle = throttle;
+    if shared.last_decision.is_some() {
+        shared.last_decision = Some(autopilot_decision(
+            shared.power,
+            throttle,
+            shared.pending_items,
+        ));
+    }
+    drop(shared);
     scheduler_state_impl(state)
 }
 
@@ -405,8 +420,9 @@ pub fn set_throttle(
 mod tests {
     use super::{
         BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
-        SchedulerDecision, SchedulerStateOutcome, ThrottleOverride, batch_outcome_pace,
-        batch_request, pending_items, success_pace, total_failures,
+        SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome,
+        ThrottleOverride, batch_outcome_pace, batch_request, pending_items, set_throttle_impl,
+        success_pace, total_failures,
     };
     use majestical_services::index::{IndexRunOutcome, KindStatusRow};
     use std::time::Duration;
@@ -592,5 +608,60 @@ mod tests {
                 "last_error": "the last batch failed: disk full",
             })
         );
+    }
+
+    /// A scheduler with a prior tick's decision already recorded, so
+    /// `set_throttle_impl` has power/pending values to recompute from.
+    fn ticked_state(
+        decision: SchedulerDecision,
+        power: PowerState,
+        pending_items: u64,
+    ) -> SchedulerState {
+        SchedulerState(std::sync::RwLock::new(SchedulerShared {
+            throttle: ThrottleOverride::Auto,
+            last_decision: Some(decision),
+            power,
+            pending_items,
+            running: false,
+            last_error: None,
+        }))
+    }
+
+    #[test]
+    fn set_throttle_recomputes_the_decision_immediately_on_pause() {
+        let state = ticked_state(
+            SchedulerDecision::RunFull,
+            PowerState {
+                source: PowerSource::Ac,
+                low_power_mode: false,
+            },
+            214,
+        );
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Paused);
+        assert_eq!(
+            outcome.decision,
+            Some(SchedulerDecision::Hold(HoldReason::Paused))
+        );
+    }
+
+    #[test]
+    fn set_throttle_recomputes_the_decision_immediately_back_to_auto() {
+        let state = ticked_state(
+            SchedulerDecision::Hold(HoldReason::Paused),
+            PowerState {
+                source: PowerSource::Ac,
+                low_power_mode: false,
+            },
+            214,
+        );
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Auto);
+        assert_eq!(outcome.decision, Some(SchedulerDecision::RunFull));
+    }
+
+    #[test]
+    fn set_throttle_before_the_first_tick_leaves_the_decision_none() {
+        let state = SchedulerState(std::sync::RwLock::new(SchedulerShared::default()));
+        let outcome = set_throttle_impl(&state, ThrottleOverride::Paused);
+        assert_eq!(outcome.decision, None);
     }
 }

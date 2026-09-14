@@ -267,7 +267,7 @@ fn run_batch(
 /// except a `RunFull` batch that made progress, so this never spins hot —
 /// including on a batch that ran clean but wrote nothing, which holds for a
 /// full [`TICK`] rather than immediately re-running the same failing items.
-fn run_tick(app: &AppHandle) -> Duration {
+fn run_tick_inner(app: &AppHandle) -> Duration {
     let state = app.state::<AppState>();
     let Some(cfg) = selected_catalog(&state) else {
         return TICK;
@@ -288,6 +288,16 @@ fn run_tick(app: &AppHandle) -> Duration {
         return TICK;
     };
     run_batch(&cfg, &scheduler, decision, &req)
+}
+
+/// [`run_tick_inner`], then a tray refresh — every path through the inner
+/// function changes something the tray's status line reports (the catalog
+/// selection, a poll's decision, or a batch's outcome), so the refresh sits
+/// here once rather than before each of the inner function's early returns.
+fn run_tick(app: &AppHandle) -> Duration {
+    let pause = run_tick_inner(app);
+    crate::tray::refresh(app);
+    pause
 }
 
 /// The loop body: forever, run one tick and sleep for whatever it decided.
@@ -346,8 +356,15 @@ fn scheduler_state_impl(state: &SchedulerState) -> SchedulerStateOutcome {
 /// batches are short by construction (`BATCH_LIMIT` items), which IS the
 /// pause latency, the same "between files" doctrine `ingest.rs`'s cancel
 /// follows.
+///
+/// `pub(crate)`, not private: `tray.rs`'s throttle-radio handler calls this
+/// same function rather than duplicating it, so a click in the tray and a
+/// call from the Settings surface change the throttle identically.
 #[must_use]
-fn set_throttle_impl(state: &SchedulerState, throttle: ThrottleOverride) -> SchedulerStateOutcome {
+pub(crate) fn set_throttle_impl(
+    state: &SchedulerState,
+    throttle: ThrottleOverride,
+) -> SchedulerStateOutcome {
     state
         .0
         .write()
@@ -366,6 +383,11 @@ pub fn scheduler_state(state: State<'_, SchedulerState>) -> SchedulerStateOutcom
     scheduler_state_impl(&state)
 }
 
+/// One line more than a pure wrapper over `set_throttle_impl`: the
+/// Settings surface is the other caller that can change the throttle (the
+/// tray's own radio items call `set_throttle_impl` directly — see
+/// `tray.rs`), so this is where a Settings-driven change reaches the tray's
+/// menu, the same rebuild-on-change rule `run_tick` follows for every tick.
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
@@ -373,10 +395,13 @@ pub fn scheduler_state(state: State<'_, SchedulerState>) -> SchedulerStateOutcom
 )]
 #[tauri::command]
 pub fn set_throttle(
+    app: AppHandle,
     state: State<'_, SchedulerState>,
     throttle: ThrottleOverride,
 ) -> SchedulerStateOutcome {
-    set_throttle_impl(&state, throttle)
+    let outcome = set_throttle_impl(&state, throttle);
+    crate::tray::refresh(&app);
+    outcome
 }
 
 #[cfg(test)]

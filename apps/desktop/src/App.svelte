@@ -2,7 +2,13 @@
   import { onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import type { UnlistenFn } from "@tauri-apps/api/event";
-  import { api, errorMessage, errorNotices, INGEST_PROGRESS_EVENT } from "./lib/api";
+  import {
+    api,
+    errorMessage,
+    errorNotices,
+    INGEST_PROGRESS_EVENT,
+    NAVIGATE_SETTINGS_EVENT,
+  } from "./lib/api";
   import type { AppStatus, IngestProgress } from "./lib/api";
   import BrowseView from "./lib/BrowseView.svelte";
   import IngestView from "./lib/IngestView.svelte";
@@ -71,6 +77,30 @@
         return;
       }
       ingestBusy = true;
+    }).then((off) => {
+      if (gone) {
+        void off();
+        return;
+      }
+      unlisten = off;
+    });
+    return () => {
+      gone = true;
+      if (unlisten !== null) void unlisten();
+    };
+  });
+
+  /**
+   * The tray's "Health…" item and its attention line ("Last batch failed")
+   * both fire this after showing and focusing the window, so a click from
+   * the tray lands on the surface that explains why, not wherever the shell
+   * was left open to.
+   */
+  $effect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let gone = false;
+    void listen(NAVIGATE_SETTINGS_EVENT, () => {
+      show("settings");
     }).then((off) => {
       if (gone) {
         void off();

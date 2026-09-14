@@ -1,16 +1,13 @@
+import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockConvertFileSrc } from "@tauri-apps/api/mocks";
 import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
-import { emitProgress, RUN } from "./lib/ingest-test-support";
-import {
-  mockCommands,
-  rejectCommand,
-  stubManifest,
-  stubMatchMedia,
-} from "./lib/test-support";
+import { NAVIGATE_SETTINGS_EVENT } from "./lib/api";
+import { emitProgress, listenerCount, RUN } from "./lib/ingest-test-support";
+import { mockCommands, rejectCommand, stubManifest, stubMatchMedia } from "./lib/test-support";
 import doctorOutcome from "./lib/fixtures/doctor_outcome.json";
 
 beforeEach(() => {
@@ -288,6 +285,23 @@ test("the settings surface swaps in with the doctor's health rows", async () => 
   );
   expect(screen.queryByRole("searchbox")).toBeNull();
   expect(settings.getAttribute("aria-current")).toBe("page");
+});
+
+test("the tray's navigate-settings event selects the Settings surface", async () => {
+  mockCatalog(["Card"]);
+  render(App);
+
+  // Still on Search: the event can arrive at any time, not only after the
+  // operator has clicked into Settings themselves. Two listeners mount with
+  // the shell (ingest progress and this one); wait for both, the same race
+  // `emitProgress` guards against.
+  await screen.findByRole("searchbox");
+  await waitFor(() => expect(listenerCount()).toBeGreaterThanOrEqual(2));
+
+  await emit(NAVIGATE_SETTINGS_EVENT, null);
+
+  expect(await screen.findByRole("heading", { name: "Health" })).toBeTruthy();
+  expect(screen.queryByRole("searchbox")).toBeNull();
 });
 
 test("the organize surface swaps in with both of its columns", async () => {

@@ -7,6 +7,7 @@ pub mod indexer;
 pub mod ingest;
 pub mod power;
 pub mod thumb_protocol;
+pub mod tray;
 
 /// Builds and runs the Tauri app.
 ///
@@ -77,7 +78,25 @@ pub fn run() {
         .setup(|app| {
             commands::restore_persisted_catalog(app.handle())?;
             indexer::spawn_loop(app.handle());
+            tray::build_tray(app.handle())?;
             Ok(())
+        })
+        // Closing the window hides it to the tray instead of quitting —
+        // "Quit Majestical" on the tray menu is the only way out (see
+        // `tray.rs::handle_menu_event`). On macOS the Dock icon goes away
+        // with it (`Accessory`) so a hidden app does not sit in the Dock
+        // looking quit; `tray::show_window` puts both back.
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                let _ = tauri::Manager::app_handle(window)
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
         })
         .register_uri_scheme_protocol("thumb", |ctx, request| {
             thumb_protocol::respond(ctx.app_handle(), &request.uri().to_string())

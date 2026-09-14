@@ -267,7 +267,7 @@ fn run_batch(
 /// except a `RunFull` batch that made progress, so this never spins hot —
 /// including on a batch that ran clean but wrote nothing, which holds for a
 /// full [`TICK`] rather than immediately re-running the same failing items.
-fn run_tick_inner(app: &AppHandle) -> Duration {
+fn run_tick(app: &AppHandle) -> Duration {
     let state = app.state::<AppState>();
     let Some(cfg) = selected_catalog(&state) else {
         return TICK;
@@ -290,22 +290,19 @@ fn run_tick_inner(app: &AppHandle) -> Duration {
     run_batch(&cfg, &scheduler, decision, &req)
 }
 
-/// [`run_tick_inner`], then a tray refresh — every path through the inner
-/// function changes something the tray's status line reports (the catalog
-/// selection, a poll's decision, or a batch's outcome), so the refresh sits
-/// here once rather than before each of the inner function's early returns.
-fn run_tick(app: &AppHandle) -> Duration {
-    let pause = run_tick_inner(app);
-    crate::tray::refresh(app);
-    pause
-}
-
-/// The loop body: forever, run one tick and sleep for whatever it decided.
-/// Runs for the life of the process — nothing ever joins this thread, the
-/// same "outlives everything" shape `ingest.rs`'s run thread has.
+/// The loop body: forever, run one tick, refresh the tray, and sleep for
+/// whatever the tick decided. Runs for the life of the process — nothing
+/// ever joins this thread, the same "outlives everything" shape
+/// `ingest.rs`'s run thread has.
+///
+/// The refresh sits here, after every tick regardless of which of
+/// `run_tick`'s early returns fired, because every path through it changes
+/// something the tray's status line reports (the catalog selection, a
+/// poll's decision, or a batch's outcome).
 fn run_loop(app: &AppHandle) {
     loop {
         let pause = run_tick(app);
+        crate::tray::refresh(app);
         std::thread::sleep(pause);
     }
 }

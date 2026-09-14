@@ -9,6 +9,8 @@ pub mod power;
 pub mod thumb_protocol;
 pub mod tray;
 
+use tauri::Manager;
+
 /// Builds and runs the Tauri app.
 ///
 /// # Panics
@@ -82,19 +84,29 @@ pub fn run() {
             Ok(())
         })
         // Closing the window hides it to the tray instead of quitting —
-        // "Quit Majestical" on the tray menu is the only way out (see
-        // `tray.rs::handle_menu_event`). On macOS the Dock icon goes away
-        // with it (`Accessory`) so a hidden app does not sit in the Dock
-        // looking quit; `tray::show_window` puts both back.
+        // "Quit Majestical" on the tray menu or the system's Cmd+Q are the
+        // ways out (see `tray.rs::handle_menu_event`). On macOS the Dock
+        // icon goes away with it (`Accessory`) so a hidden app does not sit
+        // in the Dock looking quit; `tray::show_window` puts both back.
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // A window that fails to hide here is rare (mid-teardown)
+                // and not worth surfacing: the close was already
+                // prevented, so at worst the window stays visible instead
+                // of going to the tray — a cosmetic miss, not a broken
+                // close.
                 let _ = window.hide();
                 #[cfg(target_os = "macos")]
-                let _ = tauri::Manager::app_handle(window)
+                // Same rationale as `tray::show_window`'s
+                // activation-policy call: a failed switch leaves the Dock
+                // icon in its prior state, a cosmetic inconsistency rather
+                // than a broken hide.
+                let _ = window
+                    .app_handle()
                     .set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
         })

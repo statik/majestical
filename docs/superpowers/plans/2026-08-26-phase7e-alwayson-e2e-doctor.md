@@ -498,6 +498,13 @@ git commit -m "feat: doctor_report command with wire fixtures and parity row"
 - [ ] **Step 3:** sidebar entry `data-e2e="nav-settings"`; extend the e2e
   smoke's surface loop with Settings (assert a check row renders — the
   real app's doctor runs against the fixture catalog).
+
+> **AMENDED (2026-09-14, Task 9 execution):** the smoke spec's `describe`
+> callback sits at the e2e project's 50-line `max-lines-per-function` cap,
+> so the Settings check lives in its own `specs/settings.e2e.ts` (the
+> chunk 3 per-surface pattern) rather than inside the smoke loop. Same
+> assertion: open Settings, at least one `.settings-check` row renders
+> against the fixture catalog. `smoke.e2e.ts` is untouched.
 - [ ] **Step 4:** run `pnpm -C apps/desktop test` + oxlint + e2e locally —
   PASS. Commit.
 

@@ -192,6 +192,7 @@ test("the sidebar offers exactly the surfaces this phase ships, in order", async
     "Ingest",
     "Organize",
     "Volumes",
+    "Settings",
   ]);
 });
 

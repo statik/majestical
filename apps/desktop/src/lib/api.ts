@@ -4,7 +4,9 @@
 // Fields the Rust skips when empty (`skip_serializing_if`) are optional here.
 // Every interface here is pinned by `fixtures.test.ts` against a fixture in
 // `fixtures/*.json`; a new outcome interface needs a builder in
-// `src-tauri/tests/wire_fixtures.rs` too.
+// `src-tauri/tests/wire_fixtures.rs` too. Not the whole contract: the
+// always-on/health subject lives in `api-alwayson.ts`, pinned by
+// `fixtures.alwayson.test.ts`, and is spread into `api` below.
 import { invoke } from "@tauri-apps/api/core";
 import { alwaysOnApi } from "./api-alwayson";
 
@@ -447,6 +449,8 @@ export interface IngestState {
  * a second place to change it.
  */
 export const api = {
+  // Keys below must stay disjoint from `alwaysOnApi`'s: a spread-then-literal
+  // collision is a silent last-write-wins, not a type error.
   ...alwaysOnApi,
   appStatus: () => invoke<AppStatus>("app_status"),
   searchAssets: (query: string) =>

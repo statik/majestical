@@ -10,6 +10,19 @@ use std::path::Path;
 
 #[cfg(test)]
 fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
+    diff_against_ref_normalized(root, state, args, ToString::to_string);
+}
+
+/// Everything [`diff_against_ref`] does, with `normalize` applied to BOTH
+/// binaries' stdout AND stderr before comparing — for a verb whose output
+/// this branch intentionally changed (see [`without_ledger`]).
+#[cfg(test)]
+fn diff_against_ref_normalized(
+    root: &Path,
+    state: &Path,
+    args: &[&str],
+    normalize: fn(&str) -> String,
+) {
     let reference = Path::new("/tmp/maj-ref");
     if !reference.is_file() {
         eprintln!("SKIP parity({args:?}): /tmp/maj-ref missing — build it first");
@@ -30,17 +43,167 @@ fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
     let (new, old) = (run("new"), run("ref"));
     assert_eq!(
         (
-            String::from_utf8_lossy(&new.stdout),
-            String::from_utf8_lossy(&new.stderr),
+            normalize(&String::from_utf8_lossy(&new.stdout)),
+            normalize(&String::from_utf8_lossy(&new.stderr)),
             new.status.code()
         ),
         (
-            String::from_utf8_lossy(&old.stdout),
-            String::from_utf8_lossy(&old.stderr),
+            normalize(&String::from_utf8_lossy(&old.stdout)),
+            normalize(&String::from_utf8_lossy(&old.stderr)),
             old.status.code()
         ),
         "stdout/stderr/exit diverged for {args:?}"
     );
+}
+
+/// Renders `text` as the reference binary would: without the failure
+/// ledger `index status` this branch adds. The reference is built at the
+/// merge-base with `main`, which predates the ledger, so
+/// `index_status_output_is_byte_identical` compares modulo it rather than
+/// losing its parity coverage outright. Two shapes carry it, both stripped
+/// here: the `, N failed` column each per-kind text line gained, and the
+/// JSON counterparts — each per-kind object's new `"failed":N` member, and
+/// whichever name the top-level ledger member carries (`"failed_last_run"`
+/// on the reference, renamed to `"failed"` on this branch).
+///
+/// Every strip is an exact-substring removal from the original bytes, so a
+/// formatting change anywhere (compact vs pretty, key order, spacing) still
+/// fails the comparison. Applied to BOTH binaries' output, so nothing
+/// outside the removed spans can hide behind it. The per-kind text and JSON
+/// strips are pinned to the fixture catalog's `0` count — a line or member
+/// carrying a non-zero count is left untouched, so a real difference there
+/// still diverges loudly instead of being silently normalized away.
+///
+/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
+/// it exists, `index_status_output_is_byte_identical` is blind to the
+/// ledger. Once the reference binary includes it (i.e. once this branch is
+/// on `main`), delete this function, [`strip_ledger_member`], and
+/// [`diff_against_ref_normalized`] (unless a later normalizer still needs
+/// it), and point `index_status_output_is_byte_identical` back at
+/// [`diff_against_ref`]. Scheduled as a step of phase 7F Task 15 in
+/// `docs/superpowers/plans/2026-09-14-phase7f-hardening.md`.
+#[cfg(test)]
+fn without_ledger(text: &str) -> String {
+    // `split_inclusive` keeps each line's own newline (and the last line's
+    // absence of one), so a text that never mentions the ledger normalizes
+    // to itself byte for byte.
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let body = body.strip_suffix(", 0 failed").unwrap_or(body);
+        let body = strip_ledger_member(body).unwrap_or_else(|| body.to_string());
+        kept.push_str(&body.replace(",\"failed\":0", ""));
+        kept.push_str(newline);
+    }
+    kept
+}
+
+/// Cuts whichever top-level ledger member is present — `"failed":{…}` (this
+/// branch) or `"failed_last_run":{…}` (the reference) — out of a JSON line,
+/// comma included, but ONLY when that member's value is an empty object:
+/// the reference predates the ledger and always hardcodes an empty one
+/// (never varying with real failures), so stripping it unconditionally
+/// would erase genuine content this branch's binary reports and hide a
+/// real divergence behind the strip. `serde_json` is used ONLY to build the
+/// needle (re-serializing that one member's value); the removal itself is
+/// an exact-substring cut from the original bytes, so the line is never
+/// reformatted. `Value::get` looks up a direct child only, so this can't be
+/// fooled by the per-kind objects' own (numeric) `"failed"` members. `None`
+/// when the line isn't a JSON object, carries neither member, or the
+/// member is non-empty — a document with real ledger content, or a
+/// differently-shaped one, therefore passes through unstripped and
+/// diverges loudly instead of being normalized into agreement.
+#[cfg(test)]
+fn strip_ledger_member(line: &str) -> Option<String> {
+    let document: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let (key, value) = ["failed", "failed_last_run"]
+        .into_iter()
+        .find_map(|key| Some((key, document.get(key)?)))?;
+    if !value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return None;
+    }
+    let needle = format!("\"{key}\":{}", serde_json::to_string(value).ok()?);
+    let mut start = line.find(&needle)?;
+    let mut end = start + needle.len();
+    if line[end..].starts_with(',') {
+        end += 1;
+    } else if line[..start].ends_with(',') {
+        start -= 1;
+    }
+    Some(format!("{}{}", &line[..start], &line[end..]))
+}
+
+#[cfg(test)]
+mod without_ledger_tests {
+    use super::without_ledger;
+
+    /// The new-shape text (each per-kind line ending `, 0 failed`) and the
+    /// old-shape text it replaces (no such column) must normalize to the
+    /// SAME string — the whole point of the normalizer.
+    #[test]
+    fn new_and_old_shape_text_normalize_identically() {
+        let new_shape = "thumbs: 1 done, 2 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+                          0 need model, 0 failed\n\
+                          embeddings: 0 done, 0 pending, 0 offline, 0 unsupported, \
+                          0 need ffmpeg, 0 need model, 0 failed\n";
+        let old_shape = "thumbs: 1 done, 2 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+                          0 need model\n\
+                          embeddings: 0 done, 0 pending, 0 offline, 0 unsupported, \
+                          0 need ffmpeg, 0 need model\n";
+        assert_eq!(without_ledger(new_shape), without_ledger(old_shape));
+        // The old shape has nothing to strip, so it must pass through
+        // byte for byte — pins that the normalizer isn't just collapsing
+        // both inputs to some other, unrelated string.
+        assert_eq!(without_ledger(old_shape), old_shape);
+    }
+
+    /// The new-shape JSON (each per-kind object gaining `"failed":N`, the
+    /// top-level member renamed `failed_last_run` -> `failed`) and the
+    /// old-shape JSON it replaces must normalize to the SAME string, on an
+    /// empty (no-failures) ledger — the fixture catalog's actual shape.
+    /// Unlike the text case, the old shape here is NOT already its own
+    /// normal form: it still carries the (always-empty, hardcoded)
+    /// `failed_last_run` member the reference predates the ledger with,
+    /// which the normalizer strips from both sides alike.
+    #[test]
+    fn new_and_old_shape_json_normalize_identically() {
+        let new_shape = "{\"failed\":{},\"thumbs\":{\"done\":1,\"failed\":0,\
+                          \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":2,\
+                          \"unsupported\":0}}\n";
+        let old_shape = "{\"failed_last_run\":{},\"thumbs\":{\"done\":1,\
+                          \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":2,\
+                          \"unsupported\":0}}\n";
+        let expected = "{\"thumbs\":{\"done\":1,\"needs_ffmpeg\":0,\"needs_model\":0,\
+                         \"offline\":0,\"pending\":2,\"unsupported\":0}}\n";
+        assert_eq!(without_ledger(new_shape), without_ledger(old_shape));
+        assert_eq!(without_ledger(old_shape), expected);
+    }
+
+    /// A per-kind line carrying a non-zero failed count is left completely
+    /// unchanged — the normalizer only ever strips the fixture's known `0`,
+    /// so a real failure count still shows up as a divergence.
+    #[test]
+    fn per_kind_line_with_nonzero_failed_count_is_unchanged() {
+        let line = "pdf: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+                     0 need model, 2 failed\n";
+        assert_eq!(without_ledger(line), line);
+    }
+
+    /// A JSON document whose top-level `failed` ledger is non-empty is left
+    /// completely unchanged: the reference can never produce real ledger
+    /// content (it predates the ledger and hardcodes an empty object), so
+    /// stripping non-empty content here would hide a genuine divergence.
+    #[test]
+    fn json_with_nonempty_top_level_failed_is_unchanged() {
+        let line = "{\"failed\":{\"thumbs\":[{\"asset\":\"xxh3:abc\",\
+                     \"error\":\"boom\"}]},\"thumbs\":{\"done\":0,\"failed\":1,\
+                     \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":0,\
+                     \"unsupported\":0}}\n";
+        assert_eq!(without_ledger(line), line);
+    }
 }
 
 /// Runs `args` once per binary, each against its OWN catalog root/state —
@@ -279,7 +442,7 @@ fn index_status_output_is_byte_identical() {
         ["index", "status", "--json"].as_slice(),
         ["index", "status"].as_slice(),
     ] {
-        diff_against_ref(&root, &state, args);
+        diff_against_ref_normalized(&root, &state, args, without_ledger);
     }
 }
 

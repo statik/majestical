@@ -1,7 +1,7 @@
 //! Derivation-queue planning and execution for `maj index run`/`maj index
 //! status`. Moved from `crates/cli/src/index_cmd.rs`: `VALID_KINDS`/
 //! `capabilities`/`gather_sources`/`build_plan`/`workkind_name`/the
-//! failure-report reader live directly in this module (shared so `run` and
+//! failure ledger live directly in this module (shared so `run` and
 //! `status` can never plan differently for the same catalog state); the
 //! derivation engine itself — every per-kind runner, the worker pool, and
 //! the `text_fts` heal — lives in the `run`/`heal`/`blob_read` submodules,
@@ -16,7 +16,7 @@ mod heal;
 mod run;
 
 pub use run::{
-    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeImageOutcome,
+    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, ItemFailure, KeyframeImageOutcome,
     KeyframeOutcome, OcrOutcome, PdfOutcome, ThumbOutcome, TranscribeOutcome,
     TranscriptEmbedOutcome, run,
 };
@@ -36,7 +36,7 @@ use majestical_core::projection::Projection;
 use majestical_index::blob::BlobStore;
 use majestical_index::model::SIGLIP;
 use majestical_index::work::{self, AssetSource, Capabilities, KindStatus, WorkKind, WorkPlan};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The `--kinds` values `index run`/`index status` understand. Every name
@@ -59,7 +59,8 @@ pub const VALID_KINDS: &[&str] = &[
     "captions",
 ];
 
-/// The state-dir file a pass overwrites with its per-item failures, and
+/// The state-dir file holding the failure ledger: every permanent per-item
+/// failure this catalog has accumulated, which the planner holds back and
 /// `index status` reads back.
 pub const FAILURES_FILE: &str = "index-failures.json";
 
@@ -147,137 +148,275 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 
 /// Builds the plan for one pass: gathers sources fresh from the projection
 /// (so `--watch` sees newly scanned assets), diffs against `blobs` under
-/// the caller-computed `caps`, then narrows `items` to `kinds`.
+/// the caller-computed `caps`, narrows `items` to `kinds`, then holds back
+/// every item `ledger` already remembers as a permanent failure. The per-kind
+/// counters on the returned plan describe the WHOLE catalog regardless of
+/// `kinds` — only `items` is narrowed to it, because the `retain` above never
+/// adjusts the counters `plan_work` already set, and [`apply_ledger`]
+/// inherits that same split between counters and items.
 #[must_use]
 pub fn build_plan(
     projection: &Projection,
     blobs: &BlobStore,
     kinds: &BTreeSet<String>,
     caps: &Capabilities,
+    ledger: &Ledger,
 ) -> WorkPlan {
     let sources = gather_sources(projection);
     let mut plan = work::plan_work(&sources, blobs, caps);
     plan.items
         .retain(|item| kinds.contains(workkind_name(item.kind)));
-    plan
+    apply_ledger(plan, ledger)
 }
 
-/// Reads the last run's failure marker. A missing file is an empty report
-/// (a fresh catalog has no last run to report on); an unparsable one is
-/// noted and treated as empty — the next run overwrites it.
+/// One remembered permanent failure. `asset` is the key the planner matches
+/// on; `path`/`error` are for display.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LedgerRow {
+    pub asset: String,
+    pub path: String,
+    pub error: String,
+}
+
+/// Every kind's remembered permanent failures as `{kind: [row, ..]}`, where
+/// `kind` is the `--kinds` name ([`workkind_name`]) — so the two work kinds
+/// behind `transcripts` (and behind `ocr`) share one key, exactly as the
+/// planner and every wire shape name them.
+pub type Ledger = BTreeMap<String, Vec<LedgerRow>>;
+
+/// Reads the failure ledger from [`FAILURES_FILE`] in the state dir. A
+/// missing file is an empty ledger (a fresh catalog has never failed at
+/// anything); an unparsable one is noted and treated as empty — the next
+/// [`record_failures`] rewrites it.
 #[must_use]
-pub fn read_failure_report(
-    state_dir: &Path,
-    notices: &crate::notices::Notices,
-) -> serde_json::Map<String, serde_json::Value> {
+pub fn read_ledger(state_dir: &Path, notices: &crate::notices::Notices) -> Ledger {
     let path = state_dir.join(FAILURES_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
-        return serde_json::Map::new();
+        return Ledger::new();
     };
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) {
-        map
-    } else {
+    let Ok(ledger) = serde_json::from_slice(&bytes) else {
+        let path = path.display();
         notices.push(format!(
-            "note: ignoring unparsable failure report at {} — treating as empty",
-            path.display()
+            "note: ignoring unparsable failure ledger at {path} — treating as empty \
+             (an older version wrote a different shape; it is rebuilt by the next run)"
         ));
-        serde_json::Map::new()
-    }
+        return Ledger::new();
+    };
+    ledger
 }
 
-/// One kind's per-item failures as `{path, error}` rows — shared by
-/// [`failure_report_json`]'s per-kind map and (independently) the CLI's own
-/// `--json` rendering of a run's failures.
-fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
-    failed
-        .iter()
-        .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
-        .collect()
-}
+/// Distinguishes concurrent writers inside one process (the desktop
+/// scheduler thread and a `retry_failed_items` command thread), so their
+/// temp files never collide; the pid distinguishes processes.
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// This pass's failures as `{kind: [{path, error}, ..]}`, kinds with no
-/// failures omitted. Never written to disk as-is: [`merge_failure_report`]
-/// first folds it over the previous report so a `--kinds`-filtered run only
-/// speaks for the kinds it actually worked.
-fn failure_report_json(o: &IndexRunOutcome) -> serde_json::Value {
-    let kinds: [(&str, Vec<(PathBuf, String)>); 8] = [
-        ("thumbs", o.thumbs.failed.clone()),
-        ("embeddings", o.embed.failed.clone()),
-        ("keyframes", o.keyframes.failed.clone()),
-        ("keyframe-images", o.keyframe_images.failed.clone()),
-        ("transcripts", o.transcript_failures()),
-        ("ocr", o.ocr.failed.clone()),
-        ("pdf", o.pdf.failed.clone()),
-        ("captions", o.captions.failed.clone()),
-    ];
-    let mut map = serde_json::Map::new();
-    for (kind, failed) in kinds {
-        if !failed.is_empty() {
-            map.insert(kind.to_string(), failed_json(&failed).into());
-        }
-    }
-    serde_json::Value::Object(map)
-}
-
-/// Folds this pass's failures over the previous report: keys for every kind
-/// in this pass's `--kinds` set are replaced (cleared when the kind now has
-/// no failures), while kinds the pass never worked keep their old record —
-/// `index run --kinds thumbs` must not erase a pdf failure whose item was
-/// never retried.
-fn merge_failure_report(
-    previous: serde_json::Map<String, serde_json::Value>,
-    current: &serde_json::Value,
-    kinds: &BTreeSet<String>,
-) -> serde_json::Value {
-    let mut merged = previous;
-    for kind in kinds {
-        merged.remove(kind);
-    }
-    if let Some(current) = current.as_object() {
-        for (kind, failures) in current {
-            merged.insert(kind.clone(), failures.clone());
-        }
-    }
-    serde_json::Value::Object(merged)
-}
-
-fn write_failure_report(state_dir: &Path, report: &serde_json::Value) -> Result<()> {
+/// Writes `ledger` to [`FAILURES_FILE`] via temp-file-then-rename in the same
+/// directory: this file is cumulative state that several writers — the
+/// desktop scheduler, a desktop command, a CLI run — can read-modify-write
+/// concurrently, so neither a crash nor two overlapping writers may leave a
+/// torn file where a reader can see it. A crash between the write and the
+/// rename leaves an inert `.tmp-*` sibling behind; nothing reads those.
+fn write_ledger(state_dir: &Path, ledger: &Ledger) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
     let path = state_dir.join(FAILURES_FILE);
-    std::fs::write(&path, report.to_string())
-        .with_context(|| format!("writing failure report {}", path.display()))
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = state_dir.join(format!("{FAILURES_FILE}.tmp-{}-{seq}", std::process::id()));
+    let bytes = serde_json::to_vec(ledger).context("serializing the failure ledger")?;
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("writing failure ledger {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming failure ledger into place at {}", path.display()))
 }
 
-/// Folds one `index run` pass's failures into the on-disk failure marker
-/// `index status` reads back — state, not rendering, so it lives here
-/// rather than in the CLI's `run_once` (moved from
-/// `crates/cli/src/index_cmd.rs::run_once`'s bookkeeping half). Any head
-/// that calls [`run`] and then this keeps `index status` truthful.
+/// One kind's permanent failures as ledger rows, at most one per asset (a
+/// kind spanning two work kinds can fail the same asset twice in a pass);
+/// the last row for an asset wins, so the freshest error text survives.
+fn rows_for(failed: &[ItemFailure]) -> Vec<LedgerRow> {
+    let mut by_asset: BTreeMap<String, LedgerRow> = BTreeMap::new();
+    for failure in failed.iter().filter(|f| !f.transient) {
+        by_asset.insert(
+            failure.asset.clone(),
+            LedgerRow {
+                asset: failure.asset.clone(),
+                path: failure.path.display().to_string(),
+                error: failure.error.clone(),
+            },
+        );
+    }
+    by_asset.into_values().collect()
+}
+
+/// This pass's PERMANENT failures as a ledger fragment, keyed by `--kinds`
+/// name: transient rows are dropped (they were never really attempted — see
+/// [`ItemFailure`]), and kinds with nothing permanent are omitted entirely.
+/// Never written as-is: [`merge_ledger`] folds it over what is already
+/// remembered, because a `--kinds`-filtered pass only ever adds.
+fn permanent_failures(outcome: &IndexRunOutcome) -> Ledger {
+    let sources: [(&str, Vec<ItemFailure>); 8] = [
+        ("thumbs", outcome.thumbs.failed.clone()),
+        ("embeddings", outcome.embed.failed.clone()),
+        ("keyframes", outcome.keyframes.failed.clone()),
+        ("keyframe-images", outcome.keyframe_images.failed.clone()),
+        ("transcripts", outcome.transcript_failures()),
+        ("ocr", outcome.ocr.failed.clone()),
+        ("pdf", outcome.pdf.failed.clone()),
+        ("captions", outcome.captions.failed.clone()),
+    ];
+    let mut ledger = Ledger::new();
+    for (kind, failed) in sources {
+        let rows = rows_for(&failed);
+        if !rows.is_empty() {
+            ledger.insert(kind.to_string(), rows);
+        }
+    }
+    ledger
+}
+
+/// `previous` ∪ `current`, per kind, deduplicated by `asset`: a re-failed
+/// item's row is replaced (fresh error text), never duplicated, and a kind
+/// this pass never worked keeps its rows untouched. No run ever clears a
+/// kind — only [`clear_failures`] does.
+fn merge_ledger(previous: Ledger, current: Ledger) -> Ledger {
+    let mut merged = previous;
+    for (kind, rows) in current {
+        let entry = merged.entry(kind).or_default();
+        let mut by_asset: BTreeMap<String, LedgerRow> = std::mem::take(entry)
+            .into_iter()
+            .map(|row| (row.asset.clone(), row))
+            .collect();
+        for row in rows {
+            by_asset.insert(row.asset.clone(), row);
+        }
+        *entry = by_asset.into_values().collect();
+    }
+    merged
+}
+
+/// After a run: folds this pass's permanent failures into the catalog's
+/// failure ledger, so the planner holds those items back until an explicit
+/// retry. State, not rendering — any head that calls [`run`] and then this
+/// keeps `index status` truthful.
 ///
 /// # Errors
-/// Returns an error if the state dir can't be resolved or the marker can't
+/// Returns an error if the state dir can't be resolved or the ledger can't
 /// be written.
-pub fn update_failure_report(
+pub fn record_failures(
     catalog_dir: &Path,
     outcome: &IndexRunOutcome,
-    kinds: &BTreeSet<String>,
     notices: &crate::notices::Notices,
 ) -> Result<(), ServiceError> {
-    update_failure_report_impl(catalog_dir, outcome, kinds, notices).map_err(ServiceError::from)
+    record_failures_impl(catalog_dir, outcome, notices).map_err(ServiceError::from)
 }
 
-fn update_failure_report_impl(
+fn record_failures_impl(
     catalog_dir: &Path,
     outcome: &IndexRunOutcome,
-    kinds: &BTreeSet<String>,
     notices: &crate::notices::Notices,
 ) -> Result<()> {
     let state_dir = crate::state_dir::state_dir_for(catalog_dir, notices)?;
-    let previous = read_failure_report(&state_dir, notices);
-    let current = failure_report_json(outcome);
-    let merged = merge_failure_report(previous, &current, kinds);
-    write_failure_report(&state_dir, &merged)
+    let previous = read_ledger(&state_dir, notices);
+    let merged = merge_ledger(previous, permanent_failures(outcome));
+    write_ledger(&state_dir, &merged)
+}
+
+/// Forgets every remembered failure for `kinds`, so the next plan queues
+/// those items again; returns how many rows were removed. The one way a
+/// ledger row ever goes away.
+///
+/// # Errors
+/// Returns an error if the state dir can't be resolved or the ledger can't
+/// be written.
+pub fn clear_failures(
+    catalog_dir: &Path,
+    kinds: &BTreeSet<String>,
+    notices: &crate::notices::Notices,
+) -> Result<u64, ServiceError> {
+    clear_failures_impl(catalog_dir, kinds, notices).map_err(ServiceError::from)
+}
+
+fn clear_failures_impl(
+    catalog_dir: &Path,
+    kinds: &BTreeSet<String>,
+    notices: &crate::notices::Notices,
+) -> Result<u64> {
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, notices)?;
+    let mut ledger = read_ledger(&state_dir, notices);
+    let mut cleared = 0u64;
+    for kind in kinds {
+        if let Some(rows) = ledger.remove(kind) {
+            cleared += rows.len() as u64;
+        }
+    }
+    if cleared > 0 {
+        write_ledger(&state_dir, &ledger)?;
+    }
+    Ok(cleared)
+}
+
+/// The catalog's failure ledger exactly as it stands — what `index status`
+/// reports and what an MCP dry run counts a retry would clear.
+///
+/// # Errors
+/// Returns an error if the state dir can't be resolved.
+pub fn known_failures(
+    catalog_dir: &Path,
+    notices: &crate::notices::Notices,
+) -> Result<Ledger, ServiceError> {
+    let state_dir = crate::state_dir::state_dir_for(catalog_dir, notices)?;
+    Ok(read_ledger(&state_dir, notices))
+}
+
+/// The [`KindStatus`] counters one [`WorkKind`] reports into — the same
+/// mapping [`workkind_name`] makes, on the plan's own fields.
+fn kind_status_mut(plan: &mut WorkPlan, kind: WorkKind) -> &mut KindStatus {
+    match kind {
+        WorkKind::Thumb => &mut plan.thumbs,
+        WorkKind::ImageEmbed => &mut plan.embeddings,
+        WorkKind::Keyframes => &mut plan.keyframes,
+        WorkKind::KeyframeImages => &mut plan.keyframe_images,
+        WorkKind::Transcribe | WorkKind::TranscriptEmbed => &mut plan.transcripts,
+        WorkKind::OcrImage | WorkKind::OcrKeyframes => &mut plan.ocr,
+        WorkKind::PdfText => &mut plan.pdf,
+        WorkKind::Caption => &mut plan.captions,
+    }
+}
+
+/// Holds back every planned item the ledger already remembers as a
+/// permanent failure of that (`--kinds` name, asset) pair: the item leaves
+/// `items`, and its kind's `pending` count moves to `failed` — so `index
+/// status` says "held back", never a silent zero.
+///
+/// The ledger keys by the `--kinds` name, not by [`WorkKind`], so a row under
+/// a two-stage kind holds back BOTH stages for that asset: a `transcripts`
+/// row holds back both Transcribe and `TranscriptEmbed` — including a
+/// `TranscriptEmbed` item that a teammate-synced transcript would otherwise
+/// make ready to run — and an `ocr` row holds back both `OcrImage` and
+/// `OcrKeyframes`. Both stay held until [`clear_failures`] drops that key;
+/// finer (kind, not just `--kinds` name)-level keying is a recorded
+/// deferral.
+#[must_use]
+pub fn apply_ledger(plan: WorkPlan, ledger: &Ledger) -> WorkPlan {
+    if ledger.is_empty() {
+        return plan;
+    }
+    let mut plan = plan;
+    let mut held: Vec<WorkKind> = Vec::new();
+    plan.items.retain(|item| {
+        let known = ledger
+            .get(workkind_name(item.kind))
+            .is_some_and(|rows| rows.iter().any(|row| row.asset == item.asset));
+        if known {
+            held.push(item.kind);
+        }
+        !known
+    });
+    for kind in held {
+        let status = kind_status_mut(&mut plan, kind);
+        status.pending = status.pending.saturating_sub(1);
+        status.failed += 1;
+    }
+    plan
 }
 
 /// One derivation kind's queue counts, mirroring [`KindStatus`] as a
@@ -290,6 +429,8 @@ pub struct KindStatusRow {
     pub unsupported: u64,
     pub needs_ffmpeg: u64,
     pub needs_model: u64,
+    /// Held back by the failure ledger until an explicit retry.
+    pub failed: u64,
 }
 
 impl From<&KindStatus> for KindStatusRow {
@@ -301,6 +442,7 @@ impl From<&KindStatus> for KindStatusRow {
             unsupported: status.unsupported,
             needs_ffmpeg: status.needs_ffmpeg,
             needs_model: status.needs_model,
+            failed: status.failed,
         }
     }
 }
@@ -308,7 +450,7 @@ impl From<&KindStatus> for KindStatusRow {
 /// Everything `maj index status` renders: every kind's queue counts, plus
 /// the remedy lines gated on whether that kind actually has anything
 /// waiting on a missing model (`None` when there's nothing to remedy), and
-/// the last run's per-item failures exactly as read off disk.
+/// the failure ledger exactly as read off disk.
 #[derive(serde::Serialize)]
 pub struct IndexStatusOutcome {
     pub thumbs: KindStatusRow,
@@ -324,7 +466,9 @@ pub struct IndexStatusOutcome {
     pub captions: KindStatusRow,
     pub transcripts_remedy: Option<String>,
     pub captions_remedy: Option<String>,
-    pub failed_last_run: serde_json::Value,
+    /// Every permanent failure this catalog remembers, keyed by `--kinds`
+    /// name — the items the planner holds back until `--retry-failed`.
+    pub failed: Ledger,
     /// Diagnostics collected during this operation, verbatim — the lines the
     /// CLI prints to stderr. Absent from the wire when empty.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -366,7 +510,7 @@ fn push_platform_unavailable_notices(plan: &WorkPlan, notices: &crate::notices::
 
 /// `maj index status`: the derivation queue's current state per kind
 /// without doing any work — a diff against the blob store, same as `run`,
-/// just not executed — plus the last run's per-item failures.
+/// just not executed — plus every failure the ledger remembers.
 ///
 /// # Errors
 /// Returns an error if the catalog can't be opened/synced or the state dir
@@ -381,8 +525,8 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
     let blobs = BlobStore::new(catalog_dir);
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
     let caps = capabilities(catalog_dir, app.notices());
-    let plan = build_plan(&projection, &blobs, &kinds, &caps);
-    let failures = read_failure_report(&state_dir, app.notices());
+    let ledger = read_ledger(&state_dir, app.notices());
+    let plan = build_plan(&projection, &blobs, &kinds, &caps, &ledger);
     let transcripts_remedy = (plan.transcripts.needs_model > 0)
         .then(|| transcript_model_remedy(caps.whisper, caps.text_model))
         .flatten();
@@ -399,7 +543,7 @@ fn status_impl(app: &FsApp, catalog_dir: &Path) -> Result<IndexStatusOutcome> {
         captions: (&plan.captions).into(),
         transcripts_remedy,
         captions_remedy,
-        failed_last_run: serde_json::Value::Object(failures),
+        failed: ledger,
         notices: app.notices().drain(),
     })
 }
@@ -475,12 +619,7 @@ mod tests {
         let outcome = status(&app, &root).expect("status");
         assert_eq!(outcome.thumbs.pending, 0);
         assert_eq!(outcome.thumbs.done, 0);
-        assert!(
-            outcome
-                .failed_last_run
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     }
 
     /// The notice text itself, independent of any real platform: pins the
@@ -660,7 +799,7 @@ mod tests {
             describer_tag: None,
         };
         let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
-        let plan = build_plan(&projection, &blobs, &kinds, &caps);
+        let plan = build_plan(&projection, &blobs, &kinds, &caps, &Ledger::new());
 
         let row = KindStatusRow::from(&plan.keyframe_images);
         assert_eq!(row.done, 2, "two videos carry the completion marker");
@@ -680,13 +819,64 @@ mod tests {
         // The same plan under a `--kinds thumbs` request keeps the counts
         // (status always reports every kind) but drops the items.
         let thumbs_only: BTreeSet<String> = ["thumbs".to_string()].into();
-        let narrowed = build_plan(&projection, &blobs, &thumbs_only, &caps);
+        let narrowed = build_plan(&projection, &blobs, &thumbs_only, &caps, &Ledger::new());
         assert_eq!(narrowed.keyframe_images.pending, 2);
         assert!(
             !narrowed
                 .items
                 .iter()
                 .any(|item| item.kind == WorkKind::KeyframeImages)
+        );
+    }
+
+    /// `status` end to end, not `apply_ledger` in isolation: plant one real
+    /// image so a Thumb item plans, ledger that asset as a known `thumbs`
+    /// failure the way `record_failures` would, then confirm `status` holds
+    /// it back — pins that `status_impl` actually wires `read_ledger` into
+    /// `build_plan` rather than planning against an empty ledger. A Thumb
+    /// item for an image never depends on ffmpeg/the encoder model/whisper,
+    /// so this holds on every OS this crate builds for.
+    #[test]
+    fn status_holds_back_a_ledgered_item_and_reports_it_as_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        image::RgbImage::new(4, 4)
+            .save(src.join("photo.png"))
+            .expect("write a real PNG for the planner to see");
+        // Auto-detected volume identity (`None`) so `gather_sources` resolves
+        // this as online.
+        crate::scan::scan(&mut app, &src, None).expect("scan");
+
+        let (_, projection) = open_catalog(&app, &root).expect("open catalog");
+        let asset = gather_sources(&projection)
+            .into_iter()
+            .next()
+            .expect("the one scanned image source")
+            .asset;
+
+        let notices = crate::notices::Notices::new();
+        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
+        write_ledger(&state_dir, &ledger_of(&[("thumbs", &[asset.as_str()])])).expect("seed");
+
+        let outcome = status(&app, &root).expect("status");
+        assert_eq!(
+            outcome.thumbs.pending, 0,
+            "pending: {}",
+            outcome.thumbs.pending
+        );
+        assert_eq!(
+            outcome.thumbs.failed, 1,
+            "failed: {}",
+            outcome.thumbs.failed
+        );
+        assert_eq!(
+            outcome.failed.get("thumbs").map(Vec::len),
+            Some(1),
+            "{:?}",
+            outcome.failed
         );
     }
 
@@ -704,100 +894,298 @@ mod tests {
         assert_eq!(workkind_name(WorkKind::Caption), "captions");
     }
 
-    #[test]
-    fn failure_report_json_includes_only_kinds_with_failures() {
-        let outcomes = IndexRunOutcome {
-            thumbs: ThumbOutcome {
-                written: 1,
-                failed: Vec::new(),
-            },
-            embed: EmbedOutcome {
-                written: 0,
-                loaded: 0,
-                failed: Vec::new(),
-            },
-            keyframes: KeyframeOutcome::default(),
-            keyframe_images: KeyframeImageOutcome::default(),
-            transcribe: TranscribeOutcome::default(),
-            transcript_embed: TranscriptEmbedOutcome::default(),
-            ocr: OcrOutcome::default(),
-            pdf: PdfOutcome {
-                written: 0,
-                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
-            },
-            captions: CaptionOutcome::default(),
-            notices: Vec::new(),
-        };
-        let report = failure_report_json(&outcomes);
-        let map = report.as_object().expect("object");
-        assert_eq!(map.len(), 1, "only the pdf kind failed: {report}");
-        let entries = map["pdf"].as_array().expect("array");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["path"], "/media/broken.pdf");
-        assert_eq!(entries[0]["error"], "not a valid pdf");
+    fn work_item(asset: &str, kind: WorkKind) -> work::WorkItem {
+        work::WorkItem {
+            asset: asset.to_string(),
+            asset_hex: asset.trim_start_matches("xxh3:").to_string(),
+            abs_path: PathBuf::from("/media/x"),
+            kind,
+        }
     }
 
-    /// A `--kinds`-filtered pass only speaks for its own kinds: it replaces
-    /// (or clears) their keys and preserves every other kind's record.
+    fn row(asset: &str, error: &str) -> LedgerRow {
+        LedgerRow {
+            asset: asset.to_string(),
+            path: "/media/x".to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    fn ledger_of(entries: &[(&str, &[&str])]) -> Ledger {
+        entries
+            .iter()
+            .map(|(kind, assets)| {
+                let rows = assets.iter().map(|a| row(a, "boom")).collect();
+                ((*kind).to_string(), rows)
+            })
+            .collect()
+    }
+
+    fn failure(asset: &str, error: &str, transient: bool) -> ItemFailure {
+        ItemFailure {
+            asset: asset.to_string(),
+            path: PathBuf::from("/media/x"),
+            error: error.to_string(),
+            transient,
+        }
+    }
+
+    /// A kind the pass never worked keeps its rows verbatim, and a kind it
+    /// re-failed keeps exactly one row per asset — carrying the fresh error
+    /// text, never a duplicate.
     #[test]
-    fn merge_failure_report_preserves_kinds_the_pass_never_worked() {
-        let mut previous = serde_json::Map::new();
-        previous.insert(
+    fn merge_ledger_replaces_a_refailed_row_and_keeps_other_kinds() {
+        let previous: Ledger = BTreeMap::from([
+            (
+                "pdf".to_string(),
+                vec![row("xxh3:aa", "not a valid pdf"), row("xxh3:bb", "stale")],
+            ),
+            ("thumbs".to_string(), vec![row("xxh3:cc", "old")]),
+        ]);
+        let current: Ledger = BTreeMap::from([(
             "pdf".to_string(),
-            serde_json::json!([{ "path": "/m/broken.pdf", "error": "not a valid pdf" }]),
-        );
-        previous.insert(
-            "thumbs".to_string(),
-            serde_json::json!([{ "path": "/m/old.png", "error": "stale" }]),
-        );
+            vec![row("xxh3:aa", "still broken"), row("xxh3:dd", "new")],
+        )]);
 
-        // A thumbs-only pass with no failures: clears thumbs, keeps pdf.
-        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
-        let merged = merge_failure_report(previous.clone(), &serde_json::json!({}), &kinds);
-        let map = merged.as_object().expect("object");
-        assert!(map.contains_key("pdf"), "pdf record must survive: {merged}");
-        assert!(
-            !map.contains_key("thumbs"),
-            "a clean thumbs pass clears its own record: {merged}"
+        let merged = merge_ledger(previous, current);
+        let pdf = &merged["pdf"];
+        assert_eq!(
+            pdf.len(),
+            3,
+            "one row per asset, never a duplicate: {pdf:?}"
         );
-
-        // A pdf pass with a fresh failure: replaces pdf, keeps thumbs.
-        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
-        let current = serde_json::json!({
-            "pdf": [{ "path": "/m/broken.pdf", "error": "still broken" }],
-        });
-        let merged = merge_failure_report(previous, &current, &kinds);
-        let map = merged.as_object().expect("object");
-        assert_eq!(map["pdf"][0]["error"], "still broken");
-        assert_eq!(map["thumbs"][0]["error"], "stale");
+        let refailed = pdf
+            .iter()
+            .find(|r| r.asset == "xxh3:aa")
+            .expect("the re-failed row");
+        assert_eq!(refailed.error, "still broken");
+        assert!(pdf.iter().any(|r| r.asset == "xxh3:bb"));
+        assert!(pdf.iter().any(|r| r.asset == "xxh3:dd"));
+        assert_eq!(merged["thumbs"], vec![row("xxh3:cc", "old")]);
     }
 
     #[test]
-    fn update_failure_report_writes_the_state_dir_marker() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("cat");
-        FsApp::init(&root, "m1", "m1").expect("init");
+    fn permanent_failures_drops_transient_rows() {
         let outcome = IndexRunOutcome {
-            pdf: PdfOutcome {
+            thumbs: ThumbOutcome {
                 written: 0,
-                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+                failed: vec![
+                    failure("xxh3:aa", "volume vanished", true),
+                    failure("xxh3:bb", "decode failed", false),
+                ],
             },
             ..IndexRunOutcome::default()
         };
-        let kinds: BTreeSet<String> = ["pdf".to_string()].into();
-        let notices = crate::notices::Notices::new();
-        update_failure_report(&root, &outcome, &kinds, &notices).expect("update");
-        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
-        let report = read_failure_report(&state_dir, &notices);
-        assert_eq!(report["pdf"][0]["error"], "not a valid pdf");
+        let ledger = permanent_failures(&outcome);
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        let thumbs = &ledger["thumbs"];
+        assert_eq!(thumbs.len(), 1, "{thumbs:?}");
+        assert_eq!(thumbs[0].asset, "xxh3:bb");
+        assert_eq!(thumbs[0].error, "decode failed");
     }
 
-    /// `status` is the verb that shows the last run's failures, so its own
-    /// read of a corrupt marker is exactly the diagnostic a caller needs —
-    /// pins that the outcome actually carries it home rather than the sink
-    /// being drained into a value nobody reads.
+    /// One `--kinds` name can span two work kinds; both stages' permanent
+    /// failures land under that one key, never under a Rust field name.
     #[test]
-    fn status_carries_the_unparsable_failure_report_note_on_its_outcome() {
+    fn permanent_failures_keys_both_transcript_stages_and_both_ocr_kinds_by_their_kinds_name() {
+        let outcome = IndexRunOutcome {
+            transcribe: TranscribeOutcome {
+                written: 0,
+                failed: vec![failure("xxh3:aa", "whisper refused", false)],
+            },
+            transcript_embed: TranscriptEmbedOutcome {
+                failed: vec![failure("xxh3:bb", "chunking failed", false)],
+                ..TranscriptEmbedOutcome::default()
+            },
+            ocr: OcrOutcome {
+                failed: vec![
+                    failure("xxh3:cc", "vision refused the still", false),
+                    failure("xxh3:dd", "vision refused a keyframe", false),
+                ],
+                ..OcrOutcome::default()
+            },
+            ..IndexRunOutcome::default()
+        };
+        let ledger = permanent_failures(&outcome);
+        let assets: Vec<&str> = ledger["transcripts"]
+            .iter()
+            .map(|r| r.asset.as_str())
+            .collect();
+        assert_eq!(assets, vec!["xxh3:aa", "xxh3:bb"], "{ledger:?}");
+        assert_eq!(ledger["ocr"].len(), 2, "{ledger:?}");
+        assert!(
+            !ledger.contains_key("transcript_embed"),
+            "no Rust field names on the wire: {ledger:?}"
+        );
+    }
+
+    #[test]
+    fn apply_ledger_moves_a_matching_item_from_pending_to_failed() {
+        let plan = || WorkPlan {
+            items: vec![
+                work_item("xxh3:aa", WorkKind::Thumb),
+                work_item("xxh3:bb", WorkKind::Thumb),
+            ],
+            thumbs: KindStatus {
+                pending: 2,
+                ..KindStatus::default()
+            },
+            ..WorkPlan::default()
+        };
+
+        let held = apply_ledger(plan(), &ledger_of(&[("thumbs", &["xxh3:aa"])]));
+        assert_eq!(held.items.len(), 1, "the known failure is held back");
+        assert_eq!(held.items[0].asset, "xxh3:bb");
+        assert_eq!(held.thumbs.pending, 1);
+        assert_eq!(held.thumbs.failed, 1);
+
+        // The same asset remembered under a DIFFERENT kind holds nothing
+        // back: the ledger is keyed by (kind, asset), not asset alone.
+        let untouched = apply_ledger(plan(), &ledger_of(&[("pdf", &["xxh3:aa"])]));
+        assert_eq!(untouched.items.len(), 2);
+        assert_eq!(untouched.thumbs.pending, 2);
+        assert_eq!(untouched.thumbs.failed, 0);
+    }
+
+    /// Both work kinds behind one `--kinds` name resolve to the same ledger
+    /// key and the same [`KindStatus`] counters.
+    #[test]
+    fn apply_ledger_maps_both_transcript_work_kinds_to_the_transcripts_key() {
+        let plan = WorkPlan {
+            items: vec![
+                work_item("xxh3:aa", WorkKind::Transcribe),
+                work_item("xxh3:bb", WorkKind::TranscriptEmbed),
+                work_item("xxh3:cc", WorkKind::OcrImage),
+                work_item("xxh3:dd", WorkKind::OcrKeyframes),
+            ],
+            transcripts: KindStatus {
+                pending: 2,
+                ..KindStatus::default()
+            },
+            ocr: KindStatus {
+                pending: 2,
+                ..KindStatus::default()
+            },
+            ..WorkPlan::default()
+        };
+        let ledger = ledger_of(&[
+            ("transcripts", &["xxh3:aa", "xxh3:bb"]),
+            ("ocr", &["xxh3:cc", "xxh3:dd"]),
+        ]);
+
+        let held = apply_ledger(plan, &ledger);
+        assert!(held.items.is_empty(), "{:?}", held.items);
+        assert_eq!(held.transcripts.pending, 0);
+        assert_eq!(held.transcripts.failed, 2);
+        assert_eq!(held.ocr.pending, 0);
+        assert_eq!(held.ocr.failed, 2);
+    }
+
+    #[test]
+    fn clear_failures_removes_only_the_named_kinds_and_reports_the_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        let notices = crate::notices::Notices::new();
+        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
+        write_ledger(
+            &state_dir,
+            &ledger_of(&[("thumbs", &["xxh3:aa", "xxh3:bb"]), ("pdf", &["xxh3:cc"])]),
+        )
+        .expect("seed");
+
+        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
+        let cleared = clear_failures(&root, &kinds, &notices).expect("clear");
+        assert_eq!(cleared, 2, "both thumbs rows were dropped");
+
+        let remaining = known_failures(&root, &notices).expect("known");
+        assert!(!remaining.contains_key("thumbs"), "{remaining:?}");
+        assert_eq!(remaining["pdf"].len(), 1, "{remaining:?}");
+    }
+
+    /// `write_ledger` writes through a `<FAILURES_FILE>.tmp-<pid>-<seq>`
+    /// sibling and renames it into place — a reader must never observe a
+    /// torn write, and the success path leaves no temp file behind (a crash
+    /// mid-write can leave one; it is inert, nothing reads it).
+    #[test]
+    fn write_ledger_leaves_no_tmp_file_behind() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        write_ledger(state_dir.path(), &ledger_of(&[("thumbs", &["xxh3:aa"])])).expect("write");
+
+        let leftover_tmp: Vec<_> = std::fs::read_dir(state_dir.path())
+            .expect("read state dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftover_tmp.is_empty(), "{leftover_tmp:?}");
+
+        let ledger = read_ledger(state_dir.path(), &crate::notices::Notices::new());
+        assert_eq!(ledger["thumbs"], vec![row("xxh3:aa", "boom")]);
+    }
+
+    #[test]
+    fn read_ledger_treats_missing_and_unparsable_as_empty_with_a_notice() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let notices = crate::notices::Notices::new();
+        assert!(read_ledger(state.path(), &notices).is_empty(), "missing");
+        assert!(
+            notices.drain().is_empty(),
+            "a fresh catalog has no ledger and nothing to say about it"
+        );
+
+        std::fs::write(state.path().join(FAILURES_FILE), b"{ not json").expect("plant");
+        let ledger = read_ledger(state.path(), &notices);
+        assert!(ledger.is_empty(), "{ledger:?}");
+        let drained = notices.drain();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(
+            drained[0].contains("ignoring unparsable failure ledger"),
+            "{drained:?}"
+        );
+        assert!(
+            drained[0].contains("rebuilt by the next run"),
+            "the notice must say the ledger self-heals on the next run: {drained:?}"
+        );
+    }
+
+    /// The `--retry-failed` sequence at the state-dir level: a run records
+    /// its permanent failures, and the clear that a retry does first drops
+    /// exactly the requested kinds' rows.
+    #[test]
+    fn run_with_retry_failed_clears_the_requested_kinds_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        let notices = crate::notices::Notices::new();
+        let outcome = IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 0,
+                failed: vec![failure("xxh3:aa", "decode failed", false)],
+            },
+            pdf: PdfOutcome {
+                written: 0,
+                failed: vec![failure("xxh3:bb", "not a valid pdf", false)],
+            },
+            ..IndexRunOutcome::default()
+        };
+        record_failures(&root, &outcome, &notices).expect("record");
+        assert_eq!(known_failures(&root, &notices).expect("known").len(), 2);
+
+        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
+        let cleared = clear_failures(&root, &kinds, &notices).expect("clear");
+        assert_eq!(cleared, 1);
+
+        let remaining = known_failures(&root, &notices).expect("known");
+        assert!(!remaining.contains_key("thumbs"), "{remaining:?}");
+        assert_eq!(remaining["pdf"][0].error, "not a valid pdf");
+    }
+
+    /// `status` is the verb that shows known failures, so its own read of a
+    /// corrupt ledger is exactly the diagnostic a caller needs — pins that
+    /// the outcome actually carries it home rather than the sink being
+    /// drained into a value nobody reads.
+    #[test]
+    fn status_carries_the_unparsable_failure_ledger_note_on_its_outcome() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("cat");
         let app = FsApp::init(&root, "m1", "m1").expect("init");
@@ -808,26 +1196,112 @@ mod tests {
             outcome
                 .notices
                 .iter()
-                .any(|n| n.contains("ignoring unparsable failure report")),
+                .any(|n| n.contains("ignoring unparsable failure ledger")),
             "{:?}",
             outcome.notices
         );
     }
 
-    /// A marker file the next run will overwrite anyway must never be a hard
-    /// failure — it degrades to an empty report plus one notice.
+    /// Random passes, small asset alphabet so the same id recurs across
+    /// kinds and within one kind: the ledger a pass contributes is exactly
+    /// its permanent failures, one row per asset per kind, and no transient
+    /// failure ever reaches it.
     #[test]
-    fn unparsable_failure_report_is_a_notice() {
-        let state = tempfile::tempdir().expect("tempdir");
-        std::fs::write(state.path().join(FAILURES_FILE), b"{ not json").expect("plant");
-        let notices = crate::notices::Notices::new();
-        let report = read_failure_report(state.path(), &notices);
-        assert!(report.is_empty());
-        let drained = notices.drain();
-        assert_eq!(drained.len(), 1);
-        assert!(
-            drained[0].contains("ignoring unparsable failure report"),
-            "{drained:?}"
-        );
+    fn no_transient_failure_ever_reaches_the_ledger() {
+        use proptest::prelude::*;
+
+        fn failures() -> impl Strategy<Value = Vec<ItemFailure>> {
+            prop::collection::vec(
+                ("xxh3:[a-d]", any::<bool>()).prop_map(|(asset, transient)| ItemFailure {
+                    asset,
+                    path: PathBuf::from("/media/x"),
+                    error: "boom".to_string(),
+                    transient,
+                }),
+                0..5usize,
+            )
+        }
+
+        proptest!(|(lists in prop::collection::vec(failures(), 9..=9))| {
+            let outcome = outcome_with_failures(&lists);
+            let ledger = permanent_failures(&outcome);
+
+            let mut expected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (kind, list) in KIND_SOURCES.iter().zip(lists.iter()) {
+                for f in list.iter().filter(|f| !f.transient) {
+                    expected
+                        .entry((*kind).to_string())
+                        .or_default()
+                        .insert(f.asset.clone());
+                }
+            }
+
+            let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (kind, rows) in &ledger {
+                let assets: BTreeSet<String> = rows.iter().map(|r| r.asset.clone()).collect();
+                prop_assert_eq!(assets.len(), rows.len(), "one row per asset: {:?}", rows);
+                actual.insert(kind.clone(), assets);
+            }
+            prop_assert_eq!(actual, expected);
+        });
     }
+
+    /// The nine `*Outcome.failed` lists in [`KIND_SOURCES`] order, so the
+    /// property test can drive every executor's failures from one vector.
+    fn outcome_with_failures(lists: &[Vec<ItemFailure>]) -> IndexRunOutcome {
+        let at = |i: usize| lists.get(i).cloned().unwrap_or_default();
+        IndexRunOutcome {
+            thumbs: ThumbOutcome {
+                written: 0,
+                failed: at(0),
+            },
+            embed: EmbedOutcome {
+                failed: at(1),
+                ..EmbedOutcome::default()
+            },
+            keyframes: KeyframeOutcome {
+                failed: at(2),
+                ..KeyframeOutcome::default()
+            },
+            keyframe_images: KeyframeImageOutcome {
+                failed: at(3),
+                ..KeyframeImageOutcome::default()
+            },
+            transcribe: TranscribeOutcome {
+                written: 0,
+                failed: at(4),
+            },
+            transcript_embed: TranscriptEmbedOutcome {
+                failed: at(5),
+                ..TranscriptEmbedOutcome::default()
+            },
+            ocr: OcrOutcome {
+                failed: at(6),
+                ..OcrOutcome::default()
+            },
+            pdf: PdfOutcome {
+                written: 0,
+                failed: at(7),
+            },
+            captions: CaptionOutcome {
+                failed: at(8),
+                ..CaptionOutcome::default()
+            },
+            notices: Vec::new(),
+        }
+    }
+
+    /// The `--kinds` name each of the nine `*Outcome.failed` lists feeds,
+    /// in the order [`outcome_with_failures`] fills them.
+    const KIND_SOURCES: [&str; 9] = [
+        "thumbs",
+        "embeddings",
+        "keyframes",
+        "keyframe-images",
+        "transcripts",
+        "transcripts",
+        "ocr",
+        "pdf",
+        "captions",
+    ];
 }

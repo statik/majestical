@@ -4,17 +4,40 @@ use crate::event::{AssetId, Event};
 use crate::projection::Projection;
 use std::collections::BTreeSet;
 
-/// Adapter errors crossing a port boundary keep their message and source
-/// but drop the concrete type, so core-level code never names an adapter.
+/// Why a port call failed: the port could not do its job at all (unreachable,
+/// timed out, overloaded — retrying later may succeed), or it answered and
+/// refused THIS input (a 4xx, an unusable response body — retrying the same
+/// input will fail the same way).
+///
+/// Callers that remember failures need the split: an `Unavailable` port says
+/// nothing about the item that happened to be in flight, while a
+/// `RefusedInput` is a verdict on that input and worth remembering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortFailure {
+    /// The port itself is the problem — nothing was learned about the input.
+    Unavailable,
+    /// The port worked and rejected this particular input.
+    RefusedInput,
+}
+
+/// Adapter errors crossing a port boundary keep their message, source and
+/// failure class but drop the concrete type, so core-level code never names
+/// an adapter.
 #[derive(Debug, thiserror::Error)]
 #[error("{context}: {source}")]
 pub struct PortError {
     pub context: String,
     #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
+    pub failure: PortFailure,
 }
 
 impl PortError {
+    /// A port that could not do its job: [`PortFailure::Unavailable`]. This
+    /// is the default reading of an adapter error — an adapter that can tell
+    /// a rejected input apart from a broken port uses [`Self::refused`] for
+    /// the former and this for everything else.
+    #[must_use]
     pub fn new(
         context: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -22,6 +45,22 @@ impl PortError {
         Self {
             context: context.into(),
             source: Box::new(source),
+            failure: PortFailure::Unavailable,
+        }
+    }
+
+    /// A port that answered and refused this input:
+    /// [`PortFailure::RefusedInput`]. Retrying the same input hits the same
+    /// wall, so callers may record it against the item instead of retrying.
+    #[must_use]
+    pub fn refused(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            context: context.into(),
+            source: Box::new(source),
+            failure: PortFailure::RefusedInput,
         }
     }
 }
@@ -269,6 +308,22 @@ mod tests {
         fn volume_asset_counts(&self) -> Result<Vec<(String, u64)>, PortError> {
             Ok(Vec::new())
         }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("backend said no")]
+    struct Refusal;
+
+    /// The two constructors are the whole classification API: `new` is the
+    /// conservative default every existing adapter already uses, `refused`
+    /// the opt-in an adapter reaches for when it can tell the input was the
+    /// problem. A mutant swapping either class must fail here.
+    #[test]
+    fn port_error_constructors_carry_their_failure_class() {
+        let unavailable = PortError::new("caption", Refusal);
+        let refused = PortError::refused("caption", Refusal);
+        assert_eq!(unavailable.failure, PortFailure::Unavailable);
+        assert_eq!(refused.failure, PortFailure::RefusedInput);
     }
 
     #[test]

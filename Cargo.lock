@@ -4577,6 +4577,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "httpmock",
  "image",
  "majestical-catalog-sqlite",
  "majestical-core",

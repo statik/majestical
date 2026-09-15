@@ -128,6 +128,7 @@ pub fn batch_request(decision: SchedulerDecision) -> Option<IndexRunReq> {
         limit: Some(BATCH_LIMIT),
         threads,
         api_key: None,
+        retry_failed: false,
     })
 }
 
@@ -239,15 +240,15 @@ fn run_batch(
         .running = true;
     // `AssertUnwindSafe` (inside `catch_panic`): the closure captures only
     // `&CatalogCfg`/`&IndexRunReq`, both plain data with no interior
-    // mutability for a panic to leave half-updated. Refreshing the
-    // failure-report marker lives in here too, not after: a panic in that
+    // mutability for a panic to leave half-updated. Recording this pass's
+    // failures in the ledger lives in here too, not after: a panic in that
     // write must be caught the same as one from `index::run` itself, or it
     // would still kill the thread with `running` left stuck `true`.
     let result: Result<IndexRunOutcome, CommandError> =
         crate::ingest::catch_panic("the scheduler", || {
             let fs_app = open_app(cfg)?;
             let outcome = index::run(&fs_app, &cfg.catalog, req)?;
-            index::update_failure_report(&cfg.catalog, &outcome, &req.kinds, fs_app.notices())?;
+            index::record_failures(&cfg.catalog, &outcome, fs_app.notices())?;
             Ok(outcome)
         });
     let (last_error, pace) = match result {
@@ -427,7 +428,7 @@ mod tests {
         ThrottleOverride, batch_outcome_pace, batch_request, pending_items, set_throttle_impl,
         success_pace, total_failures,
     };
-    use majestical_services::index::{IndexRunOutcome, KindStatusRow};
+    use majestical_services::index::{IndexRunOutcome, ItemFailure, KindStatusRow};
     use std::time::Duration;
 
     fn kind_row(pending: u64) -> KindStatusRow {
@@ -438,6 +439,7 @@ mod tests {
             unsupported: 0,
             needs_ffmpeg: 0,
             needs_model: 0,
+            failed: 0,
         }
     }
 
@@ -453,7 +455,7 @@ mod tests {
             captions: kind_row(counts[7]),
             transcripts_remedy: None,
             captions_remedy: None,
-            failed_last_run: serde_json::Value::Object(serde_json::Map::new()),
+            failed: std::collections::BTreeMap::new(),
             notices: Vec::new(),
         }
     }
@@ -526,7 +528,12 @@ mod tests {
     #[test]
     fn total_failures_counts_every_kind_including_both_transcript_stages() {
         let mut outcome = IndexRunOutcome::default();
-        let failure = || (std::path::PathBuf::from("/media/x"), "failed".to_string());
+        let failure = || ItemFailure {
+            asset: "xxh3:aa11".to_string(),
+            path: std::path::PathBuf::from("/media/x"),
+            error: "failed".to_string(),
+            transient: false,
+        };
         outcome.thumbs.failed.push(failure());
         outcome.embed.failed.push(failure());
         outcome.keyframes.failed.push(failure());
@@ -542,14 +549,18 @@ mod tests {
     #[test]
     fn batch_outcome_pace_holds_and_names_the_failure_count_when_nothing_progressed() {
         let mut outcome = IndexRunOutcome::default();
-        outcome.thumbs.failed.push((
-            std::path::PathBuf::from("/media/broken.jpg"),
-            "decode failed".to_string(),
-        ));
-        outcome.pdf.failed.push((
-            std::path::PathBuf::from("/media/broken.pdf"),
-            "not a valid pdf".to_string(),
-        ));
+        outcome.thumbs.failed.push(ItemFailure {
+            asset: "xxh3:aa11".to_string(),
+            path: std::path::PathBuf::from("/media/broken.jpg"),
+            error: "decode failed".to_string(),
+            transient: false,
+        });
+        outcome.pdf.failed.push(ItemFailure {
+            asset: "xxh3:bb22".to_string(),
+            path: std::path::PathBuf::from("/media/broken.pdf"),
+            error: "not a valid pdf".to_string(),
+            transient: false,
+        });
         let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunFull, &outcome);
         assert_eq!(pace, super::TICK);
         let message = last_error.expect("a no-progress batch must report why");

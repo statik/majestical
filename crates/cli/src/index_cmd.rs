@@ -9,7 +9,7 @@ use anyhow::Result;
 use majestical_services::app::FsApp;
 use majestical_services::index::{IndexRunOutcome, IndexRunReq, VALID_KINDS};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Args for `maj index run`, bundled to keep `cmd_index_run`'s own signature
 /// within the house 5-positional-parameter limit.
@@ -18,6 +18,9 @@ pub(crate) struct IndexRunArgs {
     pub(crate) threads: Option<usize>,
     pub(crate) limit: Option<usize>,
     pub(crate) kinds: Option<Vec<String>>,
+    /// Clears the selected kinds' remembered failures before the pass, so
+    /// items the ledger holds back are attempted once more.
+    pub(crate) retry_failed: bool,
     pub(crate) json: bool,
 }
 
@@ -36,50 +39,43 @@ fn parse_kinds(kinds: Option<&[String]>) -> Result<BTreeSet<String>> {
     Ok(kinds.iter().cloned().collect())
 }
 
-fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
-    failed
-        .iter()
-        .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
-        .collect()
-}
-
 fn run_result_json(o: &IndexRunOutcome) -> serde_json::Value {
     serde_json::json!({
-        "thumbnails": { "written": o.thumbs.written, "failed": failed_json(&o.thumbs.failed) },
+        "thumbnails": { "written": o.thumbs.written, "failed": o.thumbs.failed },
         "embeddings": {
             "written": o.embed.written,
             "loaded_from_blobs": o.embed.loaded,
-            "failed": failed_json(&o.embed.failed),
+            "failed": o.embed.failed,
         },
         "keyframes": {
             "videos_done": o.keyframes.videos_done,
             "keyframes_written": o.keyframes.keyframes_written,
             "keyframes_failed": o.keyframes.keyframes_failed,
-            "failed": failed_json(&o.keyframes.failed),
+            "failed": o.keyframes.failed,
         },
         "keyframe-images": {
             "videos_done": o.keyframe_images.videos_done,
             "images_written": o.keyframe_images.images_written,
             "images_skipped": o.keyframe_images.images_skipped,
-            "failed": failed_json(&o.keyframe_images.failed),
+            "failed": o.keyframe_images.failed,
         },
         "transcripts": {
             "transcribed": o.transcribe.written,
             "chunks_written": o.transcript_embed.chunks_written,
             "chunks_loaded_from_blobs": o.transcript_embed.loaded,
             "chunks_empty": o.transcript_embed.empty,
-            "failed": failed_json(&o.transcript_failures()),
+            "failed": o.transcript_failures(),
         },
         "ocr": {
             "images_written": o.ocr.images_written,
             "videos_done": o.ocr.videos_done,
             "keyframes_written": o.ocr.keyframes_written,
-            "failed": failed_json(&o.ocr.failed),
+            "failed": o.ocr.failed,
         },
-        "pdf": { "written": o.pdf.written, "failed": failed_json(&o.pdf.failed) },
+        "pdf": { "written": o.pdf.written, "failed": o.pdf.failed },
         "captions": {
             "written": o.captions.written,
-            "failed": failed_json(&o.captions.failed),
+            "failed": o.captions.failed,
         },
     })
 }
@@ -143,7 +139,7 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
     // `--json` branch above, for callers that want it out-of-band).
-    for (_, err) in o
+    for failure in o
         .thumbs
         .failed
         .iter()
@@ -156,7 +152,11 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
         .chain(&o.pdf.failed)
         .chain(&o.captions.failed)
     {
-        eprintln!("failed: {err}");
+        if failure.transient {
+            eprintln!("failed (transient): {}", failure.error);
+        } else {
+            eprintln!("failed: {}", failure.error);
+        }
     }
 }
 
@@ -183,24 +183,20 @@ fn explicitly_requested_ffmpeg_kind(kinds: Option<&[String]>) -> Option<&'static
         .find(|name| kinds.iter().any(|kind| kind == name))
 }
 
-/// One `index run` pass: calls the services engine, updates the on-disk
-/// failure marker `index status` reads back (state, folded into the
-/// services layer — see `majestical_services::index::update_failure_report`
-/// — so any head calling `index::run` keeps `index status` truthful, not
-/// just this CLI), and renders the result.
+/// One `index run` pass: calls the services engine, folds this pass's
+/// permanent failures into the on-disk ledger `index status` reads back
+/// (state, folded into the services layer — see
+/// `majestical_services::index::record_failures` — so any head calling
+/// `index::run` keeps `index status` truthful, not just this CLI), and
+/// renders the result.
 ///
 /// # Errors
-/// Returns an error if the engine fails, or the failure marker can't be
+/// Returns an error if the engine fails, or the ledger can't be
 /// read/written.
 fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> Result<()> {
     let outcome = majestical_services::index::run(app, catalog_dir, req)?;
     crate::print_notices(&outcome.notices);
-    majestical_services::index::update_failure_report(
-        catalog_dir,
-        &outcome,
-        &req.kinds,
-        app.notices(),
-    )?;
+    majestical_services::index::record_failures(catalog_dir, &outcome, app.notices())?;
     print_run_result(&outcome, json);
     Ok(())
 }
@@ -220,6 +216,7 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             "--kinds {kind} requires ffmpeg/ffprobe on PATH (brew install ffmpeg)"
         );
     }
+    let mut first_pass = true;
     loop {
         // Rebuilt every pass (not hoisted above the loop): the describer API
         // key is read fresh each time, same as before this extraction, when
@@ -230,27 +227,42 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             limit: args.limit,
             threads: args.threads,
             api_key: crate::describer_cmd::env_api_key(),
+            retry_failed: retry_on_pass(first_pass, args.retry_failed),
         };
         run_once(app, catalog_dir, &req, args.json)?;
         if !args.watch {
             break;
         }
+        first_pass = false;
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
     Ok(())
 }
 
+/// Whether this pass clears the ledger: `--retry-failed` is a one-shot
+/// clear on the FIRST pass only. Under `--watch`, clearing on every tick
+/// would re-attempt a known-bad item every five seconds forever — exactly
+/// the loop the ledger exists to stop — so later passes run with the
+/// ledger sticky again.
+fn retry_on_pass(first_pass: bool, requested: bool) -> bool {
+    first_pass && requested
+}
+
 /// Prints one line per derivation kind: `done`, `pending`, `offline`,
-/// `unsupported`, `needs_ffmpeg` (need ffmpeg), `needs_model` (need model).
+/// `unsupported`, `needs_ffmpeg` (need ffmpeg), `needs_model` (need model),
+/// `failed` (items this plan holds back because the ledger remembers them
+/// failing).
 fn print_kind_status(name: &str, status: &majestical_services::index::KindStatusRow) {
     println!(
-        "{name}: {} done, {} pending, {} offline, {} unsupported, {} need ffmpeg, {} need model",
+        "{name}: {} done, {} pending, {} offline, {} unsupported, {} need ffmpeg, \
+         {} need model, {} failed",
         status.done,
         status.pending,
         status.offline,
         status.unsupported,
         status.needs_ffmpeg,
         status.needs_model,
+        status.failed,
     );
 }
 
@@ -262,6 +274,7 @@ fn kind_status_json(status: &majestical_services::index::KindStatusRow) -> serde
         "unsupported": status.unsupported,
         "needs_ffmpeg": status.needs_ffmpeg,
         "needs_model": status.needs_model,
+        "failed": status.failed,
     })
 }
 
@@ -279,27 +292,38 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
     }
 }
 
-/// Per-kind failure lines from the last run's marker, e.g.
-/// `pdf failed last run: 1 (broken.pdf: not a valid pdf)`.
-fn print_last_run_failures(failures: &serde_json::Value) {
-    let Some(failures) = failures.as_object() else {
-        return;
-    };
-    for (kind, list) in failures {
-        let Some(entries) = list.as_array() else {
+/// Per-kind lines for the failures the ledger remembers, e.g. `pdf: 1 known
+/// failure(s) remembered (not a valid pdf)`, followed by a single
+/// remedy line naming the command that retries them — one remedy for the
+/// whole report, not one per kind.
+///
+/// These rows are deliberately NOT the same number as the per-kind `failed`
+/// count printed above: that count is plan-derived (items still pending that
+/// this plan holds back), while a ledger row can outlive it — an asset whose
+/// derivation later arrived by sync is done, yet its row stays until a
+/// retry clears it. Hence "remembered" here and "failed" on the per-kind
+/// line: only the latter claims something is being skipped right now.
+fn print_known_failures(failures: &majestical_services::index::Ledger) {
+    let mut any = false;
+    for (kind, rows) in failures {
+        let Some(first) = rows.first() else {
             continue;
         };
-        if entries.is_empty() {
-            continue;
-        }
-        let first = entries[0]["error"].as_str().unwrap_or("<unknown reason>");
-        println!("{kind} failed last run: {} ({first})", entries.len());
+        any = true;
+        println!(
+            "{kind}: {} known failure(s) remembered ({})",
+            rows.len(),
+            first.error,
+        );
+    }
+    if any {
+        println!("retry with: maj index run --retry-failed");
     }
 }
 
 /// Reports the queue's current state per derivation kind without doing any
 /// work — a diff against the blob store, same as `run`, just not executed —
-/// plus the last run's per-item failures from the failure marker. Compute
+/// plus every failure the ledger remembers. Compute
 /// lives in `majestical_services::index::status`; this renders its
 /// [`majestical_services::index::IndexStatusOutcome`].
 ///
@@ -321,7 +345,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
                 "ocr": kind_status_json(&outcome.ocr),
                 "pdf": kind_status_json(&outcome.pdf),
                 "captions": kind_status_json(&outcome.captions),
-                "failed_last_run": outcome.failed_last_run,
+                "failed": outcome.failed,
             })
         );
     } else {
@@ -334,7 +358,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
         print_kind_status("pdf", &outcome.pdf);
         print_kind_status("captions", &outcome.captions);
         print_status_remedies(&outcome);
-        print_last_run_failures(&outcome.failed_last_run);
+        print_known_failures(&outcome.failed);
     }
     Ok(())
 }
@@ -355,6 +379,17 @@ pub(crate) fn cmd_model_fetch(verify: bool, only: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_failed_clears_on_the_first_pass_only() {
+        assert!(retry_on_pass(true, true));
+        assert!(
+            !retry_on_pass(false, true),
+            "a later --watch pass must not re-clear"
+        );
+        assert!(!retry_on_pass(true, false));
+        assert!(!retry_on_pass(false, false));
+    }
 
     #[test]
     fn parse_kinds_defaults_to_every_kind() {

@@ -2,10 +2,11 @@
 //! queued items (thumbnails, embeddings, keyframes, keyframe images,
 //! transcripts, transcript-embeddings, OCR, PDF text, captions), and heals
 //! `text_fts` from blobs. Moved from `crates/cli/src/index_cmd.rs`. The
-//! `--watch` loop, the failure-report bookkeeping (`failure_report_json`/
-//! `merge_failure_report`/`write_failure_report`), and all rendering
-//! (`print_run_result`/`run_result_json`) stay in the CLI — this module
-//! hands back one [`IndexRunOutcome`] per pass and never prints.
+//! `--watch` loop and all rendering (`print_run_result`/`run_result_json`)
+//! stay in the CLI, and the failure ledger (`record_failures`/
+//! `clear_failures`/`apply_ledger`) lives next door in `index/mod.rs` —
+//! this module hands back one [`IndexRunOutcome`] per pass and never
+//! prints.
 use crate::app::FsApp;
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
@@ -13,7 +14,7 @@ use crate::error::ServiceError;
 use crate::index::heal::heal_text_fts;
 use anyhow::{Context, Result};
 use majestical_core::media_kind::{MediaKind, media_kind};
-use majestical_core::ports::{Describer, TagSubject};
+use majestical_core::ports::{Describer, PortError, PortFailure, TagSubject};
 use majestical_core::projection::Projection;
 use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
@@ -35,37 +36,69 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// matches the level `BlobStore::write_vector` uses for vector blobs.
 const BLOB_ZSTD_LEVEL: i32 = 3;
 
-/// One failed work item, as every `*Outcome.failed` list serializes it:
-/// `{"path": ..., "error": ...}` rather than a positional 2-tuple — the
-/// shape an MCP agent (or any other JSON consumer) expects from a
-/// key-value pair, matching the object shape the CLI's own hand-built
-/// `failed_json` helpers (`crates/cli/src/index_cmd.rs`,
-/// `crates/services/src/index/mod.rs`) already produce by hand. The
-/// underlying field stays `Vec<(PathBuf, String)>` — every executor in this
-/// module pushes plain tuples — so this exists purely as a
-/// `serialize_with` target ([`serialize_failed_items`]), not a type every
-/// call site needs to construct.
-#[derive(serde::Serialize)]
-struct FailedItem<'a> {
-    path: &'a std::path::Path,
-    error: &'a str,
+/// One item that did not get its derivation this pass. `transient` means
+/// the item was never really attempted — the describer backend failed or
+/// cascaded, or the source vanished mid-batch — and must NOT be remembered
+/// by the failure ledger (see `record_failures` in `index/mod.rs`);
+/// everything else is a permanent failure of this item's bytes and is.
+///
+/// Every `*Outcome.failed` list carries these, and they serialize as
+/// `{"asset", "path", "error", "transient"}` objects — the shape an MCP
+/// agent (or any other JSON consumer) reads a failure row as, and what the
+/// CLI's `--json` rendering passes straight through.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ItemFailure {
+    pub asset: String,
+    #[serde(serialize_with = "path_display")]
+    pub path: PathBuf,
+    pub error: String,
+    pub transient: bool,
 }
 
-/// `serialize_with` target for every `failed: Vec<(PathBuf, String)>` field
-/// in this module's per-kind outcome structs — see [`FailedItem`].
-fn serialize_failed_items<S: serde::Serializer>(
-    items: &[(PathBuf, String)],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeSeq;
-    let mut seq = serializer.serialize_seq(Some(items.len()))?;
-    for (path, error) in items {
-        seq.serialize_element(&FailedItem {
-            path,
-            error: error.as_str(),
-        })?;
+impl ItemFailure {
+    /// Classifies a runner error by the one signal every kind shares: if
+    /// the source path no longer exists when the failure is recorded, the
+    /// volume went away under the batch — transient. The empty-path
+    /// sentinel `TranscriptEmbed` items carry (they read a blob, not the
+    /// source) is never "vanished".
+    ///
+    /// The probe is deliberately imprecise, in the cheap direction: a false
+    /// "transient" costs one extra retry next pass, while a false
+    /// "permanent" costs a ledger row that hides a healthy item until an
+    /// explicit retry — so it biases toward the cheap mistake.
+    /// `Path::exists()` is also `false` for a path that exists but can't be
+    /// stat'd (permission denied), which is intended: an unreadable-to-us
+    /// volume is exactly as re-attemptable as an unmounted one.
+    #[must_use]
+    pub fn classify(item: &work::WorkItem, error: impl std::fmt::Display) -> Self {
+        let vanished = !item.abs_path.as_os_str().is_empty() && !item.abs_path.exists();
+        Self {
+            asset: item.asset.clone(),
+            path: item.abs_path.clone(),
+            error: error.to_string(),
+            transient: vanished,
+        }
     }
-    seq.end()
+
+    /// A failure the caller already knows is not the item's fault — no
+    /// source probe, just the transient class. Takes the same
+    /// `impl Display` error as [`Self::classify`] so the two constructors
+    /// are interchangeable at a call site.
+    #[must_use]
+    pub fn transient(item: &work::WorkItem, error: impl std::fmt::Display) -> Self {
+        Self {
+            asset: item.asset.clone(),
+            path: item.abs_path.clone(),
+            error: error.to_string(),
+            transient: true,
+        }
+    }
+}
+
+/// `serialize_with` target for [`ItemFailure::path`]: the displayed path
+/// string, rather than serde's default `PathBuf` shape.
+fn path_display<S: serde::Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&p.display().to_string())
 }
 
 /// One pass's request: `--kinds` already validated/defaulted by the CLI (see
@@ -80,6 +113,9 @@ pub struct IndexRunReq {
     pub limit: Option<usize>,
     pub threads: Option<usize>,
     pub api_key: Option<String>,
+    /// Forget every permanent failure the ledger remembers for `kinds`
+    /// before planning, so this pass attempts those items again.
+    pub retry_failed: bool,
 }
 
 fn default_index_jobs() -> usize {
@@ -124,15 +160,14 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
     Ok(())
 }
 
-/// One pass's thumbnail-kind result: `written` new thumbnails and per-item
-/// `failed` (path, reason) — mirrors [`EmbedOutcome`]/[`KeyframeOutcome`]'s
-/// shape so every kind's executor returns one outcome value instead of a
-/// bare tuple.
+/// One pass's thumbnail-kind result: `written` new thumbnails and one
+/// [`ItemFailure`] row per item that failed — mirrors
+/// [`EmbedOutcome`]/[`KeyframeOutcome`]'s shape so every kind's executor
+/// returns one outcome value instead of a bare tuple.
 #[derive(Default, serde::Serialize)]
 pub struct ThumbOutcome {
     pub written: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// Works every thumbnail item with `jobs` parallel workers sharing one
@@ -141,7 +176,7 @@ pub struct ThumbOutcome {
 fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> ThumbOutcome {
     let next = AtomicUsize::new(0);
     let written = AtomicU64::new(0);
-    let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    let failed: Mutex<Vec<ItemFailure>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..jobs.max(1) {
             scope.spawn(|| {
@@ -155,10 +190,14 @@ fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> 
                             written.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(err) => {
+                            // Classified before the lock: `classify` stats the
+                            // source path, and a filesystem call has no place
+                            // inside a mutex every worker contends for.
+                            let failure = ItemFailure::classify(item, err);
                             let mut guard = failed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            guard.push((item.abs_path.clone(), err.to_string()));
+                            guard.push(failure);
                         }
                     }
                 }
@@ -185,13 +224,13 @@ struct EmbedPaths {
 /// One pass's embedding-kind result: `written` new embeddings (encoder ran),
 /// `loaded` vectors pulled in from blobs the local Lance store didn't have
 /// yet (the blob↔Lance diff — a teammate's synced vectors, or a lance dir
-/// just rebuilt after corruption), and per-item `failed` (path, reason).
+/// just rebuilt after corruption), and one [`ItemFailure`] row per item
+/// that failed.
 #[derive(Default, serde::Serialize)]
 pub struct EmbedOutcome {
     pub written: u64,
     pub loaded: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// One pass's keyframe-kind result: `videos_done` videos whose manifest got
@@ -199,15 +238,15 @@ pub struct EmbedOutcome {
 /// `keyframes_written` individual frames actually extracted and embedded,
 /// `keyframes_failed` individual timestamps that failed extract/embed
 /// (whether or not their video ended up over the half-failed threshold — see
-/// [`over_half_failed`]), and per-video `failed` (path, reason — for a video
-/// over that threshold, the reason includes the first per-timestamp failure).
+/// [`over_half_failed`]), and one [`ItemFailure`] row per video that failed
+/// — for a video over that threshold, the row's `error` includes the first
+/// per-timestamp failure.
 #[derive(Default, serde::Serialize)]
 pub struct KeyframeOutcome {
     pub videos_done: u64,
     pub keyframes_written: u64,
     pub keyframes_failed: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// One `index run` pass: builds the plan, works every kind's items, and
@@ -231,7 +270,13 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
     let state_dir = crate::state_dir::state_dir_for(catalog_dir, app.notices())?;
     let blobs = BlobStore::new(catalog_dir);
     let caps = crate::index::capabilities(catalog_dir, app.notices());
-    let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps);
+    if req.retry_failed {
+        let cleared = crate::index::clear_failures(catalog_dir, &req.kinds, app.notices())?;
+        app.notices()
+            .push(format!("cleared {cleared} known failure(s) for retry"));
+    }
+    let ledger = crate::index::read_ledger(&state_dir, app.notices());
+    let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps, &ledger);
     let items = split_and_cap_items(plan.items, req.limit);
 
     let jobs = req.threads.unwrap_or_else(default_index_jobs);
@@ -474,7 +519,7 @@ fn embed_and_store(
     blobs: &BlobStore,
     store: &VectorStore,
     items: &[&work::WorkItem],
-) -> Result<(u64, Vec<(PathBuf, String)>)> {
+) -> Result<(u64, Vec<ItemFailure>)> {
     let mut encoder = Encoder::load(
         model_dir,
         &EncoderOptions {
@@ -494,7 +539,7 @@ fn embed_and_store(
                     store.add(std::mem::take(&mut batch))?;
                 }
             }
-            Err(err) => failed.push((item.abs_path.clone(), err.to_string())),
+            Err(err) => failed.push(ItemFailure::classify(item, err)),
         }
     }
     if !batch.is_empty() {
@@ -840,8 +885,8 @@ fn run_keyframe_items(
                         .first_failure_reason
                         .as_deref()
                         .unwrap_or("<no reason recorded>");
-                    outcome.failed.push((
-                        item.abs_path.clone(),
+                    outcome.failed.push(ItemFailure::classify(
+                        item,
                         over_half_failed_message(
                             &item.abs_path,
                             result.keyframe_failures,
@@ -861,7 +906,7 @@ fn run_keyframe_items(
                 blobs.write_atomic(&manifest_path, &manifest)?;
                 outcome.videos_done += 1;
             }
-            Err(reason) => outcome.failed.push((item.abs_path.clone(), reason)),
+            Err(reason) => outcome.failed.push(ItemFailure::classify(item, reason)),
         }
     }
     if !batch.is_empty() {
@@ -874,16 +919,15 @@ fn run_keyframe_items(
 /// manifest timestamp now has an image blob (the pass that wrote their
 /// `KeyframeImagesComplete` marker), `images_written` frames freshly
 /// extracted and encoded this pass, `images_skipped` timestamps whose blob
-/// an earlier pass had already written (the resume path), and per-video
-/// `failed` (path, reason) — mirroring [`OcrOutcome`], the other kind that
-/// works a video's manifest timestamps into one blob each.
+/// an earlier pass had already written (the resume path), and one
+/// [`ItemFailure`] row per video that failed — mirroring [`OcrOutcome`], the
+/// other kind that works a video's manifest timestamps into one blob each.
 #[derive(Default, serde::Serialize)]
 pub struct KeyframeImageOutcome {
     pub videos_done: u64,
     pub images_written: u64,
     pub images_skipped: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// One video's keyframe-image pass result — [`VideoOcrResult`]'s shape, for
@@ -986,10 +1030,10 @@ fn run_keyframe_image_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Keyf
                     outcome.videos_done += 1;
                 } else {
                     let first = result.first_failure.as_deref().unwrap_or("<no reason>");
-                    // No path in the message: the tuple's first element
+                    // No path in the message: the row's `path` field
                     // already carries it (ffmpeg reasons embed it too).
-                    outcome.failed.push((
-                        item.abs_path.clone(),
+                    outcome.failed.push(ItemFailure::classify(
+                        item,
                         format!(
                             "{}/{} keyframe images failed to extract — first failure: {first} \
                              — video incomplete, will retry",
@@ -998,21 +1042,18 @@ fn run_keyframe_image_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Keyf
                     ));
                 }
             }
-            Err(err) => outcome
-                .failed
-                .push((item.abs_path.clone(), err.to_string())),
+            Err(err) => outcome.failed.push(ItemFailure::classify(item, err)),
         }
     }
     outcome
 }
 
 /// One pass's transcribe-kind result: `written` new transcript blobs and
-/// per-item `failed` (path, reason).
+/// one [`ItemFailure`] row per item that failed.
 #[derive(Default, serde::Serialize)]
 pub struct TranscribeOutcome {
     pub written: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// Timeout-sizing fallback for sources ffprobe can't report a duration for
@@ -1065,9 +1106,7 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
     for item in items {
         match transcribe_one(blobs, &transcriber, item) {
             Ok(()) => outcome.written += 1,
-            Err(err) => outcome
-                .failed
-                .push((item.abs_path.clone(), err.to_string())),
+            Err(err) => outcome.failed.push(ItemFailure::classify(item, err)),
         }
     }
     Ok(outcome)
@@ -1077,16 +1116,19 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
 /// chunk vectors, `loaded` vectors pulled in from chunk blobs the local
 /// text Lance table didn't have yet (the blob↔Lance diff — see
 /// [`load_missing_text_vectors_from_blobs`]), `empty` transcripts that
-/// chunked to nothing (their `ChunksEmpty` marker written), and per-item
-/// `failed` (transcript blob path, reason — the item's own `abs_path` can
-/// be the empty sentinel, see `work::WorkItem::abs_path`).
+/// chunked to nothing (their `ChunksEmpty` marker written), and one
+/// [`ItemFailure`] row per item that failed. These items read the
+/// transcript blob, never the source, so the row's `path` is that blob's
+/// path (built by hand at the push site, not through `classify`, whose
+/// vanished-source probe has no meaning for a blob) and the row is always
+/// permanent; the item's own `abs_path` may be the empty sentinel here (see
+/// `work::WorkItem::abs_path`).
 #[derive(Default, serde::Serialize)]
 pub struct TranscriptEmbedOutcome {
     pub chunks_written: u64,
     pub loaded: u64,
     pub empty: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// What embedding one transcript's chunks produced.
@@ -1226,7 +1268,16 @@ fn run_transcript_embed_items(
             match embed_transcript_chunks(blobs, &mut encoder, &store, item) {
                 Ok(ChunkEmbedResult::Written(n)) => outcome.chunks_written += n,
                 Ok(ChunkEmbedResult::Empty) => outcome.empty += 1,
-                Err(err) => outcome.failed.push((transcript_path, err.to_string())),
+                // Built by hand rather than through `classify`: the row's
+                // path is the transcript blob this pass read, not the item's
+                // source (which is the empty sentinel here), and a blob path
+                // never "vanishes" the way a source volume does.
+                Err(err) => outcome.failed.push(ItemFailure {
+                    asset: item.asset.clone(),
+                    path: transcript_path,
+                    error: err.to_string(),
+                    transient: false,
+                }),
             }
         }
     }
@@ -1327,8 +1378,7 @@ pub struct OcrOutcome {
     pub images_written: u64,
     pub videos_done: u64,
     pub keyframes_written: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 fn ocr_one_still(blobs: &BlobStore, item: &work::WorkItem) -> Result<()> {
@@ -1439,9 +1489,7 @@ fn run_ocr_items(
     for item in stills {
         match ocr_one_still(blobs, item) {
             Ok(()) => outcome.images_written += 1,
-            Err(err) => outcome
-                .failed
-                .push((item.abs_path.clone(), err.to_string())),
+            Err(err) => outcome.failed.push(ItemFailure::classify(item, err)),
         }
     }
     for item in videos {
@@ -1452,10 +1500,10 @@ fn run_ocr_items(
                     outcome.videos_done += 1;
                 } else {
                     let first = result.first_failure.as_deref().unwrap_or("<no reason>");
-                    // No path in the message: the tuple's first element
+                    // No path in the message: the row's `path` field
                     // already carries it (Vision/ffmpeg reasons embed it too).
-                    outcome.failed.push((
-                        item.abs_path.clone(),
+                    outcome.failed.push(ItemFailure::classify(
+                        item,
                         format!(
                             "{}/{} keyframes failed OCR — first failure: {first} — \
                              video incomplete, will retry",
@@ -1464,9 +1512,7 @@ fn run_ocr_items(
                     ));
                 }
             }
-            Err(err) => outcome
-                .failed
-                .push((item.abs_path.clone(), err.to_string())),
+            Err(err) => outcome.failed.push(ItemFailure::classify(item, err)),
         }
     }
     outcome
@@ -1476,8 +1522,7 @@ fn run_ocr_items(
 #[derive(Default, serde::Serialize)]
 pub struct PdfOutcome {
     pub written: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 fn pdf_text_one(blobs: &BlobStore, item: &work::WorkItem) -> Result<()> {
@@ -1501,9 +1546,7 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
     for item in items {
         match pdf_text_one(blobs, item) {
             Ok(()) => outcome.written += 1,
-            Err(err) => outcome
-                .failed
-                .push((item.abs_path.clone(), err.to_string())),
+            Err(err) => outcome.failed.push(ItemFailure::classify(item, err)),
         }
     }
     outcome
@@ -1511,12 +1554,11 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
 
 /// One pass's caption-kind result: `written` caption-item completions (a
 /// still's caption blob, or a video's captions blob — each with its tags
-/// blob) and per-item `failed` (path, reason).
+/// blob) and one [`ItemFailure`] row per item that failed.
 #[derive(Default, serde::Serialize)]
 pub struct CaptionOutcome {
     pub written: u64,
-    #[serde(serialize_with = "serialize_failed_items")]
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<ItemFailure>,
 }
 
 /// Upper bound on keyframes described per video: captioning every detected
@@ -1528,14 +1570,35 @@ const MAX_DESCRIBED_KEYFRAMES: usize = 12;
 /// backend failure in a pass — see [`run_caption_items`]'s abort policy.
 const DESCRIBER_SKIPPED_REASON: &str = "describer unavailable — skipped after first failure";
 
-/// Why one caption item failed: a `Backend` (describer) failure aborts the
-/// remaining items in this pass — the backend is down for all of them, and
-/// hammering it item after item just burns wall-clock — while an `Item`
-/// failure (missing thumb, unreadable manifest, frame extraction) records
-/// and moves on to the next item.
+/// Why one caption item failed, split by what the failure says about the
+/// remaining items.
+///
+/// `Backend` means the describer could not answer at all — unreachable,
+/// timed out, 5xx, rate-limited ([`PortFailure::Unavailable`]). It is down
+/// for every item, so the pass aborts rather than burning wall-clock item by
+/// item, and every row it produces is transient: nothing was learned about
+/// those items' bytes.
+///
+/// `Item` means this one item failed on its own merits — a missing thumb, an
+/// unreadable manifest, a frame that would not extract, or a describer that
+/// answered and refused THIS input ([`PortFailure::RefusedInput`]: a 4xx, an
+/// unusable response body). The pass records the row and continues with the
+/// next item, and the row is permanent: the same bytes will fail the same
+/// way next pass.
 enum CaptionFailure {
     Backend(String),
     Item(String),
+}
+
+/// Routes a describer port error into the two caption classes. A port that
+/// refused THIS input is an item failure (recorded, permanent, the pass
+/// continues); a port that is unavailable is a backend failure (transient,
+/// the pass aborts).
+fn caption_failure(error: &PortError) -> CaptionFailure {
+    match error.failure {
+        PortFailure::Unavailable => CaptionFailure::Backend(error.to_string()),
+        PortFailure::RefusedInput => CaptionFailure::Item(error.to_string()),
+    }
 }
 
 /// Works every `Caption` item serially against the configured describer.
@@ -1576,15 +1639,14 @@ fn run_caption_items(
         match caption_one_item(blobs, &describer, item, &model_tag, env) {
             Ok(()) => outcome.written += 1,
             Err(CaptionFailure::Item(reason)) => {
-                outcome.failed.push((item.abs_path.clone(), reason));
+                outcome.failed.push(ItemFailure::classify(item, reason));
             }
             Err(CaptionFailure::Backend(reason)) => {
-                outcome.failed.push((item.abs_path.clone(), reason));
+                outcome.failed.push(ItemFailure::transient(item, reason));
                 for skipped in &items[index + 1..] {
-                    outcome.failed.push((
-                        skipped.abs_path.clone(),
-                        DESCRIBER_SKIPPED_REASON.to_string(),
-                    ));
+                    outcome
+                        .failed
+                        .push(ItemFailure::transient(skipped, DESCRIBER_SKIPPED_REASON));
                 }
                 break;
             }
@@ -1632,15 +1694,13 @@ fn caption_still(
     })?;
     let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
     if !caption_path.is_file() {
-        let caption = describer
-            .caption(&webp)
-            .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        let caption = describer.caption(&webp).map_err(|e| caption_failure(&e))?;
         write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
             .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     }
     let suggestions = describer
         .suggest_tags(TagSubject::Image(&webp), vocab)
-        .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        .map_err(|e| caption_failure(&e))?;
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
 }
@@ -1670,7 +1730,7 @@ fn caption_video(
     } else {
         describer
             .suggest_tags(TagSubject::Captions(&texts), &env.vocab)
-            .map_err(|e| CaptionFailure::Backend(e.to_string()))?
+            .map_err(|e| caption_failure(&e))?
     };
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
@@ -1749,9 +1809,7 @@ fn caption_video_frame(
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     let webp = majestical_index::thumbs::thumbnail_webp(&frame)
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
-    describer
-        .caption(&webp)
-        .map_err(|e| CaptionFailure::Backend(e.to_string()))
+    describer.caption(&webp).map_err(|e| caption_failure(&e))
 }
 
 /// Up to [`MAX_DESCRIBED_KEYFRAMES`] timestamps, evenly spaced across the
@@ -1881,7 +1939,7 @@ pub struct IndexRunOutcome {
     pub keyframes: KeyframeOutcome,
     /// Serialized under the `--kinds` name (`keyframe-images`) rather than
     /// the Rust field name, so every wire shape — this struct, the CLI's
-    /// hand-built `--json`, and the failure report's per-kind map — names
+    /// hand-built `--json`, and the failure ledger's per-kind map — names
     /// the kind identically.
     #[serde(rename = "keyframe-images")]
     pub keyframe_images: KeyframeImageOutcome,
@@ -1900,7 +1958,7 @@ impl IndexRunOutcome {
     /// The transcripts CLI kind spans two executors — their failures merge
     /// for reporting.
     #[must_use]
-    pub fn transcript_failures(&self) -> Vec<(PathBuf, String)> {
+    pub fn transcript_failures(&self) -> Vec<ItemFailure> {
         let mut merged = self.transcribe.failed.clone();
         merged.extend(self.transcript_embed.failed.iter().cloned());
         merged
@@ -1956,27 +2014,236 @@ mod tests {
         }
     }
 
-    /// Pins the wire shape every `failed: Vec<(PathBuf, String)>` field in
-    /// this module serializes through: a JSON array of `{"path", "error"}`
-    /// objects, not a positional 2-tuple — a regression back to
-    /// `["path", "error"]` pairs would silently break every consumer that
+    /// Pins the wire shape every `failed: Vec<ItemFailure>` field in this
+    /// module serializes through: a JSON array of `{"asset", "path",
+    /// "error", "transient"}` objects, not a positional tuple — a
+    /// regression back to pairs would silently break every consumer that
     /// serializes an outcome directly (e.g. `maj mcp`'s `index_run` tool,
     /// which serializes `IndexRunOutcome` as-is).
     #[test]
     fn failed_items_serialize_as_named_objects_not_tuples() {
         let outcome = ThumbOutcome {
             written: 0,
-            failed: vec![(
-                PathBuf::from("/media/broken.mov"),
-                "decode failed".to_string(),
-            )],
+            failed: vec![ItemFailure {
+                asset: "xxh3:aa11".to_string(),
+                path: PathBuf::from("/media/broken.mov"),
+                error: "decode failed".to_string(),
+                transient: false,
+            }],
         };
         let json = serde_json::to_value(&outcome).expect("serialize");
         assert_eq!(
             json["failed"],
-            serde_json::json!([{"path": "/media/broken.mov", "error": "decode failed"}]),
-            "failed items must serialize as named {{path, error}} objects: {json}"
+            serde_json::json!([{
+                "asset": "xxh3:aa11",
+                "path": "/media/broken.mov",
+                "error": "decode failed",
+                "transient": false,
+            }]),
+            "failed items must serialize as named objects: {json}"
         );
+    }
+
+    /// One failure row on its own — the shape the ledger (and every head)
+    /// reads a row as, pinned independently of any outcome struct.
+    #[test]
+    fn failed_item_wire_shape_carries_transient() {
+        let failure = ItemFailure {
+            asset: "xxh3:bb22".to_string(),
+            path: PathBuf::from("/media/broken.pdf"),
+            error: "not a valid pdf".to_string(),
+            transient: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&failure).expect("serialize"),
+            serde_json::json!({
+                "asset": "xxh3:bb22",
+                "path": "/media/broken.pdf",
+                "error": "not a valid pdf",
+                "transient": false,
+            })
+        );
+    }
+
+    fn caption_item(hex: &str, source: &Path) -> work::WorkItem {
+        work::WorkItem {
+            asset: format!("xxh3:{hex}"),
+            asset_hex: hex.to_string(),
+            abs_path: source.to_path_buf(),
+            kind: WorkKind::Caption,
+        }
+    }
+
+    /// A source that is gone by the time its failure is recorded means the
+    /// volume went away under the batch — never the item's own fault, so
+    /// the ledger must not remember it.
+    #[test]
+    fn classify_marks_a_vanished_source_transient() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("clip.mov");
+        std::fs::write(&source, b"bytes").expect("seed source");
+        let item = caption_item("aa11", &source);
+
+        let present = ItemFailure::classify(&item, "decode failed");
+        assert!(!present.transient, "a source still on disk is permanent");
+        assert_eq!(present.asset, "xxh3:aa11");
+        assert_eq!(present.path, source);
+        assert_eq!(present.error, "decode failed");
+
+        std::fs::remove_file(&source).expect("remove source");
+        assert!(
+            ItemFailure::classify(&item, "decode failed").transient,
+            "a source that vanished mid-batch is transient"
+        );
+    }
+
+    /// `TranscriptEmbed` items carry an empty `abs_path` sentinel (they read
+    /// a transcript blob, not the source), which must never read as a
+    /// vanished volume — every one of them would be dropped from the ledger.
+    #[test]
+    fn classify_never_marks_the_empty_path_sentinel_transient() {
+        let item = work::WorkItem {
+            asset: "xxh3:bb22".to_string(),
+            asset_hex: "bb22".to_string(),
+            abs_path: PathBuf::new(),
+            kind: WorkKind::TranscriptEmbed,
+        };
+        assert!(!ItemFailure::classify(&item, "chunking failed").transient);
+    }
+
+    /// The backend-outage cascade: the item whose describer call failed and
+    /// every item abandoned after it (`DESCRIBER_SKIPPED_REASON`) are
+    /// failures of the backend, not of their bytes. Every source here is on
+    /// disk, so only the transient constructor — not the vanished-source
+    /// signal — can make these rows transient.
+    #[test]
+    fn backend_failure_cascade_is_transient_for_every_skipped_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let notices = crate::notices::Notices::new();
+        let config_path =
+            crate::describer_config::config_path(&root, &notices).expect("config path");
+        majestical_describe::DescriberConfig {
+            backend: majestical_describe::BackendKind::Ollama,
+            // Port 1: nothing listens there, so the very first describer
+            // call fails to connect — the outage this cascade exists for.
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+        }
+        .store(&config_path)
+        .expect("store describer config");
+
+        let blobs = BlobStore::new(&root);
+        let items: Vec<work::WorkItem> = ["aa11", "bb22", "cc33"]
+            .iter()
+            .map(|hex| {
+                let source = dir.path().join(format!("{hex}.jpg"));
+                std::fs::write(&source, b"jpeg").expect("seed source");
+                let thumb = blobs.path_for(hex, &Derivation::Thumb);
+                blobs.write_atomic(&thumb, b"webp").expect("seed thumb");
+                caption_item(hex, &source)
+            })
+            .collect();
+        let env = PassEnv {
+            catalog_root: &root,
+            notices: &notices,
+            vocab: Vec::new(),
+            api_key: None,
+        };
+
+        let outcome = run_caption_items(&blobs, &items, &env);
+
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.failed.len(), items.len(), "{:?}", outcome.failed);
+        assert!(
+            outcome.failed.iter().all(|failure| failure.transient),
+            "a backend outage must record only transient rows: {:?}",
+            outcome.failed
+        );
+        assert!(
+            outcome.failed[1..]
+                .iter()
+                .all(|failure| failure.error == DESCRIBER_SKIPPED_REASON),
+            "every item after the first must be the skipped cascade: {:?}",
+            outcome.failed
+        );
+    }
+
+    /// The other half of the cascade: a backend that ANSWERS and refuses each
+    /// request (a 400 per item — an oversized frame, a content-policy
+    /// rejection, a model that will not take images) is not an outage. Each
+    /// row is a permanent verdict on that item, and the pass must work every
+    /// remaining item instead of abandoning them, or the always-on scheduler
+    /// retries the same rejected bytes forever.
+    #[test]
+    fn caption_rejected_by_the_backend_is_permanent_and_the_pass_continues() {
+        use httpmock::prelude::{MockServer, POST};
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400)
+                .json_body(serde_json::json!({"error": "image too large"}));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let notices = crate::notices::Notices::new();
+        let config_path =
+            crate::describer_config::config_path(&root, &notices).expect("config path");
+        majestical_describe::DescriberConfig {
+            backend: majestical_describe::BackendKind::Ollama,
+            base_url: server.base_url(),
+            model: "test-model".to_string(),
+            api_key: None,
+        }
+        .store(&config_path)
+        .expect("store describer config");
+
+        let blobs = BlobStore::new(&root);
+        let items: Vec<work::WorkItem> = ["aa11", "bb22", "cc33"]
+            .iter()
+            .map(|hex| {
+                let source = dir.path().join(format!("{hex}.jpg"));
+                std::fs::write(&source, b"jpeg").expect("seed source");
+                let thumb = blobs.path_for(hex, &Derivation::Thumb);
+                blobs.write_atomic(&thumb, b"webp").expect("seed thumb");
+                caption_item(hex, &source)
+            })
+            .collect();
+        let env = PassEnv {
+            catalog_root: &root,
+            notices: &notices,
+            vocab: Vec::new(),
+            api_key: None,
+        };
+
+        let outcome = run_caption_items(&blobs, &items, &env);
+
+        assert_eq!(outcome.written, 0);
+        assert_eq!(
+            outcome.failed.len(),
+            items.len(),
+            "a rejection must not cascade — every item gets its own attempt: {:?}",
+            outcome.failed
+        );
+        assert!(
+            outcome.failed.iter().all(|failure| !failure.transient),
+            "a refused input is the item's own permanent failure: {:?}",
+            outcome.failed
+        );
+        assert!(
+            outcome
+                .failed
+                .iter()
+                .all(|failure| failure.error != DESCRIBER_SKIPPED_REASON),
+            "no item may be abandoned to the cascade: {:?}",
+            outcome.failed
+        );
+        mock.assert_calls(items.len());
     }
 
     #[test]
@@ -2242,6 +2509,7 @@ mod tests {
             limit: None,
             threads: Some(1),
             api_key: None,
+            retry_failed: false,
         };
         let outcome = run(&app, &root, &req).expect("run");
 
@@ -2446,11 +2714,11 @@ mod tests {
         assert_eq!(outcome.images_written, 1);
         assert_eq!(outcome.videos_done, 0);
         assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
-        assert_eq!(outcome.failed[0].0, video);
+        assert_eq!(outcome.failed[0].path, video);
         assert!(
-            outcome.failed[0].1.contains("1/2"),
+            outcome.failed[0].error.contains("1/2"),
             "the row must carry the failure/total counts: {}",
-            outcome.failed[0].1
+            outcome.failed[0].error
         );
         assert!(
             keyframe_image_path(&blobs, hex, 1500).is_file(),
@@ -2512,9 +2780,9 @@ mod tests {
 
         assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
         assert!(
-            outcome.failed[0].1.contains("keyframe manifest"),
+            outcome.failed[0].error.contains("keyframe manifest"),
             "{}",
-            outcome.failed[0].1
+            outcome.failed[0].error
         );
         assert_eq!(outcome.videos_done, 0);
         assert!(!keyframe_images_marker(&blobs, hex).is_file());
@@ -2538,6 +2806,7 @@ mod tests {
             limit: Some(1),
             threads: Some(1),
             api_key: None,
+            retry_failed: false,
         };
         let outcome = run(&app, &root, &req).expect("run");
         assert_eq!(outcome.thumbs.written, 0);
@@ -2556,10 +2825,12 @@ mod tests {
     #[test]
     fn made_progress_ignores_a_batch_whose_every_item_failed() {
         let mut outcome = IndexRunOutcome::default();
-        outcome.thumbs.failed.push((
-            PathBuf::from("/media/broken.jpg"),
-            "decode failed".to_string(),
-        ));
+        outcome.thumbs.failed.push(ItemFailure {
+            asset: "xxh3:aa11".to_string(),
+            path: PathBuf::from("/media/broken.jpg"),
+            error: "decode failed".to_string(),
+            transient: false,
+        });
         assert!(!outcome.made_progress());
     }
 

@@ -5,6 +5,7 @@
 mod common;
 
 use common::{maj, walkdir_find};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 #[cfg(test)]
@@ -803,14 +804,15 @@ fn ocr_indexing_still_image_end_to_end() {
 }
 
 /// An item-level failure (a file that isn't really a PDF) is a run-level
-/// success: the run exits 0, records the failure in the per-run failure
-/// marker (surfaced by `index status`), writes no done-blob, and re-plans
-/// the same item on the next run instead of dropping it.
+/// success: the run exits 0, writes no done-blob, and records the failure
+/// in the catalog's failure ledger — which `index status` surfaces and the
+/// planner honours, so the next run holds the item back rather than
+/// re-failing on it forever.
 // The failing item is a pdf, an Apple-only kind the planner excludes
 // off-macOS — nothing is ever attempted there, so no failure is recorded.
 #[cfg(target_os = "macos")]
 #[test]
-fn failed_derivations_are_reported_and_replanned() {
+fn failed_derivations_are_remembered_and_held_back() {
     let media = tempfile::tempdir().unwrap();
     std::fs::write(media.path().join("broken.pdf"), b"not a pdf").unwrap();
     let catalog = tempfile::tempdir().unwrap();
@@ -839,21 +841,23 @@ fn failed_derivations_are_reported_and_replanned() {
         .args(["index", "status"])
         .assert()
         .success()
-        .stdout(contains("failed last run"));
+        .stdout(contains("pdf: 1 known failure(s)"))
+        .stdout(contains("--retry-failed"));
 
-    // Re-planned, not dropped: the second run fails on the same item again.
+    // Remembered, not re-attempted: the ledger holds the item back, so the
+    // second run neither plans nor re-reports it.
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())
         .args(["index", "run", "--kinds", "pdf", "--json"])
         .assert()
         .success()
-        .stdout(contains("broken.pdf"));
+        .stdout(contains("broken.pdf").not());
 }
 
 /// A `--kinds`-filtered run must not erase another kind's failure record:
-/// the failure marker is merged per kind, so a later `--kinds thumbs` pass
-/// (which never retried the broken pdf item) leaves the pdf failure
-/// standing in `index status`.
+/// the ledger is merged per kind and no run ever clears one, so a later
+/// `--kinds thumbs` pass leaves the pdf failure standing in `index
+/// status`.
 // Same pdf dependency as above: off-macOS the kind is excluded before any
 // failure record can exist to survive.
 #[cfg(target_os = "macos")]
@@ -894,7 +898,7 @@ fn failure_records_survive_runs_of_other_kinds() {
         .args(["index", "status"])
         .assert()
         .success()
-        .stdout(contains("pdf failed last run"));
+        .stdout(contains("pdf: 1 known failure(s)"));
 }
 
 /// `index run --kinds transcripts` with no whisper model is a graceful
@@ -1217,4 +1221,137 @@ fn index_run_keyframe_images_writes_images_and_status_counts_them() {
         .assert()
         .success()
         .stdout(contains("keyframe-images: 0 videos, 0 images written"));
+}
+
+/// A permanently undecodable image (`.png` extension, text bytes) fails
+/// once, is remembered, is SKIPPED on the next run (no attempt, no new
+/// failure), and is attempted again only under `--retry-failed` — in the
+/// SAME run that clears it, which pins `run_impl`'s clear-before-plan order.
+#[test]
+fn index_run_remembers_a_permanent_failure_and_skips_it_until_retried() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.png"), b"this is not a png").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 1 failed"))
+        .stderr(contains("failed: decoding"))
+        .stderr(contains("failed (transient):").not());
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "thumbs: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+             0 need model, 1 failed",
+        ))
+        .stdout(contains("thumbs: 1 known failure(s) remembered"))
+        .stdout(contains("retry with: maj index run --retry-failed"));
+    // Skipped: no attempt, so no failure this run.
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 0 failed"));
+    // Retried: attempted again IN THIS RUN, fails again, re-recorded (still
+    // 1 row, not 2).
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs", "--retry-failed"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 1 failed"))
+        .stderr(contains("cleared 1 known failure(s) for retry"));
+    let out = maj(&root, &state)
+        .args(["index", "status", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["failed"]["thumbs"].as_array().unwrap().len(), 1);
+    assert_eq!(json["thumbs"]["failed"], 1);
+}
+
+/// With rows under two kinds, `index status` names each kind on its own
+/// line but prints the retry remedy exactly once — the remedy is about the
+/// command, not about any one kind. Seeds the second kind by rewriting the
+/// ledger file directly (a real second permanent failure would need `PDFKit`
+/// or a model), which is also what proves the rows are read from the file
+/// rather than re-derived.
+#[test]
+fn index_status_prints_the_retry_remedy_once_across_kinds() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.png"), b"this is not a png").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+
+    let ledgers = walkdir_find(&state, "index-failures.json");
+    assert_eq!(ledgers.len(), 1, "one ledger file under the state dir");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ledgers[0]).unwrap()).unwrap();
+    ledger["pdf"] = serde_json::json!([
+        { "asset": "xxh3:00000000000000000000000000000000", "path": "/x/broken.pdf",
+          "error": "not a valid pdf" }
+    ]);
+    std::fs::write(&ledgers[0], ledger.to_string()).unwrap();
+
+    let out = maj(&root, &state)
+        .args(["index", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("thumbs: 1 known failure(s) remembered"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("pdf: 1 known failure(s) remembered"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("retry with: maj index run --retry-failed")
+            .count(),
+        1,
+        "the remedy prints once, not once per kind:\n{stdout}"
+    );
+
+    // A retry scoped to one kind clears only that kind's rows: the seeded
+    // `pdf` row survives a `--kinds thumbs --retry-failed` run.
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs", "--retry-failed"])
+        .assert()
+        .success()
+        .stderr(contains("cleared 1 known failure(s) for retry"));
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("pdf: 1 known failure(s) remembered"));
 }

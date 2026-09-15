@@ -170,7 +170,9 @@ fn caption_status_without_describer_names_the_remedy() {
 /// A backend outage mid-run is a run-level success: the first failing item
 /// is recorded, the remaining caption items are skipped (not hammered
 /// against a dead backend), and every item re-plans next run because no
-/// done-blob was written.
+/// done-blob was written. Both failures are transient (a dead backend is
+/// never the item's fault), so the failure ledger stays empty and `index
+/// status` still counts both items pending rather than held back.
 #[test]
 fn caption_backend_outage_mid_run_skips_remaining_and_reports() {
     let server = MockServer::start();
@@ -215,15 +217,19 @@ fn caption_backend_outage_mid_run_skips_remaining_and_reports() {
         .success()
         .stdout(contains("captions: 0 written, 2 failed"))
         .stderr(contains("500"))
-        .stderr(contains("skipped after first failure"));
+        .stderr(contains("skipped after first failure"))
+        // The transient form of the per-failure line, printed only when the
+        // row carries `transient: true` — the permanent form is pinned in
+        // `index_smoke.rs`.
+        .stderr(contains("failed (transient):"));
 
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())
         .args(["index", "status"])
         .assert()
         .success()
-        .stdout(contains("captions failed last run: 2"))
-        .stdout(contains("captions: 0 done, 2 pending"));
+        .stdout(contains("captions: 0 done, 2 pending"))
+        .stdout(contains("known failure(s)").not());
 }
 
 /// A partial item — caption blob written, tags call failed — must re-plan

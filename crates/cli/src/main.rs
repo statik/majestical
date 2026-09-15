@@ -342,6 +342,11 @@ enum IndexCmd {
         /// thumbs,embeddings,keyframes,transcripts,ocr,pdf,captions.
         #[arg(long, value_delimiter = ',')]
         kinds: Option<Vec<String>>,
+        /// Clear the failure ledger for the selected kinds first, then run —
+        /// a still-broken item is simply re-recorded. With --watch, only the
+        /// first pass clears; later passes leave the ledger sticky.
+        #[arg(long)]
+        retry_failed: bool,
         #[arg(long)]
         json: bool,
     },
@@ -573,6 +578,7 @@ fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
             threads,
             limit,
             kinds,
+            retry_failed,
             json,
         } => {
             let args = index_cmd::IndexRunArgs {
@@ -580,6 +586,7 @@ fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
                 threads,
                 limit,
                 kinds,
+                retry_failed,
                 json,
             };
             index_cmd::cmd_index_run(app, catalog, &args)

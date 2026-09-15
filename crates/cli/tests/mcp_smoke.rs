@@ -1273,10 +1273,11 @@ fn get_asset_found_carries_notices_nested_on_the_asset() {
 }
 
 /// `index_run`'s executed arm records this pass's permanent failures in the
-/// on-disk ledger AFTER the pass returns, through a sink of its own. Those lines are appended to the
-/// run outcome's existing `notices` rather than shipped as a second field —
-/// pins that the append happens at all. The catalog is empty and no models
-/// are installed, so every kind degrades to a no-op and the pass is quick.
+/// on-disk ledger AFTER the pass returns, through a sink of its own. Those
+/// lines are appended to the run outcome's existing `notices` rather than
+/// shipped as a second field — pins that the append happens at all. The catalog
+/// is empty and no models are installed, so every kind degrades to a no-op and
+/// the pass is quick.
 #[test]
 fn index_run_appends_the_failure_ledger_note_to_the_run_outcome() {
     let dir = tempfile::tempdir().expect("tempdir");

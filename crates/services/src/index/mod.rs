@@ -149,7 +149,11 @@ fn workkind_name(kind: WorkKind) -> &'static str {
 /// Builds the plan for one pass: gathers sources fresh from the projection
 /// (so `--watch` sees newly scanned assets), diffs against `blobs` under
 /// the caller-computed `caps`, narrows `items` to `kinds`, then holds back
-/// every item `ledger` already remembers as a permanent failure.
+/// every item `ledger` already remembers as a permanent failure. The per-kind
+/// counters on the returned plan describe the WHOLE catalog regardless of
+/// `kinds` — only `items` is narrowed to it, because the `retain` above never
+/// adjusts the counters `plan_work` already set, and [`apply_ledger`]
+/// inherits that same split between counters and items.
 #[must_use]
 pub fn build_plan(
     projection: &Projection,
@@ -191,22 +195,30 @@ pub fn read_ledger(state_dir: &Path, notices: &crate::notices::Notices) -> Ledge
         return Ledger::new();
     };
     let Ok(ledger) = serde_json::from_slice(&bytes) else {
+        let path = path.display();
         notices.push(format!(
-            "note: ignoring unparsable failure ledger at {} — treating as empty",
-            path.display()
+            "note: ignoring unparsable failure ledger at {path} — treating as empty \
+             (an older version wrote a different shape; it is rebuilt by the next run)"
         ));
         return Ledger::new();
     };
     ledger
 }
 
+/// Writes `ledger` to [`FAILURES_FILE`] via temp-file-then-rename in the same
+/// directory: this file is cumulative state that two heads — the desktop
+/// scheduler and a CLI run — can read-modify-write, so a crash or an
+/// interleaved write must never leave a torn file on disk.
 fn write_ledger(state_dir: &Path, ledger: &Ledger) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
     let path = state_dir.join(FAILURES_FILE);
+    let tmp_path = state_dir.join(format!("{FAILURES_FILE}.tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec(ledger).context("serializing the failure ledger")?;
-    std::fs::write(&path, bytes)
-        .with_context(|| format!("writing failure ledger {}", path.display()))
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("writing failure ledger {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming failure ledger into place at {}", path.display()))
 }
 
 /// One kind's permanent failures as ledger rows, at most one per asset (a
@@ -366,6 +378,15 @@ fn kind_status_mut(plan: &mut WorkPlan, kind: WorkKind) -> &mut KindStatus {
 /// permanent failure of that (`--kinds` name, asset) pair: the item leaves
 /// `items`, and its kind's `pending` count moves to `failed` — so `index
 /// status` says "held back", never a silent zero.
+///
+/// The ledger keys by the `--kinds` name, not by [`WorkKind`], so a row under
+/// a two-stage kind holds back BOTH stages for that asset: a `transcripts`
+/// row holds back both Transcribe and `TranscriptEmbed` — including a
+/// `TranscriptEmbed` item that a teammate-synced transcript would otherwise
+/// make ready to run — and an `ocr` row holds back both `OcrImage` and
+/// `OcrKeyframes`. Both stay held until [`clear_failures`] drops that key;
+/// finer (kind, not just `--kinds` name)-level keying is a recorded
+/// deferral.
 #[must_use]
 pub fn apply_ledger(plan: WorkPlan, ledger: &Ledger) -> WorkPlan {
     if ledger.is_empty() {
@@ -800,6 +821,57 @@ mod tests {
         );
     }
 
+    /// `status` end to end, not `apply_ledger` in isolation: plant one real
+    /// image so a Thumb item plans, ledger that asset as a known `thumbs`
+    /// failure the way `record_failures` would, then confirm `status` holds
+    /// it back — pins that `status_impl` actually wires `read_ledger` into
+    /// `build_plan` rather than planning against an empty ledger. A Thumb
+    /// item for an image never depends on ffmpeg/the encoder model/whisper,
+    /// so this holds on every OS this crate builds for.
+    #[test]
+    fn status_holds_back_a_ledgered_item_and_reports_it_as_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let mut app = FsApp::init(&root, "m1", "m1").expect("init");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        image::RgbImage::new(4, 4)
+            .save(src.join("photo.png"))
+            .expect("write a real PNG for the planner to see");
+        // Auto-detected volume identity (`None`) so `gather_sources` resolves
+        // this as online.
+        crate::scan::scan(&mut app, &src, None).expect("scan");
+
+        let (_, projection) = open_catalog(&app, &root).expect("open catalog");
+        let asset = gather_sources(&projection)
+            .into_iter()
+            .next()
+            .expect("the one scanned image source")
+            .asset;
+
+        let notices = crate::notices::Notices::new();
+        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
+        write_ledger(&state_dir, &ledger_of(&[("thumbs", &[asset.as_str()])])).expect("seed");
+
+        let outcome = status(&app, &root).expect("status");
+        assert_eq!(
+            outcome.thumbs.pending, 0,
+            "pending: {}",
+            outcome.thumbs.pending
+        );
+        assert_eq!(
+            outcome.thumbs.failed, 1,
+            "failed: {}",
+            outcome.thumbs.failed
+        );
+        assert_eq!(
+            outcome.failed.get("thumbs").map(Vec::len),
+            Some(1),
+            "{:?}",
+            outcome.failed
+        );
+    }
+
     #[test]
     fn workkind_name_covers_every_kind() {
         assert_eq!(workkind_name(WorkKind::Thumb), "thumbs");
@@ -1023,6 +1095,26 @@ mod tests {
         assert_eq!(remaining["pdf"].len(), 1, "{remaining:?}");
     }
 
+    /// `write_ledger` writes through a `<FAILURES_FILE>.tmp-<pid>` sibling and
+    /// renames it into place — two heads read-modify-writing this file must
+    /// never observe a torn write, and a crash between the write and the
+    /// rename must never leave a stray temp file behind either.
+    #[test]
+    fn write_ledger_leaves_no_tmp_file_behind() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        write_ledger(state_dir.path(), &ledger_of(&[("thumbs", &["xxh3:aa"])])).expect("write");
+
+        let leftover_tmp: Vec<_> = std::fs::read_dir(state_dir.path())
+            .expect("read state dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftover_tmp.is_empty(), "{leftover_tmp:?}");
+
+        let ledger = read_ledger(state_dir.path(), &crate::notices::Notices::new());
+        assert_eq!(ledger["thumbs"], vec![row("xxh3:aa", "boom")]);
+    }
+
     #[test]
     fn read_ledger_treats_missing_and_unparsable_as_empty_with_a_notice() {
         let state = tempfile::tempdir().expect("tempdir");
@@ -1041,6 +1133,10 @@ mod tests {
         assert!(
             drained[0].contains("ignoring unparsable failure ledger"),
             "{drained:?}"
+        );
+        assert!(
+            drained[0].contains("rebuilt by the next run"),
+            "the notice must say the ledger self-heals on the next run: {drained:?}"
         );
     }
 

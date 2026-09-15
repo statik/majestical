@@ -35,7 +35,19 @@ type Config = Omit<WebdriverIO.Config, "capabilities"> & {
 
 export const config: Config = {
   runner: "local",
-  specs: ["./specs/**/*.e2e.ts"],
+  // Explicit order, ingest LAST: an ingest run appends immutable events
+  // (two new assets, a new volume for the destination) that
+  // `volumes.e2e.ts`'s exact-count asserts would see; nothing can undo
+  // them, so nothing runs after it.
+  specs: [
+    "./specs/smoke.e2e.ts",
+    "./specs/search.e2e.ts",
+    "./specs/volumes.e2e.ts",
+    "./specs/browse.e2e.ts",
+    "./specs/organize.e2e.ts",
+    "./specs/settings.e2e.ts",
+    "./specs/ingest.e2e.ts",
+  ],
   maxInstances: 1,
   logLevel: "info",
   bail: 0,

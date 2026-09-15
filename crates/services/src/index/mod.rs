@@ -205,15 +205,23 @@ pub fn read_ledger(state_dir: &Path, notices: &crate::notices::Notices) -> Ledge
     ledger
 }
 
+/// Distinguishes concurrent writers inside one process (the desktop
+/// scheduler thread and a `retry_failed_items` command thread), so their
+/// temp files never collide; the pid distinguishes processes.
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Writes `ledger` to [`FAILURES_FILE`] via temp-file-then-rename in the same
-/// directory: this file is cumulative state that two heads — the desktop
-/// scheduler and a CLI run — can read-modify-write, so a crash or an
-/// interleaved write must never leave a torn file on disk.
+/// directory: this file is cumulative state that several writers — the
+/// desktop scheduler, a desktop command, a CLI run — can read-modify-write
+/// concurrently, so neither a crash nor two overlapping writers may leave a
+/// torn file where a reader can see it. A crash between the write and the
+/// rename leaves an inert `.tmp-*` sibling behind; nothing reads those.
 fn write_ledger(state_dir: &Path, ledger: &Ledger) -> Result<()> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
     let path = state_dir.join(FAILURES_FILE);
-    let tmp_path = state_dir.join(format!("{FAILURES_FILE}.tmp-{}", std::process::id()));
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = state_dir.join(format!("{FAILURES_FILE}.tmp-{}-{seq}", std::process::id()));
     let bytes = serde_json::to_vec(ledger).context("serializing the failure ledger")?;
     std::fs::write(&tmp_path, bytes)
         .with_context(|| format!("writing failure ledger {}", tmp_path.display()))?;
@@ -1095,10 +1103,10 @@ mod tests {
         assert_eq!(remaining["pdf"].len(), 1, "{remaining:?}");
     }
 
-    /// `write_ledger` writes through a `<FAILURES_FILE>.tmp-<pid>` sibling and
-    /// renames it into place — two heads read-modify-writing this file must
-    /// never observe a torn write, and a crash between the write and the
-    /// rename must never leave a stray temp file behind either.
+    /// `write_ledger` writes through a `<FAILURES_FILE>.tmp-<pid>-<seq>`
+    /// sibling and renames it into place — a reader must never observe a
+    /// torn write, and the success path leaves no temp file behind (a crash
+    /// mid-write can leave one; it is inert, nothing reads it).
     #[test]
     fn write_ledger_leaves_no_tmp_file_behind() {
         let state_dir = tempfile::tempdir().expect("tempdir");

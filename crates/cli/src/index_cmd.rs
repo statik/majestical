@@ -180,24 +180,20 @@ fn explicitly_requested_ffmpeg_kind(kinds: Option<&[String]>) -> Option<&'static
         .find(|name| kinds.iter().any(|kind| kind == name))
 }
 
-/// One `index run` pass: calls the services engine, updates the on-disk
-/// failure marker `index status` reads back (state, folded into the
-/// services layer — see `majestical_services::index::update_failure_report`
-/// — so any head calling `index::run` keeps `index status` truthful, not
-/// just this CLI), and renders the result.
+/// One `index run` pass: calls the services engine, folds this pass's
+/// permanent failures into the on-disk ledger `index status` reads back
+/// (state, folded into the services layer — see
+/// `majestical_services::index::record_failures` — so any head calling
+/// `index::run` keeps `index status` truthful, not just this CLI), and
+/// renders the result.
 ///
 /// # Errors
-/// Returns an error if the engine fails, or the failure marker can't be
+/// Returns an error if the engine fails, or the ledger can't be
 /// read/written.
 fn run_once(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq, json: bool) -> Result<()> {
     let outcome = majestical_services::index::run(app, catalog_dir, req)?;
     crate::print_notices(&outcome.notices);
-    majestical_services::index::update_failure_report(
-        catalog_dir,
-        &outcome,
-        &req.kinds,
-        app.notices(),
-    )?;
+    majestical_services::index::record_failures(catalog_dir, &outcome, app.notices())?;
     print_run_result(&outcome, json);
     Ok(())
 }
@@ -227,6 +223,7 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             limit: args.limit,
             threads: args.threads,
             api_key: crate::describer_cmd::env_api_key(),
+            retry_failed: false,
         };
         run_once(app, catalog_dir, &req, args.json)?;
         if !args.watch {
@@ -276,27 +273,25 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
     }
 }
 
-/// Per-kind failure lines from the last run's marker, e.g.
-/// `pdf failed last run: 1 (broken.pdf: not a valid pdf)`.
-fn print_last_run_failures(failures: &serde_json::Value) {
-    let Some(failures) = failures.as_object() else {
-        return;
-    };
-    for (kind, list) in failures {
-        let Some(entries) = list.as_array() else {
+/// Per-kind lines for the failures the ledger remembers, e.g. `pdf: 1 known
+/// failure(s), skipped until `maj index run --retry-failed` (not a valid
+/// pdf)` — each names both how many items are held back and the remedy.
+fn print_known_failures(failures: &majestical_services::index::Ledger) {
+    for (kind, rows) in failures {
+        let Some(first) = rows.first() else {
             continue;
         };
-        if entries.is_empty() {
-            continue;
-        }
-        let first = entries[0]["error"].as_str().unwrap_or("<unknown reason>");
-        println!("{kind} failed last run: {} ({first})", entries.len());
+        println!(
+            "{kind}: {} known failure(s), skipped until `maj index run --retry-failed` ({})",
+            rows.len(),
+            first.error,
+        );
     }
 }
 
 /// Reports the queue's current state per derivation kind without doing any
 /// work — a diff against the blob store, same as `run`, just not executed —
-/// plus the last run's per-item failures from the failure marker. Compute
+/// plus every failure the ledger remembers. Compute
 /// lives in `majestical_services::index::status`; this renders its
 /// [`majestical_services::index::IndexStatusOutcome`].
 ///
@@ -318,7 +313,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
                 "ocr": kind_status_json(&outcome.ocr),
                 "pdf": kind_status_json(&outcome.pdf),
                 "captions": kind_status_json(&outcome.captions),
-                "failed_last_run": outcome.failed_last_run,
+                "failed": outcome.failed,
             })
         );
     } else {
@@ -331,7 +326,7 @@ pub(crate) fn cmd_index_status(app: &FsApp, catalog_dir: &Path, json: bool) -> R
         print_kind_status("pdf", &outcome.pdf);
         print_kind_status("captions", &outcome.captions);
         print_status_remedies(&outcome);
-        print_last_run_failures(&outcome.failed_last_run);
+        print_known_failures(&outcome.failed);
     }
     Ok(())
 }

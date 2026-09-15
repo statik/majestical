@@ -1068,14 +1068,15 @@ fn index_run_exec(
         limit: args.limit,
         threads: args.threads,
         api_key: crate::describer_cmd::env_api_key(),
+        retry_failed: false,
     };
     let mut outcome = majestical_services::runtime::run_off_tokio_runtime(|| {
         let app = FsApp::open(catalog, machine_id, author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;
     let notices = Notices::new();
-    majestical_services::index::update_failure_report(catalog, &outcome, kinds, &notices)?;
-    // The marker update runs after the pass, so its diagnostics belong at the
+    majestical_services::index::record_failures(catalog, &outcome, &notices)?;
+    // The ledger update runs after the pass, so its diagnostics belong at the
     // end of the run's own list rather than in a second field.
     outcome.notices.extend(notices.drain());
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)

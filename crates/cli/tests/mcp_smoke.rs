@@ -656,7 +656,7 @@ fn index_status_matches() {
         serde_json::json!(0),
         "{structured}"
     );
-    assert!(structured["failed_last_run"].is_object(), "{structured}");
+    assert!(structured["failed"].is_object(), "{structured}");
 }
 
 #[test]
@@ -1272,16 +1272,16 @@ fn get_asset_found_carries_notices_nested_on_the_asset() {
     );
 }
 
-/// `index_run`'s executed arm updates the on-disk failure marker AFTER the
-/// pass returns, through a sink of its own. Those lines are appended to the
+/// `index_run`'s executed arm records this pass's permanent failures in the
+/// on-disk ledger AFTER the pass returns, through a sink of its own. Those lines are appended to the
 /// run outcome's existing `notices` rather than shipped as a second field —
 /// pins that the append happens at all. The catalog is empty and no models
 /// are installed, so every kind degrades to a no-op and the pass is quick.
 #[test]
-fn index_run_appends_the_failure_report_note_to_the_run_outcome() {
+fn index_run_appends_the_failure_ledger_note_to_the_run_outcome() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
-    // Materializes the per-catalog state dir so the marker can be planted in
+    // Materializes the per-catalog state dir so the ledger can be planted in
     // it — the same trick `search_with_a_planted_fake_model_does_not_panic_the_server`
     // uses to find that directory.
     common::maj(&root, &state)
@@ -1304,8 +1304,8 @@ fn index_run_appends_the_failure_report_note_to_the_run_outcome() {
     assert!(
         notices.iter().any(|note| note
             .as_str()
-            .is_some_and(|s| s.contains("ignoring unparsable failure report"))),
-        "the marker-update note must be folded in: {structured}"
+            .is_some_and(|s| s.contains("ignoring unparsable failure ledger"))),
+        "the ledger note must be folded in: {structured}"
     );
 }
 

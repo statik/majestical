@@ -113,6 +113,9 @@ pub struct IndexRunReq {
     pub limit: Option<usize>,
     pub threads: Option<usize>,
     pub api_key: Option<String>,
+    /// Forget every permanent failure the ledger remembers for `kinds`
+    /// before planning, so this pass attempts those items again.
+    pub retry_failed: bool,
 }
 
 fn default_index_jobs() -> usize {
@@ -267,7 +270,13 @@ fn run_impl(app: &FsApp, catalog_dir: &Path, req: &IndexRunReq) -> Result<IndexR
     let state_dir = crate::state_dir::state_dir_for(catalog_dir, app.notices())?;
     let blobs = BlobStore::new(catalog_dir);
     let caps = crate::index::capabilities(catalog_dir, app.notices());
-    let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps);
+    if req.retry_failed {
+        let cleared = crate::index::clear_failures(catalog_dir, &req.kinds, app.notices())?;
+        app.notices()
+            .push(format!("cleared {cleared} known failure(s) for retry"));
+    }
+    let ledger = crate::index::read_ledger(&state_dir, app.notices());
+    let plan = crate::index::build_plan(&projection, &blobs, &req.kinds, &caps, &ledger);
     let items = split_and_cap_items(plan.items, req.limit);
 
     let jobs = req.threads.unwrap_or_else(default_index_jobs);
@@ -1930,7 +1939,7 @@ pub struct IndexRunOutcome {
     pub keyframes: KeyframeOutcome,
     /// Serialized under the `--kinds` name (`keyframe-images`) rather than
     /// the Rust field name, so every wire shape — this struct, the CLI's
-    /// hand-built `--json`, and the failure report's per-kind map — names
+    /// hand-built `--json`, and the failure ledger's per-kind map — names
     /// the kind identically.
     #[serde(rename = "keyframe-images")]
     pub keyframe_images: KeyframeImageOutcome,
@@ -2500,6 +2509,7 @@ mod tests {
             limit: None,
             threads: Some(1),
             api_key: None,
+            retry_failed: false,
         };
         let outcome = run(&app, &root, &req).expect("run");
 
@@ -2796,6 +2806,7 @@ mod tests {
             limit: Some(1),
             threads: Some(1),
             api_key: None,
+            retry_failed: false,
         };
         let outcome = run(&app, &root, &req).expect("run");
         assert_eq!(outcome.thumbs.written, 0);

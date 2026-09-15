@@ -112,6 +112,9 @@ pub struct KindStatus {
     pub needs_ffmpeg: u64,
     /// Blob missing and no encoder model is installed.
     pub needs_model: u64,
+    /// Blob missing, but a previous run failed on this item permanently and
+    /// the ledger holds it back until retried.
+    pub failed: u64,
 }
 
 /// The full diff between required derivations and what the blob store

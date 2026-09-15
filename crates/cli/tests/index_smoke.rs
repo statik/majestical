@@ -5,6 +5,7 @@
 mod common;
 
 use common::{maj, walkdir_find};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 #[cfg(test)]
@@ -803,14 +804,15 @@ fn ocr_indexing_still_image_end_to_end() {
 }
 
 /// An item-level failure (a file that isn't really a PDF) is a run-level
-/// success: the run exits 0, records the failure in the per-run failure
-/// marker (surfaced by `index status`), writes no done-blob, and re-plans
-/// the same item on the next run instead of dropping it.
+/// success: the run exits 0, writes no done-blob, and records the failure
+/// in the catalog's failure ledger — which `index status` surfaces and the
+/// planner honours, so the next run holds the item back rather than
+/// re-failing on it forever.
 // The failing item is a pdf, an Apple-only kind the planner excludes
 // off-macOS — nothing is ever attempted there, so no failure is recorded.
 #[cfg(target_os = "macos")]
 #[test]
-fn failed_derivations_are_reported_and_replanned() {
+fn failed_derivations_are_remembered_and_held_back() {
     let media = tempfile::tempdir().unwrap();
     std::fs::write(media.path().join("broken.pdf"), b"not a pdf").unwrap();
     let catalog = tempfile::tempdir().unwrap();
@@ -839,21 +841,23 @@ fn failed_derivations_are_reported_and_replanned() {
         .args(["index", "status"])
         .assert()
         .success()
-        .stdout(contains("failed last run"));
+        .stdout(contains("pdf: 1 known failure(s)"))
+        .stdout(contains("--retry-failed"));
 
-    // Re-planned, not dropped: the second run fails on the same item again.
+    // Remembered, not re-attempted: the ledger holds the item back, so the
+    // second run neither plans nor re-reports it.
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())
         .args(["index", "run", "--kinds", "pdf", "--json"])
         .assert()
         .success()
-        .stdout(contains("broken.pdf"));
+        .stdout(contains("broken.pdf").not());
 }
 
 /// A `--kinds`-filtered run must not erase another kind's failure record:
-/// the failure marker is merged per kind, so a later `--kinds thumbs` pass
-/// (which never retried the broken pdf item) leaves the pdf failure
-/// standing in `index status`.
+/// the ledger is merged per kind and no run ever clears one, so a later
+/// `--kinds thumbs` pass leaves the pdf failure standing in `index
+/// status`.
 // Same pdf dependency as above: off-macOS the kind is excluded before any
 // failure record can exist to survive.
 #[cfg(target_os = "macos")]
@@ -894,7 +898,7 @@ fn failure_records_survive_runs_of_other_kinds() {
         .args(["index", "status"])
         .assert()
         .success()
-        .stdout(contains("pdf failed last run"));
+        .stdout(contains("pdf: 1 known failure(s)"));
 }
 
 /// `index run --kinds transcripts` with no whisper model is a graceful

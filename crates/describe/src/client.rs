@@ -41,11 +41,20 @@ fn to_port_error(context: impl Into<String>, error: DescribeHttpError) -> PortEr
     }
 }
 
+/// The 4xx statuses that are about the caller's credentials (401, 407),
+/// account (402), routing (404), or timing (408, 429) rather than the
+/// payload: the same input is expected to succeed once the operator fixes
+/// the cause, so these stay `Unavailable` — an expired key must not turn
+/// every item into a permanent ledger row. 403 is deliberately NOT here:
+/// `OpenRouter` answers a bad key with 401 and a content-moderation refusal
+/// with 403, so 403 is a verdict on the input.
+const NOT_ABOUT_THE_PAYLOAD: [u16; 6] = [401, 402, 404, 407, 408, 429];
+
 /// HTTP statuses that mean "this request was wrong" rather than "this
-/// backend is having a bad time": the 4xx band minus 429, which is
-/// rate-limiting — the same request later is expected to succeed.
+/// backend is having a bad time": the 4xx band minus
+/// [`NOT_ABOUT_THE_PAYLOAD`].
 fn is_client_rejection(status: u16) -> bool {
-    (400..500).contains(&status) && status != 429
+    (400..500).contains(&status) && !NOT_ABOUT_THE_PAYLOAD.contains(&status)
 }
 
 /// All three backends accept base64 data URLs on the OpenAI-compatible
@@ -608,6 +617,21 @@ mod tests {
     fn a_5xx_or_a_429_is_an_unavailable_backend() {
         assert_eq!(caption_failure_for_status(503), PortFailure::Unavailable);
         assert_eq!(caption_failure_for_status(429), PortFailure::Unavailable);
+    }
+
+    /// The 4xx statuses about credentials, the account, routing, or timing
+    /// say nothing about the input either; 403 (moderation on `OpenRouter`)
+    /// does.
+    #[test]
+    fn credential_account_routing_and_timing_4xx_are_unavailable() {
+        for status in [401, 402, 404, 407, 408] {
+            assert_eq!(
+                caption_failure_for_status(status),
+                PortFailure::Unavailable,
+                "{status}"
+            );
+        }
+        assert_eq!(caption_failure_for_status(403), PortFailure::RefusedInput);
     }
 
     /// A 200 whose body has no `choices[0].message.content`: the backend

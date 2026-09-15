@@ -37,6 +37,7 @@ describe("scheduler state fixtures", () => {
     expect(typedSchedulerState.running).toBe(true);
     expect(typedSchedulerState.decision?.mode).toBe("run_full");
     expect(typedSchedulerState.last_error).toBeUndefined();
+    expect(typedSchedulerState.failed_items).toBe(0);
     expect(allSchedulerModes).toContain(typedSchedulerState.decision?.mode);
 
     expect(typedSchedulerStateHeld.running).toBe(false);
@@ -46,6 +47,7 @@ describe("scheduler state fixtures", () => {
     }
     expect(typedSchedulerStateHeld.decision.hold_reason).toBe("paused");
     expect(typedSchedulerStateHeld.last_error?.length).toBeGreaterThan(0);
+    expect(typedSchedulerStateHeld.failed_items).toBe(3);
   });
 });
 

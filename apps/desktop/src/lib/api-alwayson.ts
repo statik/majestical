@@ -82,6 +82,12 @@ export interface SchedulerStateOutcome {
   power: PowerState;
   decision: SchedulerDecision | null;
   pending_items: number;
+  /**
+   * The failure ledger's held-back items: work the planner skips until an
+   * explicit retry clears it, so it counts as neither done nor pending —
+   * see `pending_items`.
+   */
+  failed_items: number;
   running: boolean;
   last_error?: string;
 }
@@ -91,4 +97,10 @@ export const alwaysOnApi = {
   schedulerState: () => invoke<SchedulerStateOutcome>("scheduler_state"),
   setThrottle: (throttle: ThrottleOverride) =>
     invoke<SchedulerStateOutcome>("set_throttle", { throttle }),
+  /**
+   * Forgets every remembered failure for the selected catalog and nudges the
+   * scheduler loop, so the retried items are attempted within seconds. The
+   * returned state already reports `failed_items: 0`.
+   */
+  retryFailedItems: () => invoke<SchedulerStateOutcome>("retry_failed_items"),
 };

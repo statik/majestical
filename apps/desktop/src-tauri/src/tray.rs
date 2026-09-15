@@ -396,6 +396,7 @@ mod tests {
             last_decision: decision,
             power: power(source),
             pending_items,
+            failed_items: 0,
             running: false,
             last_error: last_error.map(str::to_string),
         }

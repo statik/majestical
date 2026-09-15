@@ -3,6 +3,7 @@
   "decision": {
     "mode": "run_full"
   },
+  "failed_items": 0,
   "pending_items": 42,
   "power": {
     "low_power_mode": false,

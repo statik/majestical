@@ -14,14 +14,20 @@ use majestical_desktop::commands::{
     rename_para_node_impl, rename_tag_impl, run_saved_search_impl, search_assets_impl,
     use_existing_catalog_impl,
 };
+use majestical_desktop::indexer::{
+    SchedulerShared, SchedulerState, SchedulerWake, retry_failed_items_impl,
+};
 use majestical_desktop::ingest::{
     DEFAULT_INGEST_TEMPLATE, FinishedIngest, IngestJob, IngestProgress, IngestState, ProgressSink,
     StartIngest, cancel_ingest_impl, ingest_state_impl, list_unfinished_ingests_impl,
     plan_ingest_impl, start_ingest_impl,
 };
 use majestical_desktop::thumb_protocol;
+use majestical_services::index::{self, IndexRunOutcome, ItemFailure};
+use majestical_services::notices::Notices;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 // `#[cfg(test)]` on the helpers below is not redundant despite this file
 // already building with `--cfg test`: clippy's in-test detection for
@@ -2049,6 +2055,63 @@ fn a_source_that_is_not_a_directory_is_refused_by_both_ingest_paths() {
         assert!(
             !ingest_state_impl(&fixture.state).busy,
             "a refused source must not leave the slot held"
+        );
+    });
+}
+
+/// The one place the ledger write is exercised end to end: a real catalog,
+/// a real permanent failure recorded through the public writer, then the
+/// retry. Three things must hold afterwards — the ledger is empty, the
+/// reported count is zero (the number the Settings surface renders), and
+/// the loop's sleep has been cut short so the retried items get attempted
+/// within seconds rather than after a full tick.
+#[test]
+fn retry_failed_items_clears_the_ledger_zeroes_the_count_and_nudges() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_for(dir.path());
+        initialize_catalog_impl(&cfg).expect("init");
+
+        let notices = Notices::new();
+        let mut run = IndexRunOutcome::default();
+        run.thumbs.failed.push(ItemFailure {
+            asset: "xxh3:0123456789abcdef0123456789abcdef".to_string(),
+            path: dir.path().join("broken.jpg"),
+            error: "decode failed".to_string(),
+            transient: false,
+        });
+        index::record_failures(&cfg.catalog, &run, &notices).expect("record failures");
+        assert!(
+            !index::known_failures(&cfg.catalog, &notices)
+                .expect("ledger")
+                .is_empty(),
+            "the ledger must hold the failure this test is about to retry"
+        );
+
+        let scheduler = SchedulerState(RwLock::new(SchedulerShared::default()));
+        scheduler
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed_items = 1;
+        let wake = SchedulerWake::default();
+
+        let outcome =
+            retry_failed_items_impl(Some(&cfg), &scheduler, &wake).expect("retry must succeed");
+
+        assert_eq!(outcome.failed_items, 0, "the retried count must be zeroed");
+        assert!(
+            index::known_failures(&cfg.catalog, &notices)
+                .expect("ledger")
+                .is_empty(),
+            "every remembered failure must be forgotten"
+        );
+        let start = Instant::now();
+        wake.wait(Duration::from_secs(5));
+        let waited = start.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "the retry must nudge the loop awake, waited {waited:?}"
         );
     });
 }

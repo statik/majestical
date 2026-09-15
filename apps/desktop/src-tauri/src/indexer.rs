@@ -1,7 +1,7 @@
 //! The background index scheduler: one loop thread, power-aware, spawned in
 //! `setup` next to `restore_persisted_catalog`. The `ingest.rs` pattern
 //! exactly — this module owns the state struct, the loop thread, and the
-//! two `#[tauri::command]` one-liners over `*_impl` functions here.
+//! `#[tauri::command]` one-liners over `*_impl` functions here.
 //!
 //! Unlike an ingest run, the scheduler has no caller waiting on it and no
 //! single job to name: it reads the currently selected catalog from
@@ -18,7 +18,8 @@ use majestical_services::index::{
     self, IndexRunOutcome, IndexRunReq, IndexStatusOutcome, VALID_KINDS,
 };
 use serde::Serialize;
-use std::sync::{PoisonError, RwLock};
+use std::collections::BTreeSet;
+use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 
@@ -57,6 +58,9 @@ pub struct SchedulerShared {
     /// The sum of every kind's `pending` row from the last status poll —
     /// see [`pending_items`].
     pub pending_items: u64,
+    /// The sum of every kind's `failed` row from the last status poll —
+    /// items the ledger holds back until retried. See [`failed_items`].
+    pub failed_items: u64,
     /// Whether a batch is executing right now.
     pub running: bool,
     /// The last failed batch's message, kept for Health; cleared on the
@@ -74,20 +78,57 @@ impl Default for SchedulerShared {
                 low_power_mode: false,
             },
             pending_items: 0,
+            failed_items: 0,
             running: false,
             last_error: None,
         }
     }
 }
 
-/// Wire outcome for `scheduler_state`/`set_throttle`.
-#[derive(Serialize)]
+/// The loop's sleep, made interruptible: [`retry_failed_items_impl`] sets
+/// the flag and notifies so the next tick starts now instead of after up to
+/// a full [`TICK`]. Managed separately from [`SchedulerState`] so the
+/// existing `RwLock` users (`tray.rs`, the tests) are untouched — this needs
+/// a `Condvar`, which pairs with a `Mutex`, not with that `RwLock`.
+#[derive(Default)]
+pub struct SchedulerWake {
+    woken: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl SchedulerWake {
+    /// Sleeps up to `pause`, returning early if nudged, and consumes the
+    /// nudge either way — so one nudge shortens one sleep, not every sleep
+    /// after it. A nudge that lands while no one is waiting is still
+    /// remembered, and the next `wait` returns immediately.
+    pub fn wait(&self, pause: Duration) {
+        let woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
+        // `wait_timeout_while` re-checks the predicate itself, so a spurious
+        // wakeup does not cut the sleep short.
+        let (mut woken, _timed_out) = self
+            .cv
+            .wait_timeout_while(woken, pause, |woken| !*woken)
+            .unwrap_or_else(PoisonError::into_inner);
+        *woken = false;
+    }
+
+    /// Cuts the current (or next) [`wait`](Self::wait) short. `notify_one`,
+    /// not `notify_all`: there is exactly one waiter, the scheduler loop.
+    pub fn nudge(&self) {
+        *self.woken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.cv.notify_one();
+    }
+}
+
+/// Wire outcome for `scheduler_state`/`set_throttle`/`retry_failed_items`.
+#[derive(Debug, Serialize)]
 pub struct SchedulerStateOutcome {
     pub available: bool,
     pub throttle: ThrottleOverride,
     pub power: PowerState,
     pub decision: Option<SchedulerDecision>,
     pub pending_items: u64,
+    pub failed_items: u64,
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -109,13 +150,33 @@ pub fn pending_items(status: &IndexStatusOutcome) -> u64 {
         + status.captions.pending
 }
 
+/// Sum of every kind's `failed` row — the mirror of [`pending_items`].
+/// These are items the failure ledger holds back from planning until a
+/// retry clears it, so they count as neither done nor pending; `index
+/// status` reports them in their own column for the same reason.
+#[must_use]
+pub fn failed_items(status: &IndexStatusOutcome) -> u64 {
+    status.thumbs.failed
+        + status.embeddings.failed
+        + status.keyframes.failed
+        + status.keyframe_images.failed
+        + status.transcripts.failed
+        + status.ocr.failed
+        + status.pdf.failed
+        + status.captions.failed
+}
+
 /// Maps a scheduler decision to the one batch it authorizes: `RunLow` caps
 /// to a single worker thread, `RunFull` leaves the services default
 /// (CPU-scaled) parallelism, and a `Hold` — for any reason — authorizes
 /// nothing. Pure and no-I/O, so this is testable without a thread, a
 /// catalog, or a power probe.
+///
+/// `api_key` is the environment's describer key, read by the caller once per
+/// tick rather than in here — same rule the command impls follow, so reading
+/// the environment stays out of the pure function.
 #[must_use]
-pub fn batch_request(decision: SchedulerDecision) -> Option<IndexRunReq> {
+pub fn batch_request(decision: SchedulerDecision, api_key: Option<String>) -> Option<IndexRunReq> {
     let threads = match decision {
         SchedulerDecision::RunLow => Some(1),
         SchedulerDecision::RunFull => None,
@@ -127,7 +188,9 @@ pub fn batch_request(decision: SchedulerDecision) -> Option<IndexRunReq> {
         kinds: VALID_KINDS.iter().map(|s| (*s).to_string()).collect(),
         limit: Some(BATCH_LIMIT),
         threads,
-        api_key: None,
+        api_key,
+        // The scheduler never clears the ledger; `retry_failed_items` is the
+        // one path that does, on an explicit ask from the user.
         retry_failed: false,
     })
 }
@@ -175,9 +238,13 @@ fn poll_and_decide(
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
     shared.power = power;
     shared.pending_items = pending;
+    shared.failed_items = failed_items(&status);
     shared.last_decision = Some(decision);
     drop(shared);
-    Ok((decision, batch_request(decision)))
+    Ok((
+        decision,
+        batch_request(decision, crate::commands::env_api_key()),
+    ))
 }
 
 /// Every kind's `failed` list, summed — what [`batch_outcome_pace`] reports
@@ -300,11 +367,15 @@ fn run_tick(app: &AppHandle) -> Duration {
 /// `run_tick`'s early returns fired, because every path through it changes
 /// something the tray's status line reports (the catalog selection, a
 /// poll's decision, or a batch's outcome).
+///
+/// The sleep goes through [`SchedulerWake`] rather than
+/// `std::thread::sleep`, so a `retry_failed_items` call gets its retried
+/// items attempted within seconds instead of after up to a full [`TICK`].
 fn run_loop(app: &AppHandle) {
     loop {
         let pause = run_tick(app);
         crate::tray::refresh(app);
-        std::thread::sleep(pause);
+        app.state::<SchedulerWake>().wait(pause);
     }
 }
 
@@ -345,6 +416,7 @@ fn scheduler_state_impl(state: &SchedulerState) -> SchedulerStateOutcome {
         power: shared.power,
         decision: shared.last_decision,
         pending_items: shared.pending_items,
+        failed_items: shared.failed_items,
         running: shared.running,
         last_error: shared.last_error.clone(),
     }
@@ -389,6 +461,42 @@ pub(crate) fn set_throttle_impl(
     scheduler_state_impl(state)
 }
 
+/// Clears the failure ledger for every kind of the selected catalog, zeroes
+/// the reported count, and nudges the loop. The next tick re-plans, so the
+/// retried items are attempted within seconds rather than a full [`TICK`].
+///
+/// The count is zeroed here rather than left for the next poll to correct:
+/// the ledger is empty the moment `clear_failures` returns, so reporting
+/// the pre-clear number back to the caller that just cleared it would be a
+/// stale answer with nothing to justify it.
+///
+/// `pub`, unlike the other `*_impl`s in this module: `tests/commands.rs` is
+/// a separate crate and drives this one against a real catalog, which is
+/// the only place the ledger write is exercised.
+///
+/// # Errors
+/// Returns an error if no catalog is selected, if the catalog cannot be
+/// opened, or if the ledger cannot be written.
+pub fn retry_failed_items_impl(
+    cfg: Option<&CatalogCfg>,
+    scheduler: &SchedulerState,
+    wake: &SchedulerWake,
+) -> Result<SchedulerStateOutcome, CommandError> {
+    let Some(cfg) = cfg else {
+        return Err(anyhow::anyhow!("no catalog selected").into());
+    };
+    let fs_app = open_app(cfg)?;
+    let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
+    index::clear_failures(&cfg.catalog, &kinds, fs_app.notices())?;
+    scheduler
+        .0
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .failed_items = 0;
+    wake.nudge();
+    Ok(scheduler_state_impl(scheduler))
+}
+
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
@@ -397,6 +505,30 @@ pub(crate) fn set_throttle_impl(
 #[tauri::command]
 pub fn scheduler_state(state: State<'_, SchedulerState>) -> SchedulerStateOutcome {
     scheduler_state_impl(&state)
+}
+
+/// Same one extra line as [`set_throttle`]: the tray's status line reports
+/// the scheduler's decision, and clearing the ledger changes what the next
+/// tick will find, so the tray is rebuilt here too. Refreshed even on the
+/// error path — the failure left the tray no more stale than it was, and
+/// the branch would buy nothing.
+///
+/// # Errors
+/// Whatever [`retry_failed_items_impl`] returns.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command hands a handler its state and arguments by value"
+)]
+#[tauri::command]
+pub fn retry_failed_items(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    scheduler: State<'_, SchedulerState>,
+    wake: State<'_, SchedulerWake>,
+) -> Result<SchedulerStateOutcome, CommandError> {
+    let outcome = retry_failed_items_impl(selected_catalog(&state).as_ref(), &scheduler, &wake);
+    crate::tray::refresh(&app);
+    outcome
 }
 
 /// One line more than a pure wrapper over `set_throttle_impl`: the
@@ -424,14 +556,14 @@ pub fn set_throttle(
 mod tests {
     use super::{
         BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
-        SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome,
-        ThrottleOverride, batch_outcome_pace, batch_request, pending_items, set_throttle_impl,
-        success_pace, total_failures,
+        SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome, SchedulerWake,
+        ThrottleOverride, batch_outcome_pace, batch_request, failed_items, pending_items,
+        retry_failed_items_impl, set_throttle_impl, success_pace, total_failures,
     };
     use majestical_services::index::{IndexRunOutcome, ItemFailure, KindStatusRow};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    fn kind_row(pending: u64) -> KindStatusRow {
+    fn kind_row(pending: u64, failed: u64) -> KindStatusRow {
         KindStatusRow {
             done: 0,
             pending,
@@ -439,20 +571,30 @@ mod tests {
             unsupported: 0,
             needs_ffmpeg: 0,
             needs_model: 0,
-            failed: 0,
+            failed,
         }
     }
 
-    fn status_with_pending(counts: [u64; 8]) -> IndexStatusOutcome {
+    fn status_from(rows: [KindStatusRow; 8]) -> IndexStatusOutcome {
+        let [
+            thumbs,
+            embeddings,
+            keyframes,
+            keyframe_images,
+            transcripts,
+            ocr,
+            pdf,
+            captions,
+        ] = rows;
         IndexStatusOutcome {
-            thumbs: kind_row(counts[0]),
-            embeddings: kind_row(counts[1]),
-            keyframes: kind_row(counts[2]),
-            keyframe_images: kind_row(counts[3]),
-            transcripts: kind_row(counts[4]),
-            ocr: kind_row(counts[5]),
-            pdf: kind_row(counts[6]),
-            captions: kind_row(counts[7]),
+            thumbs,
+            embeddings,
+            keyframes,
+            keyframe_images,
+            transcripts,
+            ocr,
+            pdf,
+            captions,
             transcripts_remedy: None,
             captions_remedy: None,
             failed: std::collections::BTreeMap::new(),
@@ -460,10 +602,82 @@ mod tests {
         }
     }
 
+    fn status_with_pending(counts: [u64; 8]) -> IndexStatusOutcome {
+        status_from(counts.map(|pending| kind_row(pending, 0)))
+    }
+
+    fn status_with_failed(counts: [u64; 8]) -> IndexStatusOutcome {
+        status_from(counts.map(|failed| kind_row(0, failed)))
+    }
+
     #[test]
     fn pending_items_sums_every_kind() {
         let status = status_with_pending([1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(pending_items(&status), 36);
+    }
+
+    /// The mirror of `pending_items_sums_every_kind`: held-back items are
+    /// counted from the `failed` column only, so a status with no failures
+    /// reports zero however much work is pending.
+    #[test]
+    fn failed_items_sums_every_kind() {
+        let status = status_with_failed([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(failed_items(&status), 36);
+        assert_eq!(pending_items(&status), 0);
+        assert_eq!(
+            failed_items(&status_with_pending([1, 2, 3, 4, 5, 6, 7, 8])),
+            0
+        );
+    }
+
+    #[test]
+    fn wake_returns_early_when_nudged_and_consumes_the_nudge() {
+        let wake = SchedulerWake::default();
+        wake.nudge();
+        let start = Instant::now();
+        wake.wait(Duration::from_secs(5));
+        let nudged = start.elapsed();
+        assert!(
+            nudged < Duration::from_secs(1),
+            "a nudged wait must return at once, took {nudged:?}"
+        );
+
+        let start = Instant::now();
+        wake.wait(Duration::from_millis(50));
+        let unnudged = start.elapsed();
+        assert!(
+            unnudged >= Duration::from_millis(50),
+            "the nudge must be consumed, so the next wait sleeps; took {unnudged:?}"
+        );
+    }
+
+    #[test]
+    fn wake_nudged_from_another_thread_interrupts_a_wait() {
+        let wake = std::sync::Arc::new(SchedulerWake::default());
+        let nudger = std::sync::Arc::clone(&wake);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            nudger.nudge();
+        });
+        let start = Instant::now();
+        wake.wait(Duration::from_secs(5));
+        let waited = start.elapsed();
+        handle.join().expect("the nudging thread");
+        assert!(
+            waited < Duration::from_secs(2),
+            "a nudge from another thread must cut the wait short, took {waited:?}"
+        );
+    }
+
+    /// Nothing to clear and nothing to nudge for: the retry is a catalog
+    /// operation, so it fails rather than silently succeeding.
+    #[test]
+    fn retry_failed_items_without_a_catalog_is_an_error() {
+        let scheduler = SchedulerState(std::sync::RwLock::new(SchedulerShared::default()));
+        let wake = SchedulerWake::default();
+        let error = retry_failed_items_impl(None, &scheduler, &wake)
+            .expect_err("a retry with no catalog selected must be an error");
+        assert!(error.message.contains("no catalog"), "{}", error.message);
     }
 
     #[test]
@@ -474,14 +688,14 @@ mod tests {
 
     #[test]
     fn batch_request_run_low_caps_to_one_thread() {
-        let req = batch_request(SchedulerDecision::RunLow).expect("a batch");
+        let req = batch_request(SchedulerDecision::RunLow, None).expect("a batch");
         assert_eq!(req.limit, Some(BATCH_LIMIT));
         assert_eq!(req.threads, Some(1));
     }
 
     #[test]
     fn batch_request_run_full_uses_default_parallelism() {
-        let req = batch_request(SchedulerDecision::RunFull).expect("a batch");
+        let req = batch_request(SchedulerDecision::RunFull, None).expect("a batch");
         assert_eq!(req.limit, Some(BATCH_LIMIT));
         assert_eq!(req.threads, None);
     }
@@ -493,7 +707,26 @@ mod tests {
             HoldReason::LowPowerMode,
             HoldReason::NoPendingWork,
         ] {
-            assert!(batch_request(SchedulerDecision::Hold(reason)).is_none());
+            assert!(batch_request(SchedulerDecision::Hold(reason), None).is_none());
+        }
+    }
+
+    /// The key the tick read from the environment reaches the batch — a
+    /// describer-backed kind (captions) needs it, and the scheduler is the
+    /// only caller that has no user-supplied key to fall back on. Nothing
+    /// else about the request changes with it, `retry_failed` least of all:
+    /// the loop never clears the ledger, only `retry_failed_items` does.
+    #[test]
+    fn batch_request_carries_the_key_it_is_given() {
+        for (decision, threads) in [
+            (SchedulerDecision::RunLow, Some(1)),
+            (SchedulerDecision::RunFull, None),
+        ] {
+            let req = batch_request(decision, Some("sk".to_string())).expect("a batch");
+            assert_eq!(req.api_key.as_deref(), Some("sk"));
+            assert_eq!(req.limit, Some(BATCH_LIMIT));
+            assert_eq!(req.threads, threads);
+            assert!(!req.retry_failed, "the scheduler never clears the ledger");
         }
     }
 
@@ -578,6 +811,7 @@ mod tests {
             },
             decision: Some(SchedulerDecision::RunFull),
             pending_items: 12,
+            failed_items: 0,
             running: true,
             last_error: None,
         };
@@ -590,6 +824,7 @@ mod tests {
                 "power": {"source": "ac", "low_power_mode": false},
                 "decision": {"mode": "run_full"},
                 "pending_items": 12,
+                "failed_items": 0,
                 "running": true,
             })
         );
@@ -606,6 +841,7 @@ mod tests {
             },
             decision: Some(SchedulerDecision::Hold(HoldReason::Paused)),
             pending_items: 4,
+            failed_items: 3,
             running: false,
             last_error: Some("the last batch failed: disk full".to_string()),
         };
@@ -618,6 +854,7 @@ mod tests {
                 "power": {"source": "battery", "low_power_mode": false},
                 "decision": {"mode": "hold", "hold_reason": "paused"},
                 "pending_items": 4,
+                "failed_items": 3,
                 "running": false,
                 "last_error": "the last batch failed: disk full",
             })
@@ -636,6 +873,7 @@ mod tests {
             last_decision: Some(decision),
             power,
             pending_items,
+            failed_items: 0,
             running: false,
             last_error: None,
         }))

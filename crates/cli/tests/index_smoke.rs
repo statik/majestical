@@ -261,7 +261,7 @@ fn search_without_model_degrades_with_notice() {
         .args(["search", "photo"])
         .assert()
         .success()
-        .stdout(contains("results"))
+        .stdout(contains("1 result\n"))
         .stderr(contains("maj model fetch"));
 }
 
@@ -352,7 +352,7 @@ fn search_reports_empty_index_without_loading_an_unloadable_model() {
         .args(["search", "photo"])
         .assert()
         .success()
-        .stdout(contains("results"))
+        .stdout(contains("1 result\n"))
         .stderr(contains("semantic index is empty"));
 }
 
@@ -437,7 +437,7 @@ fn search_degrades_on_a_corrupt_lance_store_and_never_touches_it() {
         .args(["search", "photo"])
         .assert()
         .success()
-        .stdout(contains("results"))
+        .stdout(contains("1 result\n"))
         .stderr(contains("semantic index unreadable"));
 
     for (path, before) in manifest_paths.iter().zip(&corrupted_bytes) {

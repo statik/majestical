@@ -1079,9 +1079,10 @@ fn index_run_dry(
     args: &IndexRunArgs,
 ) -> anyhow::Result<serde_json::Value> {
     let status = majestical_services::index::status(app, catalog)?;
-    // Read, never written: a dry run reports the ledger exactly as it stands.
-    let ledger = majestical_services::index::known_failures(catalog, app.notices())?;
-    let counts = known_failure_counts(&ledger, kinds);
+    // Read, never written: a dry run reports the ledger exactly as it stands
+    // — the one snapshot `status` already took, so the counts here and the
+    // rows in `status.failed` cannot describe two different moments.
+    let counts = known_failure_counts(&status.failed, kinds);
     // No fold here: notices ride NESTED on the embedded status, the same
     // convention `get_asset`'s found arm follows — a serialized outcome
     // keeps its own `notices`; only hand-built summaries fold at the top.

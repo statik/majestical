@@ -343,7 +343,8 @@ enum IndexCmd {
         #[arg(long, value_delimiter = ',')]
         kinds: Option<Vec<String>>,
         /// Clear the failure ledger for the selected kinds first, then run —
-        /// a still-broken item is simply re-recorded.
+        /// a still-broken item is simply re-recorded. With --watch, only the
+        /// first pass clears; later passes leave the ledger sticky.
         #[arg(long)]
         retry_failed: bool,
         #[arg(long)]

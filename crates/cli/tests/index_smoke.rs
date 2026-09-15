@@ -1249,7 +1249,7 @@ fn index_run_remembers_a_permanent_failure_and_skips_it_until_retried() {
         .assert()
         .success()
         .stdout(contains("thumbnails: 0 written, 1 failed"))
-        .stderr(contains("failed: "))
+        .stderr(contains("failed: decoding"))
         .stderr(contains("failed (transient):").not());
     maj(&root, &state)
         .args(["index", "status"])
@@ -1259,7 +1259,7 @@ fn index_run_remembers_a_permanent_failure_and_skips_it_until_retried() {
             "thumbs: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
              0 need model, 1 failed",
         ))
-        .stdout(contains("thumbs: 1 known failure(s) skipped until retried"))
+        .stdout(contains("thumbs: 1 known failure(s) remembered"))
         .stdout(contains("retry with: maj index run --retry-failed"));
     // Skipped: no attempt, so no failure this run.
     maj(&root, &state)
@@ -1327,11 +1327,11 @@ fn index_status_prints_the_retry_remedy_once_across_kinds() {
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("thumbs: 1 known failure(s) skipped until retried"),
+        stdout.contains("thumbs: 1 known failure(s) remembered"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("pdf: 1 known failure(s) skipped until retried"),
+        stdout.contains("pdf: 1 known failure(s) remembered"),
         "{stdout}"
     );
     assert_eq!(
@@ -1341,4 +1341,17 @@ fn index_status_prints_the_retry_remedy_once_across_kinds() {
         1,
         "the remedy prints once, not once per kind:\n{stdout}"
     );
+
+    // A retry scoped to one kind clears only that kind's rows: the seeded
+    // `pdf` row survives a `--kinds thumbs --retry-failed` run.
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs", "--retry-failed"])
+        .assert()
+        .success()
+        .stderr(contains("cleared 1 known failure(s) for retry"));
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains("pdf: 1 known failure(s) remembered"));
 }

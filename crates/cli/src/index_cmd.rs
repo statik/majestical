@@ -216,6 +216,7 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             "--kinds {kind} requires ffmpeg/ffprobe on PATH (brew install ffmpeg)"
         );
     }
+    let mut first_pass = true;
     loop {
         // Rebuilt every pass (not hoisted above the loop): the describer API
         // key is read fresh each time, same as before this extraction, when
@@ -226,15 +227,25 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             limit: args.limit,
             threads: args.threads,
             api_key: crate::describer_cmd::env_api_key(),
-            retry_failed: args.retry_failed,
+            retry_failed: retry_on_pass(first_pass, args.retry_failed),
         };
         run_once(app, catalog_dir, &req, args.json)?;
         if !args.watch {
             break;
         }
+        first_pass = false;
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
     Ok(())
+}
+
+/// Whether this pass clears the ledger: `--retry-failed` is a one-shot
+/// clear on the FIRST pass only. Under `--watch`, clearing on every tick
+/// would re-attempt a known-bad item every five seconds forever — exactly
+/// the loop the ledger exists to stop — so later passes run with the
+/// ledger sticky again.
+fn retry_on_pass(first_pass: bool, requested: bool) -> bool {
+    first_pass && requested
 }
 
 /// Prints one line per derivation kind: `done`, `pending`, `offline`,
@@ -282,7 +293,7 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
 }
 
 /// Per-kind lines for the failures the ledger remembers, e.g. `pdf: 1 known
-/// failure(s) skipped until retried (not a valid pdf)`, followed by a single
+/// failure(s) remembered (not a valid pdf)`, followed by a single
 /// remedy line naming the command that retries them — one remedy for the
 /// whole report, not one per kind.
 ///
@@ -290,7 +301,8 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
 /// count printed above: that count is plan-derived (items still pending that
 /// this plan holds back), while a ledger row can outlive it — an asset whose
 /// derivation later arrived by sync is done, yet its row stays until a
-/// retry clears it.
+/// retry clears it. Hence "remembered" here and "failed" on the per-kind
+/// line: only the latter claims something is being skipped right now.
 fn print_known_failures(failures: &majestical_services::index::Ledger) {
     let mut any = false;
     for (kind, rows) in failures {
@@ -299,7 +311,7 @@ fn print_known_failures(failures: &majestical_services::index::Ledger) {
         };
         any = true;
         println!(
-            "{kind}: {} known failure(s) skipped until retried ({})",
+            "{kind}: {} known failure(s) remembered ({})",
             rows.len(),
             first.error,
         );
@@ -367,6 +379,17 @@ pub(crate) fn cmd_model_fetch(verify: bool, only: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_failed_clears_on_the_first_pass_only() {
+        assert!(retry_on_pass(true, true));
+        assert!(
+            !retry_on_pass(false, true),
+            "a later --watch pass must not re-clear"
+        );
+        assert!(!retry_on_pass(true, false));
+        assert!(!retry_on_pass(false, false));
+    }
 
     #[test]
     fn parse_kinds_defaults_to_every_kind() {

@@ -3,10 +3,10 @@
 //! transcripts, transcript-embeddings, OCR, PDF text, captions), and heals
 //! `text_fts` from blobs. Moved from `crates/cli/src/index_cmd.rs`. The
 //! `--watch` loop and all rendering (`print_run_result`/`run_result_json`)
-//! stay in the CLI, and the failure-report bookkeeping
-//! (`failure_report_json`/`merge_failure_report`/`write_failure_report`)
-//! lives next door in `index/mod.rs` — this module hands back one
-//! [`IndexRunOutcome`] per pass and never prints.
+//! stay in the CLI, and the failure ledger (`record_failures`/
+//! `clear_failures`/`apply_ledger`) lives next door in `index/mod.rs` —
+//! this module hands back one [`IndexRunOutcome`] per pass and never
+//! prints.
 use crate::app::FsApp;
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;

@@ -47,8 +47,9 @@ pub(crate) fn cmd_search(app: &mut FsApp, catalog_dir: &Path, args: &SearchArgs)
 /// keyframe hit) `timestamp_ms`, and (for a text hit) `source`/`locator`/
 /// `snippet`; text prints one line per hit (`{asset} {name}  [label●|○,...]`,
 /// `tags:`, `@MmSSs`, and the text hit's locator + quoted snippet appended
-/// when present) followed by a `"{n} results"` summary line, a truncation
-/// hint when the result count hit `limit` exactly, and — when a layer ran
+/// when present) followed by a pluralized `"N results"` (`"1 result"` for
+/// exactly one hit) summary line, a truncation hint when the result count
+/// hit `limit` exactly, and — when a layer ran
 /// but hasn't indexed every eligible asset yet — its coverage notice.
 fn print_search_results(outcome: &SearchOutcome, json: bool, limit: usize) {
     if json {
@@ -136,7 +137,7 @@ fn print_search_results_text(outcome: &SearchOutcome, limit: usize) {
         }
         println!();
     }
-    println!("{} results", outcome.count);
+    println!("{}", results_line(outcome.count));
     // A result count exactly at `limit` almost always means more matches
     // exist past it — say so, rather than letting a truncated list look
     // like the complete answer.
@@ -156,6 +157,15 @@ fn print_search_results_text(outcome: &SearchOutcome, limit: usize) {
             "{}: {} of {} {} — {}",
             notice.label, notice.covered, notice.eligible, notice.noun, notice.remedy
         );
+    }
+}
+
+/// The summary line's count, pluralized: `1 result`, otherwise `N results`.
+fn results_line(count: usize) -> String {
+    if count == 1 {
+        "1 result".to_string()
+    } else {
+        format!("{count} results")
     }
 }
 
@@ -238,7 +248,14 @@ fn print_saved_searches(saved: &[SavedSearch], json: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextMeta, format_ts, render_text_meta};
+    use super::{TextMeta, format_ts, render_text_meta, results_line};
+
+    #[test]
+    fn results_line_pluralizes() {
+        assert_eq!(results_line(0), "0 results");
+        assert_eq!(results_line(1), "1 result");
+        assert_eq!(results_line(2), "2 results");
+    }
 
     #[test]
     fn format_ts_renders_minutes_and_seconds() {

@@ -52,7 +52,10 @@ gui-e2e:
 # the PNGs are committed, so this is not part of any build or CI job. Byte-
 # stable: `png:exclude-chunks=date,time` strips the only per-run difference
 # ImageMagick otherwise writes, so running this twice with no glyph change
-# leaves `git status` clean (verified: two runs, `cmp` identical).
+# leaves `git status` clean (verified: two runs, `cmp` identical). Both the
+# `@1x` (22 px) and `@2x` (44 px) sets are written; `tray.rs` embeds only
+# the `@2x` set (the tray library sizes them to 18 pt itself), the `@1x` set
+# is kept for completeness.
 TRAY_ICON_FONT := "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
 tray-icons:
     #!/usr/bin/env bash

@@ -179,8 +179,11 @@ fn location_add_impl(
     );
     // Git-init style: idempotently create the layout so the first push
     // has somewhere to land. Never touches existing files.
-    for sub in ["events", "blobs"] {
-        let dir = canonical.join(sub);
+    let events = canonical.join("events");
+    let blobs = majestical_index::blob::BlobStore::new(&canonical)
+        .root()
+        .to_path_buf();
+    for dir in [events, blobs] {
         std::fs::create_dir_all(&dir).with_context(|| format!("initializing {}", dir.display()))?;
     }
     cfg.locations.push(Location {
@@ -1137,6 +1140,25 @@ mod location_add_rm_tests {
         assert!(err.to_string().contains("already configured"));
         let err = location_rm(&catalog, "ghost", &Notices::new()).expect_err("unknown rm");
         assert!(err.to_string().contains("no sync location named"));
+    }
+
+    /// A drift guard, not a regression test: it also passes against the
+    /// hand-rolled `join("blobs")` this replaced, because `BlobStore::root()`
+    /// is that path today. What it pins is the coupling — a future change
+    /// to the store's layout fails here instead of leaving `location_add`'s
+    /// skeleton pointing at a directory nothing reads.
+    #[test]
+    fn location_add_creates_the_blob_root_the_store_opens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = catalog_dir(dir.path());
+        let loc = dir.path().join("remote");
+        std::fs::create_dir(&loc).expect("mkdir");
+        location_add(&catalog, "nas", &loc, &Notices::new()).expect("add");
+        assert!(
+            majestical_index::blob::BlobStore::new(&loc).root().is_dir(),
+            "the store's own root() must resolve to a directory location_add created"
+        );
+        assert!(loc.join("events").is_dir());
     }
 
     #[test]

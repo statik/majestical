@@ -14,7 +14,7 @@ use crate::error::ServiceError;
 use crate::index::heal::heal_text_fts;
 use anyhow::{Context, Result};
 use majestical_core::media_kind::{MediaKind, media_kind};
-use majestical_core::ports::{Describer, TagSubject};
+use majestical_core::ports::{Describer, PortError, PortFailure, TagSubject};
 use majestical_core::projection::Projection;
 use majestical_describe::HttpDescriber;
 use majestical_index::blob::{BlobStore, Derivation};
@@ -1560,14 +1560,35 @@ const MAX_DESCRIBED_KEYFRAMES: usize = 12;
 /// backend failure in a pass — see [`run_caption_items`]'s abort policy.
 const DESCRIBER_SKIPPED_REASON: &str = "describer unavailable — skipped after first failure";
 
-/// Why one caption item failed: a `Backend` (describer) failure aborts the
-/// remaining items in this pass — the backend is down for all of them, and
-/// hammering it item after item just burns wall-clock — while an `Item`
-/// failure (missing thumb, unreadable manifest, frame extraction) records
-/// and moves on to the next item.
+/// Why one caption item failed, split by what the failure says about the
+/// remaining items.
+///
+/// `Backend` means the describer could not answer at all — unreachable,
+/// timed out, 5xx, rate-limited ([`PortFailure::Unavailable`]). It is down
+/// for every item, so the pass aborts rather than burning wall-clock item by
+/// item, and every row it produces is transient: nothing was learned about
+/// those items' bytes.
+///
+/// `Item` means this one item failed on its own merits — a missing thumb, an
+/// unreadable manifest, a frame that would not extract, or a describer that
+/// answered and refused THIS input ([`PortFailure::RefusedInput`]: a 4xx, an
+/// unusable response body). The pass records the row and continues with the
+/// next item, and the row is permanent: the same bytes will fail the same
+/// way next pass.
 enum CaptionFailure {
     Backend(String),
     Item(String),
+}
+
+/// Routes a describer port error into the two caption classes. A port that
+/// refused THIS input is an item failure (recorded, permanent, the pass
+/// continues); a port that is unavailable is a backend failure (transient,
+/// the pass aborts).
+fn caption_failure(error: &PortError) -> CaptionFailure {
+    match error.failure {
+        PortFailure::Unavailable => CaptionFailure::Backend(error.to_string()),
+        PortFailure::RefusedInput => CaptionFailure::Item(error.to_string()),
+    }
 }
 
 /// Works every `Caption` item serially against the configured describer.
@@ -1663,15 +1684,13 @@ fn caption_still(
     })?;
     let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
     if !caption_path.is_file() {
-        let caption = describer
-            .caption(&webp)
-            .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        let caption = describer.caption(&webp).map_err(|e| caption_failure(&e))?;
         write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
             .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     }
     let suggestions = describer
         .suggest_tags(TagSubject::Image(&webp), vocab)
-        .map_err(|e| CaptionFailure::Backend(e.to_string()))?;
+        .map_err(|e| caption_failure(&e))?;
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
 }
@@ -1701,7 +1720,7 @@ fn caption_video(
     } else {
         describer
             .suggest_tags(TagSubject::Captions(&texts), &env.vocab)
-            .map_err(|e| CaptionFailure::Backend(e.to_string()))?
+            .map_err(|e| caption_failure(&e))?
     };
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
@@ -1780,9 +1799,7 @@ fn caption_video_frame(
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     let webp = majestical_index::thumbs::thumbnail_webp(&frame)
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
-    describer
-        .caption(&webp)
-        .map_err(|e| CaptionFailure::Backend(e.to_string()))
+    describer.caption(&webp).map_err(|e| caption_failure(&e))
 }
 
 /// Up to [`MAX_DESCRIBED_KEYFRAMES`] timestamps, evenly spaced across the
@@ -2142,6 +2159,81 @@ mod tests {
             "every item after the first must be the skipped cascade: {:?}",
             outcome.failed
         );
+    }
+
+    /// The other half of the cascade: a backend that ANSWERS and refuses each
+    /// request (a 400 per item — an oversized frame, a content-policy
+    /// rejection, a model that will not take images) is not an outage. Each
+    /// row is a permanent verdict on that item, and the pass must work every
+    /// remaining item instead of abandoning them, or the always-on scheduler
+    /// retries the same rejected bytes forever.
+    #[test]
+    fn caption_rejected_by_the_backend_is_permanent_and_the_pass_continues() {
+        use httpmock::prelude::{MockServer, POST};
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400)
+                .json_body(serde_json::json!({"error": "image too large"}));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let notices = crate::notices::Notices::new();
+        let config_path =
+            crate::describer_config::config_path(&root, &notices).expect("config path");
+        majestical_describe::DescriberConfig {
+            backend: majestical_describe::BackendKind::Ollama,
+            base_url: server.base_url(),
+            model: "test-model".to_string(),
+            api_key: None,
+        }
+        .store(&config_path)
+        .expect("store describer config");
+
+        let blobs = BlobStore::new(&root);
+        let items: Vec<work::WorkItem> = ["aa11", "bb22", "cc33"]
+            .iter()
+            .map(|hex| {
+                let source = dir.path().join(format!("{hex}.jpg"));
+                std::fs::write(&source, b"jpeg").expect("seed source");
+                let thumb = blobs.path_for(hex, &Derivation::Thumb);
+                blobs.write_atomic(&thumb, b"webp").expect("seed thumb");
+                caption_item(hex, &source)
+            })
+            .collect();
+        let env = PassEnv {
+            catalog_root: &root,
+            notices: &notices,
+            vocab: Vec::new(),
+            api_key: None,
+        };
+
+        let outcome = run_caption_items(&blobs, &items, &env);
+
+        assert_eq!(outcome.written, 0);
+        assert_eq!(
+            outcome.failed.len(),
+            items.len(),
+            "a rejection must not cascade — every item gets its own attempt: {:?}",
+            outcome.failed
+        );
+        assert!(
+            outcome.failed.iter().all(|failure| !failure.transient),
+            "a refused input is the item's own permanent failure: {:?}",
+            outcome.failed
+        );
+        assert!(
+            outcome
+                .failed
+                .iter()
+                .all(|failure| failure.error != DESCRIBER_SKIPPED_REASON),
+            "no item may be abandoned to the cascade: {:?}",
+            outcome.failed
+        );
+        mock.assert_calls(items.len());
     }
 
     #[test]

@@ -27,8 +27,25 @@ fn tags_prompt(vocab: &[String]) -> String {
     )
 }
 
+/// Splits this client's errors into the two port classes. A backend that
+/// answered — a 4xx on this request, a body we cannot use — refused THIS
+/// input, and sending the same bytes again gets the same answer; everything
+/// else (no connection, a timeout, a 5xx, a 429) is the backend being
+/// unavailable and says nothing about the input.
 fn to_port_error(context: impl Into<String>, error: DescribeHttpError) -> PortError {
-    PortError::new(context, error)
+    match error {
+        DescribeHttpError::Request { .. } => PortError::new(context, error),
+        DescribeHttpError::Rejected { .. }
+        | DescribeHttpError::Malformed { .. }
+        | DescribeHttpError::Shape => PortError::refused(context, error),
+    }
+}
+
+/// HTTP statuses that mean "this request was wrong" rather than "this
+/// backend is having a bad time": the 4xx band minus 429, which is
+/// rate-limiting — the same request later is expected to succeed.
+fn is_client_rejection(status: u16) -> bool {
+    (400..500).contains(&status) && status != 429
 }
 
 /// All three backends accept base64 data URLs on the OpenAI-compatible
@@ -47,6 +64,12 @@ fn image_content(image: &[u8], prompt: &str) -> serde_json::Value {
 enum DescribeHttpError {
     #[error("request to {url}: {message}")]
     Request { url: String, message: String },
+    #[error("backend rejected the request to {url} with HTTP {status}: {message}")]
+    Rejected {
+        url: String,
+        status: u16,
+        message: String,
+    },
     #[error("backend returned malformed JSON after retry: {snippet}")]
     Malformed { snippet: String },
     #[error("backend response missing choices[0].message.content")]
@@ -111,9 +134,18 @@ impl HttpDescriber {
             url: url.clone(),
             message,
         };
-        let mut response = request
-            .send_json(body)
-            .map_err(|error| error_at(error.to_string()))?;
+        // `http_status_as_error` is ureq's default, so a 4xx/5xx arrives here
+        // as `Error::StatusCode` rather than as a response to inspect.
+        let mut response = request.send_json(body).map_err(|error| match error {
+            ureq::Error::StatusCode(status) if is_client_rejection(status) => {
+                DescribeHttpError::Rejected {
+                    url: url.clone(),
+                    status,
+                    message: error.to_string(),
+                }
+            }
+            other => error_at(other.to_string()),
+        })?;
         let value: serde_json::Value = response
             .body_mut()
             .read_json()
@@ -259,7 +291,7 @@ mod tests {
     use super::*;
     use crate::config::{BackendKind, DescriberConfig};
     use httpmock::prelude::*;
-    use majestical_core::ports::{Describer, TagSubject};
+    use majestical_core::ports::{Describer, PortFailure, TagSubject};
 
     fn config_for(server: &MockServer, backend: BackendKind, key: Option<&str>) -> DescriberConfig {
         DescriberConfig {
@@ -539,6 +571,104 @@ mod tests {
             "error must not contain text past the snippet bound"
         );
         mock.assert_calls(2);
+    }
+
+    /// Serves `status` on the chat endpoint and reports the failure class
+    /// `caption` came back with, so each status case below is one line.
+    fn caption_failure_for_status(status: u16) -> PortFailure {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(status)
+                .json_body(serde_json::json!({"error": "no"}));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .caption(b"fake-image-bytes")
+            .expect_err("non-2xx must be an error");
+        mock.assert_calls(1);
+        error.failure
+    }
+
+    /// A 4xx is the backend answering: it read this request and refused it
+    /// (oversized frame, content policy, a model that cannot take images).
+    /// Sending the same bytes again gets the same answer, so the caller may
+    /// record it against the item rather than retry it forever.
+    #[test]
+    fn a_4xx_refuses_this_input() {
+        assert_eq!(caption_failure_for_status(400), PortFailure::RefusedInput);
+        assert_eq!(caption_failure_for_status(413), PortFailure::RefusedInput);
+    }
+
+    /// 5xx is the backend failing, and 429 is the backend asking to be asked
+    /// later — neither says anything about the input.
+    #[test]
+    fn a_5xx_or_a_429_is_an_unavailable_backend() {
+        assert_eq!(caption_failure_for_status(503), PortFailure::Unavailable);
+        assert_eq!(caption_failure_for_status(429), PortFailure::Unavailable);
+    }
+
+    /// A 200 whose body has no `choices[0].message.content`: the backend
+    /// answered about this input and the answer is unusable. Retrying the
+    /// same image at the same model produces the same unusable body.
+    #[test]
+    fn a_200_with_no_caption_content_refuses_this_input() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .caption(b"fake-image-bytes")
+            .expect_err("a shapeless body must be an error");
+
+        assert_eq!(error.failure, PortFailure::RefusedInput);
+        mock.assert_calls(1);
+    }
+
+    /// Malformed tag JSON survives one retry and then gives up — a verdict
+    /// on this subject, not on the backend's health.
+    #[test]
+    fn malformed_tag_json_after_the_retry_refuses_this_input() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "no json here"}}]
+            }));
+        });
+
+        let config = config_for(&server, BackendKind::Ollama, None);
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .suggest_tags(TagSubject::Image(b"fake-image-bytes"), &[])
+            .expect_err("malformed JSON must be an error");
+
+        assert_eq!(error.failure, PortFailure::RefusedInput);
+        mock.assert_calls(2);
+    }
+
+    /// Nothing listening: no answer was ever given about the input, so the
+    /// caller must be free to retry it later.
+    #[test]
+    fn a_dead_port_is_an_unavailable_backend() {
+        let config = DescriberConfig {
+            backend: BackendKind::Ollama,
+            base_url: "http://127.0.0.1:1".into(),
+            model: "test-model".into(),
+            api_key: None,
+        };
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .caption(b"fake-image-bytes")
+            .expect_err("a dead port must be an error");
+        assert_eq!(error.failure, PortFailure::Unavailable);
     }
 
     #[test]

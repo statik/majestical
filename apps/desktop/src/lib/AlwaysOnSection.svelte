@@ -28,6 +28,10 @@
   let autostart = $state(false);
   let autostartError = $state<string | null>(null);
   let retryError = $state<string | null>(null);
+  /** A retry in flight: the button disables so a double-click cannot fire
+   *  two `retry_failed_items` calls (idempotent, but every other mutating
+   *  button in the app guards the same way). */
+  let retrying = $state(false);
 
   $effect(() => {
     void loadScheduler();
@@ -44,14 +48,20 @@
 
   async function changeThrottle(throttle: ThrottleOverride) {
     scheduler = await api.setThrottle(throttle);
+    // A successful action on the section supersedes an earlier retry error.
+    retryError = null;
   }
 
   async function retryFailed() {
+    if (retrying) return;
+    retrying = true;
     retryError = null;
     try {
       scheduler = await api.retryFailedItems();
     } catch (failure) {
       retryError = errorMessage(failure);
+    } finally {
+      retrying = false;
     }
   }
 
@@ -101,7 +111,11 @@
       <p class="settings-status settings-failed" role="status">
         {failedLine(scheduler.failed_items)}
       </p>
-      <button class="ctl-btn" onclick={() => void retryFailed()}>
+      <button
+        class="ctl-btn"
+        disabled={retrying}
+        onclick={() => void retryFailed()}
+      >
         Retry failed items
       </button>
     </div>

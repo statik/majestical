@@ -1109,9 +1109,10 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
 /// [`load_missing_text_vectors_from_blobs`]), `empty` transcripts that
 /// chunked to nothing (their `ChunksEmpty` marker written), and one
 /// [`ItemFailure`] row per item that failed. These items read the
-/// transcript blob, never the source, so the failing blob's path shows up
-/// in the row's `error` text; the row's `path` is the source path when an
-/// instance is reachable here and the empty sentinel when none is (see
+/// transcript blob, never the source, so the row's `path` is that blob's
+/// path (built by hand at the push site, not through `classify`, whose
+/// vanished-source probe has no meaning for a blob) and the row is always
+/// permanent; the item's own `abs_path` may be the empty sentinel here (see
 /// `work::WorkItem::abs_path`).
 #[derive(Default, serde::Serialize)]
 pub struct TranscriptEmbedOutcome {

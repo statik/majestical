@@ -1,7 +1,10 @@
 #![cfg(test)] // clippy.toml test exemptions key on the literal attribute
 
+mod common;
+
 use std::path::Path;
 
+use common::{SILENT_FIXTURE_MSG, is_silent};
 use majestical_index::model::{self, WHISPER};
 use majestical_index::transcribe::Transcriber;
 use majestical_index::video;
@@ -17,11 +20,11 @@ fn say_fixture(path: &Path) {
     assert!(status.success());
 }
 
-/// `say` has, on rare CI runs, produced an aiff whose decoded PCM is all
-/// zeros (a flake observed in CI, not reproduced locally) — this is how the
-/// fallback path detects and retries it.
-fn is_silent(pcm: &[f32]) -> bool {
-    pcm.iter().all(|sample| sample.abs() < 1e-6)
+#[test]
+fn is_silent_discriminates_zero_from_signal() {
+    assert!(is_silent(&[0.0, 0.0, 1e-7]));
+    assert!(!is_silent(&[0.0, 0.0, 1e-3]));
+    assert!(is_silent(&[]), "an empty buffer has no signal");
 }
 
 #[test]
@@ -45,10 +48,7 @@ fn transcribes_spoken_fixture_with_sane_timestamps() {
         let pcm = video::extract_audio_pcm(Path::new(&audio), 120_000).expect("pcm");
         // No retry here, unlike the fallback below — this is someone else's
         // committed/generated file, not one we can resynthesize in place.
-        assert!(
-            !is_silent(&pcm),
-            "MAJ_AUDIO fixture is silent — regenerate target/whisper-fixture.wav"
-        );
+        assert!(!is_silent(&pcm), "{SILENT_FIXTURE_MSG}");
         pcm
     } else {
         let tmp = tempfile::tempdir().expect("tempdir");

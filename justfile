@@ -180,24 +180,41 @@ text-encoder-conformance:
 # match what golden.py loads; bump only after re-verifying.
 WHISPER_TORCH_REVISION := "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
 
-# Whisper conformance: same synthesized speech through pinned faster-whisper
-# (reference) and our whisper-rs, compared on WER + boundary drift.
+# Whisper conformance: same committed speech fixture through pinned
+# faster-whisper (reference) and our whisper-rs, compared on WER + boundary
+# drift. CI never synthesizes audio — see `whisper-fixture` below for that.
 whisper-conformance:
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
         cargo run -p majestical-cli --bin maj -- \
         --catalog . --machine-id conformance model fetch --only whisper-large-v3-turbo-q5-v1
     mkdir -p target
-    say -o target/whisper-fixture.aiff "The quick brown fox jumps over the lazy dog. \
-        We reviewed the quarterly budget on Tuesday and shipped the release candidate."
-    # 2s leading silence: both faster-whisper and whisper.cpp absorb it into
-    # the first segment rather than reporting a nonzero start, so this alone
-    # does not make the first-boundary assert catch a timestamp-scale bug —
-    # see the module doc on whisper_conformance.rs for what actually does.
-    ffmpeg -y -v error -i target/whisper-fixture.aiff -af "adelay=2000:all=1" -ar 16000 -ac 1 target/whisper-fixture.wav
     uv run conformance/whisper/golden.py \
         --revision {{WHISPER_TORCH_REVISION}} \
-        --audio target/whisper-fixture.wav --out target/whisper-golden.json
+        --audio conformance/whisper/fixture.wav --out target/whisper-golden.json
     MAJ_MODEL_DIR="{{justfile_directory()}}/.model-cache" \
-        MAJ_AUDIO="{{justfile_directory()}}/target/whisper-fixture.wav" \
+        MAJ_AUDIO="{{justfile_directory()}}/conformance/whisper/fixture.wav" \
         MAJ_GOLDEN="{{justfile_directory()}}/target/whisper-golden.json" \
         cargo test -p majestical-index --test whisper_conformance --test whisper_gated -- --ignored --nocapture
+
+# Regenerates the committed whisper fixture from macOS `say`. Refuses a
+# silent result (a flake `say` produces on headless runners — CI runs
+# 34882576400 and 34923609907 are the recorded instances), so the
+# committed file can never be the silent one. CI never runs this; it
+# reads the committed file.
+whisper-fixture:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    say -o "$tmp/fixture.aiff" "The quick brown fox jumps over the lazy dog. \
+        We reviewed the quarterly budget on Tuesday and shipped the release candidate."
+    # 2s leading silence — see whisper_conformance.rs's module doc.
+    ffmpeg -y -v error -i "$tmp/fixture.aiff" -af "adelay=2000:all=1" -ar 16000 -ac 1 "$tmp/fixture.wav"
+    peak=$(ffmpeg -v info -i "$tmp/fixture.wav" -af volumedetect -f null - 2>&1 \
+        | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p')
+    if [ -z "$peak" ] || awk -v p="$peak" 'BEGIN { exit !(p < -60) }'; then
+        echo "whisper-fixture: synthesized audio is silent (peak ${peak:-unknown} dB) — not written" >&2
+        exit 1
+    fi
+    mv "$tmp/fixture.wav" conformance/whisper/fixture.wav
+    echo "wrote conformance/whisper/fixture.wav (peak ${peak} dB)"

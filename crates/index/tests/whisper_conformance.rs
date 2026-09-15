@@ -29,6 +29,8 @@
 //! of bug: the fixture runs long enough (~9.5s) that a x10 scale error
 //! can't land within tolerance by chance.
 
+mod common;
+
 use majestical_index::model::{self, WHISPER};
 use majestical_index::transcribe::Transcriber;
 use majestical_index::video;
@@ -99,6 +101,7 @@ fn whisper_rs_matches_faster_whisper_reference() {
         .join(" ");
     let dir = model::model_dir_for(&WHISPER).expect("dir");
     let pcm = video::extract_audio_pcm(std::path::Path::new(&audio), 120_000).expect("pcm");
+    assert!(!common::is_silent(&pcm), "{}", common::SILENT_FIXTURE_MSG);
     let transcript = Transcriber::load(&dir)
         .expect("load")
         .transcribe(&pcm)

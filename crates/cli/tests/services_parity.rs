@@ -299,6 +299,80 @@ fn diff_against_ref_with_between(root: &Path, state: &Path, args: &[&str], betwe
     );
 }
 
+/// Renders `text` as the reference binary would: with the search summary
+/// line's exactly-one-hit case still unpluralized. This branch's `maj
+/// search` prints `"1 result"` for a single hit (was `"1 results"`); the
+/// reference predates the fix and always prints the unpluralized form. Only
+/// a line consisting of EXACTLY `"1 result"` is rewritten — an exact
+/// substring/line match, not a regex — so text elsewhere (including a
+/// `"count":1` JSON member) passes through untouched, and a real divergence
+/// still fails loudly.
+///
+/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
+/// it exists, `search_output_is_byte_identical` is blind to this one line.
+/// Once the reference binary includes the fix (i.e. once this branch is on
+/// `main`), delete this function and its test and point
+/// `search_output_is_byte_identical` back at [`diff_against_ref`] — the same
+/// cleanup phase 7F Task 15's Step 4b already schedules for
+/// [`without_ledger`] and [`without_new_doctor_rows`].
+#[cfg(test)]
+fn without_result_pluralization(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        kept.push_str(if body == "1 result" {
+            "1 results"
+        } else {
+            body
+        });
+        kept.push_str(newline);
+    }
+    kept
+}
+
+#[cfg(test)]
+mod without_result_pluralization_tests {
+    use super::without_result_pluralization;
+
+    /// The new-shape line (`"1 result"`) and the old-shape line it replaces
+    /// (`"1 results"`) normalize to the SAME string — the whole point of the
+    /// normalizer — and the old shape, having nothing to strip, passes
+    /// through byte for byte.
+    #[test]
+    fn new_and_old_shape_lines_normalize_identically() {
+        let new_shape = "a.txt  [vol1\u{25cb}]\n1 result\n";
+        let old_shape = "a.txt  [vol1\u{25cb}]\n1 results\n";
+        assert_eq!(
+            without_result_pluralization(new_shape),
+            without_result_pluralization(old_shape)
+        );
+        assert_eq!(without_result_pluralization(old_shape), old_shape);
+    }
+
+    /// A multi-hit count is left completely unchanged — the normalizer only
+    /// ever rewrites the exact `"1 result"` line, so a real divergence in
+    /// any other count still shows up.
+    #[test]
+    fn other_counts_are_unchanged() {
+        let line = "0 results\n";
+        assert_eq!(without_result_pluralization(line), line);
+        let line = "2 results\n";
+        assert_eq!(without_result_pluralization(line), line);
+    }
+
+    /// JSON output's `"count":1` member is untouched — the normalizer only
+    /// rewrites a line that is EXACTLY `"1 result"`, not any substring
+    /// containing it.
+    #[test]
+    fn json_count_member_is_unchanged() {
+        let line = "{\"count\":1,\"results\":[]}\n";
+        assert_eq!(without_result_pluralization(line), line);
+    }
+}
+
 #[test]
 fn search_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -310,7 +384,7 @@ fn search_output_is_byte_identical() {
         ["search", "nomatch", "--json"].as_slice(),
         ["searches", "list", "--json"].as_slice(),
     ] {
-        diff_against_ref(&root, &state, args);
+        diff_against_ref_normalized(&root, &state, args, without_result_pluralization);
     }
 }
 

@@ -200,7 +200,9 @@ whisper-conformance:
 # silent result (a flake `say` produces on headless runners — CI runs
 # 34882576400 and 34923609907 are the recorded instances), so the
 # committed file can never be the silent one. CI never runs this; it
-# reads the committed file.
+# reads the committed file. Regeneration is not free: TTS output is not
+# byte-reproducible, so every run that gets committed adds a new ~300 KB
+# blob to history permanently — reserve it for a fixture that is actually bad.
 whisper-fixture:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -210,8 +212,10 @@ whisper-fixture:
         We reviewed the quarterly budget on Tuesday and shipped the release candidate."
     # 2s leading silence — see whisper_conformance.rs's module doc.
     ffmpeg -y -v error -i "$tmp/fixture.aiff" -af "adelay=2000:all=1" -ar 16000 -ac 1 "$tmp/fixture.wav"
-    peak=$(ffmpeg -v info -i "$tmp/fixture.wav" -af volumedetect -f null - 2>&1 \
-        | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p')
+    # -v info, not -v error: volumedetect's summary is logged at info level.
+    log=$(ffmpeg -v info -i "$tmp/fixture.wav" -af volumedetect -f null - 2>&1) \
+        || { printf '%s\n' "$log" >&2; echo "whisper-fixture: volumedetect probe failed" >&2; exit 1; }
+    peak=$(printf '%s\n' "$log" | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' | tail -n1)
     if [ -z "$peak" ] || awk -v p="$peak" 'BEGIN { exit !(p < -60) }'; then
         echo "whisper-fixture: synthesized audio is silent (peak ${peak:-unknown} dB) — not written" >&2
         exit 1

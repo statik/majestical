@@ -8,8 +8,9 @@
 //!   `MAJ_AUDIO`=/path/to/fixture.wav `MAJ_GOLDEN`=/path/to/golden.json \
 //!     `MAJ_MODEL_DIR`=… cargo test -p majestical-index --test `whisper_conformance` -- --ignored
 //!
-//! `just whisper-conformance` drives the whole pipeline (fetch, `say` +
-//! ffmpeg fixture synthesis, golden.py, this test) in one shot.
+//! `just whisper-conformance` drives fetch, golden.py, and this test against
+//! the committed `conformance/whisper/fixture.wav` in one shot. `just
+//! whisper-fixture` regenerates that file via `say` + ffmpeg synthesis.
 //!
 //! Compared on two axes rather than exact text match: word error rate (WER)
 //! tolerates the reference and whisper.cpp choosing different but equally
@@ -20,7 +21,7 @@
 //! words.
 //!
 //! Both boundaries are asserted, not just one: the fixture leads with ~2s of
-//! silence (see the justfile recipe), but both engines absorb that silence
+//! silence (see the `whisper-fixture` recipe), but both engines absorb that silence
 //! into the first segment rather than reporting a nonzero start — so the
 //! first-boundary assert only catches gross start disagreement (e.g. an
 //! engine trimming or offsetting leading audio), not a uniform timestamp
@@ -101,7 +102,11 @@ fn whisper_rs_matches_faster_whisper_reference() {
         .join(" ");
     let dir = model::model_dir_for(&WHISPER).expect("dir");
     let pcm = video::extract_audio_pcm(std::path::Path::new(&audio), 120_000).expect("pcm");
-    assert!(!common::is_silent(&pcm), "{}", common::SILENT_FIXTURE_MSG);
+    assert!(
+        !common::is_silent(&pcm),
+        "{audio}: {}",
+        common::SILENT_FIXTURE_MSG
+    );
     let transcript = Transcriber::load(&dir)
         .expect("load")
         .transcribe(&pcm)

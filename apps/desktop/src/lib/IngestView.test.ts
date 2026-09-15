@@ -17,6 +17,7 @@ import {
   renderIngest,
   RUN,
   SOURCE,
+  sourceField,
 } from "./ingest-test-support";
 import type { CommandHandler } from "./test-support";
 import { rejectCommand } from "./test-support";
@@ -52,11 +53,11 @@ test("nothing is startable before a source, a destination, a node and a plan", a
   const start = await startButton();
   expect(start.disabled).toBe(true);
 
-  await userEvent.click(screen.getByRole("button", { name: "Choose source…" }));
-  await screen.findByText(SOURCE);
+  await userEvent.click(screen.getByRole("button", { name: "Browse for source" }));
+  await waitFor(() => expect(sourceField().value).toBe(SOURCE));
   expect(start.disabled).toBe(true);
 
-  await userEvent.click(screen.getByRole("button", { name: "+ Add destination" }));
+  await userEvent.click(screen.getByRole("button", { name: "Browse for destination" }));
   await screen.findByText(DEST_A);
   expect(start.disabled).toBe(true);
 
@@ -102,7 +103,7 @@ test("any edit stales the plan back to Plan again, and refuses Start until it is
   });
   expect(start.disabled).toBe(false);
 
-  await userEvent.click(screen.getByRole("button", { name: "+ Add destination" }));
+  await userEvent.click(screen.getByRole("button", { name: "Browse for destination" }));
   await screen.findByText(DEST_B);
 
   expect(start.disabled).toBe(true);
@@ -159,8 +160,8 @@ test("a refused plan shows the command's whole message chain and its notices", a
   });
   renderIngest();
 
-  await userEvent.click(await screen.findByRole("button", { name: "Choose source…" }));
-  await screen.findByText(SOURCE);
+  await userEvent.click(await screen.findByRole("button", { name: "Browse for source" }));
+  await waitFor(() => expect(sourceField().value).toBe(SOURCE));
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),
     NODE,
@@ -176,10 +177,10 @@ test("cancelling the folder picker changes nothing", async () => {
   const calls = mockIngest({ [PICKER]: () => null });
   renderIngest();
 
-  await userEvent.click(await screen.findByRole("button", { name: "Choose source…" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Browse for source" }));
 
   await waitFor(() => expect(callsTo(calls, PICKER)).toHaveLength(1));
-  expect(screen.getByText("No source chosen yet.")).toBeTruthy();
+  expect(sourceField().value).toBe("");
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
@@ -214,7 +215,7 @@ test("an unfinished run becomes a banner, and Resume fills in everything the jou
   // Source and destinations come back off the journal; the PARA node does
   // not — `UnfinishedRun` has no field for it — so the board asks again and
   // Start stays refused until it is answered and re-planned.
-  expect(screen.getByText(SOURCE)).toBeTruthy();
+  expect(sourceField().value).toBe(SOURCE);
   expect(screen.getByText(DEST_A)).toBeTruthy();
   expect(screen.getByText(DEST_B)).toBeTruthy();
   expect(
@@ -251,7 +252,7 @@ test("hiding a resume banner leaves the board alone", async () => {
   await waitFor(() =>
     expect(screen.queryByRole("list", { name: "Unfinished runs" })).toBeNull(),
   );
-  expect(screen.getByText("No source chosen yet.")).toBeTruthy();
+  expect(sourceField().value).toBe("");
 });
 
 test("re-picking the source after a Resume drops the run it would have continued", async () => {
@@ -263,8 +264,8 @@ test("re-picking the source after a Resume drops the run it would have continued
 
   await screen.findByRole("list", { name: "Unfinished runs" });
   await userEvent.click(screen.getByRole("button", { name: `Resume run ${RUN}` }));
-  await userEvent.click(screen.getByRole("button", { name: "Choose source…" }));
-  await screen.findByText("/Volumes/OTHER-CARD");
+  await userEvent.click(screen.getByRole("button", { name: "Browse for source" }));
+  await waitFor(() => expect(sourceField().value).toBe("/Volumes/OTHER-CARD"));
 
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),
@@ -330,7 +331,7 @@ test("a state read that fails on mount says so instead of showing a clean board"
   const alert = await screen.findByRole("alert");
   expect(alert.textContent).toBe(message);
   expect(screen.getByText("one run journal could not be read")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Choose source…" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Browse for source" })).toBeTruthy();
 });
 
 test("the source panel says what the plan walked, and stops when the plan goes stale", async () => {
@@ -341,7 +342,7 @@ test("the source panel says what the plan walked, and stops when the plan goes s
   // is the plan panel's line.
   expect(screen.getByText("A7IV-CARD · 3 files · 7.0 KB")).toBeTruthy();
 
-  await userEvent.click(screen.getByRole("button", { name: "+ Add destination" }));
+  await userEvent.click(screen.getByRole("button", { name: "Browse for destination" }));
   await screen.findByText(DEST_B);
 
   await waitFor(() =>

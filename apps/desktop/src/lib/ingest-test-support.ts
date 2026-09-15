@@ -161,6 +161,30 @@ export function picksInTurn(paths: string[]): CommandHandler {
   return () => queue.shift() ?? null;
 }
 
+/** The Source field, which IS the source display now: a chosen source is
+ *  read off its value rather than out of a line of its own. */
+export function sourceField(): HTMLInputElement {
+  return screen.getByRole<HTMLInputElement>("textbox", { name: "Source path" });
+}
+
+/** Types a source path the way an operator does. The field commits on
+ *  `change`, which fires when it loses the focus — so the tab is part of
+ *  typing a path, not decoration. */
+export async function typeSource(path: string): Promise<void> {
+  const field = await screen.findByRole("textbox", { name: "Source path" });
+  await userEvent.clear(field);
+  await userEvent.type(field, path);
+  await userEvent.tab();
+}
+
+/** Types a destination and presses Enter, which is that field's own add. */
+export async function typeDest(path: string): Promise<void> {
+  const field = await screen.findByRole("textbox", {
+    name: "Destination path",
+  });
+  await userEvent.type(field, `${path}{Enter}`);
+}
+
 /** The props a suite may pin; only the clock is ever passed. */
 export interface IngestProps {
   clock?: () => number;
@@ -257,9 +281,13 @@ export async function planned(
   props: IngestProps = {},
 ): Promise<IngestCall[]> {
   renderIngest(props);
-  await userEvent.click(await screen.findByRole("button", { name: "Choose source…" }));
-  await screen.findByText(SOURCE);
-  await userEvent.click(screen.getByRole("button", { name: "+ Add destination" }));
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Browse for source" }),
+  );
+  await waitFor(() => expect(sourceField().value).toBe(SOURCE));
+  await userEvent.click(
+    screen.getByRole("button", { name: "Browse for destination" }),
+  );
   await screen.findByText(DEST_A);
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),

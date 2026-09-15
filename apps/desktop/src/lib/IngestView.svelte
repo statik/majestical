@@ -1,8 +1,11 @@
 <script lang="ts">
   /**
-   * The Ingest surface (mockup: `ingest.html`): one verified copy job in
-   * three honest states — setup with a plan on screen before anything runs,
-   * a live run, and a completion card drawn from the run's own outcome.
+   * The Ingest surface (mockups: `ingest.html`, and
+   * `2026-09-14-phase7f/ingest-path-entry.html` frame 1 for the paths):
+   * one verified copy job in three honest states — setup with a plan on
+   * screen before anything runs, a live run, and a completion card drawn
+   * from the run's own outcome. The run itself is
+   * `IngestRunPanel.svelte`; what is here is the board and the card.
    *
    * Three rules this surface is built around, all of them the backend's:
    *
@@ -12,13 +15,16 @@
    * - The BACKEND owns the run. It outlives this component: leaving the
    *   surface does not cancel anything, and coming back (or reloading)
    *   reconstructs the state from `ingest_state`.
-   * - The finished `IngestRun` — never the progress events this component
+   * - The finished `IngestRun` — never the progress events the run panel
    *   accumulated — is the authority on what a run placed. The end-of-run
    *   sweep can demote a file already announced as `file_placed`, and that
-   *   demotion appears in the outcome only. `run_stopped` is not the end
-   *   either: the sweep, the ASC MHL generation per destination and the
-   *   catalog events land after it, so a `run_stopped` is followed by
-   *   polling `ingest_state` until `busy` is false.
+   *   demotion appears in the outcome only.
+   *
+   * Source and every destination are typed as well as browsed: the native
+   * dialog reaches what it can mount, and a server share or a path out of
+   * a shot list is typed. A typed path gets no existence check here —
+   * `plan_ingest` is what validates it, and its refusal already renders in
+   * this same board.
    *
    * WIRE GAPS — everything the mockup draws that this surface does not, and
    * the field each one is waiting on. Nothing here is computed from a guess:
@@ -40,8 +46,8 @@
    *   path and nothing about capacity, and a destination is a folder the
    *   operator picked, not necessarily a mounted root at all.
    * - The run's duration on the completion card ("94.0 GB · 14:52"):
-   *   `IngestRun` carries no timing, and the elapsed clock below belongs to
-   *   the surface that watched the run — a card drawn after a reload never
+   *   `IngestRun` carries no timing, and the run panel's elapsed clock
+   *   belongs to the window that watched the run — a card drawn after a reload never
    *   saw it. A started/finished pair on `IngestRun` would close this.
    * - The now-row's target and verb ("copy → SSD-A", "verify → NAS-1"):
    *   `file_started` and `bytes_copied` name only the file, and the source
@@ -55,31 +61,18 @@
    * shares the plan panel's action row rather than sitting under it — both
    * put the button next to the thing it is a decision about.
    */
-  import { onDestroy } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
-  import type { UnlistenFn } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { api, errorMessage, errorNotices, INGEST_PROGRESS_EVENT } from "./api";
+  import { api, errorMessage, errorNotices } from "./api";
   import type {
     FinishedIngest,
     IngestPlanOutcome,
-    IngestProgress,
-    IngestState,
     ParaNodeRow,
     UnfinishedRun,
   } from "./api";
   import { fileSize } from "./format";
   import { planSummary } from "./ingest-plan";
-  import {
-    applyProgress,
-    barPercent,
-    bytesDone,
-    destRoots,
-    filePercent,
-    noProgress,
-    remainingMs,
-    timingLine,
-  } from "./ingest-progress";
+  import type { Phase } from "./ingest-progress";
+  import IngestRunPanel from "./IngestRunPanel.svelte";
   import Notices from "./Notices.svelte";
 
   /**
@@ -90,27 +83,20 @@
    */
   const DEFAULT_TEMPLATE = "{date}/{source-label}";
 
-  /** How often `ingest_state` is asked whether the sweep has finished. */
-  const POLL_MS = 200;
-
-  /** How often the elapsed clock is re-read while a run is copying. The
-   *  line reads in whole seconds, so anything faster repaints for nothing. */
-  const TICK_MS = 1000;
-
   let { clock = () => Date.now() }: {
-    /** Where the elapsed clock reads from. A parameter so a test can pin
-     *  the line without waiting real seconds out; nothing else passes it. */
+    /** Where the run panel's elapsed clock reads from. A parameter so a
+     *  test can pin the line without waiting real seconds out; nothing
+     *  else passes it. */
     clock?: () => number;
   } = $props();
-
-  /** Where this surface is: `idle` is the setup board (with the last run's
-   *  card above it, if there is one), the other three are one run. */
-  type Phase = "idle" | "preparing" | "running" | "finishing";
 
   let source = $state("");
   let dests = $state<string[]>([]);
   let para = $state("");
   let template = $state("");
+  /** The destination being typed, and why the last one was refused. */
+  let destDraft = $state("");
+  let destError = $state<string | null>(null);
   let plan = $state<IngestPlanOutcome | null>(null);
   /** The setup changed after `plan` was read: the counts on screen were
    *  true of a different job, so Start is refused until it is redone. */
@@ -126,36 +112,16 @@
   let setupError = $state<string | null>(null);
   let setupFailureNotices = $state<string[]>([]);
 
+  /** The run panel, which owns everything about a run in flight. Bound
+   *  back here because the board is drawn while it is `idle` and the card
+   *  below is drawn from the outcome it fetched. */
   let phase = $state<Phase>("idle");
-  /** The run this surface is watching, or null while it is still unnamed. */
-  let runId = $state<string | null>(null);
   let finished = $state<FinishedIngest | null>(null);
-  let stopping = $state(false);
-  let runError = $state<string | null>(null);
-  let runFailureNotices = $state<string[]>([]);
-
-  /** Everything the progress stream has said about the run being watched;
-   *  see `ingest-progress.ts` for what each event does to it. */
-  let progress = $state(noProgress());
-  /** When `run_started` arrived, and the clock's latest reading. Null until
-   *  it does: a surface that joined a run mid-flight never saw the start
-   *  and has no elapsed time to claim. */
-  let startedMs = $state<number | null>(null);
-  let nowMs = $state(0);
+  let runPanel = $state<ReturnType<typeof IngestRunPanel>>();
 
   /** Every list read takes the next number, and an answer that is no longer
    *  current is dropped — the same rule the other surfaces follow. */
   let planSeq = 0;
-  /** False once this component is gone, so the outcome poll below stops
-   *  asking a backend nobody is listening to. Its own `onDestroy` rather
-   *  than a line in the subscription effect's teardown: that effect reads
-   *  nothing reactive today, but the day it does, its teardown would start
-   *  running between re-runs and quietly kill a poll of a live run. */
-  let alive = true;
-
-  onDestroy(() => {
-    alive = false;
-  });
 
   /** Filing into an archived node files into somewhere nobody is looking. */
   let fileable = $derived(nodes.filter((node) => !node.archived));
@@ -171,58 +137,12 @@
       !planStale,
   );
 
-  let copied = $derived(bytesDone(progress));
-  let percent = $derived(barPercent(progress));
-  let roots = $derived(destRoots(progress, dests));
-  let elapsedMs = $derived(
-    startedMs === null ? null : Math.max(0, nowMs - startedMs),
-  );
-  let timing = $derived(timingLine(elapsedMs, remainingMs(progress, elapsedMs)));
-
   $effect(() => {
     void loadNodes();
   });
 
   $effect(() => {
     void loadUnfinished();
-  });
-
-  $effect(() => {
-    void adoptRunningState();
-  });
-
-  /** The elapsed line has to move between events — a big file copies for
-   *  minutes with nothing to say — so a copying run re-reads the clock once
-   *  a second, and only while it is copying. */
-  $effect(() => {
-    if (phase !== "running") return;
-    const timer = setInterval(() => {
-      nowMs = clock();
-    }, TICK_MS);
-    return () => clearInterval(timer);
-  });
-
-  /**
-   * The progress stream. Subscribed once on mount and dropped on destroy;
-   * `listen` resolves asynchronously, so a component torn down before it
-   * does unlistens as soon as the handle arrives.
-   */
-  $effect(() => {
-    let unlisten: UnlistenFn | null = null;
-    let gone = false;
-    void listen<IngestProgress>(INGEST_PROGRESS_EVENT, (event) => {
-      accept(event.payload);
-    }).then((off) => {
-      if (gone) {
-        void off();
-        return;
-      }
-      unlisten = off;
-    });
-    return () => {
-      gone = true;
-      if (unlisten !== null) void unlisten();
-    };
   });
 
   async function loadNodes() {
@@ -244,122 +164,6 @@
     } catch (failure) {
       setupError = errorMessage(failure);
       setupFailureNotices = errorNotices(failure);
-    }
-  }
-
-  /**
-   * What the backend says is going on, which is the authority on mount:
-   * the run outlives the webview, so a reload mid-run rejoins it rather
-   * than offering to start a second one.
-   */
-  async function adoptRunningState() {
-    try {
-      const state = await api.ingestState();
-      if (state.busy) {
-        resetRun(state.running ?? null);
-        // `running` is absent for the instant between the job slot being
-        // claimed and the run naming itself — busy without a name is
-        // exactly the preparing window.
-        phase = state.running === undefined ? "preparing" : "running";
-        return;
-      }
-      finished = state.finished ?? null;
-    } catch (failure) {
-      runError = errorMessage(failure);
-      runFailureNotices = errorNotices(failure);
-    }
-  }
-
-  /** Everything one run accumulated. Called at the start of every run, so
-   *  no counter, row or tally can survive into the next one. */
-  function resetRun(id: string | null) {
-    runId = id;
-    progress = noProgress();
-    startedMs = null;
-    stopping = false;
-    runError = null;
-    runFailureNotices = [];
-  }
-
-  /**
-   * One forwarded progress notification, filtered to the run this surface
-   * is watching. While a run is being prepared there is no id to filter by
-   * yet — the backend runs one ingest at a time, so the first event to
-   * arrive in that window is this run's, and its envelope names it.
-   */
-  function accept(notification: IngestProgress) {
-    if (phase === "idle") return;
-    if (runId === null) {
-      runId = notification.run_id;
-    } else if (notification.run_id !== runId) {
-      return;
-    }
-    progress = applyProgress(progress, notification.event);
-    // Every event is also a clock reading, so the elapsed line and the
-    // estimate move with the bytes rather than only on the tick.
-    nowMs = clock();
-    // Two of the events are a phase rather than a number: the run really
-    // going, and the copy loop ending — which is not the run ending, so
-    // what it ended with is fetched rather than assumed.
-    if (notification.event.type === "run_started") {
-      startedMs = nowMs;
-      phase = "running";
-    } else if (notification.event.type === "run_stopped") {
-      phase = "finishing";
-      void awaitOutcome();
-    }
-  }
-
-  function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  }
-
-  /**
-   * Waits out the end of a run. `run_stopped` says the copy loop ended, not
-   * that the outcome exists: the missing-file sweep, the ASC MHL generation
-   * per destination and the catalog events all land after it, seconds later
-   * on a big run. The progress stays on screen the whole time.
-   */
-  async function awaitOutcome() {
-    const watched = runId;
-    // `for (;;)` with the guard inside: every await below can outlive the
-    // component, so the check has to happen after each one, not only at
-    // the top of the loop.
-    for (;;) {
-      if (!alive || phase !== "finishing" || runId !== watched) return;
-      let state: IngestState;
-      try {
-        state = await api.ingestState();
-      } catch (failure) {
-        if (!alive || phase !== "finishing" || runId !== watched) return;
-        // What is lost here is this surface's view of how the run ended,
-        // not the run: it is still the backend's, and still resumable by
-        // the id — which is why the id stays on screen with the message
-        // rather than the panel simply disappearing.
-        runError = errorMessage(failure);
-        runFailureNotices = errorNotices(failure);
-        phase = "idle";
-        return;
-      }
-      if (!alive || phase !== "finishing" || runId !== watched) return;
-      if (!state.busy) {
-        finished = state.finished ?? null;
-        if (state.finished === undefined) {
-          // The job slot is free and the backend has no outcome to hand
-          // over. Nothing else on this surface would mention it: the run
-          // panel goes, no card takes its place, and the operator is left
-          // to guess what became of the copy.
-          runError = `run ${watched ?? "(unnamed)"} ended, but the backend has no outcome for it`;
-          runFailureNotices = [];
-        }
-        phase = "idle";
-        runId = null;
-        void loadUnfinished();
-        return;
-      }
-      await sleep(POLL_MS);
     }
   }
 
@@ -388,22 +192,47 @@
     resumeOf = null;
   }
 
+  /** A typed or browsed source, taken as-is: the plan step validates it. */
+  function setSource(next: string) {
+    const typed = next.trim();
+    if (typed === source) return;
+    source = typed;
+    editJob();
+  }
+
+  /** Adds one destination root; a root already in the list is refused with
+   *  the message shown, so a paste that changed nothing does not look like
+   *  it did. Shared by the typed field and the folder picker. */
+  function pushDest(root: string): boolean {
+    destError = null;
+    if (dests.includes(root)) {
+      destError = `${root} is already a destination.`;
+      return false;
+    }
+    dests = [...dests, root];
+    editJob();
+    return true;
+  }
+
+  function addTypedDest() {
+    const typed = destDraft.trim();
+    if (typed === "") return;
+    if (pushDest(typed)) destDraft = "";
+  }
+
   async function pickSource() {
     const picked = await pickFolder();
-    if (picked === null) return;
-    source = picked;
-    editJob();
+    if (picked !== null) setSource(picked);
   }
 
   async function addDest() {
     const picked = await pickFolder();
-    if (picked === null || dests.includes(picked)) return;
-    dests = [...dests, picked];
-    editJob();
+    if (picked !== null) pushDest(picked);
   }
 
   function removeDest(dest: string) {
     dests = dests.filter((root) => root !== dest);
+    destError = null;
     editJob();
   }
 
@@ -462,9 +291,7 @@
   async function start() {
     setupError = null;
     setupFailureNotices = [];
-    finished = null;
-    resetRun(null);
-    phase = "preparing";
+    runPanel?.beginRun();
     try {
       const id = await api.startIngest({
         source,
@@ -473,32 +300,12 @@
         template: templateArg(),
         resume: resumeOf ?? undefined,
       });
-      // The answer names the run, and an event that beat it has already
-      // adopted the same name: the backend holds one job slot, so there is
-      // no second run whose events could have arrived in this window.
-      runId = id;
+      runPanel?.nameRun(id);
       resumeOf = null;
     } catch (failure) {
-      phase = "idle";
-      runId = null;
+      runPanel?.dropRun();
       setupError = errorMessage(failure);
       setupFailureNotices = errorNotices(failure);
-    }
-  }
-
-  /**
-   * Cancellation is cooperative and file-granular: the engine checks
-   * between files, so the run ends after whatever is in flight — and is
-   * resumable by its id afterwards.
-   */
-  async function askToStop() {
-    stopping = true;
-    try {
-      await api.cancelIngest();
-    } catch (failure) {
-      stopping = false;
-      runError = errorMessage(failure);
-      runFailureNotices = errorNotices(failure);
     }
   }
 
@@ -514,14 +321,6 @@
 
   function dismiss(run: UnfinishedRun) {
     unfinished = unfinished.filter((row) => row.run_id !== run.run_id);
-  }
-
-  /** What the run panel is titled. `finishing` had been drawn as "Copying",
-   *  which is the one thing the run is provably no longer doing. */
-  function headingFor(current: Phase): string {
-    if (current === "preparing") return "Preparing…";
-    if (current === "finishing") return "Finishing…";
-    return "Copying";
   }
 
   /** "1 file" / "2 files" — every line that counts them says it the same
@@ -540,23 +339,18 @@
     <Notices notices={unfinishedNotices} />
   </div>
 
-  <!-- Outside every phase branch on purpose. Both the mount-time state read
-       and the end-of-run poll can fail, and both of them leave this surface
-       sitting on the idle board — where a run panel's error would never be
-       drawn, and the operator would be told nothing at all. -->
-  {#if runError}
-    <div class="ingest-panel" role="group" aria-label="Run state">
-      <Notices notices={runFailureNotices} />
-      <p class="error" role="alert">{runError}</p>
-      {#if runId !== null}
-        <p class="empty">
-          Run {runId} was going when this happened. The run is the backend's,
-          not this window's — `maj ingest unfinished` still lists it if it did
-          not finish.
-        </p>
-      {/if}
-    </div>
-  {/if}
+  <!-- The run, when there is one — and a run state this window could not
+       read even when there is not: both the mount-time read and the
+       end-of-run poll can fail, and either leaves the surface sitting on
+       the idle board, where nothing else would mention it. -->
+  <IngestRunPanel
+    bind:this={runPanel}
+    bind:phase
+    bind:finished
+    {dests}
+    {clock}
+    onended={() => void loadUnfinished()}
+  />
 
   <!-- Idle only. A banner calling a run unfinished, with a live Resume
        button, must not sit over that same run's progress. -->
@@ -691,11 +485,23 @@
     <div class="ingest-board" role="group" aria-label="Setup">
       <div class="ingest-panel">
         <h3 class="ingest-title">Source</h3>
-        {#if source === ""}
-          <p class="empty">No source chosen yet.</p>
-        {:else}
-          <p class="ingest-path">{source}</p>
-        {/if}
+        <div class="ctl-actions">
+          <input
+            class="ctl-input"
+            type="text"
+            aria-label="Source path"
+            placeholder="/Volumes/CARD_01 or any folder"
+            value={source}
+            onchange={(event) => setSource(event.currentTarget.value)}
+          />
+          <button
+            class="ctl-btn"
+            aria-label="Browse for source"
+            onclick={() => void pickSource()}
+          >
+            Browse…
+          </button>
+        </div>
         <!-- What the plan actually walked, and only while that plan is
              current: a stale count of a folder nobody re-read is a claim
              about the card that may no longer be true. -->
@@ -706,9 +512,6 @@
             )}
           </p>
         {/if}
-        <button class="ctl-btn" onclick={() => void pickSource()}>
-          Choose source…
-        </button>
       </div>
       <div class="ingest-panel">
         <h3 class="ingest-title">Destinations</h3>
@@ -717,8 +520,9 @@
             No destination yet — a verified copy needs at least one.
           </p>
         {/if}
-        <!-- Unkeyed: this list is the operator's own, and `addDest` refuses
-             a root already in it, so removal by value is unambiguous. -->
+        <!-- Unkeyed: this list is the operator's own, and `pushDest`
+             refuses a root already in it, so removal by value is
+             unambiguous. -->
         <ul class="ingest-rows" aria-label="Destinations">
           {#each dests as dest}
             <li>
@@ -732,9 +536,36 @@
             </li>
           {/each}
         </ul>
-        <button class="ctl-btn" onclick={() => void addDest()}>
-          + Add destination
-        </button>
+        <div class="ctl-actions">
+          <input
+            class="ctl-input"
+            type="text"
+            aria-label="Destination path"
+            placeholder="/Volumes/SHUTTLE_A"
+            value={destDraft}
+            oninput={(event) => (destDraft = event.currentTarget.value)}
+            onkeydown={(event) => {
+              if (event.key === "Enter") addTypedDest();
+            }}
+          />
+          <button
+            class="ctl-btn"
+            aria-label="Add destination"
+            onclick={addTypedDest}
+          >
+            Add
+          </button>
+          <button
+            class="ctl-btn"
+            aria-label="Browse for destination"
+            onclick={() => void addDest()}
+          >
+            Browse…
+          </button>
+        </div>
+        {#if destError !== null}
+          <p class="error" role="alert">{destError}</p>
+        {/if}
       </div>
     </div>
 
@@ -823,111 +654,6 @@
         <Notices notices={setupFailureNotices} />
         <p class="error" role="alert">{setupError}</p>
       {/if}
-    </div>
-  {:else}
-    <div class="ingest-panel" role="group" aria-label="Run">
-      <h3 class="ingest-title">{headingFor(phase)}</h3>
-      <p class="count">
-        {runId === null ? "naming the run…" : `run ${runId} — resumable`}
-      </p>
-
-      {#if phase === "preparing"}
-        <p class="empty">
-          The run is walking and hashing the source to plan itself. Nothing
-          has been copied yet.
-        </p>
-      {:else}
-        {#if progress.totalsKnown}
-          <div
-            class="ingest-bar"
-            role="progressbar"
-            aria-label="Bytes copied"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            aria-valuenow={percent}
-          >
-            <i style="--w: {percent}%"></i>
-          </div>
-          <p class="ingest-counts">
-            <b>{progress.placed + progress.failed} / {progress.filesTotal} files</b>
-            <span>{fileSize(copied)} / {fileSize(progress.bytesTotal)}</span>
-            <span class:ingest-bad={progress.failed > 0}>
-              {progress.failed} failed
-            </span>
-            {#if timing !== null}
-              <span>{timing}</span>
-            {/if}
-          </p>
-        {:else}
-          <p class="ingest-counts">
-            <b>{plural(progress.placed + progress.failed, "file")} done</b>
-            <span>{fileSize(copied)} copied</span>
-            <span class:ingest-bad={progress.failed > 0}>
-              {progress.failed} failed
-            </span>
-          </p>
-          <p class="empty">
-            This surface joined the run after it started, so the totals its
-            `run_started` carried are not on screen.
-          </p>
-        {/if}
-
-        <h4 class="ingest-sub">Now</h4>
-        <!-- Unkeyed: `rel` is unique within a run, but this list is built
-             here rather than handed over as a map. -->
-        <ul class="ingest-rows" aria-label="Files in flight">
-          {#each progress.copying as file}
-            <li>
-              <span class="ingest-path">{file.rel}</span>
-              <span class="ingest-stat">
-                {fileSize(file.done)} of {fileSize(file.size)} · {filePercent(
-                  file,
-                )}%
-              </span>
-            </li>
-          {/each}
-        </ul>
-
-        <h4 class="ingest-sub">Destinations</h4>
-        <ul class="ingest-rows" aria-label="Destination tallies">
-          {#each roots as root}
-            <li>
-              <span class="ingest-path">{root}</span>
-              <span class="ingest-stat">
-                {progress.verified[root] ?? 0} verified
-              </span>
-            </li>
-          {/each}
-        </ul>
-
-        {#if progress.failures.length > 0}
-          <h4 class="ingest-sub">Failures so far</h4>
-          <ul class="ingest-rows" aria-label="Failures so far">
-            {#each progress.failures as fail}
-              <li>
-                <span class="ingest-path">{fail.rel}</span>
-                <span class="ingest-bad">{fail.reason}</span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      {/if}
-
-      {#if phase === "finishing"}
-        <p class="empty">
-          The copy loop ended — waiting for the sweep, the MHL generation per
-          destination and the catalog events.
-        </p>
-      {:else}
-        <div class="ctl-actions">
-          <button class="ctl-btn ctl-warn" disabled={stopping} onclick={() => void askToStop()}>
-            {stopping
-              ? "Stopping after the current file…"
-              : "Stop after current file"}
-          </button>
-        </div>
-      {/if}
-
     </div>
   {/if}
 </div>

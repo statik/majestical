@@ -188,7 +188,9 @@ pub fn read_failure_report(
 /// One kind's per-item failures as the `{path, error}` rows the on-disk
 /// failure report (and `index status`, which reads it back) has always
 /// carried — the `transient` class an [`ItemFailure`] also carries is a
-/// runtime decision, not part of this marker.
+/// runtime decision, not part of this marker. Interim: this whole report is
+/// replaced by the failure ledger (`record_failures`, Task 3), so the
+/// `{path, error}` on-disk shape is not a contract worth preserving.
 fn failed_json(failed: &[ItemFailure]) -> Vec<serde_json::Value> {
     failed
         .iter()

@@ -2,10 +2,11 @@
 //! queued items (thumbnails, embeddings, keyframes, keyframe images,
 //! transcripts, transcript-embeddings, OCR, PDF text, captions), and heals
 //! `text_fts` from blobs. Moved from `crates/cli/src/index_cmd.rs`. The
-//! `--watch` loop, the failure-report bookkeeping (`failure_report_json`/
-//! `merge_failure_report`/`write_failure_report`), and all rendering
-//! (`print_run_result`/`run_result_json`) stay in the CLI — this module
-//! hands back one [`IndexRunOutcome`] per pass and never prints.
+//! `--watch` loop and all rendering (`print_run_result`/`run_result_json`)
+//! stay in the CLI, and the failure-report bookkeeping
+//! (`failure_report_json`/`merge_failure_report`/`write_failure_report`)
+//! lives next door in `index/mod.rs` — this module hands back one
+//! [`IndexRunOutcome`] per pass and never prints.
 use crate::app::FsApp;
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
@@ -60,6 +61,14 @@ impl ItemFailure {
     /// volume went away under the batch — transient. The empty-path
     /// sentinel `TranscriptEmbed` items carry (they read a blob, not the
     /// source) is never "vanished".
+    ///
+    /// The probe is deliberately imprecise, in the cheap direction: a false
+    /// "transient" costs one extra retry next pass, while a false
+    /// "permanent" costs a ledger row that hides a healthy item until an
+    /// explicit retry — so it biases toward the cheap mistake.
+    /// `Path::exists()` is also `false` for a path that exists but can't be
+    /// stat'd (permission denied), which is intended: an unreadable-to-us
+    /// volume is exactly as re-attemptable as an unmounted one.
     #[must_use]
     pub fn classify(item: &work::WorkItem, error: impl std::fmt::Display) -> Self {
         let vanished = !item.abs_path.as_os_str().is_empty() && !item.abs_path.exists();
@@ -71,13 +80,16 @@ impl ItemFailure {
         }
     }
 
-    /// A failure the caller already knows is not the item's fault.
+    /// A failure the caller already knows is not the item's fault — no
+    /// source probe, just the transient class. Takes the same
+    /// `impl Display` error as [`Self::classify`] so the two constructors
+    /// are interchangeable at a call site.
     #[must_use]
-    pub fn transient(item: &work::WorkItem, error: impl Into<String>) -> Self {
+    pub fn transient(item: &work::WorkItem, error: impl std::fmt::Display) -> Self {
         Self {
             asset: item.asset.clone(),
             path: item.abs_path.clone(),
-            error: error.into(),
+            error: error.to_string(),
             transient: true,
         }
     }
@@ -145,10 +157,10 @@ fn decode_and_write_thumb(blobs: &BlobStore, item: &work::WorkItem) -> Result<()
     Ok(())
 }
 
-/// One pass's thumbnail-kind result: `written` new thumbnails and per-item
-/// `failed` (path, reason) — mirrors [`EmbedOutcome`]/[`KeyframeOutcome`]'s
-/// shape so every kind's executor returns one outcome value instead of a
-/// bare tuple.
+/// One pass's thumbnail-kind result: `written` new thumbnails and one
+/// [`ItemFailure`] row per item that failed — mirrors
+/// [`EmbedOutcome`]/[`KeyframeOutcome`]'s shape so every kind's executor
+/// returns one outcome value instead of a bare tuple.
 #[derive(Default, serde::Serialize)]
 pub struct ThumbOutcome {
     pub written: u64,
@@ -175,10 +187,14 @@ fn run_thumb_items(blobs: &BlobStore, items: &[work::WorkItem], jobs: usize) -> 
                             written.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(err) => {
+                            // Classified before the lock: `classify` stats the
+                            // source path, and a filesystem call has no place
+                            // inside a mutex every worker contends for.
+                            let failure = ItemFailure::classify(item, err);
                             let mut guard = failed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            guard.push(ItemFailure::classify(item, err));
+                            guard.push(failure);
                         }
                     }
                 }
@@ -205,7 +221,8 @@ struct EmbedPaths {
 /// One pass's embedding-kind result: `written` new embeddings (encoder ran),
 /// `loaded` vectors pulled in from blobs the local Lance store didn't have
 /// yet (the blob↔Lance diff — a teammate's synced vectors, or a lance dir
-/// just rebuilt after corruption), and per-item `failed` (path, reason).
+/// just rebuilt after corruption), and one [`ItemFailure`] row per item
+/// that failed.
 #[derive(Default, serde::Serialize)]
 pub struct EmbedOutcome {
     pub written: u64,
@@ -218,8 +235,9 @@ pub struct EmbedOutcome {
 /// `keyframes_written` individual frames actually extracted and embedded,
 /// `keyframes_failed` individual timestamps that failed extract/embed
 /// (whether or not their video ended up over the half-failed threshold — see
-/// [`over_half_failed`]), and per-video `failed` (path, reason — for a video
-/// over that threshold, the reason includes the first per-timestamp failure).
+/// [`over_half_failed`]), and one [`ItemFailure`] row per video that failed
+/// — for a video over that threshold, the row's `error` includes the first
+/// per-timestamp failure.
 #[derive(Default, serde::Serialize)]
 pub struct KeyframeOutcome {
     pub videos_done: u64,
@@ -892,9 +910,9 @@ fn run_keyframe_items(
 /// manifest timestamp now has an image blob (the pass that wrote their
 /// `KeyframeImagesComplete` marker), `images_written` frames freshly
 /// extracted and encoded this pass, `images_skipped` timestamps whose blob
-/// an earlier pass had already written (the resume path), and per-video
-/// `failed` (path, reason) — mirroring [`OcrOutcome`], the other kind that
-/// works a video's manifest timestamps into one blob each.
+/// an earlier pass had already written (the resume path), and one
+/// [`ItemFailure`] row per video that failed — mirroring [`OcrOutcome`], the
+/// other kind that works a video's manifest timestamps into one blob each.
 #[derive(Default, serde::Serialize)]
 pub struct KeyframeImageOutcome {
     pub videos_done: u64,
@@ -1022,7 +1040,7 @@ fn run_keyframe_image_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Keyf
 }
 
 /// One pass's transcribe-kind result: `written` new transcript blobs and
-/// per-item `failed` (path, reason).
+/// one [`ItemFailure`] row per item that failed.
 #[derive(Default, serde::Serialize)]
 pub struct TranscribeOutcome {
     pub written: u64,
@@ -1089,9 +1107,12 @@ fn run_transcribe_items(blobs: &BlobStore, items: &[work::WorkItem]) -> Result<T
 /// chunk vectors, `loaded` vectors pulled in from chunk blobs the local
 /// text Lance table didn't have yet (the blob↔Lance diff — see
 /// [`load_missing_text_vectors_from_blobs`]), `empty` transcripts that
-/// chunked to nothing (their `ChunksEmpty` marker written), and per-item
-/// `failed` (transcript blob path, reason — the item's own `abs_path` can
-/// be the empty sentinel, see `work::WorkItem::abs_path`).
+/// chunked to nothing (their `ChunksEmpty` marker written), and one
+/// [`ItemFailure`] row per item that failed. These items read the
+/// transcript blob, never the source, so the failing blob's path shows up
+/// in the row's `error` text; the row's `path` is the source path when an
+/// instance is reachable here and the empty sentinel when none is (see
+/// `work::WorkItem::abs_path`).
 #[derive(Default, serde::Serialize)]
 pub struct TranscriptEmbedOutcome {
     pub chunks_written: u64,
@@ -1523,7 +1544,7 @@ fn run_pdf_text_items(blobs: &BlobStore, items: &[work::WorkItem]) -> PdfOutcome
 
 /// One pass's caption-kind result: `written` caption-item completions (a
 /// still's caption blob, or a video's captions blob — each with its tags
-/// blob) and per-item `failed` (path, reason).
+/// blob) and one [`ItemFailure`] row per item that failed.
 #[derive(Default, serde::Serialize)]
 pub struct CaptionOutcome {
     pub written: u64,

@@ -5,8 +5,9 @@
   // `set_throttle` instead of the tray's direct `set_throttle_impl` call —
   // and the OS "start at login" toggle via `autostart.ts`, plus a Retry
   // button for the failure ledger (`retryFailedItems`) shown once
-  // `failed_items > 0`. Both scheduler reads happen once on mount; the
-  // status line refreshes on a throttle change or a retry, not on a timer.
+  // `failed_items > 0`. The scheduler state and the autostart flag are each
+  // read once on mount; the status line refreshes on a throttle change or a
+  // retry, not on a timer.
   // A sibling component to `SettingsView.svelte` rather than folded into
   // it: the scheduler commands and the autostart plugin are two unrelated
   // backends, and keeping them apart keeps each file's state readable at a

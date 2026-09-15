@@ -504,7 +504,7 @@ fn list_saved_searches_carries_notices() {
 #[test]
 fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
     with_state_dir(|| {
-        let outcome = majestical_desktop::commands::doctor_report_impl(None)
+        let outcome = majestical_desktop::commands::doctor_report_impl(None, None)
             .expect("doctor must run with no catalog selected");
         let status_of = |name: &str| {
             outcome
@@ -514,13 +514,64 @@ fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
                 .unwrap_or_else(|| panic!("no `{name}` row"))
                 .status
         };
-        for row in ["catalog", "state_dir", "blob_residue"] {
+        for row in [
+            "catalog",
+            "state_dir",
+            "blob_residue",
+            "failed_items",
+            "describer",
+        ] {
             assert_eq!(
                 status_of(row),
                 majestical_services::doctor::CheckStatus::Warn,
                 "{row} must warn without a catalog"
             );
         }
+    });
+}
+
+/// The env key the impl is handed is the one the describer row resolves
+/// against: the same catalog, with an `OpenRouter` describer and no stored
+/// key, `Fail`s without a key and is `Ok` with one. Hermetic — the
+/// environment is never read, which is exactly why the impl takes the key
+/// as an argument.
+#[test]
+fn doctor_report_resolves_the_describer_key_from_the_argument() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        majestical_services::describer_config::set(
+            &cfg.catalog,
+            &majestical_services::describer_config::SetArgs {
+                backend: majestical_describe::BackendKind::OpenRouter,
+                model: "test-model".into(),
+                base_url: None,
+                api_key: None,
+            },
+            &majestical_services::notices::Notices::new(),
+        )
+        .expect("store describer config");
+
+        let describer_status = |env_key: Option<String>| {
+            majestical_desktop::commands::doctor_report_impl(Some(&cfg), env_key)
+                .expect("doctor")
+                .checks
+                .iter()
+                .find(|c| c.name == "describer")
+                .unwrap_or_else(|| panic!("no `describer` row"))
+                .status
+        };
+
+        assert_eq!(
+            describer_status(None),
+            majestical_services::doctor::CheckStatus::Fail,
+            "no key anywhere must fail the describer row"
+        );
+        assert_eq!(
+            describer_status(Some("sk".into())),
+            majestical_services::doctor::CheckStatus::Ok,
+            "the key passed to the impl must reach the describer row"
+        );
     });
 }
 

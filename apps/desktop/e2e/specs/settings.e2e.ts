@@ -1,5 +1,5 @@
 // Settings flow: the health panel renders the real `maj doctor` sweep over
-// the fixture catalog — all seven checks, in the order services emits them
+// the fixture catalog — all nine checks, in the order services emits them
 // (the surface never sorts), with the catalog row Ok because the fixture
 // catalog is the selected one. Environment rows (ffmpeg, models, platform)
 // are asserted present, not by status: their status is the machine's.
@@ -15,7 +15,7 @@ describe("Majestical desktop — Settings flow", () => {
   });
 
   it("shows every doctor check in the order services emits them", async () => {
-    await expect($$(".settings-check")).toBeElementsArrayOfSize(7);
+    await expect($$(".settings-check")).toBeElementsArrayOfSize(9);
     const names = await $$(".settings-check-name").map((el) => el.getText());
     expect(names).toEqual([
       "ffmpeg",
@@ -24,6 +24,8 @@ describe("Majestical desktop — Settings flow", () => {
       "state_dir",
       "catalog",
       "blob_residue",
+      "failed_items",
+      "describer",
       "platform",
     ]);
   });

@@ -47,6 +47,13 @@ pub struct DoctorRequest {
     /// The head's reading of
     /// [`majestical_describe::config::OPENROUTER_KEY_ENV`], passed in
     /// because this crate never reads the environment. `None` = not set.
+    ///
+    /// Each head MUST fill this from its own process environment and MUST
+    /// NOT accept it from a client: a remote MCP caller that could set it
+    /// would make doctor report "key configured" for a key that does not
+    /// exist on the machine captions actually run on. The `Deserialize`
+    /// derive is for in-process construction symmetry with the other
+    /// request types, not for a field a wire client fills.
     #[serde(default)]
     pub describer_env_key: Option<String>,
 }
@@ -72,7 +79,7 @@ pub fn doctor(req: &DoctorRequest) -> Result<DoctorOutcome, ServiceError> {
         check_state_dir(catalog, &notices),
         check_catalog(catalog, &notices),
         check_blob_residue(catalog, &notices),
-        check_failed_items(catalog, env_key, &notices),
+        check_failed_items(catalog, &notices),
         check_describer(catalog, env_key, &notices),
         check_platform(),
     ];
@@ -416,18 +423,13 @@ fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck 
 
 /// The failure ledger — every item the planner is holding back because it
 /// failed permanently ([`crate::index::known_failures`]) — reported as a
-/// `Warn` with the first few paths, never as a silent zero. `env_key` is
-/// unused here: both catalog-and-key checks share one signature so
-/// [`doctor`] can call them the same way.
+/// `Warn` with the first few paths, never as a silent zero. Takes no env
+/// key: nothing about the ledger depends on the describer.
 ///
 /// A ledger that can't be read at all (an unresolvable state dir) is a
-/// `Fail` carrying the error verbatim and no remedy — doctor does not
-/// invent a fix for a condition it can't name.
-fn check_failed_items(
-    catalog: Option<&Path>,
-    _env_key: Option<&str>,
-    notices: &Notices,
-) -> DoctorCheck {
+/// `Fail` carrying the error verbatim, pointed at the `state_dir` row —
+/// which fails for the same cause and carries the actual fix.
+fn check_failed_items(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
     let Some(catalog) = catalog else {
         return DoctorCheck {
             name: "failed_items".to_string(),
@@ -443,7 +445,7 @@ fn check_failed_items(
                 name: "failed_items".to_string(),
                 status: CheckStatus::Fail,
                 detail: format!("{err:#}"),
-                remedy: None,
+                remedy: Some("see the state_dir row".to_string()),
             };
         }
     };
@@ -480,6 +482,16 @@ fn check_failed_items(
 /// captions are optional, and "off" is a legitimate configuration, not a
 /// fault. An unreadable or unparsable `describer.toml` is a `Warn`: nothing
 /// is broken until captions are attempted, and the file is rewritable.
+///
+/// The two failure modes of [`crate::describer_config::load_config`] are
+/// told apart before it is called: an unresolvable state dir is not a
+/// broken `describer.toml`, and must not be answered with "rewrite that
+/// file" — the `state_dir` row already `Fail`s for that cause.
+///
+/// The `Warn` detail renders the error with `{err}`, never `{err:#}`:
+/// walking the chain reaches `toml::de::Error`, which quotes the offending
+/// source line back — and that line can be `api_key = "sk-…"`. The
+/// outermost context names the file, which is all the reader needs.
 fn check_describer(
     catalog: Option<&Path>,
     env_key: Option<&str>,
@@ -493,6 +505,14 @@ fn check_describer(
             remedy: None,
         };
     };
+    if let Err(err) = crate::describer_config::config_path(catalog, notices) {
+        return DoctorCheck {
+            name: "describer".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!("describer config location unresolvable: {err}"),
+            remedy: Some("see the state_dir row".to_string()),
+        };
+    }
     match crate::describer_config::load_config(catalog, notices) {
         Ok(None) => DoctorCheck {
             name: "describer".to_string(),
@@ -504,7 +524,7 @@ fn check_describer(
         Err(err) => DoctorCheck {
             name: "describer".to_string(),
             status: CheckStatus::Warn,
-            detail: format!("describer config unreadable: {err:#}"),
+            detail: format!("describer config unreadable: {err}"),
             remedy: Some(
                 "fix or remove describer.toml (`maj describer set …` rewrites it)".to_string(),
             ),
@@ -693,7 +713,7 @@ mod tests {
     fn failed_items_is_ok_on_an_empty_ledger() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = fixture_catalog(&dir);
-        let check = check_failed_items(Some(&root), None, &Notices::new());
+        let check = check_failed_items(Some(&root), &Notices::new());
         assert_eq!(check.status, CheckStatus::Ok);
         assert_eq!(check.detail, "no known failures");
         assert_eq!(check.remedy, None);
@@ -705,7 +725,7 @@ mod tests {
         let root = fixture_catalog(&dir);
         let paths = record_permanent_failures(&root, 2);
 
-        let check = check_failed_items(Some(&root), None, &Notices::new());
+        let check = check_failed_items(Some(&root), &Notices::new());
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("2 item(s)"), "{}", check.detail);
         for path in &paths {
@@ -725,7 +745,7 @@ mod tests {
         let root = fixture_catalog(&dir);
         let paths = record_permanent_failures(&root, 5);
 
-        let check = check_failed_items(Some(&root), None, &Notices::new());
+        let check = check_failed_items(Some(&root), &Notices::new());
         assert!(check.detail.contains("5 item(s)"), "{}", check.detail);
         let named = paths
             .iter()
@@ -736,22 +756,23 @@ mod tests {
 
     #[test]
     fn failed_items_warns_without_a_catalog() {
-        let check = check_failed_items(None, None, &Notices::new());
+        let check = check_failed_items(None, &Notices::new());
         assert_eq!(check.status, CheckStatus::Warn);
         assert_eq!(check.detail, "no catalog selected");
         assert_eq!(check.remedy, None);
     }
 
     /// An unresolvable state dir (here, a catalog path that cannot be
-    /// canonicalized) is a `Fail` with the error verbatim and no invented
-    /// remedy — not a silent "no known failures".
+    /// canonicalized) is a `Fail` with the error verbatim, pointed at the
+    /// row that fails for the same cause — not a silent "no known
+    /// failures", and not a remedy this row invents for itself.
     #[test]
     fn failed_items_fails_when_the_ledger_cannot_be_read() {
         let missing = PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz");
-        let check = check_failed_items(Some(&missing), None, &Notices::new());
+        let check = check_failed_items(Some(&missing), &Notices::new());
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(!check.detail.is_empty());
-        assert_eq!(check.remedy, None);
+        assert_eq!(check.remedy.as_deref(), Some("see the state_dir row"));
     }
 
     #[test]
@@ -844,13 +865,19 @@ mod tests {
         assert_eq!(check.detail, "no catalog selected");
     }
 
+    /// The malformed line is the one holding the key, because that is the
+    /// line `toml::de::Error` quotes back: the detail must name the file
+    /// and stop there. A `{err:#}` detail would carry `SUPERSECRET` into
+    /// CLI/MCP/GUI output and repeat the parse message the
+    /// `ConfigError::Parse` Display already embeds — hence the
+    /// exactly-once count of the path, which two chain links would double.
     #[test]
     fn describer_warns_on_an_unreadable_config() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = fixture_catalog(&dir);
         let notices = Notices::new();
         let path = crate::describer_config::config_path(&root, &notices).expect("config path");
-        std::fs::write(&path, b"this is not = valid toml [[[").expect("plant garbage config");
+        std::fs::write(&path, b"api_key = \"sk-SUPERSECRET\" oops").expect("plant broken config");
 
         let check = check_describer(Some(&root), None, &notices);
         assert_eq!(check.status, CheckStatus::Warn);
@@ -859,10 +886,39 @@ mod tests {
             "{}",
             check.detail
         );
+        assert!(
+            !check.detail.contains("SUPERSECRET"),
+            "the detail must never echo the file's contents: {}",
+            check.detail
+        );
+        assert_eq!(
+            check.detail.matches("describer.toml").count(),
+            1,
+            "the file is named once, not once per error-chain link: {}",
+            check.detail
+        );
         assert_eq!(
             check.remedy.as_deref(),
             Some("fix or remove describer.toml (`maj describer set …` rewrites it)")
         );
+    }
+
+    /// An unresolvable state dir is not a broken `describer.toml`: the row
+    /// says so and sends the reader to the row that actually failed,
+    /// instead of telling them to rewrite a file that is not the problem.
+    #[test]
+    fn describer_points_at_the_state_dir_row_when_the_catalog_path_is_bad() {
+        let missing = PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz");
+        let check = check_describer(Some(&missing), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .starts_with("describer config location unresolvable:"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(check.remedy.as_deref(), Some("see the state_dir row"));
     }
 
     /// The request's env key reaches the describer row: the same catalog

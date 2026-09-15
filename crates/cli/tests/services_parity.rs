@@ -2037,11 +2037,17 @@ const NEW_DOCTOR_ROWS: [&str; 2] = [
 /// [`doctor_output_is_byte_identical`] compares modulo those two rows rather
 /// than losing its parity coverage outright.
 ///
-/// Each strip is an exact-substring removal (the row object plus its
-/// adjoining comma) from the original bytes, so a formatting change anywhere
+/// Each strip is an exact-substring removal (the row object plus the comma
+/// that follows it) from the original bytes, so a formatting change anywhere
 /// — key order, spacing, compact vs pretty — still fails the comparison, and
 /// the reference's output, which carries neither row, normalizes to itself
 /// byte for byte.
+///
+/// Only a trailing comma is consumed, because in the real document neither
+/// row is last — `platform` always follows both. A row that did land last
+/// would keep the comma in front of it and pass through with a dangling
+/// separator, diverging loudly; that is the safe direction for a
+/// normalizer whose whole job is to hide a known difference.
 ///
 /// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
 /// it exists, `doctor_output_is_byte_identical` is blind to these two rows.
@@ -2056,12 +2062,9 @@ fn without_new_doctor_rows(text: &str) -> String {
         let Some(start) = kept.find(row) else {
             continue;
         };
-        let mut start = start;
         let mut end = start + row.len();
         if kept[end..].starts_with(',') {
             end += 1;
-        } else if kept[..start].ends_with(',') {
-            start -= 1;
         }
         kept = format!("{}{}", &kept[..start], &kept[end..]);
     }

@@ -289,8 +289,8 @@ impl MajServer {
 
     /// Reports the derivation queue's current state per kind (thumbnails,
     /// embeddings, keyframes, keyframe images, transcripts, OCR, PDF text,
-    /// captions) without doing any work, plus the last `index_run`'s
-    /// per-item failures.
+    /// captions) without doing any work, plus the known permanent failures
+    /// the ledger holds back until retried (`failed`, rows per kind).
     #[tool]
     fn index_status(&self) -> CallToolResult {
         let app = match self.open_app() {

@@ -1310,6 +1310,123 @@ fn index_run_appends_the_failure_ledger_note_to_the_run_outcome() {
     );
 }
 
+/// Seeds a catalog holding exactly one remembered `thumbs` failure — a
+/// `.png` that is really text, worked once through the CLI — and returns
+/// its root, state dir, and the on-disk ledger's path.
+#[cfg(test)]
+fn seed_a_known_thumbs_failure(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let media = dir.join("media");
+    std::fs::create_dir_all(&media).expect("mkdir");
+    std::fs::write(media.join("broken.png"), b"this is not a png").expect("write");
+    let root = dir.join("cat");
+    let state = dir.join("state");
+    common::maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    common::maj(&root, &state)
+        .args(["scan"])
+        .arg(&media)
+        .assert()
+        .success();
+    common::maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+    let ledgers = common::walkdir_find(&state, "index-failures.json");
+    assert_eq!(
+        ledgers.len(),
+        1,
+        "one ledger under the state dir: {ledgers:?}"
+    );
+    let ledger = ledgers[0].clone();
+    (root, state, ledger)
+}
+
+/// `retry_failed`'s dry run reads the real ledger — the rows a retry would
+/// clear, counted per kind and named in `would` — and writes nothing. The
+/// confirmed call then attempts the held-back item again, so it fails again.
+#[test]
+fn index_run_dry_run_reports_the_rows_a_retry_would_clear() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state, ledger) = seed_a_known_thumbs_failure(dir.path());
+    let before = std::fs::read(&ledger).expect("read the seeded ledger");
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "index_run",
+        &serde_json::json!({"kinds": ["thumbs"], "retry_failed": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    assert_eq!(
+        structured["known_failures"]["thumbs"],
+        serde_json::json!(1),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["retry_failed"],
+        serde_json::json!(true),
+        "{structured}"
+    );
+    let would = structured["would"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a dry run must describe itself: {structured}"));
+    assert!(
+        would.starts_with("clear 1 known failure(s) for thumbs"),
+        "{would}"
+    );
+    assert_eq!(
+        std::fs::read(&ledger).expect("re-read the ledger"),
+        before,
+        "a dry run must leave the ledger byte-identical"
+    );
+
+    let resp = mcp.call_tool(
+        "index_run",
+        &serde_json::json!({"kinds": ["thumbs"], "retry_failed": true, "confirm": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let failed = structured["thumbs"]["failed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the executed arm reports per-item failures: {structured}"));
+    assert_eq!(
+        failed.len(),
+        1,
+        "the cleared item is attempted again in this same pass: {structured}"
+    );
+}
+
+/// A retry with nothing recorded says so rather than guessing: zero rows,
+/// an empty `known_failures` map, and a `would` that names the zero.
+#[test]
+fn index_run_dry_run_names_a_retry_with_nothing_recorded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(
+        "index_run",
+        &serde_json::json!({"kinds": ["thumbs"], "retry_failed": true}),
+    );
+    assert_ne!(resp["result"]["isError"], serde_json::json!(true), "{resp}");
+    let structured = &resp["result"]["structuredContent"];
+    let would = structured["would"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a dry run must describe itself: {structured}"));
+    assert!(
+        would.starts_with("clear 0 known failures (none recorded)"),
+        "{would}"
+    );
+    assert_eq!(
+        structured["known_failures"],
+        serde_json::json!({}),
+        "{structured}"
+    );
+}
+
 #[test]
 fn tag_assets_defaults_to_dry_run() {
     let dir = tempfile::tempdir().expect("tempdir");

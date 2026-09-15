@@ -217,7 +217,11 @@ fn caption_backend_outage_mid_run_skips_remaining_and_reports() {
         .success()
         .stdout(contains("captions: 0 written, 2 failed"))
         .stderr(contains("500"))
-        .stderr(contains("skipped after first failure"));
+        .stderr(contains("skipped after first failure"))
+        // The transient form of the per-failure line, printed only when the
+        // row carries `transient: true` — the permanent form is pinned in
+        // `index_smoke.rs`.
+        .stderr(contains("failed (transient):"));
 
     maj(&root, &state)
         .env("MAJ_MODEL_DIR", model_dir.path())

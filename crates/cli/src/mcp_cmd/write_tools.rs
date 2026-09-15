@@ -64,7 +64,7 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Wraps a mutating tool's already-computed `Result`: on success, folds
@@ -1004,6 +1004,10 @@ struct IndexRunArgs {
     /// Parallel workers (default: CPU cores, max 4).
     #[serde(default)]
     threads: Option<usize>,
+    /// Clear the failure ledger for `kinds` before running, so items that
+    /// failed permanently are attempted again.
+    #[serde(default)]
+    retry_failed: bool,
     /// `false` (default) returns a dry-run description of what would
     /// happen; `true` executes.
     #[serde(default)]
@@ -1027,6 +1031,47 @@ fn parse_index_kinds(kinds: Option<&[String]>) -> anyhow::Result<BTreeSet<String
     Ok(kinds.iter().cloned().collect())
 }
 
+/// How many ledger rows a retry over `kinds` would clear, per kind — only
+/// the requested kinds, and only those actually holding rows, so an empty
+/// map means "nothing recorded" rather than "every kind at zero".
+fn known_failure_counts(
+    ledger: &majestical_services::index::Ledger,
+    kinds: &BTreeSet<String>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for kind in kinds {
+        let count = ledger.get(kind).map_or(0, Vec::len);
+        if count > 0 {
+            counts.insert(kind.clone(), count);
+        }
+    }
+    counts
+}
+
+/// The dry run's one-line promise. Under `retry_failed` it leads with the
+/// clear that precedes the pass, counted off the ledger as it stands right
+/// now — never a guess, and distinct when nothing is recorded, so a caller
+/// can tell "cleared nothing" from "cleared something".
+fn index_run_would(
+    kinds: &BTreeSet<String>,
+    counts: &BTreeMap<String, usize>,
+    retry_failed: bool,
+) -> String {
+    let pass = format!(
+        "run one derivation pass over kinds: {}",
+        kinds.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if !retry_failed {
+        return pass;
+    }
+    let total: usize = counts.values().sum();
+    if total == 0 {
+        return format!("clear 0 known failures (none recorded), then {pass}");
+    }
+    let named = counts.keys().cloned().collect::<Vec<_>>().join(", ");
+    format!("clear {total} known failure(s) for {named}, then {pass}")
+}
+
 fn index_run_dry(
     app: &FsApp,
     catalog: &Path,
@@ -1034,6 +1079,9 @@ fn index_run_dry(
     args: &IndexRunArgs,
 ) -> anyhow::Result<serde_json::Value> {
     let status = majestical_services::index::status(app, catalog)?;
+    // Read, never written: a dry run reports the ledger exactly as it stands.
+    let ledger = majestical_services::index::known_failures(catalog, app.notices())?;
+    let counts = known_failure_counts(&ledger, kinds);
     // No fold here: notices ride NESTED on the embedded status, the same
     // convention `get_asset`'s found arm follows — a serialized outcome
     // keeps its own `notices`; only hand-built summaries fold at the top.
@@ -1041,11 +1089,10 @@ fn index_run_dry(
         "kinds": kinds,
         "limit": args.limit,
         "threads": args.threads,
+        "retry_failed": args.retry_failed,
+        "known_failures": counts,
         "status": status,
-        "would": format!(
-            "run one derivation pass over kinds: {}",
-            kinds.iter().cloned().collect::<Vec<_>>().join(", ")
-        ),
+        "would": index_run_would(kinds, &counts, args.retry_failed),
     }))
 }
 
@@ -1068,7 +1115,7 @@ fn index_run_exec(
         limit: args.limit,
         threads: args.threads,
         api_key: crate::describer_cmd::env_api_key(),
-        retry_failed: false,
+        retry_failed: args.retry_failed,
     };
     let mut outcome = majestical_services::runtime::run_off_tokio_runtime(|| {
         let app = FsApp::open(catalog, machine_id, author)?;

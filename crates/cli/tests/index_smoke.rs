@@ -1222,3 +1222,64 @@ fn index_run_keyframe_images_writes_images_and_status_counts_them() {
         .success()
         .stdout(contains("keyframe-images: 0 videos, 0 images written"));
 }
+
+/// A permanently undecodable image (`.png` extension, text bytes) fails
+/// once, is remembered, is SKIPPED on the next run (no attempt, no new
+/// failure), and is attempted again only under `--retry-failed` — in the
+/// SAME run that clears it, which pins `run_impl`'s clear-before-plan order.
+#[test]
+fn index_run_remembers_a_permanent_failure_and_skips_it_until_retried() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.png"), b"this is not a png").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 1 failed"))
+        .stderr(contains("failed: "))
+        .stderr(contains("failed (transient):").not());
+    maj(&root, &state)
+        .args(["index", "status"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "thumbs: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
+             0 need model, 1 failed",
+        ))
+        .stdout(contains("thumbs: 1 known failure(s) skipped until retried"))
+        .stdout(contains("retry with: maj index run --retry-failed"));
+    // Skipped: no attempt, so no failure this run.
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 0 failed"));
+    // Retried: attempted again IN THIS RUN, fails again, re-recorded (still
+    // 1 row, not 2).
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs", "--retry-failed"])
+        .assert()
+        .success()
+        .stdout(contains("thumbnails: 0 written, 1 failed"))
+        .stderr(contains("cleared 1 known failure(s) for retry"));
+    let out = maj(&root, &state)
+        .args(["index", "status", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["failed"]["thumbs"].as_array().unwrap().len(), 1);
+    assert_eq!(json["thumbs"]["failed"], 1);
+}

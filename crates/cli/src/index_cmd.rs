@@ -18,6 +18,9 @@ pub(crate) struct IndexRunArgs {
     pub(crate) threads: Option<usize>,
     pub(crate) limit: Option<usize>,
     pub(crate) kinds: Option<Vec<String>>,
+    /// Clears the selected kinds' remembered failures before the pass, so
+    /// items the ledger holds back are attempted once more.
+    pub(crate) retry_failed: bool,
     pub(crate) json: bool,
 }
 
@@ -223,7 +226,7 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             limit: args.limit,
             threads: args.threads,
             api_key: crate::describer_cmd::env_api_key(),
-            retry_failed: false,
+            retry_failed: args.retry_failed,
         };
         run_once(app, catalog_dir, &req, args.json)?;
         if !args.watch {
@@ -235,16 +238,20 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
 }
 
 /// Prints one line per derivation kind: `done`, `pending`, `offline`,
-/// `unsupported`, `needs_ffmpeg` (need ffmpeg), `needs_model` (need model).
+/// `unsupported`, `needs_ffmpeg` (need ffmpeg), `needs_model` (need model),
+/// `failed` (items this plan holds back because the ledger remembers them
+/// failing).
 fn print_kind_status(name: &str, status: &majestical_services::index::KindStatusRow) {
     println!(
-        "{name}: {} done, {} pending, {} offline, {} unsupported, {} need ffmpeg, {} need model",
+        "{name}: {} done, {} pending, {} offline, {} unsupported, {} need ffmpeg, \
+         {} need model, {} failed",
         status.done,
         status.pending,
         status.offline,
         status.unsupported,
         status.needs_ffmpeg,
         status.needs_model,
+        status.failed,
     );
 }
 
@@ -256,6 +263,7 @@ fn kind_status_json(status: &majestical_services::index::KindStatusRow) -> serde
         "unsupported": status.unsupported,
         "needs_ffmpeg": status.needs_ffmpeg,
         "needs_model": status.needs_model,
+        "failed": status.failed,
     })
 }
 
@@ -274,18 +282,30 @@ fn print_status_remedies(outcome: &majestical_services::index::IndexStatusOutcom
 }
 
 /// Per-kind lines for the failures the ledger remembers, e.g. `pdf: 1 known
-/// failure(s), skipped until `maj index run --retry-failed` (not a valid
-/// pdf)` — each names both how many items are held back and the remedy.
+/// failure(s) skipped until retried (not a valid pdf)`, followed by a single
+/// remedy line naming the command that retries them — one remedy for the
+/// whole report, not one per kind.
+///
+/// These rows are deliberately NOT the same number as the per-kind `failed`
+/// count printed above: that count is plan-derived (items still pending that
+/// this plan holds back), while a ledger row can outlive it — an asset whose
+/// derivation later arrived by sync is done, yet its row stays until a
+/// retry clears it.
 fn print_known_failures(failures: &majestical_services::index::Ledger) {
+    let mut any = false;
     for (kind, rows) in failures {
         let Some(first) = rows.first() else {
             continue;
         };
+        any = true;
         println!(
-            "{kind}: {} known failure(s), skipped until `maj index run --retry-failed` ({})",
+            "{kind}: {} known failure(s) skipped until retried ({})",
             rows.len(),
             first.error,
         );
+    }
+    if any {
+        println!("retry with: maj index run --retry-failed");
     }
 }
 

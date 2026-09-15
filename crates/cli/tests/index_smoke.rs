@@ -1283,3 +1283,62 @@ fn index_run_remembers_a_permanent_failure_and_skips_it_until_retried() {
     assert_eq!(json["failed"]["thumbs"].as_array().unwrap().len(), 1);
     assert_eq!(json["thumbs"]["failed"], 1);
 }
+
+/// With rows under two kinds, `index status` names each kind on its own
+/// line but prints the retry remedy exactly once — the remedy is about the
+/// command, not about any one kind. Seeds the second kind by rewriting the
+/// ledger file directly (a real second permanent failure would need `PDFKit`
+/// or a model), which is also what proves the rows are read from the file
+/// rather than re-derived.
+#[test]
+fn index_status_prints_the_retry_remedy_once_across_kinds() {
+    let media = tempfile::tempdir().unwrap();
+    std::fs::write(media.path().join("broken.png"), b"this is not a png").unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+
+    let ledgers = walkdir_find(&state, "index-failures.json");
+    assert_eq!(ledgers.len(), 1, "one ledger file under the state dir");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ledgers[0]).unwrap()).unwrap();
+    ledger["pdf"] = serde_json::json!([
+        { "asset": "xxh3:00000000000000000000000000000000", "path": "/x/broken.pdf",
+          "error": "not a valid pdf" }
+    ]);
+    std::fs::write(&ledgers[0], ledger.to_string()).unwrap();
+
+    let out = maj(&root, &state)
+        .args(["index", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("thumbs: 1 known failure(s) skipped until retried"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("pdf: 1 known failure(s) skipped until retried"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("retry with: maj index run --retry-failed")
+            .count(),
+        1,
+        "the remedy prints once, not once per kind:\n{stdout}"
+    );
+}

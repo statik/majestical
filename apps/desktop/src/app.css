@@ -1338,3 +1338,7 @@ main > .error {
   margin: 0.25rem 0 0;
   font-weight: 600;
 }
+
+.settings-failed {
+  color: var(--attention);
+}

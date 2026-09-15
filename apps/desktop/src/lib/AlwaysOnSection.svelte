@@ -3,16 +3,18 @@
   // power-aware throttle override — the same one `tray.rs::apply_throttle`
   // exposes from the menu bar, here reached through `scheduler_state`/
   // `set_throttle` instead of the tray's direct `set_throttle_impl` call —
-  // and the OS "start at login" toggle via `autostart.ts`. Both are read
-  // once on mount; the status line refreshes on a throttle change, not on
-  // a timer. A sibling component to `SettingsView.svelte` rather than
-  // folded into it: the scheduler command and the autostart plugin are two
-  // unrelated backends, and keeping them apart keeps each file's state
-  // readable at a glance.
+  // and the OS "start at login" toggle via `autostart.ts`, plus a Retry
+  // button for the failure ledger (`retryFailedItems`) shown once
+  // `failed_items > 0`. Both scheduler reads happen once on mount; the
+  // status line refreshes on a throttle change or a retry, not on a timer.
+  // A sibling component to `SettingsView.svelte` rather than folded into
+  // it: the scheduler commands and the autostart plugin are two unrelated
+  // backends, and keeping them apart keeps each file's state readable at a
+  // glance.
   import { autostartEnabled, setAutostart } from "./autostart";
   import { api, errorMessage } from "./api";
   import type { SchedulerStateOutcome, ThrottleOverride } from "./api-alwayson";
-  import { statusLine } from "./scheduler-status";
+  import { failedLine, statusLine } from "./scheduler-status";
 
   const THROTTLES: { value: ThrottleOverride; label: string }[] = [
     { value: "auto", label: "Auto" },
@@ -24,6 +26,7 @@
   let scheduler = $state<SchedulerStateOutcome | null>(null);
   let autostart = $state(false);
   let autostartError = $state<string | null>(null);
+  let retryError = $state<string | null>(null);
 
   $effect(() => {
     void loadScheduler();
@@ -40,6 +43,15 @@
 
   async function changeThrottle(throttle: ThrottleOverride) {
     scheduler = await api.setThrottle(throttle);
+  }
+
+  async function retryFailed() {
+    retryError = null;
+    try {
+      scheduler = await api.retryFailedItems();
+    } catch (failure) {
+      retryError = errorMessage(failure);
+    }
   }
 
   async function toggleAutostart(next: boolean) {
@@ -82,6 +94,19 @@
   </div>
   {#if scheduler}
     <p class="settings-status" role="status">{statusLine(scheduler)}</p>
+  {/if}
+  {#if scheduler && scheduler.failed_items > 0}
+    <div class="ctl-actions">
+      <p class="settings-status settings-failed" role="status">
+        {failedLine(scheduler.failed_items)}
+      </p>
+      <button class="ctl-btn" onclick={() => void retryFailed()}>
+        Retry failed items
+      </button>
+    </div>
+  {/if}
+  {#if retryError !== null}
+    <p class="error" role="alert">{retryError}</p>
   {/if}
 
   <div class="settings-toggle-row">

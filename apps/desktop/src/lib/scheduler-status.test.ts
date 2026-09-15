@@ -2,7 +2,7 @@ import { expect, test } from "vitest";
 import schedulerState from "./fixtures/scheduler_state.json";
 import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
 import type { SchedulerStateOutcome } from "./api-alwayson";
-import { statusLine } from "./scheduler-status";
+import { failedLine, statusLine } from "./scheduler-status";
 
 const auto = schedulerState as SchedulerStateOutcome;
 const held = schedulerStateHeld as SchedulerStateOutcome;
@@ -54,4 +54,12 @@ const cases: { label: string; state: SchedulerStateOutcome; expected: string }[]
 
 test.each(cases)("statusLine reads $expected for $label", ({ state, expected }) => {
   expect(statusLine(state)).toBe(expected);
+});
+
+test("failedLine reads the singular form for 1", () => {
+  expect(failedLine(1)).toBe("1 item skipped after failing");
+});
+
+test("failedLine reads the plural form for 2", () => {
+  expect(failedLine(2)).toBe("2 items skipped after failing");
 });

@@ -26,6 +26,15 @@ function pendingLine(pendingItems: number): string {
     : `${pendingItems} items pending`;
 }
 
+/** The failure ledger's line, shown only when `failed_items > 0` — see
+ *  `SchedulerStateOutcome.failed_items`. Same singular/plural shape as
+ *  `pendingLine`, pinned wording: "N items skipped after failing". */
+export function failedLine(failedItems: number): string {
+  return failedItems === 1
+    ? "1 item skipped after failing"
+    : `${failedItems} items skipped after failing`;
+}
+
 export function statusLine(state: SchedulerStateOutcome): string {
   if (state.decision === null) return "Starting…";
   const { decision } = state;

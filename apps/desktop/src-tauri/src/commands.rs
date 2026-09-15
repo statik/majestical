@@ -49,10 +49,6 @@ const DEFAULT_LIMIT: usize = 50;
 /// login-item launch has no shell environment, so this returns `None`; the
 /// caller's `effective_api_key` then falls back to the key stored in
 /// `describer.toml` — that fallback is the client's, not this function's.
-#[expect(
-    dead_code,
-    reason = "first consumer is doctor_report_impl (task 6); the scheduler follows (task 8)"
-)]
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
         .ok()
@@ -224,6 +220,7 @@ pub fn app_status_impl(cfg: Option<&CatalogCfg>) -> AppStatus {
 pub fn doctor_report_impl(cfg: Option<&CatalogCfg>) -> Result<DoctorOutcome, CommandError> {
     let req = majestical_services::doctor::DoctorRequest {
         catalog: cfg.map(|c| c.catalog.clone()),
+        describer_env_key: env_api_key(),
     };
     Ok(majestical_services::doctor::doctor(&req)?)
 }

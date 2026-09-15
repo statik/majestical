@@ -191,7 +191,8 @@ enum Cmd {
     },
     /// Diagnostic sweep of the environment and (optionally) one catalog:
     /// ffmpeg/imagemagick/model presence, catalog and state-dir health,
-    /// orphaned temp files, platform capabilities.
+    /// orphaned temp files, held-back failed items, the configured describer,
+    /// platform capabilities.
     Doctor {
         /// Catalog to health-check. Independent of the top-level
         /// `--catalog`/`MAJ_CATALOG` — doctor is the one verb exempt from

@@ -387,8 +387,9 @@ impl MajServer {
 
     /// Diagnostic sweep of the environment and (optionally) one catalog:
     /// ffmpeg/imagemagick/model presence, catalog and state-dir health,
-    /// orphaned temp files, platform capabilities. Unlike every other tool
-    /// here, never opens `self.catalog` — `catalog` names a path to
+    /// orphaned temp files, held-back failed items, the configured
+    /// describer, platform capabilities. Unlike every other tool here, never
+    /// opens `self.catalog` — `catalog` names a path to
     /// health-check independent of this server's own session catalog, and
     /// omitting it runs the environment-only checks. Never a tool error in
     /// practice: findings are rows on the returned `DoctorOutcome`, not a
@@ -402,6 +403,7 @@ impl MajServer {
     fn doctor(&self, Parameters(args): Parameters<DoctorArgs>) -> CallToolResult {
         let req = majestical_services::doctor::DoctorRequest {
             catalog: args.catalog.map(std::path::PathBuf::from),
+            describer_env_key: crate::describer_cmd::env_api_key(),
         };
         match majestical_services::doctor::doctor(&req) {
             Ok(outcome) => super::structured_ok(&outcome),

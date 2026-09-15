@@ -28,6 +28,12 @@ export function duration(ms: number): string {
   return hours > 0 ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
 }
 
+/** "1 file" / "2 files" — every line that counts them says it the same
+ *  way, so two of them cannot disagree about the plural. */
+export function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
 /** Binary units, one decimal place above bytes — the inspector's header and

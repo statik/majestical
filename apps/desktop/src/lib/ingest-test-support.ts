@@ -2,114 +2,37 @@
 // the same reason `organize-test-support.ts` was: `IngestView.test.ts` (the
 // setup board, the plan and the resume banner) and `IngestView.run.test.ts`
 // (the progress stream and the completion card) must not drift into
-// describing two different runs of two different cards.
+// describing two different runs of two different cards. The fixtures
+// themselves — `paraOutcome`, `planOutcome`, `ingestRun` and the ids/paths
+// they are built from — live in `ingest-fixtures.ts`; re-exported here so
+// nothing that already imports them from this file has to change.
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { render, screen, waitFor } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
 import { expect } from "vitest";
-import type {
-  IngestPlanOutcome,
-  IngestRun,
-  ParaOutcome,
-  ProgressEvent,
-} from "./api";
+import type { ProgressEvent } from "./api";
 import { INGEST_PROGRESS_EVENT } from "./api";
+import { DEST_A, DEST_B, NODE, paraOutcome, planOutcome, RUN, SOURCE } from "./ingest-fixtures";
 import IngestView from "./IngestView.svelte";
 import type { CommandHandler } from "./test-support";
 import { mockCommands } from "./test-support";
 
+export {
+  DEST_A,
+  DEST_B,
+  ingestRun,
+  NODE,
+  OTHER_RUN,
+  paraOutcome,
+  planOutcome,
+  RUN,
+  SOURCE,
+} from "./ingest-fixtures";
+
 /** `open()` from `@tauri-apps/plugin-dialog` is a plain command invoke, so
  *  both folder pickers mock through the same channel as everything else. */
 export const PICKER = "plugin:dialog|open";
-
-export const RUN = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-export const OTHER_RUN = "01BXQ8W2M4N6P8R0T2V4X6Z8AC";
-export const SOURCE = "/Volumes/A7IV-CARD";
-export const DEST_A = "/Volumes/SSD-A";
-export const DEST_B = "/Volumes/NAS-1";
-export const NODE = "01PROJECT";
-
-/** One active node to file into, and an archived one that must not be
- *  offered — filing into an archive files into somewhere nobody looks. */
-export const paraOutcome: ParaOutcome = {
-  nodes: [
-    { id: NODE, kind: "project", name: "client-x", archived: false },
-    { id: "01ARCHIVED", kind: "archive", name: "talon-2024", archived: true },
-  ],
-};
-
-/** One of each decision the planner can reach, so every counter on the plan
- *  panel has something to count. */
-export const planOutcome: IngestPlanOutcome = {
-  plan: {
-    files: [
-      {
-        source: `${SOURCE}/DCIM/a.mov`,
-        rel: "DCIM/a.mov",
-        size: 1024,
-        prehash: "0123456789abcdef0123456789abcdef",
-        decision: { decision: "copy" },
-      },
-      {
-        source: `${SOURCE}/DCIM/b.mov`,
-        rel: "DCIM/b.mov",
-        size: 2048,
-        prehash: "89abcdef0123456789abcdef01234567",
-        decision: {
-          decision: "duplicate",
-          asset: "xxh3:89abcdef0123456789abcdef01234567",
-          action: "skip",
-        },
-      },
-      {
-        source: `${SOURCE}/DCIM/c.mov`,
-        rel: "DCIM/c.mov",
-        size: 4096,
-        prehash: null,
-        decision: { decision: "rejected", reason: "unreadable: permission denied" },
-      },
-    ],
-  },
-  subdir: "Projects/client-x/2026-08-12/A7IV-CARD",
-  node_id: NODE,
-  source_volume_id: "uuid:9E1F0C7A-0B4E-4C1D-9A2B-6D5E4F3C2B1A",
-  source_volume_label: "A7IV-CARD",
-  notices: ["a warning the plan_ingest call collected"],
-};
-
-/** A finished run: one file placed, one failed, one rejected, one MHL
- *  generation. The card is drawn from this and nothing else. */
-export const ingestRun: IngestRun = {
-  run_id: RUN,
-  outcome: {
-    placed: [
-      {
-        rel: "DCIM/a.mov",
-        size: 1024,
-        xxh3: "0123456789abcdef0123456789abcdef",
-        xxh64: "0123456789abcdef",
-        dest_rel: "Projects/client-x/2026-08-12/A7IV-CARD/DCIM/a.mov",
-      },
-    ],
-    failed: [{ rel: "DCIM/d.mov", reason: "/Volumes/SSD-A: read-back mismatch" }],
-    skipped_duplicates: ["DCIM/b.mov"],
-    rejected: [{ rel: "DCIM/c.mov", reason: "unreadable: permission denied" }],
-    skipped_resumed: 2,
-    diagnostics: ["queue lock poisoned — continuing with recovered state"],
-  },
-  generations: [
-    [
-      DEST_A,
-      {
-        path: "/Volumes/SSD-A/ascmhl/0001_SSD-A_2026-08-12_101500.mhl",
-        generation: 1,
-        roothash: "c43MDX3ScQKZk8MRLZfXmqcbSjqQPmhpqFrLzCkFvNhBAd",
-      },
-    ],
-  ],
-  notices: ["a warning the ingest run collected"],
-};
 
 /** One recorded invoke: which command, and the arguments it was handed. */
 export interface IngestCall {
@@ -159,6 +82,30 @@ export function callsTo(calls: IngestCall[], cmd: string): IngestCall[] {
 export function picksInTurn(paths: string[]): CommandHandler {
   const queue = [...paths];
   return () => queue.shift() ?? null;
+}
+
+/** The Source field, which IS the source display now: a chosen source is
+ *  read off its value rather than out of a line of its own. */
+export function sourceField(): HTMLInputElement {
+  return screen.getByRole<HTMLInputElement>("textbox", { name: "Source path" });
+}
+
+/** Types a source path the way an operator does. The field commits on
+ *  every keystroke (`oninput`); the tab afterwards only moves focus on to
+ *  the next control, as an operator's would, and commits nothing extra. */
+export async function typeSource(path: string): Promise<void> {
+  const field = await screen.findByRole("textbox", { name: "Source path" });
+  await userEvent.clear(field);
+  await userEvent.type(field, path);
+  await userEvent.tab();
+}
+
+/** Types a destination and presses Enter, which is that field's own add. */
+export async function typeDest(path: string): Promise<void> {
+  const field = await screen.findByRole("textbox", {
+    name: "Destination path",
+  });
+  await userEvent.type(field, `${path}{Enter}`);
 }
 
 /** The props a suite may pin; only the clock is ever passed. */
@@ -257,9 +204,13 @@ export async function planned(
   props: IngestProps = {},
 ): Promise<IngestCall[]> {
   renderIngest(props);
-  await userEvent.click(await screen.findByRole("button", { name: "Choose source…" }));
-  await screen.findByText(SOURCE);
-  await userEvent.click(screen.getByRole("button", { name: "+ Add destination" }));
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Browse for source" }),
+  );
+  await waitFor(() => expect(sourceField().value).toBe(SOURCE));
+  await userEvent.click(
+    screen.getByRole("button", { name: "Browse for destination" }),
+  );
   await screen.findByText(DEST_A);
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),

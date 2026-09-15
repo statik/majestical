@@ -8,6 +8,7 @@ import {
   filePercent,
   noProgress,
   remainingMs,
+  runHeading,
 } from "./ingest-progress";
 
 /** The state after one run of events, in order. */
@@ -160,4 +161,11 @@ test("there is no estimate without a total, a rate, or time to measure one", () 
     { type: "bytes_copied", rel: "a.mov", bytes_done: 1500 },
   ]);
   expect(remainingMs(over, 10_000)).toBeNull();
+});
+
+test("the run panel is never titled Copying once the copy loop has ended", () => {
+  expect(runHeading("preparing")).toBe("Preparing…");
+  expect(runHeading("running")).toBe("Copying");
+  // The sweep, the MHL generations and the catalog events are not copying.
+  expect(runHeading("finishing")).toBe("Finishing…");
 });

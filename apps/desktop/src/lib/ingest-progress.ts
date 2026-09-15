@@ -1,7 +1,9 @@
 // What one ingest run has done so far, accumulated from the progress events
 // the engine emits. A module of its own, and pure, for the same reason
 // `selection.ts` is: this is the arithmetic behind every number the run card
-// shows, and it is worth pinning without a component around it.
+// shows, and it is worth pinning without a component around it — and it also
+// carries `runHeading`, the one piece of that card that is not arithmetic at
+// all, just the phase's own title.
 //
 // It is NOT the authority on a finished run. The end-of-run sweep can demote
 // a file already announced as `file_placed`, and that demotion appears only
@@ -9,6 +11,24 @@
 // never from one of these.
 import type { ProgressEvent } from "./api";
 import { duration } from "./format";
+
+/**
+ * Where the Ingest surface is. `idle` is no run on this window — the setup
+ * board, with the last run's card above it if there is one — and the other
+ * three are one run: the run thread's own planning pass, the copy loop, and
+ * the sweep that follows it. Here rather than in either component because
+ * both of them read it: `IngestRunPanel.svelte` moves through it and
+ * `IngestView.svelte` draws the board while it is `idle`.
+ */
+export type Phase = "idle" | "preparing" | "running" | "finishing";
+
+/** What the run panel is titled in each of them. `finishing` had been drawn
+ *  as "Copying", which is the one thing the run is provably no longer doing. */
+export function runHeading(phase: Phase): string {
+  if (phase === "preparing") return "Preparing…";
+  if (phase === "finishing") return "Finishing…";
+  return "Copying";
+}
 
 /** A file between its `file_started` and its `file_placed`/`file_failed`. */
 export interface CopyingFile {

@@ -1,4 +1,4 @@
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import {
   FIXTURE_ENV_VAR,
@@ -33,9 +33,28 @@ type Config = Omit<WebdriverIO.Config, "capabilities"> & {
   capabilities: TauriCapability[];
 };
 
+// Explicit order, ingest LAST: an ingest run appends immutable events (two
+// new assets, a new volume for the destination) that `volumes.e2e.ts`'s
+// exact-count asserts would see; nothing can undo them, so nothing runs
+// after it. Every spec file must be listed here (a new one goes before
+// ingest); `onPrepare` refuses a full run when a file on disk is missing
+// from this list, since the old glob would have picked it up silently and
+// this list would not. A module const, not read back from the config: the
+// launcher rewrites `config.specs` with a `--spec` filter before `onPrepare`
+// runs, and a single-spec debugging run must keep working.
+const SPEC_FILES = [
+  "./specs/smoke.e2e.ts",
+  "./specs/search.e2e.ts",
+  "./specs/volumes.e2e.ts",
+  "./specs/browse.e2e.ts",
+  "./specs/organize.e2e.ts",
+  "./specs/settings.e2e.ts",
+  "./specs/ingest.e2e.ts",
+];
+
 export const config: Config = {
   runner: "local",
-  specs: ["./specs/**/*.e2e.ts"],
+  specs: SPEC_FILES,
   maxInstances: 1,
   logLevel: "info",
   bail: 0,
@@ -86,6 +105,17 @@ export const config: Config = {
   // the spec via `FIXTURE_ENV_VAR` (the local runner's workers inherit the
   // launcher's env, so this needs no file or capability round-trip).
   onPrepare: async (_wdioConfig, capabilities) => {
+    const onDisk = (await readdir(path.join(import.meta.dirname, "specs"))).filter((file) =>
+      file.endsWith(".e2e.ts"),
+    );
+    const listed = SPEC_FILES.map((spec) => path.basename(spec));
+    const same =
+      onDisk.length === listed.length && onDisk.every((file) => listed.includes(file));
+    if (!same) {
+      throw new Error(
+        `spec files on disk [${onDisk.join(", ")}] differ from wdio.conf.ts's list [${listed.join(", ")}]`,
+      );
+    }
     const fixture = await setupFixtureCatalog(repoRoot);
     process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
 

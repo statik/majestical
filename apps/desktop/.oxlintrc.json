@@ -59,19 +59,23 @@
       // `IngestView.svelte` is the surface with three states rather than
       // one — a setup board, a live run, and a completion card — plus the
       // resume banner, and the run is the only thing in the app whose
-      // state lives in the backend and has to be rejoined on mount. All of
-      // its arithmetic is already out of the file: `ingest-progress.ts`
-      // (the event accumulator, the bar, the estimate) and
-      // `ingest-plan.ts` (the plan's five counters). What is left is the
-      // orchestration and the declared wire-gap ledger, which is what a
-      // surface is. The cap sits three lines above where the script block
-      // is today (oxlint counts the script block, 530 lines), so nearly
-      // any growth forces the next split: lifting the run panel — the
+      // state lives in the backend and has to be rejoined on mount. The
+      // split this comment used to name has happened: the run — the
       // preparing/running/finishing states, the progress subscription and
-      // the outcome poll — into a component of its own.
+      // the outcome poll — is `IngestRunPanel.svelte`, which sits under
+      // the default cap and needs no override of its own. What is left
+      // here is the board, the completion card and the declared wire-gap
+      // ledger; all of its arithmetic is already out of the file, in
+      // `ingest-progress.ts` (the event accumulator, the bar, the
+      // estimate, the run panel's heading) and `ingest-plan.ts` (the
+      // plan's five counters). The cap sits three lines above where the
+      // script block is today (oxlint counts the script block, 330
+      // lines), so nearly any growth forces the next split: the
+      // completion card — the placed/failed/rejected lists, the MHL
+      // generations and the Re-copy action — into a component of its own.
       "files": ["src/lib/IngestView.svelte"],
       "rules": {
-        "max-lines": ["warn", { "max": 533 }]
+        "max-lines": ["warn", { "max": 333 }]
       }
     },
     {

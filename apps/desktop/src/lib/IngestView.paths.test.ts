@@ -199,3 +199,18 @@ test("a path with an inner space is kept as typed and trimmed only at the wire",
     source: "/Volumes/My Card",
   });
 });
+
+test("a whitespace-only source leaves Plan disabled", async () => {
+  mockIngest();
+  renderIngest();
+
+  await screen.findByRole("option", { name: "project/client-x" });
+  await userEvent.selectOptions(
+    screen.getByRole("combobox", { name: "PARA node" }),
+    NODE,
+  );
+  await userEvent.type(sourceField(), "   ");
+  expect(
+    screen.getByRole<HTMLButtonElement>("button", { name: "Plan" }).disabled,
+  ).toBe(true);
+});

@@ -1,4 +1,4 @@
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import {
   FIXTURE_ENV_VAR,
@@ -38,7 +38,10 @@ export const config: Config = {
   // Explicit order, ingest LAST: an ingest run appends immutable events
   // (two new assets, a new volume for the destination) that
   // `volumes.e2e.ts`'s exact-count asserts would see; nothing can undo
-  // them, so nothing runs after it.
+  // them, so nothing runs after it. Every spec file must be listed here
+  // (a new one goes before ingest); `onPrepare` refuses to run when a
+  // file on disk is missing from this list, since the old glob would have
+  // picked it up silently and this list would not.
   specs: [
     "./specs/smoke.e2e.ts",
     "./specs/search.e2e.ts",
@@ -97,7 +100,18 @@ export const config: Config = {
   // per-capability `env` override, and hands the fixture's own details to
   // the spec via `FIXTURE_ENV_VAR` (the local runner's workers inherit the
   // launcher's env, so this needs no file or capability round-trip).
-  onPrepare: async (_wdioConfig, capabilities) => {
+  onPrepare: async (wdioConfig, capabilities) => {
+    const onDisk = (await readdir(path.join(import.meta.dirname, "specs"))).filter((file) =>
+      file.endsWith(".e2e.ts"),
+    );
+    const listed = (wdioConfig.specs ?? []).map((spec) => path.basename(String(spec)));
+    const same =
+      onDisk.length === listed.length && onDisk.every((file) => listed.includes(file));
+    if (!same) {
+      throw new Error(
+        `spec files on disk [${onDisk.join(", ")}] differ from wdio.conf.ts's list [${listed.join(", ")}]`,
+      );
+    }
     const fixture = await setupFixtureCatalog(repoRoot);
     process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
 

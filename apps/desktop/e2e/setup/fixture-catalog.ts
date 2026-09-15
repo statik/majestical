@@ -115,7 +115,7 @@ async function seedIngestJob(
   base: string,
   majBin: string,
   env: NodeJS.ProcessEnv,
-): Promise<{ ingestSourceDir: string; ingestDestDir: string }> {
+): Promise<{ ingestSourceDir: string; ingestDestDir: string; paraNodeName: string }> {
   const ingestSourceDir = path.join(base, "ingest-src");
   const ingestDestDir = path.join(base, "ingest-dst");
   await mkdir(ingestSourceDir, { recursive: true });
@@ -124,7 +124,7 @@ async function seedIngestJob(
     await writeFile(path.join(ingestSourceDir, name), contents);
   }
   runMaj(majBin, ["para", "add", "project", PARA_NODE], env);
-  return { ingestSourceDir, ingestDestDir };
+  return { ingestSourceDir, ingestDestDir, paraNodeName: PARA_NODE };
 }
 
 /**
@@ -172,9 +172,7 @@ export async function setupFixtureCatalog(repoRoot: string): Promise<FixtureCata
     volumeLabel: VOLUME_LABEL,
     tagName: TAG_NAME,
     photoFileName: `${PHOTO_NAME}.jpg`,
-    ingestSourceDir: ingest.ingestSourceDir,
-    ingestDestDir: ingest.ingestDestDir,
-    paraNodeName: PARA_NODE,
+    ...ingest,
   };
 }
 

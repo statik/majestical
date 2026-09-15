@@ -33,9 +33,11 @@ import { suppressAutoFocusRecovery } from "../setup/window-focus.ts";
 /** Start does the planning walk, hashes every file, copies, verifies each
  *  copy by reading it back, and writes an MHL generation per destination —
  *  on two 14-byte files that is fast, but it is a real backend run over a
- *  real filesystem, so it gets a minute rather than the surface-render
- *  timeouts the rest of this file uses. */
-const RUN_TIMEOUT = 60_000;
+ *  real filesystem, so it gets longer than the surface-render timeouts the
+ *  rest of this file uses — but less than mocha's own 60 s test timeout
+ *  (wdio.conf.ts), so a stalled run fails naming this element rather than
+ *  as a generic test timeout. */
+const RUN_TIMEOUT = 30_000;
 
 /** Fills the board in: the typed source, the typed destination, and the
  *  PARA node to file under. The source box commits on every keystroke
@@ -74,7 +76,10 @@ async function selectNode(optionText: string): Promise<void> {
     select,
     optionText,
   );
-  await expect(select).not.toHaveValue("");
+  // The consequence, not the assignment: the source is already set, so a
+  // `pickNode` that ran is what enables Plan. (`toHaveValue` would pass
+  // even with the dispatch removed — the value was set directly.)
+  await expect($("button=Plan")).toBeEnabled();
 }
 
 /**
@@ -107,14 +112,18 @@ async function runToCompletion(): Promise<void> {
   await expect($('[aria-label="Failed files"]')).not.toBeExisting();
 }
 
-/** And the bytes are really there. Files land at `<dest>/<subdir>/<rel>`
- *  (crates/ingest/src/engine.rs), where the subdir comes from the layout
- *  template, so this matches on the tail of each path rather than naming a
- *  date-dependent folder. */
-async function assertPlacedOnDisk(destDir: string): Promise<void> {
+/** And the bytes are really there, filed under the node. Files land at
+ *  `<dest>/<subdir>/<rel>` (crates/ingest/src/engine.rs) where the subdir
+ *  is `Projects/<node>/<date>/<label>` (crates/services/src/ingest.rs's
+ *  `render_ingest_subdir`): the node prefix is deterministic and asserted,
+ *  only the date segment after it is not. */
+async function assertPlacedOnDisk(destDir: string, paraNodeName: string): Promise<void> {
   const placed = await readdir(destDir, { recursive: true });
-  expect(placed.some((entry) => entry.endsWith("clip-a.txt"))).toBe(true);
-  expect(placed.some((entry) => entry.endsWith("clip-b.txt"))).toBe(true);
+  const under = `Projects/${paraNodeName}/`;
+  const clips = placed.filter(
+    (entry) => entry.startsWith(under) && /clip-[ab]\.txt$/u.test(entry),
+  );
+  expect(clips).toHaveLength(2);
 }
 
 describe("Majestical desktop — Ingest flow", () => {
@@ -131,6 +140,6 @@ describe("Majestical desktop — Ingest flow", () => {
     await fillJob(fixture);
     await planTwoCopies();
     await runToCompletion();
-    await assertPlacedOnDisk(fixture.ingestDestDir);
+    await assertPlacedOnDisk(fixture.ingestDestDir, fixture.paraNodeName);
   });
 });

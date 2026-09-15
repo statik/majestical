@@ -128,13 +128,11 @@
 
   let summary = $derived(planSummary(plan));
 
-  let canPlan = $derived(source.trim() !== "" && para !== "" && !planning);
+  /** The source as the wire sees it: trimmed here only (the field keeps what was typed). */
+  let sourceArg = $derived(source.trim());
+  let canPlan = $derived(sourceArg !== "" && para !== "" && !planning);
   let canStart = $derived(
-    source.trim() !== "" &&
-      dests.length > 0 &&
-      para !== "" &&
-      plan !== null &&
-      !planStale,
+    sourceArg !== "" && dests.length > 0 && para !== "" && plan !== null && !planStale,
   );
 
   $effect(() => {
@@ -266,7 +264,7 @@
     setupFailureNotices = [];
     try {
       const outcome = await api.planIngest({
-        source: source.trim(),
+        source: sourceArg,
         para,
         template: templateArg(),
       });
@@ -302,7 +300,7 @@
     runPanel.beginRun();
     try {
       const id = await api.startIngest({
-        source: source.trim(),
+        source: sourceArg,
         dests,
         para,
         template: templateArg(),
@@ -436,7 +434,7 @@
                mid-click takes the focus with it. The message below is for
                the other case entirely: a card drawn after a reload, with no
                source or node left on the board to plan from. -->
-          {#if source.trim() === "" || para === ""}
+          {#if sourceArg === "" || para === ""}
             <p class="empty">
               Choose the source and the PARA node again below to re-copy these.
             </p>

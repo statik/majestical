@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { duration, fileSize, isoDay, timecode } from "./format";
+import { duration, fileSize, isoDay, plural, timecode } from "./format";
 
 test("bytes below a kilobyte are counted exactly, in bytes", () => {
   expect(fileSize(0)).toBe("0 B");
@@ -32,4 +32,10 @@ test("a duration is minutes and seconds, and grows an hours field", () => {
   expect(duration(3_600_000)).toBe("1:00:00");
   // Truncated, not rounded: a run 59.9 seconds in has not reached a minute.
   expect(duration(59_900)).toBe("00:59");
+});
+
+test("a count of one is singular, and every other count is plural", () => {
+  expect(plural(1, "file")).toBe("1 file");
+  expect(plural(2, "file")).toBe("2 files");
+  expect(plural(0, "file")).toBe("0 files");
 });

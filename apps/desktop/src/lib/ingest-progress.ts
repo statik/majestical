@@ -1,7 +1,9 @@
 // What one ingest run has done so far, accumulated from the progress events
 // the engine emits. A module of its own, and pure, for the same reason
 // `selection.ts` is: this is the arithmetic behind every number the run card
-// shows, and it is worth pinning without a component around it.
+// shows, and it is worth pinning without a component around it — and it also
+// carries `runHeading`, the one piece of that card that is not arithmetic at
+// all, just the phase's own title.
 //
 // It is NOT the authority on a finished run. The end-of-run sweep can demote
 // a file already announced as `file_placed`, and that demotion appears only

@@ -19,14 +19,18 @@
    * The board and the completion card are the parent's, so `phase` and
    * `finished` bind back to it, and one run is driven through
    * `beginRun`/`nameRun`/`dropRun` — the three things a `start_ingest`
-   * call can turn into.
+   * call can turn into. The parent must mount `<IngestRunPanel>`
+   * unconditionally, never inside a phase branch: this component's own
+   * mount-time `adoptRunningState` call is how the surface rejoins a run
+   * already in flight, and a branch that skips mounting it skips that
+   * rejoin too.
    */
   import { onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { api, errorMessage, errorNotices, INGEST_PROGRESS_EVENT } from "./api";
   import type { FinishedIngest, IngestProgress, IngestState } from "./api";
-  import { fileSize } from "./format";
+  import { fileSize, plural } from "./format";
   import {
     applyProgress,
     barPercent,
@@ -290,12 +294,6 @@
       runError = errorMessage(failure);
       runFailureNotices = errorNotices(failure);
     }
-  }
-
-  /** "1 file" / "2 files" — every line that counts them says it the same
-   *  way, so two of them cannot disagree about the plural. */
-  function plural(count: number, noun: string): string {
-    return `${count} ${noun}${count === 1 ? "" : "s"}`;
   }
 </script>
 

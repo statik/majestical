@@ -69,7 +69,7 @@
     ParaNodeRow,
     UnfinishedRun,
   } from "./api";
-  import { fileSize } from "./format";
+  import { fileSize, plural } from "./format";
   import { planSummary } from "./ingest-plan";
   import type { Phase } from "./ingest-progress";
   import IngestRunPanel from "./IngestRunPanel.svelte";
@@ -289,9 +289,13 @@
    * why the surface says "Preparing…" rather than drawing an empty bar.
    */
   async function start() {
+    // `bind:this` is set at mount, and `<IngestRunPanel>` is mounted
+    // unconditionally — so a null here means this component never mounted,
+    // not a state Start should quietly do nothing for.
+    if (runPanel === undefined) throw new Error("run panel not mounted");
     setupError = null;
     setupFailureNotices = [];
-    runPanel?.beginRun();
+    runPanel.beginRun();
     try {
       const id = await api.startIngest({
         source,
@@ -300,10 +304,10 @@
         template: templateArg(),
         resume: resumeOf ?? undefined,
       });
-      runPanel?.nameRun(id);
+      runPanel.nameRun(id);
       resumeOf = null;
     } catch (failure) {
-      runPanel?.dropRun();
+      runPanel.dropRun();
       setupError = errorMessage(failure);
       setupFailureNotices = errorNotices(failure);
     }
@@ -321,12 +325,6 @@
 
   function dismiss(run: UnfinishedRun) {
     unfinished = unfinished.filter((row) => row.run_id !== run.run_id);
-  }
-
-  /** "1 file" / "2 files" — every line that counts them says it the same
-   *  way, so two of them cannot disagree about the plural. */
-  function plural(count: number, noun: string): string {
-    return `${count} ${noun}${count === 1 ? "" : "s"}`;
   }
 </script>
 
@@ -541,9 +539,14 @@
             class="ctl-input"
             type="text"
             aria-label="Destination path"
+            aria-invalid={destError !== null}
+            aria-describedby={destError === null ? undefined : "dest-error"}
             placeholder="/Volumes/SHUTTLE_A"
             value={destDraft}
-            oninput={(event) => (destDraft = event.currentTarget.value)}
+            oninput={(event) => {
+              destDraft = event.currentTarget.value;
+              destError = null;
+            }}
             onkeydown={(event) => {
               if (event.key === "Enter") addTypedDest();
             }}
@@ -564,7 +567,7 @@
           </button>
         </div>
         {#if destError !== null}
-          <p class="error" role="alert">{destError}</p>
+          <p id="dest-error" class="error" role="alert">{destError}</p>
         {/if}
       </div>
     </div>

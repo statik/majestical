@@ -9,6 +9,7 @@ import {
   NODE,
   PICKER,
   picksInTurn,
+  planned,
   renderIngest,
   SOURCE,
   sourceField,
@@ -61,6 +62,42 @@ test("a typed source path is the job's source", async () => {
   // The dialog is the alternative route, not the route: a typed path never
   // opens it.
   expect(callsTo(calls, PICKER)).toHaveLength(0);
+});
+
+test("a source typed and left uncommitted is committed by clicking Plan", async () => {
+  const calls = mockIngest();
+  renderIngest();
+
+  // No tab: the field is left focused, mid-edit. Choosing the PARA node and
+  // clicking Plan both move focus away from it, which is what a text input
+  // commits a `change` on — the same commit `typeSource`'s own tab forces.
+  await userEvent.type(sourceField(), SOURCE);
+  await userEvent.selectOptions(
+    screen.getByRole("combobox", { name: "PARA node" }),
+    NODE,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+  await waitFor(() => expect(callsTo(calls, "plan_ingest")).toHaveLength(1));
+  expect(callsTo(calls, "plan_ingest")[0]?.args).toEqual({
+    source: SOURCE,
+    para: NODE,
+    template: undefined,
+  });
+});
+
+test("a typed source after a plan stales it", async () => {
+  const calls = mockIngest({ [PICKER]: picksInTurn([SOURCE, DEST_A]) });
+  await planned(calls);
+
+  await typeSource("/Volumes/OTHER");
+
+  // The same rule `IngestView.test.ts` pins for a browsed destination —
+  // this is the typed half, on the source field.
+  expect(screen.getByText(/plan again before starting/u)).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "Plan again" }),
+  ).toBeTruthy();
 });
 
 test("Enter in the destination field adds it and clears the field", async () => {

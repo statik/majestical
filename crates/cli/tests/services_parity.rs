@@ -15,7 +15,8 @@ fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
 
 /// Everything [`diff_against_ref`] does, with `normalize` applied to BOTH
 /// binaries' stdout AND stderr before comparing — for a verb whose output
-/// this branch intentionally changed (see [`without_ledger`]).
+/// this branch intentionally changed (see [`without_ledger`],
+/// [`without_new_doctor_rows`], [`without_result_pluralization`]).
 #[cfg(test)]
 fn diff_against_ref_normalized(
     root: &Path,

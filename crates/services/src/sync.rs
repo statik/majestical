@@ -1142,6 +1142,11 @@ mod location_add_rm_tests {
         assert!(err.to_string().contains("no sync location named"));
     }
 
+    /// A drift guard, not a regression test: it also passes against the
+    /// hand-rolled `join("blobs")` this replaced, because `BlobStore::root()`
+    /// is that path today. What it pins is the coupling — a future change
+    /// to the store's layout fails here instead of leaving `location_add`'s
+    /// skeleton pointing at a directory nothing reads.
     #[test]
     fn location_add_creates_the_blob_root_the_store_opens() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -37,8 +37,10 @@ const ATTENTION_LINE: &str = "Last batch failed — open Health…";
 /// `icons/tray/`. The `@2x` (44×44) files are the ones loaded: `tray_icon`
 /// 0.24's macOS `set_icon` builds the `NSImage` from the PNG bytes and then
 /// sizes it to 18 points tall regardless of pixel dimensions, so a 44 px
-/// image renders at 18 pt with 2× density on a Retina display and is
-/// downsampled on a 1× one — no `HiDPI` plumbing of our own. (The phase 7E
+/// image renders at 18 pt with 2× density on a Retina display and — by
+/// the same fixed 18 pt sizing, inferred from the library source rather
+/// than observed on a 1× display — downsampled on a 1× one; no `HiDPI`
+/// plumbing of our own. (The phase 7E
 /// note that a `@2x` file "would render twice the intended size" was wrong
 /// for this library version.) The `@1x` (22×22) files are still generated
 /// by the same recipe; nothing loads them.

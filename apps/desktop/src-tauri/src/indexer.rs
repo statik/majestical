@@ -211,6 +211,22 @@ fn success_pace(decision: SchedulerDecision) -> Duration {
     }
 }
 
+/// Publishes one poll's findings into the shared state — the counts the
+/// tray and Settings read, the power reading, and the decision. Pure over
+/// its inputs, so a test can prove every field lands without a catalog, a
+/// power probe, or a thread.
+fn publish_poll(
+    shared: &mut SchedulerShared,
+    status: &IndexStatusOutcome,
+    power: PowerState,
+    decision: SchedulerDecision,
+) {
+    shared.power = power;
+    shared.pending_items = pending_items(status);
+    shared.failed_items = failed_items(status);
+    shared.last_decision = Some(decision);
+}
+
 /// Polls pending work and power, decides this tick's mode, and publishes
 /// both into `scheduler` before returning the decision and the batch it
 /// authorizes (`None` for a hold) — so a caller reading `scheduler_state`
@@ -236,10 +252,7 @@ fn poll_and_decide(
         .throttle;
     let decision = autopilot_decision(power, throttle, pending);
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
-    shared.power = power;
-    shared.pending_items = pending;
-    shared.failed_items = failed_items(&status);
-    shared.last_decision = Some(decision);
+    publish_poll(&mut shared, &status, power, decision);
     drop(shared);
     Ok((
         decision,
@@ -371,11 +384,22 @@ fn run_tick(app: &AppHandle) -> Duration {
 /// The sleep goes through [`SchedulerWake`] rather than
 /// `std::thread::sleep`, so a `retry_failed_items` call gets its retried
 /// items attempted within seconds instead of after up to a full [`TICK`].
+///
+/// The `wait`/`std::thread::sleep` swap itself is untestable by
+/// construction — this is an infinite loop behind an `AppHandle`, with
+/// nothing to observe from outside it — so it is the one line in this
+/// module with no test that fails when it is reverted. [`SchedulerWake`]'s
+/// own tests cover the producer side (`nudge` cutting a `wait` short); nudge
+/// wiring runs at every tick, and `retry_failed_items_impl` calling
+/// `wake.nudge()` is covered directly.
 fn run_loop(app: &AppHandle) {
+    // Bound once, above the loop: a missing `.manage::<SchedulerWake>()`
+    // then fails at spawn time, not silently on the first tick.
+    let wake = app.state::<SchedulerWake>();
     loop {
         let pause = run_tick(app);
         crate::tray::refresh(app);
-        app.state::<SchedulerWake>().wait(pause);
+        wake.wait(pause);
     }
 }
 
@@ -462,13 +486,27 @@ pub(crate) fn set_throttle_impl(
 }
 
 /// Clears the failure ledger for every kind of the selected catalog, zeroes
-/// the reported count, and nudges the loop. The next tick re-plans, so the
-/// retried items are attempted within seconds rather than a full [`TICK`].
+/// the reported count, and nudges the loop. The retried items are attempted
+/// on the loop's next pass rather than after up to a full [`TICK`] — a
+/// batch already in flight finishes first; the nudge only shortens the
+/// sleep between ticks, it does not interrupt a running batch.
+///
+/// A retry that interleaves with a finishing batch's `record_failures`
+/// (both read-modify-write the ledger file) can be overwritten by that
+/// batch's pre-clear read; the window is milliseconds, the next poll shows
+/// the true count, and clicking again is the remedy — no locking scheme is
+/// warranted.
 ///
 /// The count is zeroed here rather than left for the next poll to correct:
 /// the ledger is empty the moment `clear_failures` returns, so reporting
 /// the pre-clear number back to the caller that just cleared it would be a
 /// stale answer with nothing to justify it.
+///
+/// `open_app` is kept here not for the notices sink — a local `Notices`
+/// would do just as well, since `clear_failures` resolves the state dir
+/// itself — but so a retry against a moved or deleted catalog fails loudly
+/// instead of reporting success for a clear of nothing; the notices it
+/// collects are dropped, as `run_batch` documents for its own.
 ///
 /// `pub`, unlike the other `*_impl`s in this module: `tests/commands.rs` is
 /// a separate crate and drives this one against a real catalog, which is
@@ -483,7 +521,9 @@ pub fn retry_failed_items_impl(
     wake: &SchedulerWake,
 ) -> Result<SchedulerStateOutcome, CommandError> {
     let Some(cfg) = cfg else {
-        return Err(anyhow::anyhow!("no catalog selected").into());
+        return Err(
+            anyhow::anyhow!("no catalog selected yet — initialize or choose one first").into(),
+        );
     };
     let fs_app = open_app(cfg)?;
     let kinds: BTreeSet<String> = VALID_KINDS.iter().map(|s| (*s).to_string()).collect();
@@ -558,7 +598,7 @@ mod tests {
         BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
         SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome, SchedulerWake,
         ThrottleOverride, batch_outcome_pace, batch_request, failed_items, pending_items,
-        retry_failed_items_impl, set_throttle_impl, success_pace, total_failures,
+        publish_poll, retry_failed_items_impl, set_throttle_impl, success_pace, total_failures,
     };
     use majestical_services::index::{IndexRunOutcome, ItemFailure, KindStatusRow};
     use std::time::{Duration, Instant};
@@ -608,6 +648,36 @@ mod tests {
 
     fn status_with_failed(counts: [u64; 8]) -> IndexStatusOutcome {
         status_from(counts.map(|failed| kind_row(0, failed)))
+    }
+
+    /// Sibling of `status_with_pending`/`status_with_failed` with both
+    /// columns non-zero at once, for a test that must tell `pending_items`
+    /// and `failed_items` apart rather than one that happens to be zero.
+    fn status_with(pending: [u64; 8], failed: [u64; 8]) -> IndexStatusOutcome {
+        status_from(std::array::from_fn(|i| kind_row(pending[i], failed[i])))
+    }
+
+    /// `publish_poll` is the seam `poll_and_decide` writes through, and
+    /// `poll_and_decide` itself is untestable without a catalog and a power
+    /// probe — this proves every field lands without either. Both
+    /// `pending` and `failed` are non-zero across several kinds so a test
+    /// that mixed the two counts up would fail.
+    #[test]
+    fn publish_poll_lands_every_field() {
+        let mut shared = SchedulerShared::default();
+        let status = status_with([1, 0, 2, 0, 3, 0, 4, 0], [0, 5, 0, 6, 0, 7, 0, 8]);
+        let power = PowerState {
+            source: PowerSource::Battery,
+            low_power_mode: true,
+        };
+        let decision = SchedulerDecision::RunLow;
+
+        publish_poll(&mut shared, &status, power, decision);
+
+        assert_eq!(shared.power, power);
+        assert_eq!(shared.pending_items, 10);
+        assert_eq!(shared.failed_items, 26);
+        assert_eq!(shared.last_decision, Some(decision));
     }
 
     #[test]

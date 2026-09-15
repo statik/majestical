@@ -44,6 +44,17 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// impls, not the command wrappers, so it is reachable from a test.
 const DEFAULT_LIMIT: usize = 50;
 
+/// The describer API key from the environment — the same variable the CLI
+/// reads, so a GUI launched from a shell honors the same override. A
+/// login-item launch has no shell environment and falls back to the key
+/// stored in `describer.toml`.
+#[expect(dead_code, reason = "wired into the scheduler by the next task")]
+pub(crate) fn env_api_key() -> Option<String> {
+    std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
+        .ok()
+        .filter(|k| !k.is_empty())
+}
+
 /// This app's catalog wiring — managed Tauri state, rebuilt when the user
 /// picks or initializes a catalog.
 #[derive(Clone, Debug)]

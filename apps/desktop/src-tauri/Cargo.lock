@@ -5112,6 +5112,7 @@ dependencies = [
  "anyhow",
  "hostname",
  "majestical-core",
+ "majestical-describe",
  "majestical-index",
  "majestical-ingest",
  "majestical-services",

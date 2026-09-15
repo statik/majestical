@@ -7,9 +7,9 @@
     errorMessage,
     errorNotices,
     INGEST_PROGRESS_EVENT,
-    NAVIGATE_SETTINGS_EVENT,
   } from "./lib/api";
   import type { AppStatus, IngestProgress } from "./lib/api";
+  import { NAVIGATE_SETTINGS_EVENT } from "./lib/api-alwayson";
   import BrowseView from "./lib/BrowseView.svelte";
   import IngestView from "./lib/IngestView.svelte";
   import Inspector from "./lib/Inspector.svelte";

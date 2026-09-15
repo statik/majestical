@@ -396,8 +396,11 @@ fn doctor_matches_cli_json() {
     with_state_dir(|| {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = seeded_cfg(dir.path().join("cat"));
-        let outcome =
-            majestical_desktop::commands::doctor_report_impl(Some(&cfg)).expect("command");
+        let outcome = majestical_desktop::commands::doctor_report_impl(
+            Some(&cfg),
+            majestical_desktop::commands::env_api_key(),
+        )
+        .expect("command");
         assert_eq!(
             serde_json::to_value(&outcome).expect("serialize command outcome"),
             cli_doctor_json(&maj, &cfg.catalog),

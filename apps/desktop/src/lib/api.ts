@@ -4,8 +4,11 @@
 // Fields the Rust skips when empty (`skip_serializing_if`) are optional here.
 // Every interface here is pinned by `fixtures.test.ts` against a fixture in
 // `fixtures/*.json`; a new outcome interface needs a builder in
-// `src-tauri/tests/wire_fixtures.rs` too.
+// `src-tauri/tests/wire_fixtures.rs` too. Not the whole contract: the
+// always-on/health subject lives in `api-alwayson.ts`, pinned by
+// `fixtures.alwayson.test.ts`, and is spread into `api` below.
 import { invoke } from "@tauri-apps/api/core";
+import { alwaysOnApi } from "./api-alwayson";
 
 /** `majestical_services::search::VolumeRef` */
 export interface VolumeRef {
@@ -182,31 +185,6 @@ export interface AssetDetail {
 export interface AppStatus {
   catalog_path: string;
   catalog_ready: boolean;
-}
-
-/** `majestical_services::doctor::CheckStatus`, serialized snake_case. */
-export type CheckStatus = "ok" | "warn" | "fail";
-
-/**
- * `majestical_services::doctor::DoctorCheck`. `remedy` is absent on an `Ok`
- * row and present on `Fail`; a `Warn` row may carry one (the no-catalog
- * `catalog` row does) or not (`blob_residue` and `platform` warnings don't).
- */
-export interface DoctorCheck {
-  name: string;
-  status: CheckStatus;
-  detail: string;
-  remedy?: string;
-}
-
-/**
- * `majestical_services::doctor::DoctorOutcome` — what `doctorReport` returns.
- * Runs even before a catalog is chosen: the catalog-dependent checks report
- * `Warn` rows instead of the command failing.
- */
-export interface DoctorOutcome {
-  checks: DoctorCheck[];
-  notices?: string[];
 }
 
 /** `majestical_services::tags::TagRow` */
@@ -439,62 +417,6 @@ export interface IngestProgress {
 export const INGEST_PROGRESS_EVENT = "ingest-progress";
 
 /**
- * The Tauri event `tray.rs` emits after showing and focusing the main
- * window from "Health…" or the tray's attention line ("Last batch failed"),
- * so the shell selects the Settings surface rather than wherever it was
- * left open to.
- */
-export const NAVIGATE_SETTINGS_EVENT = "navigate-settings";
-
-/** `majestical_services::autopilot::ThrottleOverride`, serialized snake_case. */
-export type ThrottleOverride = "auto" | "paused" | "low" | "full";
-
-/** `majestical_services::autopilot::PowerSource`, serialized snake_case. */
-export type PowerSource = "ac" | "battery" | "unknown";
-
-/** `majestical_services::autopilot::PowerState` */
-export interface PowerState {
-  source: PowerSource;
-  low_power_mode: boolean;
-}
-
-/**
- * `majestical_services::autopilot::SchedulerDecision` — serde tag `mode`,
- * `hold_reason` only present on the `hold` arm, both snake_case.
- */
-export type SchedulerDecision =
-  | { mode: "run_full" }
-  | { mode: "run_low" }
-  | {
-      mode: "hold";
-      hold_reason: "paused" | "low_power_mode" | "no_pending_work";
-    };
-
-/** The `hold` arm's reason, pulled out so a `Record<HoldReason, ...>` (as
- *  `scheduler-status.ts` builds) fails to type-check on a variant it hasn't
- *  covered, rather than silently falling through. */
-export type HoldReason = Extract<
-  SchedulerDecision,
-  { mode: "hold" }
->["hold_reason"];
-
-/**
- * `indexer::SchedulerStateOutcome` — what `scheduler_state`/`set_throttle`
- * return. `decision` is `null`, not absent, before the scheduler loop's
- * first tick has run; `last_error` is absent both before that first tick
- * and once a later batch has succeeded.
- */
-export interface SchedulerStateOutcome {
-  available: boolean;
-  throttle: ThrottleOverride;
-  power: PowerState;
-  decision: SchedulerDecision | null;
-  pending_items: number;
-  running: boolean;
-  last_error?: string;
-}
-
-/**
  * `commands::FinishedIngest` — how the last run ended. A failure is a value
  * the state keeps, not a lost promise: the run outlives the webview, so the
  * error that ended it survives a reload too.
@@ -527,8 +449,10 @@ export interface IngestState {
  * a second place to change it.
  */
 export const api = {
+  // Keys below must stay disjoint from `alwaysOnApi`'s: a spread-then-literal
+  // collision is a silent last-write-wins, not a type error.
+  ...alwaysOnApi,
   appStatus: () => invoke<AppStatus>("app_status"),
-  doctorReport: () => invoke<DoctorOutcome>("doctor_report"),
   searchAssets: (query: string) =>
     invoke<SearchOutcome>("search_assets", { query }),
   runSavedSearch: (name: string) =>
@@ -594,10 +518,6 @@ export const api = {
   ingestState: () => invoke<IngestState>("ingest_state"),
   listUnfinishedIngests: () =>
     invoke<UnfinishedRunsOutcome>("list_unfinished_ingests"),
-  // Background index scheduler.
-  schedulerState: () => invoke<SchedulerStateOutcome>("scheduler_state"),
-  setThrottle: (throttle: ThrottleOverride) =>
-    invoke<SchedulerStateOutcome>("set_throttle", { throttle }),
 };
 
 /**

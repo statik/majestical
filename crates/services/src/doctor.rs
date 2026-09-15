@@ -44,6 +44,18 @@ pub struct DoctorOutcome {
 pub struct DoctorRequest {
     /// Catalog to health-check; `None` skips catalog checks with a Warn row.
     pub catalog: Option<PathBuf>,
+    /// The head's reading of
+    /// [`majestical_describe::config::OPENROUTER_KEY_ENV`], passed in
+    /// because this crate never reads the environment. `None` = not set.
+    ///
+    /// Each head MUST fill this from its own process environment and MUST
+    /// NOT accept it from a client: a remote MCP caller that could set it
+    /// would make doctor report "key configured" for a key that does not
+    /// exist on the machine captions actually run on. The `Deserialize`
+    /// derive is for in-process construction symmetry with the other
+    /// request types, not for a field a wire client fills.
+    #[serde(default)]
+    pub describer_env_key: Option<String>,
 }
 
 /// `maj doctor`: runs every check below, in order, and reports the row each
@@ -59,6 +71,7 @@ pub struct DoctorRequest {
 pub fn doctor(req: &DoctorRequest) -> Result<DoctorOutcome, ServiceError> {
     let notices = Notices::new();
     let catalog = req.catalog.as_deref();
+    let env_key = req.describer_env_key.as_deref();
     let checks = vec![
         check_ffmpeg(),
         check_imagemagick(),
@@ -66,6 +79,8 @@ pub fn doctor(req: &DoctorRequest) -> Result<DoctorOutcome, ServiceError> {
         check_state_dir(catalog, &notices),
         check_catalog(catalog, &notices),
         check_blob_residue(catalog, &notices),
+        check_failed_items(catalog, &notices),
+        check_describer(catalog, env_key, &notices),
         check_platform(),
     ];
     Ok(DoctorOutcome {
@@ -406,6 +421,160 @@ fn check_blob_residue(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck 
     }
 }
 
+/// The failure ledger — every item the planner is holding back because it
+/// failed permanently ([`crate::index::known_failures`]) — reported as a
+/// `Warn` with the first few paths, never as a silent zero. Takes no env
+/// key: nothing about the ledger depends on the describer.
+///
+/// A ledger that can't be read at all (an unresolvable state dir) is a
+/// `Fail` carrying the error verbatim, pointed at the `state_dir` row —
+/// which fails for the same cause and carries the actual fix.
+fn check_failed_items(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck {
+    let Some(catalog) = catalog else {
+        return DoctorCheck {
+            name: "failed_items".to_string(),
+            status: CheckStatus::Warn,
+            detail: "no catalog selected".to_string(),
+            remedy: None,
+        };
+    };
+    let ledger = match crate::index::known_failures(catalog, notices) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            return DoctorCheck {
+                name: "failed_items".to_string(),
+                status: CheckStatus::Fail,
+                detail: format!("{err:#}"),
+                remedy: Some("see the state_dir row".to_string()),
+            };
+        }
+    };
+
+    // Flattened across kinds: the row is about how many items the catalog is
+    // holding back, not about which kind holds them.
+    let rows: Vec<&crate::index::LedgerRow> = ledger.values().flatten().collect();
+    if rows.is_empty() {
+        return DoctorCheck {
+            name: "failed_items".to_string(),
+            status: CheckStatus::Ok,
+            detail: "no known failures".to_string(),
+            remedy: None,
+        };
+    }
+    let samples: Vec<&str> = rows.iter().take(3).map(|row| row.path.as_str()).collect();
+    DoctorCheck {
+        name: "failed_items".to_string(),
+        status: CheckStatus::Warn,
+        detail: format!(
+            "{} item(s) skipped after failing permanently: {}",
+            rows.len(),
+            samples.join(", ")
+        ),
+        remedy: Some(
+            "maj index run --retry-failed (or Retry failed items in Settings → Always-on)"
+                .to_string(),
+        ),
+    }
+}
+
+/// The configured describer, and — for `OpenRouter` — whether a key will
+/// actually be available when captions run. No describer at all is `Ok`:
+/// captions are optional, and "off" is a legitimate configuration, not a
+/// fault. An unreadable or unparsable `describer.toml` is a `Warn`: nothing
+/// is broken until captions are attempted, and the file is rewritable.
+///
+/// The two failure modes of [`crate::describer_config::load_config`] are
+/// told apart before it is called: an unresolvable state dir is not a
+/// broken `describer.toml`, and must not be answered with "rewrite that
+/// file" — the `state_dir` row already `Fail`s for that cause.
+///
+/// The `Warn` detail renders the error with `{err}`, never `{err:#}`:
+/// walking the chain reaches `toml::de::Error`, which quotes the offending
+/// source line back — and that line can be `api_key = "sk-…"`. The
+/// outermost context names the file, which is all the reader needs.
+fn check_describer(
+    catalog: Option<&Path>,
+    env_key: Option<&str>,
+    notices: &Notices,
+) -> DoctorCheck {
+    let Some(catalog) = catalog else {
+        return DoctorCheck {
+            name: "describer".to_string(),
+            status: CheckStatus::Warn,
+            detail: "no catalog selected".to_string(),
+            remedy: None,
+        };
+    };
+    if let Err(err) = crate::describer_config::config_path(catalog, notices) {
+        return DoctorCheck {
+            name: "describer".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!("describer config location unresolvable: {err}"),
+            remedy: Some("see the state_dir row".to_string()),
+        };
+    }
+    match crate::describer_config::load_config(catalog, notices) {
+        Ok(None) => DoctorCheck {
+            name: "describer".to_string(),
+            status: CheckStatus::Ok,
+            detail: "no describer configured — captions off".to_string(),
+            remedy: None,
+        },
+        Ok(Some(config)) => describer_config_row(&config, env_key),
+        Err(err) => DoctorCheck {
+            name: "describer".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!("describer config unreadable: {err}"),
+            remedy: Some(
+                "fix or remove describer.toml (`maj describer set …` rewrites it)".to_string(),
+            ),
+        },
+    }
+}
+
+/// The row a stored describer config produces. The local backends need
+/// nothing beyond an endpoint, so they are always `Ok`; `OpenRouter` is
+/// `Ok` only when [`majestical_describe::DescriberConfig::effective_api_key`]
+/// — the same resolution the caption runner performs, so this can't report
+/// a key the run wouldn't find — yields one.
+fn describer_config_row(
+    config: &majestical_describe::DescriberConfig,
+    env_key: Option<&str>,
+) -> DoctorCheck {
+    use majestical_describe::BackendKind;
+    use majestical_describe::config::OPENROUTER_KEY_ENV;
+
+    let backend = config.backend.as_str();
+    let model = &config.model;
+    let ok = |detail: String| DoctorCheck {
+        name: "describer".to_string(),
+        status: CheckStatus::Ok,
+        detail,
+        remedy: None,
+    };
+    match config.backend {
+        BackendKind::Ollama | BackendKind::LmStudio => ok(format!("{backend} · {model}")),
+        BackendKind::OpenRouter => {
+            if config
+                .effective_api_key(env_key.map(str::to_string))
+                .is_some()
+            {
+                ok(format!("{backend} · {model} · key configured"))
+            } else {
+                DoctorCheck {
+                    name: "describer".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: format!(
+                        "{backend} · {model} · no API key from describer.toml or \
+                         {OPENROUTER_KEY_ENV}"
+                    ),
+                    remedy: Some(crate::capability::OPENROUTER_KEY_MISSING_REASON.to_string()),
+                }
+            }
+        }
+    }
+}
+
 /// Always `Ok` on macOS; on any other platform, `Warn`s listing every Apple
 /// capability that is honestly unavailable there rather than failing —
 /// absence of a macOS-only capability on a non-macOS build is expected, not
@@ -440,6 +609,61 @@ fn check_platform() -> DoctorCheck {
 mod tests {
     use super::*;
     use crate::app::FsApp;
+    use majestical_describe::config::OPENROUTER_KEY_ENV;
+    use majestical_describe::{BackendKind, DescriberConfig};
+
+    /// A freshly initialized catalog under `dir`, the arrangement every
+    /// catalog-dependent check here needs.
+    fn fixture_catalog(dir: &tempfile::TempDir) -> PathBuf {
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        root
+    }
+
+    /// Writes a real `describer.toml` for `root` the way `maj describer set`
+    /// would — through [`crate::describer_config::config_path`], so the file
+    /// lands exactly where [`check_describer`] looks for it.
+    fn store_describer(root: &Path, backend: BackendKind, api_key: Option<&str>) {
+        let notices = Notices::new();
+        let path = crate::describer_config::config_path(root, &notices).expect("config path");
+        DescriberConfig {
+            backend,
+            base_url: backend.default_base_url().to_string(),
+            model: "test-model".to_string(),
+            api_key: api_key.map(str::to_string),
+        }
+        .store(&path)
+        .expect("store describer config");
+    }
+
+    /// Records `count` permanent thumb failures into `root`'s failure ledger
+    /// through the public [`crate::index::record_failures`] path — the same
+    /// one a real run writes through, so this can't pin a shape the
+    /// production writer doesn't produce. Returns the paths recorded.
+    fn record_permanent_failures(root: &Path, count: usize) -> Vec<String> {
+        let mut outcome = crate::index::IndexRunOutcome::default();
+        let mut paths = Vec::new();
+        for i in 0..count {
+            let path = root.join(format!("broken-{i}.jpg"));
+            paths.push(path.display().to_string());
+            let failure = crate::index::ItemFailure {
+                asset: format!("asset{i}"),
+                path,
+                error: "decode failed".to_string(),
+                transient: false,
+            };
+            // Alternating kinds, so the count the check reports is proven to
+            // flatten across kinds rather than read the first kind only.
+            if i % 2 == 0 {
+                outcome.thumbs.failed.push(failure);
+            } else {
+                outcome.embed.failed.push(failure);
+            }
+        }
+        let notices = Notices::new();
+        crate::index::record_failures(root, &outcome, &notices).expect("record failures");
+        paths
+    }
 
     fn find<'a>(checks: &'a [DoctorCheck], name: &str) -> &'a DoctorCheck {
         checks
@@ -478,9 +702,247 @@ mod tests {
                 "state_dir",
                 "catalog",
                 "blob_residue",
+                "failed_items",
+                "describer",
                 "platform",
             ]
         );
+    }
+
+    #[test]
+    fn failed_items_is_ok_on_an_empty_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        let check = check_failed_items(Some(&root), &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "no known failures");
+        assert_eq!(check.remedy, None);
+    }
+
+    #[test]
+    fn failed_items_warns_with_count_and_remedy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        let paths = record_permanent_failures(&root, 2);
+
+        let check = check_failed_items(Some(&root), &Notices::new());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("2 item(s)"), "{}", check.detail);
+        for path in &paths {
+            assert!(check.detail.contains(path), "{}", check.detail);
+        }
+        assert_eq!(
+            check.remedy.as_deref(),
+            Some("maj index run --retry-failed (or Retry failed items in Settings → Always-on)")
+        );
+    }
+
+    /// Only the first three paths are named, however many rows there are —
+    /// the count still reports every one of them.
+    #[test]
+    fn failed_items_names_at_most_three_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        let paths = record_permanent_failures(&root, 5);
+
+        let check = check_failed_items(Some(&root), &Notices::new());
+        assert!(check.detail.contains("5 item(s)"), "{}", check.detail);
+        let named = paths
+            .iter()
+            .filter(|p| check.detail.contains(p.as_str()))
+            .count();
+        assert_eq!(named, 3, "{}", check.detail);
+    }
+
+    #[test]
+    fn failed_items_warns_without_a_catalog() {
+        let check = check_failed_items(None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.detail, "no catalog selected");
+        assert_eq!(check.remedy, None);
+    }
+
+    /// An unresolvable state dir (here, a catalog path that cannot be
+    /// canonicalized) is a `Fail` with the error verbatim, pointed at the
+    /// row that fails for the same cause — not a silent "no known
+    /// failures", and not a remedy this row invents for itself.
+    #[test]
+    fn failed_items_fails_when_the_ledger_cannot_be_read() {
+        let missing = PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz");
+        let check = check_failed_items(Some(&missing), &Notices::new());
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(!check.detail.is_empty());
+        assert_eq!(check.remedy.as_deref(), Some("see the state_dir row"));
+    }
+
+    #[test]
+    fn describer_is_ok_when_unconfigured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        let check = check_describer(Some(&root), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "no describer configured — captions off");
+        assert_eq!(check.remedy, None);
+    }
+
+    #[test]
+    fn describer_is_ok_for_a_local_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::Ollama, None);
+        let check = check_describer(Some(&root), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "ollama · test-model");
+        assert_eq!(check.remedy, None);
+    }
+
+    /// A local backend never consults the environment override — the key
+    /// env var names `OpenRouter`'s host, so it must not turn an LM Studio
+    /// row into a "key configured" one either.
+    #[test]
+    fn describer_is_ok_for_lm_studio_even_with_an_env_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::LmStudio, None);
+        let check = check_describer(Some(&root), Some("sk-env"), &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "lm-studio · test-model");
+    }
+
+    #[test]
+    fn describer_fails_for_openrouter_without_any_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::OpenRouter, None);
+        let check = check_describer(Some(&root), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.remedy.as_deref(),
+            Some(crate::capability::OPENROUTER_KEY_MISSING_REASON)
+        );
+    }
+
+    /// The `Fail` detail names the environment variable so the reader knows
+    /// the second place a key can come from.
+    #[test]
+    fn describer_fail_detail_names_the_env_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::OpenRouter, None);
+        let check = check_describer(Some(&root), None, &Notices::new());
+        assert!(
+            check.detail.contains(OPENROUTER_KEY_ENV),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn describer_is_ok_for_openrouter_with_only_the_env_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::OpenRouter, None);
+        let check = check_describer(Some(&root), Some("sk-env"), &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "open-router · test-model · key configured");
+        assert_eq!(check.remedy, None);
+    }
+
+    #[test]
+    fn describer_is_ok_for_openrouter_with_only_the_file_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::OpenRouter, Some("sk-file"));
+        let check = check_describer(Some(&root), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "open-router · test-model · key configured");
+    }
+
+    #[test]
+    fn describer_warns_without_a_catalog() {
+        let check = check_describer(None, None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.detail, "no catalog selected");
+    }
+
+    /// The malformed line is the one holding the key, because that is the
+    /// line `toml::de::Error` quotes back: the detail must name the file
+    /// and stop there. A `{err:#}` detail would carry `SUPERSECRET` into
+    /// CLI/MCP/GUI output and repeat the parse message the
+    /// `ConfigError::Parse` Display already embeds — hence the
+    /// exactly-once count of the path, which two chain links would double.
+    #[test]
+    fn describer_warns_on_an_unreadable_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        let notices = Notices::new();
+        let path = crate::describer_config::config_path(&root, &notices).expect("config path");
+        std::fs::write(&path, b"api_key = \"sk-SUPERSECRET\" oops").expect("plant broken config");
+
+        let check = check_describer(Some(&root), None, &notices);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.detail.starts_with("describer config unreadable:"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("SUPERSECRET"),
+            "the detail must never echo the file's contents: {}",
+            check.detail
+        );
+        assert_eq!(
+            check.detail.matches("describer.toml").count(),
+            1,
+            "the file is named once, not once per error-chain link: {}",
+            check.detail
+        );
+        assert_eq!(
+            check.remedy.as_deref(),
+            Some("fix or remove describer.toml (`maj describer set …` rewrites it)")
+        );
+    }
+
+    /// An unresolvable state dir is not a broken `describer.toml`: the row
+    /// says so and sends the reader to the row that actually failed,
+    /// instead of telling them to rewrite a file that is not the problem.
+    #[test]
+    fn describer_points_at_the_state_dir_row_when_the_catalog_path_is_bad() {
+        let missing = PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz");
+        let check = check_describer(Some(&missing), None, &Notices::new());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .starts_with("describer config location unresolvable:"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(check.remedy.as_deref(), Some("see the state_dir row"));
+    }
+
+    /// The request's env key reaches the describer row: the same catalog
+    /// reports `Fail` without it and `Ok` with it, through `doctor` itself
+    /// rather than the check function.
+    #[test]
+    fn doctor_passes_the_request_env_key_to_the_describer_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = fixture_catalog(&dir);
+        store_describer(&root, BackendKind::OpenRouter, None);
+
+        let without = doctor(&DoctorRequest {
+            catalog: Some(root.clone()),
+            describer_env_key: None,
+        })
+        .expect("doctor");
+        assert_eq!(find(&without.checks, "describer").status, CheckStatus::Fail);
+
+        let with = doctor(&DoctorRequest {
+            catalog: Some(root),
+            describer_env_key: Some("sk-env".to_string()),
+        })
+        .expect("doctor");
+        assert_eq!(find(&with.checks, "describer").status, CheckStatus::Ok);
     }
 
     #[test]
@@ -490,6 +952,7 @@ mod tests {
         FsApp::init(&root, "m1", "m1").expect("init");
         let req = DoctorRequest {
             catalog: Some(root),
+            describer_env_key: None,
         };
         let outcome = doctor(&req).expect("doctor");
         assert_eq!(find(&outcome.checks, "catalog").status, CheckStatus::Ok);
@@ -499,6 +962,7 @@ mod tests {
     fn doctor_with_missing_catalog_path_fails_catalog_row() {
         let req = DoctorRequest {
             catalog: Some(PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz")),
+            describer_env_key: None,
         };
         let outcome =
             doctor(&req).expect("a bad catalog path is a row, not an Err — polarity doctrine");
@@ -518,6 +982,7 @@ mod tests {
         std::fs::create_dir_all(root.join("blobs")).expect("mkdir blobs");
         let req = DoctorRequest {
             catalog: Some(root),
+            describer_env_key: None,
         };
         let outcome = doctor(&req).expect("doctor");
         assert_eq!(
@@ -536,6 +1001,7 @@ mod tests {
         std::fs::write(blobs.join(".tmp-1234-0"), b"orphaned").expect("plant orphan");
         let req = DoctorRequest {
             catalog: Some(root),
+            describer_env_key: None,
         };
         let outcome = doctor(&req).expect("doctor");
         let row = find(&outcome.checks, "blob_residue");

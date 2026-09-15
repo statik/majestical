@@ -4,6 +4,7 @@
     "hold_reason": "paused",
     "mode": "hold"
   },
+  "failed_items": 3,
   "last_error": "index run failed: model cache directory is not writable",
   "pending_items": 7,
   "power": {

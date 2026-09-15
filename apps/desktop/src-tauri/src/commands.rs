@@ -44,6 +44,22 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// impls, not the command wrappers, so it is reachable from a test.
 const DEFAULT_LIMIT: usize = 50;
 
+/// The describer API key from the environment — the same variable the CLI
+/// reads, so a GUI launched from a shell honors the same override. A
+/// login-item launch has no shell environment, so this returns `None`; the
+/// caller's `effective_api_key` then falls back to the key stored in
+/// `describer.toml` — that fallback is the client's, not this function's.
+///
+/// `pub` so a test can hand it to an impl explicitly: the impls take the
+/// key as an argument rather than reading the environment themselves, so
+/// that reading it stays the command wrapper's job.
+#[must_use]
+pub fn env_api_key() -> Option<String> {
+    std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
+        .ok()
+        .filter(|k| !k.is_empty())
+}
+
 /// This app's catalog wiring — managed Tauri state, rebuilt when the user
 /// picks or initializes a catalog.
 #[derive(Clone, Debug)]
@@ -204,11 +220,20 @@ pub fn app_status_impl(cfg: Option<&CatalogCfg>) -> AppStatus {
 /// rather than requiring one: doctor is the one command that must work
 /// before catalog selection, same as `maj doctor` at the CLI head.
 ///
+/// `env_key` is passed in rather than read here so the describer row is
+/// testable without touching the process environment; the command wrapper
+/// supplies [`env_api_key`], which is the head's own reading of it —
+/// doctor's env key never comes from a client.
+///
 /// # Errors
 /// In practice never; see the services module's own doc for why.
-pub fn doctor_report_impl(cfg: Option<&CatalogCfg>) -> Result<DoctorOutcome, CommandError> {
+pub fn doctor_report_impl(
+    cfg: Option<&CatalogCfg>,
+    env_key: Option<String>,
+) -> Result<DoctorOutcome, CommandError> {
     let req = majestical_services::doctor::DoctorRequest {
         catalog: cfg.map(|c| c.catalog.clone()),
+        describer_env_key: env_key,
     };
     Ok(majestical_services::doctor::doctor(&req)?)
 }
@@ -640,7 +665,7 @@ pub fn app_status(state: State<'_, AppState>) -> AppStatus {
 )]
 #[tauri::command]
 pub fn doctor_report(state: State<'_, AppState>) -> Result<DoctorOutcome, CommandError> {
-    doctor_report_impl(selected_catalog(&state).as_ref())
+    doctor_report_impl(selected_catalog(&state).as_ref(), env_api_key())
 }
 
 /// Searches the catalog. `limit` defaults to 50 results.

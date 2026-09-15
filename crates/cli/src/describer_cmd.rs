@@ -8,7 +8,7 @@ use majestical_services::describer_config::{self, DescriberConfigView, SetArgs};
 use majestical_services::notices::Notices;
 
 pub(crate) fn env_api_key() -> Option<String> {
-    std::env::var("MAJ_OPENROUTER_KEY")
+    std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
         .ok()
         .filter(|k| !k.is_empty())
 }

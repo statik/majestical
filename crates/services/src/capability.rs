@@ -25,6 +25,17 @@ pub fn minilm_model_dir_if_present() -> Option<PathBuf> {
 /// `search`'s coverage notices so the two surfaces cannot drift.
 pub const DESCRIBER_REMEDY: &str = "run `maj describer set` to configure a backend";
 
+/// Recorded for every caption item in a pass when `OpenRouter` is configured
+/// but no key is available from the config file or the environment —
+/// before any request is made. Transient: operator-fixable, not the item's
+/// fault, so the ledger never remembers it.
+///
+/// It names [`majestical_describe::config::OPENROUTER_KEY_ENV`] in prose and
+/// so cannot be built from it at const time; `the_no_key_reason_names_the_key_env_var`
+/// keeps the two from drifting.
+pub const OPENROUTER_KEY_MISSING_REASON: &str =
+    "OpenRouter needs an API key — set it with `maj describer set --api-key` or MAJ_OPENROUTER_KEY";
+
 /// The `model fetch` remedy for the transcript pipeline, naming exactly the
 /// missing models — `None` when both are installed. Shared by `index
 /// status` and `search`'s coverage notices so the command they print is
@@ -42,5 +53,21 @@ pub fn transcript_model_remedy(whisper: bool, text_model: bool) -> Option<String
         None
     } else {
         Some(format!("run `maj model fetch {}`", fetches.join(" ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OPENROUTER_KEY_MISSING_REASON;
+
+    /// The reason text names the environment variable in prose, so it cannot
+    /// be built from [`majestical_describe::config::OPENROUTER_KEY_ENV`] at
+    /// const time. This is what keeps the two from drifting apart.
+    #[test]
+    fn the_no_key_reason_names_the_key_env_var() {
+        assert!(
+            OPENROUTER_KEY_MISSING_REASON.contains(majestical_describe::config::OPENROUTER_KEY_ENV),
+            "{OPENROUTER_KEY_MISSING_REASON}"
+        );
     }
 }

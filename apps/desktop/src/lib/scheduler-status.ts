@@ -12,7 +12,7 @@
 // pending count when nonzero" refinement `menu_model` applies to a Low
 // Power Mode hold. Both are tray-only polish, not information this line
 // claims to give.
-import type { HoldReason, SchedulerStateOutcome } from "./api";
+import type { HoldReason, SchedulerStateOutcome } from "./api-alwayson";
 
 const HOLD_LINES: Record<HoldReason, string> = {
   paused: "Paused",
@@ -24,6 +24,15 @@ function pendingLine(pendingItems: number): string {
   return pendingItems === 1
     ? "1 item pending"
     : `${pendingItems} items pending`;
+}
+
+/** The failure ledger's line, shown only when `failed_items > 0` — see
+ *  `SchedulerStateOutcome.failed_items`. Same singular/plural shape as
+ *  `pendingLine`, pinned wording: "N items skipped after failing". */
+export function failedLine(failedItems: number): string {
+  return failedItems === 1
+    ? "1 item skipped after failing"
+    : `${failedItems} items skipped after failing`;
 }
 
 export function statusLine(state: SchedulerStateOutcome): string {

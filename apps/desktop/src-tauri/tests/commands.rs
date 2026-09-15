@@ -14,14 +14,20 @@ use majestical_desktop::commands::{
     rename_para_node_impl, rename_tag_impl, run_saved_search_impl, search_assets_impl,
     use_existing_catalog_impl,
 };
+use majestical_desktop::indexer::{
+    SchedulerShared, SchedulerState, SchedulerWake, retry_failed_items_impl,
+};
 use majestical_desktop::ingest::{
     DEFAULT_INGEST_TEMPLATE, FinishedIngest, IngestJob, IngestProgress, IngestState, ProgressSink,
     StartIngest, cancel_ingest_impl, ingest_state_impl, list_unfinished_ingests_impl,
     plan_ingest_impl, start_ingest_impl,
 };
 use majestical_desktop::thumb_protocol;
+use majestical_services::index::{self, IndexRunOutcome, ItemFailure};
+use majestical_services::notices::Notices;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 // `#[cfg(test)]` on the helpers below is not redundant despite this file
 // already building with `--cfg test`: clippy's in-test detection for
@@ -504,7 +510,7 @@ fn list_saved_searches_carries_notices() {
 #[test]
 fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
     with_state_dir(|| {
-        let outcome = majestical_desktop::commands::doctor_report_impl(None)
+        let outcome = majestical_desktop::commands::doctor_report_impl(None, None)
             .expect("doctor must run with no catalog selected");
         let status_of = |name: &str| {
             outcome
@@ -514,13 +520,64 @@ fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
                 .unwrap_or_else(|| panic!("no `{name}` row"))
                 .status
         };
-        for row in ["catalog", "state_dir", "blob_residue"] {
+        for row in [
+            "catalog",
+            "state_dir",
+            "blob_residue",
+            "failed_items",
+            "describer",
+        ] {
             assert_eq!(
                 status_of(row),
                 majestical_services::doctor::CheckStatus::Warn,
                 "{row} must warn without a catalog"
             );
         }
+    });
+}
+
+/// The env key the impl is handed is the one the describer row resolves
+/// against: the same catalog, with an `OpenRouter` describer and no stored
+/// key, `Fail`s without a key and is `Ok` with one. Hermetic — the
+/// environment is never read, which is exactly why the impl takes the key
+/// as an argument.
+#[test]
+fn doctor_report_resolves_the_describer_key_from_the_argument() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = seeded_cfg(dir.path());
+        majestical_services::describer_config::set(
+            &cfg.catalog,
+            &majestical_services::describer_config::SetArgs {
+                backend: majestical_describe::BackendKind::OpenRouter,
+                model: "test-model".into(),
+                base_url: None,
+                api_key: None,
+            },
+            &majestical_services::notices::Notices::new(),
+        )
+        .expect("store describer config");
+
+        let describer_status = |env_key: Option<String>| {
+            majestical_desktop::commands::doctor_report_impl(Some(&cfg), env_key)
+                .expect("doctor")
+                .checks
+                .iter()
+                .find(|c| c.name == "describer")
+                .unwrap_or_else(|| panic!("no `describer` row"))
+                .status
+        };
+
+        assert_eq!(
+            describer_status(None),
+            majestical_services::doctor::CheckStatus::Fail,
+            "no key anywhere must fail the describer row"
+        );
+        assert_eq!(
+            describer_status(Some("sk".into())),
+            majestical_services::doctor::CheckStatus::Ok,
+            "the key passed to the impl must reach the describer row"
+        );
     });
 }
 
@@ -1998,6 +2055,63 @@ fn a_source_that_is_not_a_directory_is_refused_by_both_ingest_paths() {
         assert!(
             !ingest_state_impl(&fixture.state).busy,
             "a refused source must not leave the slot held"
+        );
+    });
+}
+
+/// The one place the ledger write is exercised end to end: a real catalog,
+/// a real permanent failure recorded through the public writer, then the
+/// retry. Three things must hold afterwards — the ledger is empty, the
+/// reported count is zero (the number the Settings surface renders), and
+/// the loop's sleep has been cut short so the retried items get attempted
+/// within seconds rather than after a full tick.
+#[test]
+fn retry_failed_items_clears_the_ledger_zeroes_the_count_and_nudges() {
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_for(dir.path());
+        initialize_catalog_impl(&cfg).expect("init");
+
+        let notices = Notices::new();
+        let mut run = IndexRunOutcome::default();
+        run.thumbs.failed.push(ItemFailure {
+            asset: "xxh3:0123456789abcdef0123456789abcdef".to_string(),
+            path: dir.path().join("broken.jpg"),
+            error: "decode failed".to_string(),
+            transient: false,
+        });
+        index::record_failures(&cfg.catalog, &run, &notices).expect("record failures");
+        assert!(
+            !index::known_failures(&cfg.catalog, &notices)
+                .expect("ledger")
+                .is_empty(),
+            "the ledger must hold the failure this test is about to retry"
+        );
+
+        let scheduler = SchedulerState(RwLock::new(SchedulerShared::default()));
+        scheduler
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed_items = 1;
+        let wake = SchedulerWake::default();
+
+        let outcome =
+            retry_failed_items_impl(Some(&cfg), &scheduler, &wake).expect("retry must succeed");
+
+        assert_eq!(outcome.failed_items, 0, "the retried count must be zeroed");
+        assert!(
+            index::known_failures(&cfg.catalog, &notices)
+                .expect("ledger")
+                .is_empty(),
+            "every remembered failure must be forgotten"
+        );
+        let start = Instant::now();
+        wake.wait(Duration::from_secs(5));
+        let waited = start.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "the retry must nudge the loop awake, waited {waited:?}"
         );
     });
 }

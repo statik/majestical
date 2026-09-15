@@ -2019,6 +2019,93 @@ fn reference_knows_subcommand(help_text: &str, name: &str) -> bool {
         .any(|line| line.split_whitespace().next() == Some(name))
 }
 
+/// The two doctor rows this branch adds (`failed_items`, `describer`), as
+/// the fixture catalog renders them: no ledger rows and no `describer.toml`,
+/// so both are `Ok` with fixed detail text. Pinned as whole serialized row
+/// objects — a row reporting anything else (a real ledger finding, a
+/// configured describer, a missing `OpenRouter` key) does not match, so it
+/// passes through unstripped and diverges loudly.
+#[cfg(test)]
+const NEW_DOCTOR_ROWS: [&str; 2] = [
+    r#"{"name":"failed_items","status":"ok","detail":"no known failures"}"#,
+    r#"{"name":"describer","status":"ok","detail":"no describer configured — captions off"}"#,
+];
+
+/// Renders a `doctor --json` document as the reference binary would: without
+/// the two rows this branch adds. The reference is built at the merge-base
+/// with `main`, which predates them, so
+/// [`doctor_output_is_byte_identical`] compares modulo those two rows rather
+/// than losing its parity coverage outright.
+///
+/// Each strip is an exact-substring removal (the row object plus the comma
+/// that follows it) from the original bytes, so a formatting change anywhere
+/// — key order, spacing, compact vs pretty — still fails the comparison, and
+/// the reference's output, which carries neither row, normalizes to itself
+/// byte for byte.
+///
+/// Only a trailing comma is consumed, because in the real document neither
+/// row is last — `platform` always follows both. A row that did land last
+/// would keep the comma in front of it and pass through with a dangling
+/// separator, diverging loudly; that is the safe direction for a
+/// normalizer whose whole job is to hide a known difference.
+///
+/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
+/// it exists, `doctor_output_is_byte_identical` is blind to these two rows.
+/// Once the reference binary includes them (i.e. once this branch is on
+/// `main`), delete this function and its test and point the parity test back
+/// at [`diff_against_ref`] — the same cleanup phase 7F Task 15's Step 4b
+/// already schedules for [`without_ledger`].
+#[cfg(test)]
+fn without_new_doctor_rows(text: &str) -> String {
+    let mut kept = text.to_string();
+    for row in NEW_DOCTOR_ROWS {
+        let Some(start) = kept.find(row) else {
+            continue;
+        };
+        let mut end = start + row.len();
+        if kept[end..].starts_with(',') {
+            end += 1;
+        }
+        kept = format!("{}{}", &kept[..start], &kept[end..]);
+    }
+    kept
+}
+
+#[cfg(test)]
+mod without_new_doctor_rows_tests {
+    use super::without_new_doctor_rows;
+
+    /// A document carrying the two new rows and the reference's document
+    /// without them normalize to the SAME string — and the reference's,
+    /// having nothing to strip, passes through byte for byte.
+    #[test]
+    fn new_and_old_doctor_documents_normalize_identically() {
+        let new_shape = "{\"checks\":[{\"name\":\"blob_residue\",\"status\":\"ok\",\
+                          \"detail\":\"clean\"},{\"name\":\"failed_items\",\"status\":\"ok\",\
+                          \"detail\":\"no known failures\"},{\"name\":\"describer\",\
+                          \"status\":\"ok\",\"detail\":\"no describer configured — captions \
+                          off\"},{\"name\":\"platform\",\"status\":\"ok\",\
+                          \"detail\":\"macOS\"}]}\n";
+        let old_shape = "{\"checks\":[{\"name\":\"blob_residue\",\"status\":\"ok\",\
+                          \"detail\":\"clean\"},{\"name\":\"platform\",\"status\":\"ok\",\
+                          \"detail\":\"macOS\"}]}\n";
+        assert_eq!(
+            without_new_doctor_rows(new_shape),
+            without_new_doctor_rows(old_shape)
+        );
+        assert_eq!(without_new_doctor_rows(old_shape), old_shape);
+    }
+
+    /// A row reporting a real finding is NOT one of the pinned no-finding
+    /// rows, so it survives normalization and still diverges.
+    #[test]
+    fn a_row_with_real_findings_is_left_alone() {
+        let with_findings = "{\"checks\":[{\"name\":\"failed_items\",\"status\":\"warn\",\
+                              \"detail\":\"2 item(s) skipped\"}]}\n";
+        assert_eq!(without_new_doctor_rows(with_findings), with_findings);
+    }
+}
+
 /// `doctor` is read-only, so a shared root serves both binaries (same
 /// reasoning as `browse_output_is_byte_identical`). Constrained to `--json`
 /// against an already-initialized fixture catalog, passed via doctor's own
@@ -2028,6 +2115,9 @@ fn reference_knows_subcommand(help_text: &str, name: &str) -> bool {
 /// actually needs pinned is that the catalog-dependent rows (`catalog`,
 /// `state_dir`, `blob_residue`) agree once a real catalog is in play, not
 /// just the environment-only ones.
+///
+/// Compared modulo the two rows this branch adds — see
+/// [`without_new_doctor_rows`], which is temporary.
 ///
 /// Two independent skip reasons, checked in order: the reference binary may
 /// be missing entirely (same as every other row in this file), or it may be
@@ -2057,9 +2147,10 @@ fn doctor_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
     let catalog_arg = root.to_str().expect("utf8");
-    diff_against_ref(
+    diff_against_ref_normalized(
         &root,
         &state,
         &["doctor", "--catalog", catalog_arg, "--json"],
+        without_new_doctor_rows,
     );
 }

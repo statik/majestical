@@ -1227,12 +1227,15 @@ for dir in [events, blobs] {
   (add: "the ledger remembers only permanent failures; a transient
   failure must never be written to it").
 - [ ] **Step 4:** Update the memory index entry for the project state.
-- [ ] **Step 4b (added in execution, chunk 3):** delete the TEMPORARY parity
-  normalizer once chunk 3 is on main — `without_ledger`,
-  `strip_ledger_member`, and `diff_against_ref_normalized` in
-  `crates/cli/tests/services_parity.rs` (and their unit tests), then point
-  `index_status_output_is_byte_identical` back at `diff_against_ref`.
-  Same cleanup 7D's Task 21 did for `without_keyframe_images`.
+- [ ] **Step 4b (added in execution, chunks 3 and 4):** delete the TEMPORARY
+  parity normalizers once chunks 3 and 4 are on main — in
+  `crates/cli/tests/services_parity.rs`: `without_ledger`,
+  `strip_ledger_member` (chunk 3, `index_status_output_is_byte_identical`)
+  and `without_new_doctor_rows` with its `NEW_DOCTOR_ROWS` const (chunk 4,
+  `doctor_output_is_byte_identical`), their unit-test modules, and then
+  `diff_against_ref_normalized` (shared by both callers — last to go);
+  point both rows back at `diff_against_ref`. Same cleanup 7D's Task 21
+  did for `without_keyframe_images`.
 - [ ] **Step 5: Commit + PR**:
   `git commit -m "docs: phase 7F close — deferrals, mutants triage, 7G handoff"`
 

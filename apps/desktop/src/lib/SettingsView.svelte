@@ -7,7 +7,7 @@
   // Plus the Always-on section (`AlwaysOnSection.svelte`), which is NOT
   // read-only: its throttle radio and "start at login" toggle both act.
   import { api, errorMessage, errorNotices } from "./api";
-  import type { DoctorOutcome } from "./api";
+  import type { DoctorOutcome } from "./api-alwayson";
   import AlwaysOnSection from "./AlwaysOnSection.svelte";
   import Notices from "./Notices.svelte";
 

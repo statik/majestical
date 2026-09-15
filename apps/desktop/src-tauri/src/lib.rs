@@ -87,6 +87,10 @@ pub fn run() {
         .manage(indexer::SchedulerState(std::sync::RwLock::new(
             indexer::SchedulerShared::default(),
         )))
+        // The loop's interruptible sleep. Its own managed state rather than
+        // a field on `SchedulerShared`: a `Condvar` pairs with a `Mutex`,
+        // not with that `RwLock`.
+        .manage(indexer::SchedulerWake::default())
         .setup(|app| {
             commands::restore_persisted_catalog(app.handle())?;
             indexer::spawn_loop(app.handle());
@@ -152,6 +156,7 @@ pub fn run() {
             commands::use_existing_catalog,
             indexer::scheduler_state,
             indexer::set_throttle,
+            indexer::retry_failed_items,
         ])
         .run(tauri::generate_context!())
         .expect("error while running majestical desktop");

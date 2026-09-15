@@ -628,7 +628,8 @@ fn ingest_progress_fixture() {
     );
 }
 
-/// A machine on AC, running full, nothing wrong yet — `last_error` absent.
+/// A machine on AC, running full, nothing wrong yet — `last_error` absent
+/// and `failed_items` zero.
 #[test]
 fn scheduler_state_fixture() {
     let scheduler_state = SchedulerStateOutcome {
@@ -640,6 +641,7 @@ fn scheduler_state_fixture() {
         },
         decision: Some(SchedulerDecision::RunFull),
         pending_items: 42,
+        failed_items: 0,
         running: true,
         last_error: None,
     };
@@ -684,9 +686,9 @@ fn doctor_outcome_fixture() {
     );
 }
 
-/// Paused by the user, on battery, carrying the previous batch's failure —
-/// pins the `Hold` tagged union's `hold_reason` field and `last_error`'s
-/// presence together.
+/// Paused by the user, on battery, carrying the previous batch's failure and
+/// a non-zero `failed_items` — pins the `Hold` tagged union's `hold_reason`
+/// field, `last_error`'s presence, and the held-back count together.
 #[test]
 fn scheduler_state_held_fixture() {
     let scheduler_state = SchedulerStateOutcome {
@@ -698,6 +700,7 @@ fn scheduler_state_held_fixture() {
         },
         decision: Some(SchedulerDecision::Hold(HoldReason::Paused)),
         pending_items: 7,
+        failed_items: 3,
         running: false,
         last_error: Some("index run failed: model cache directory is not writable".to_string()),
     };

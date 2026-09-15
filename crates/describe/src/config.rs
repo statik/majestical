@@ -33,12 +33,18 @@ impl BackendKind {
     }
 }
 
+/// The one place the key environment variable's name lives. Heads (CLI,
+/// GUI, MCP) read it and pass the value in as `env_key`; this crate — and
+/// `majestical-services` below it — never touches the environment itself,
+/// so a head can supply the key some other way.
+pub const OPENROUTER_KEY_ENV: &str = "MAJ_OPENROUTER_KEY";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DescriberConfig {
     pub backend: BackendKind,
     pub base_url: String,
     pub model: String,
-    /// `OpenRouter` key. `MAJ_OPENROUTER_KEY` (passed in by the caller as
+    /// `OpenRouter` key. [`OPENROUTER_KEY_ENV`] (passed in by the caller as
     /// `env_key`) overrides so the file can stay keyless — but only when
     /// `backend` is `OpenRouter`; see `effective_api_key`.
     pub api_key: Option<String>,
@@ -112,7 +118,7 @@ impl DescriberConfig {
     }
 
     /// The key to send: the environment override wins, but only for
-    /// `OpenRouter` — `MAJ_OPENROUTER_KEY` naming that host explicitly, so it
+    /// `OpenRouter` — [`OPENROUTER_KEY_ENV`] naming that host explicitly, so it
     /// must never leak as a Bearer header to an Ollama/LM Studio `base_url`
     /// a user has pointed at a non-local host. Every other backend always
     /// uses the file's key (or none).

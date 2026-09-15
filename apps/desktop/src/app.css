@@ -593,8 +593,9 @@ main > .error {
 /* The compact controls. These are the naming note's second kind — one thing
    rendered the same way everywhere — so they take a neutral prefix rather
    than a surface's: the small button, input, detail card and action row are
-   what Organize draws, and what the selection bar in Browse and Search
-   draws too. Everything only Organize ever renders stays `org-`. */
+   what Organize draws, what the selection bar in Browse and Search draws,
+   and what Settings' Always-on retry row draws too. Everything only
+   Organize ever renders stays `org-`. */
 .ctl-detail {
   display: flex;
   flex-direction: column;
@@ -1337,4 +1338,8 @@ main > .error {
 .settings-status {
   margin: 0.25rem 0 0;
   font-weight: 600;
+}
+
+.settings-failed {
+  color: var(--attention);
 }

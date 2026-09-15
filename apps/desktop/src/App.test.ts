@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App.svelte";
 import type { AppStatus, AssetDetail, SearchHit } from "./lib/api";
-import { NAVIGATE_SETTINGS_EVENT } from "./lib/api";
+import { NAVIGATE_SETTINGS_EVENT } from "./lib/api-alwayson";
 import { emitProgress, listenerCount, RUN } from "./lib/ingest-test-support";
 import { mockCommands, rejectCommand, stubManifest, stubMatchMedia } from "./lib/test-support";
 import doctorOutcome from "./lib/fixtures/doctor_outcome.json";

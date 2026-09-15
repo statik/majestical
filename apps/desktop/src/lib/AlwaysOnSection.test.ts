@@ -4,8 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test } from "vitest";
 import schedulerState from "./fixtures/scheduler_state.json";
 import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
-import type { SchedulerStateOutcome } from "./api";
-import { statusLine } from "./scheduler-status";
+import type { SchedulerStateOutcome } from "./api-alwayson";
+import { failedLine, statusLine } from "./scheduler-status";
 import { mockCommands, rejectCommand } from "./test-support";
 import AlwaysOnSection from "./AlwaysOnSection.svelte";
 
@@ -209,4 +209,70 @@ test("the status line renders statusLine's result through role=status", async ()
   await waitFor(() =>
     expect(status.textContent).toBe(statusLine(auto)),
   );
+});
+
+test("no failed line when failed_items is 0", async () => {
+  mockCommands({
+    scheduler_state: () => auto,
+    "plugin:autostart|is_enabled": () => false,
+  });
+  render(AlwaysOnSection);
+
+  await screen.findByRole("status");
+  expect(screen.queryByText(/skipped after failing/u)).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: "Retry failed items" }),
+  ).toBeNull();
+});
+
+test("the failed line and button appear with the held fixture's count", async () => {
+  mockCommands({
+    scheduler_state: () => held,
+    "plugin:autostart|is_enabled": () => false,
+  });
+  render(AlwaysOnSection);
+
+  await screen.findByText(failedLine(held.failed_items));
+  screen.getByRole("button", { name: "Retry failed items" });
+});
+
+test("clicking Retry invokes retry_failed_items and applies the RESPONSE", async () => {
+  const calls: unknown[] = [];
+  mockCommands({
+    scheduler_state: () => held,
+    retry_failed_items: (args) => {
+      calls.push(args);
+      return auto;
+    },
+    "plugin:autostart|is_enabled": () => false,
+  });
+  render(AlwaysOnSection);
+
+  await screen.findByText(failedLine(held.failed_items));
+  await userEvent.click(
+    screen.getByRole("button", { name: "Retry failed items" }),
+  );
+
+  await waitFor(() =>
+    expect(screen.queryByText(/skipped after failing/u)).toBeNull(),
+  );
+  expect(calls.length).toBe(1);
+});
+
+test("a rejected retry shows the error and keeps the line", async () => {
+  mockCommands({
+    scheduler_state: () => held,
+    retry_failed_items: () => rejectCommand("retry failed: still locked"),
+    "plugin:autostart|is_enabled": () => false,
+  });
+  render(AlwaysOnSection);
+
+  await screen.findByText(failedLine(held.failed_items));
+  await userEvent.click(
+    screen.getByRole("button", { name: "Retry failed items" }),
+  );
+
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toBe("retry failed: still locked");
+  screen.getByText(failedLine(held.failed_items));
 });

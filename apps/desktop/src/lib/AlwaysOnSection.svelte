@@ -11,7 +11,7 @@
   // readable at a glance.
   import { autostartEnabled, setAutostart } from "./autostart";
   import { api, errorMessage } from "./api";
-  import type { SchedulerStateOutcome, ThrottleOverride } from "./api";
+  import type { SchedulerStateOutcome, ThrottleOverride } from "./api-alwayson";
   import { statusLine } from "./scheduler-status";
 
   const THROTTLES: { value: ThrottleOverride; label: string }[] = [

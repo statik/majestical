@@ -29,12 +29,14 @@
       // whole `Outcome` (five per-file lists) plus a seven-variant progress
       // union. Raised again for phase 7E's always-on wire (scheduler state,
       // throttle, power) with room for the doctor report that lands next
-      // to it. The next raise is refused: the always-on/health subject
-      // (scheduler + doctor types and their wrappers) moves to a sibling
-      // module instead, the way the test files split by subject.
+      // to it. Lowered back down for phase 7F: the always-on/health subject
+      // (scheduler + doctor types and their wrappers) moved to
+      // `api-alwayson.ts`. The next raise is refused: the ingest subject
+      // (plan/run/progress types and their wrappers) moves to
+      // `api-ingest.ts` next.
       "files": ["src/lib/api.ts"],
       "rules": {
-        "max-lines": ["warn", { "max": 640 }]
+        "max-lines": ["warn", { "max": 560 }]
       }
     },
     {
@@ -76,10 +78,12 @@
       // The shell mounts one component per surface, so its import count is
       // the number of surfaces plus the handful of shared pieces — the
       // measure this rule is for (incidental coupling) is not what it is
-      // counting here.
+      // counting here. Raised by one for phase 7F's api.ts split:
+      // `NAVIGATE_SETTINGS_EVENT` now comes from its own `api-alwayson.ts`
+      // module alongside `./lib/api`.
       "files": ["src/App.svelte"],
       "rules": {
-        "import/max-dependencies": ["warn", { "max": 13 }]
+        "import/max-dependencies": ["warn", { "max": 14 }]
       }
     },
     {
@@ -109,12 +113,15 @@
       // `ALWAYS_ON`'s `scheduler_state` mock reuses `scheduler_state.json`
       // (also imported by `AlwaysOnSection.test.ts` and `fixtures.test.ts`)
       // rather than inlining a third copy of the wire shape, which is the
-      // one dependency over the default here. Same next-split plan as the
-      // `max-lines` override above: the two Settings-shell tests move to
-      // `src/App.settings.test.ts`, taking this import with them.
+      // one dependency over the default here. Raised by one more for phase
+      // 7F's api.ts split: `NAVIGATE_SETTINGS_EVENT` now comes from its own
+      // `api-alwayson.ts` module alongside `./lib/api`. Same next-split
+      // plan as the `max-lines` override above: the two Settings-shell
+      // tests move to `src/App.settings.test.ts`, taking this import with
+      // them.
       "files": ["src/App.test.ts"],
       "rules": {
-        "import/max-dependencies": ["warn", { "max": 11 }]
+        "import/max-dependencies": ["warn", { "max": 12 }]
       }
     },
     {

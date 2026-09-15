@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 import schedulerState from "./fixtures/scheduler_state.json";
 import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
-import type { SchedulerStateOutcome } from "./api";
+import type { SchedulerStateOutcome } from "./api-alwayson";
 import { statusLine } from "./scheduler-status";
 
 const auto = schedulerState as SchedulerStateOutcome;

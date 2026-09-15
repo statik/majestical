@@ -12,7 +12,7 @@
 // pending count when nonzero" refinement `menu_model` applies to a Low
 // Power Mode hold. Both are tray-only polish, not information this line
 // claims to give.
-import type { HoldReason, SchedulerStateOutcome } from "./api";
+import type { HoldReason, SchedulerStateOutcome } from "./api-alwayson";
 
 const HOLD_LINES: Record<HoldReason, string> = {
   paused: "Paused",

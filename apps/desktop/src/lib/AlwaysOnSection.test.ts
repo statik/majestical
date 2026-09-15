@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test } from "vitest";
 import schedulerState from "./fixtures/scheduler_state.json";
 import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
-import type { SchedulerStateOutcome } from "./api";
+import type { SchedulerStateOutcome } from "./api-alwayson";
 import { statusLine } from "./scheduler-status";
 import { mockCommands, rejectCommand } from "./test-support";
 import AlwaysOnSection from "./AlwaysOnSection.svelte";

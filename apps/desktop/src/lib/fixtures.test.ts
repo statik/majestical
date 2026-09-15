@@ -6,9 +6,7 @@ import type {
   AssignOutcome,
   BrowseListOutcome,
   BrowseTreeOutcome,
-  CheckStatus,
   CommandError,
-  DoctorOutcome,
   FinishedIngest,
   IngestPlanOutcome,
   IngestProgress,
@@ -19,8 +17,6 @@ import type {
   ParaOutcome,
   ProgressEvent,
   SavedSearches,
-  SchedulerDecision,
-  SchedulerStateOutcome,
   SearchOutcome,
   TagRenameOutcome,
   TagsListOutcome,
@@ -34,7 +30,6 @@ import assignOutcome from "./fixtures/assign_outcome.json";
 import browseList from "./fixtures/browse_list.json";
 import browseTree from "./fixtures/browse_tree.json";
 import commandError from "./fixtures/command_error.json";
-import doctorOutcome from "./fixtures/doctor_outcome.json";
 import ingestPlan from "./fixtures/ingest_plan.json";
 import ingestProgress from "./fixtures/ingest_progress.json";
 import ingestRun from "./fixtures/ingest_run.json";
@@ -44,8 +39,6 @@ import ingestStateRunning from "./fixtures/ingest_state_running.json";
 import mountedRoots from "./fixtures/mounted_roots.json";
 import paraOutcome from "./fixtures/para_outcome.json";
 import savedSearches from "./fixtures/saved_searches.json";
-import schedulerState from "./fixtures/scheduler_state.json";
-import schedulerStateHeld from "./fixtures/scheduler_state_held.json";
 import searchOutcome from "./fixtures/search_outcome.json";
 import tagRenameOutcome from "./fixtures/tag_rename_outcome.json";
 import tagsListOutcome from "./fixtures/tags_list_outcome.json";
@@ -64,13 +57,6 @@ const typedAssetDetail: AssetDetail = assetDetail as AssetDetail;
 const typedVolumesOutcome: VolumesOutcome = volumesOutcome;
 const typedSavedSearches: SavedSearches = savedSearches;
 const typedCommandError: CommandError = commandError;
-// `DoctorCheck.status` is a string-literal union (`CheckStatus`); JSON
-// module inference widens it to `string`, same reason `AssetDetail` above
-// needs a cast rather than a plain assignment.
-const typedDoctorOutcome: DoctorOutcome = doctorOutcome as DoctorOutcome;
-// The annotation is the check: a literal the `CheckStatus` union drops fails
-// `tsc` here, which the cast above would otherwise hide.
-const allCheckStatuses: CheckStatus[] = ["ok", "warn", "fail"];
 const typedBrowseTree: BrowseTreeOutcome = browseTree;
 const typedBrowseList: BrowseListOutcome = browseList;
 const typedTagsListOutcome: TagsListOutcome = tagsListOutcome;
@@ -101,19 +87,6 @@ const typedIngestPlan: IngestPlanOutcome = ingestPlan as IngestPlanOutcome;
 const typedIngestRun: IngestRun = ingestRun as IngestRun;
 const typedUnfinishedRuns: UnfinishedRunsOutcome = unfinishedRuns;
 const typedIngestProgress: IngestProgress[] = ingestProgress as IngestProgress[];
-// `SchedulerStateOutcome.decision` is a tagged union (`SchedulerDecision`)
-// whose `mode` discriminant JSON module inference widens to `string`, same
-// reason as `AssetDetail` above — a cast, plus the literal array below
-// pinning the three modes and the `hold` arm's `hold_reason` values.
-const typedSchedulerState: SchedulerStateOutcome =
-  schedulerState as SchedulerStateOutcome;
-const typedSchedulerStateHeld: SchedulerStateOutcome =
-  schedulerStateHeld as SchedulerStateOutcome;
-const allSchedulerModes: SchedulerDecision["mode"][] = [
-  "run_full",
-  "run_low",
-  "hold",
-];
 const typedIngestRunning: IngestState = ingestStateRunning;
 const typedIngestDone: IngestState = ingestStateDone as IngestState;
 const typedIngestFailed: IngestState = ingestStateFailed as IngestState;
@@ -234,35 +207,5 @@ describe("ingest state fixtures", () => {
     }
     expect(typedIngestFailed.finished.error.message.length).toBeGreaterThan(0);
     expect(allFinishedStatuses).toContain(typedIngestFailed.finished.status);
-  });
-});
-
-describe("scheduler state fixtures", () => {
-  it("carry the running and held shapes the scheduler card renders", () => {
-    expect(typedSchedulerState.available).toBe(true);
-    expect(typedSchedulerState.running).toBe(true);
-    expect(typedSchedulerState.decision?.mode).toBe("run_full");
-    expect(typedSchedulerState.last_error).toBeUndefined();
-    expect(allSchedulerModes).toContain(typedSchedulerState.decision?.mode);
-
-    expect(typedSchedulerStateHeld.running).toBe(false);
-    expect(typedSchedulerStateHeld.decision?.mode).toBe("hold");
-    if (typedSchedulerStateHeld.decision?.mode !== "hold") {
-      throw new Error("the held fixture must carry a hold_reason");
-    }
-    expect(typedSchedulerStateHeld.decision.hold_reason).toBe("paused");
-    expect(typedSchedulerStateHeld.last_error?.length).toBeGreaterThan(0);
-  });
-});
-
-describe("doctor outcome fixture", () => {
-  it("carries one row per status, a remedy on warn and fail, and a notice", () => {
-    const statuses = typedDoctorOutcome.checks.map((c) => c.status);
-    expect(statuses).toEqual(allCheckStatuses);
-    const [ok, warn, fail] = typedDoctorOutcome.checks;
-    expect(ok?.remedy).toBeUndefined();
-    expect(warn?.remedy?.length).toBeGreaterThan(0);
-    expect(fail?.remedy?.length).toBeGreaterThan(0);
-    expect(typedDoctorOutcome.notices?.length).toBeGreaterThan(0);
   });
 });

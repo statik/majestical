@@ -68,14 +68,16 @@ test("a source typed and left uncommitted is committed by clicking Plan", async 
   const calls = mockIngest();
   renderIngest();
 
-  // No tab: the field is left focused, mid-edit. Choosing the PARA node and
-  // clicking Plan both move focus away from it, which is what a text input
-  // commits a `change` on — the same commit `typeSource`'s own tab forces.
-  await userEvent.type(sourceField(), SOURCE);
+  // The node is chosen FIRST so the only thing that moves focus off the
+  // still-focused source field is the Plan click itself — the commit a
+  // text input makes on blur is what this pins, not the tab `typeSource`
+  // forces.
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),
     NODE,
   );
+  await userEvent.type(sourceField(), SOURCE);
+  expect(document.activeElement).toBe(sourceField());
   await userEvent.click(screen.getByRole("button", { name: "Plan" }));
 
   await waitFor(() => expect(callsTo(calls, "plan_ingest")).toHaveLength(1));

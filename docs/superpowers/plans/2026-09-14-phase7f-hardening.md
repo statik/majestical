@@ -1232,10 +1232,11 @@ for dir in [events, blobs] {
   `crates/cli/tests/services_parity.rs`: `without_ledger`,
   `strip_ledger_member` (chunk 3, `index_status_output_is_byte_identical`)
   and `without_new_doctor_rows` with its `NEW_DOCTOR_ROWS` const (chunk 4,
-  `doctor_output_is_byte_identical`), their unit-test modules, and then
-  `diff_against_ref_normalized` (shared by both callers — last to go);
-  point both rows back at `diff_against_ref`. Same cleanup 7D's Task 21
-  did for `without_keyframe_images`.
+  `doctor_output_is_byte_identical`), `without_result_pluralization`
+  (chunk 6, `search_output_is_byte_identical`), their unit-test modules,
+  and then `diff_against_ref_normalized` (shared by all three callers —
+  last to go); point the three rows back at `diff_against_ref`. Same
+  cleanup 7D's Task 21 did for `without_keyframe_images`.
 - [ ] **Step 5: Commit + PR**:
   `git commit -m "docs: phase 7F close — deferrals, mutants triage, 7G handoff"`
 

@@ -436,7 +436,7 @@
                mid-click takes the focus with it. The message below is for
                the other case entirely: a card drawn after a reload, with no
                source or node left on the board to plan from. -->
-          {#if source === "" || para === ""}
+          {#if source.trim() === "" || para === ""}
             <p class="empty">
               Choose the source and the PARA node again below to re-copy these.
             </p>

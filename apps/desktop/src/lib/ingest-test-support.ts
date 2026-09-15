@@ -91,8 +91,8 @@ export function sourceField(): HTMLInputElement {
 }
 
 /** Types a source path the way an operator does. The field commits on
- *  `change`, which fires when it loses the focus — so the tab is part of
- *  typing a path, not decoration. */
+ *  every keystroke (`oninput`); the tab afterwards only moves focus on to
+ *  the next control, as an operator's would, and commits nothing extra. */
 export async function typeSource(path: string): Promise<void> {
   const field = await screen.findByRole("textbox", { name: "Source path" });
   await userEvent.clear(field);

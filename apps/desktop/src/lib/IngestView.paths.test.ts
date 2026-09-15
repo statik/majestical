@@ -80,6 +80,13 @@ test("a typed source enables Plan without leaving the field", async () => {
   );
   await userEvent.type(sourceField(), SOURCE);
   expect(document.activeElement).toBe(sourceField());
+  // The consequence, not just the precondition: Plan is already enabled
+  // while the field still has focus. A blur-only commit would leave it
+  // disabled here (jsdom blurs on the click below, so the click alone
+  // cannot tell the two apart).
+  expect(
+    screen.getByRole<HTMLButtonElement>("button", { name: "Plan" }).disabled,
+  ).toBe(false);
   await userEvent.click(screen.getByRole("button", { name: "Plan" }));
 
   await waitFor(() => expect(callsTo(calls, "plan_ingest")).toHaveLength(1));

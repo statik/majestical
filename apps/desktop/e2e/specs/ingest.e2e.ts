@@ -52,9 +52,29 @@ async function fillJob(fixture: FixtureCatalog): Promise<void> {
 
   // Rendered as `${kind}/${name}` from the node setup/fixture-catalog.ts
   // seeded with `maj para add project e2e-ingest`.
-  await $('[aria-label="PARA node"]').selectByVisibleText(
-    `project/${fixture.paraNodeName}`,
+  await selectNode(`project/${fixture.paraNodeName}`);
+}
+
+/** Chooses a PARA node by its option text. Not `selectByVisibleText`: against
+ *  this embedded WebKit driver (tauri-plugin-wdio-webdriver) the option click
+ *  it performs leaves the `<select>`'s value unchanged and fires no `change`
+ *  (observed 2026-09-15: value still `""`, Plan still disabled), the same
+ *  class of gap organize.e2e.ts documents for a held-key click. Setting the
+ *  value and dispatching `change` runs the exact `onchange` handler
+ *  IngestView.svelte wires (`pickNode`), so this exercises the real app code. */
+async function selectNode(optionText: string): Promise<void> {
+  const select = await $('[aria-label="PARA node"]');
+  await select.waitForDisplayed({ timeout: 10_000 });
+  await browser.execute(
+    `const select = arguments[0];
+     const option = Array.from(select.options).find((o) => o.text === arguments[1]);
+     if (!option) throw new Error("no PARA option " + arguments[1]);
+     select.value = option.value;
+     select.dispatchEvent(new Event("change", { bubbles: true }));`,
+    select,
+    optionText,
   );
+  await expect(select).not.toHaveValue("");
 }
 
 /**

@@ -128,9 +128,9 @@
 
   let summary = $derived(planSummary(plan));
 
-  let canPlan = $derived(source !== "" && para !== "" && !planning);
+  let canPlan = $derived(source.trim() !== "" && para !== "" && !planning);
   let canStart = $derived(
-    source !== "" &&
+    source.trim() !== "" &&
       dests.length > 0 &&
       para !== "" &&
       plan !== null &&
@@ -192,11 +192,15 @@
     resumeOf = null;
   }
 
-  /** A typed or browsed source, taken as-is: the plan step validates it. */
+  /** A typed or browsed source, kept exactly as typed (trimmed only at the
+   *  wire, so a path with an inner space is never fought while it is being
+   *  typed) and committed on every keystroke: Plan enables as the operator
+   *  types. A blur-only commit would leave their first click on the still-
+   *  disabled Plan button dead — Chrome and WebKit do not blur the field
+   *  for a click on a disabled control. */
   function setSource(next: string) {
-    const typed = next.trim();
-    if (typed === source) return;
-    source = typed;
+    if (next === source) return;
+    source = next;
     editJob();
   }
 
@@ -262,7 +266,7 @@
     setupFailureNotices = [];
     try {
       const outcome = await api.planIngest({
-        source,
+        source: source.trim(),
         para,
         template: templateArg(),
       });
@@ -298,7 +302,7 @@
     runPanel.beginRun();
     try {
       const id = await api.startIngest({
-        source,
+        source: source.trim(),
         dests,
         para,
         template: templateArg(),
@@ -490,7 +494,7 @@
             aria-label="Source path"
             placeholder="/Volumes/CARD_01 or any folder"
             value={source}
-            onchange={(event) => setSource(event.currentTarget.value)}
+            oninput={(event) => setSource(event.currentTarget.value)}
           />
           <button
             class="ctl-btn"

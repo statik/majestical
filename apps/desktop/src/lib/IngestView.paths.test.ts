@@ -64,14 +64,16 @@ test("a typed source path is the job's source", async () => {
   expect(callsTo(calls, PICKER)).toHaveLength(0);
 });
 
-test("a source typed and left uncommitted is committed by clicking Plan", async () => {
+test("a typed source enables Plan without leaving the field", async () => {
   const calls = mockIngest();
   renderIngest();
 
-  // The node is chosen FIRST so the only thing that moves focus off the
-  // still-focused source field is the Plan click itself — the commit a
-  // text input makes on blur is what this pins, not the tab `typeSource`
-  // forces.
+  // The node is chosen FIRST, so the source field is still focused when
+  // Plan is clicked: the field commits as it is typed, which is what lets
+  // that click land on an enabled button (a blur-only commit would leave
+  // it dead — see `setSource`).
+  // The node list loads on mount; wait for its option before choosing it.
+  await screen.findByRole("option", { name: "project/client-x" });
   await userEvent.selectOptions(
     screen.getByRole("combobox", { name: "PARA node" }),
     NODE,
@@ -168,4 +170,25 @@ test("whitespace-only input is ignored", async () => {
 
   expect(within(destList()).queryAllByRole("listitem")).toHaveLength(0);
   expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("a path with an inner space is kept as typed and trimmed only at the wire", async () => {
+  const calls = mockIngest();
+  renderIngest();
+
+  await screen.findByRole("option", { name: "project/client-x" });
+  await userEvent.selectOptions(
+    screen.getByRole("combobox", { name: "PARA node" }),
+    NODE,
+  );
+  await userEvent.type(sourceField(), "  /Volumes/My Card  ");
+  // The field shows exactly what was typed — nothing is trimmed under the
+  // operator's cursor mid-edit.
+  expect(sourceField().value).toBe("  /Volumes/My Card  ");
+  await userEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+  await waitFor(() => expect(callsTo(calls, "plan_ingest")).toHaveLength(1));
+  expect(callsTo(calls, "plan_ingest")[0]?.args).toMatchObject({
+    source: "/Volumes/My Card",
+  });
 });

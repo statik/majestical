@@ -626,12 +626,19 @@ mod tests {
         for i in 0..count {
             let path = root.join(format!("broken-{i}.jpg"));
             paths.push(path.display().to_string());
-            outcome.thumbs.failed.push(crate::index::ItemFailure {
+            let failure = crate::index::ItemFailure {
                 asset: format!("asset{i}"),
                 path,
                 error: "decode failed".to_string(),
                 transient: false,
-            });
+            };
+            // Alternating kinds, so the count the check reports is proven to
+            // flatten across kinds rather than read the first kind only.
+            if i % 2 == 0 {
+                outcome.thumbs.failed.push(failure);
+            } else {
+                outcome.embed.failed.push(failure);
+            }
         }
         let notices = Notices::new();
         crate::index::record_failures(root, &outcome, &notices).expect("record failures");

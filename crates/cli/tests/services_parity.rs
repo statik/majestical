@@ -10,20 +10,6 @@ use std::path::Path;
 
 #[cfg(test)]
 fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
-    diff_against_ref_normalized(root, state, args, ToString::to_string);
-}
-
-/// Everything [`diff_against_ref`] does, with `normalize` applied to BOTH
-/// binaries' stdout AND stderr before comparing — for a verb whose output
-/// this branch intentionally changed (see [`without_ledger`],
-/// [`without_new_doctor_rows`], [`without_result_pluralization`]).
-#[cfg(test)]
-fn diff_against_ref_normalized(
-    root: &Path,
-    state: &Path,
-    args: &[&str],
-    normalize: fn(&str) -> String,
-) {
     let reference = Path::new("/tmp/maj-ref");
     if !reference.is_file() {
         eprintln!("SKIP parity({args:?}): /tmp/maj-ref missing — build it first");
@@ -44,167 +30,17 @@ fn diff_against_ref_normalized(
     let (new, old) = (run("new"), run("ref"));
     assert_eq!(
         (
-            normalize(&String::from_utf8_lossy(&new.stdout)),
-            normalize(&String::from_utf8_lossy(&new.stderr)),
+            String::from_utf8_lossy(&new.stdout),
+            String::from_utf8_lossy(&new.stderr),
             new.status.code()
         ),
         (
-            normalize(&String::from_utf8_lossy(&old.stdout)),
-            normalize(&String::from_utf8_lossy(&old.stderr)),
+            String::from_utf8_lossy(&old.stdout),
+            String::from_utf8_lossy(&old.stderr),
             old.status.code()
         ),
         "stdout/stderr/exit diverged for {args:?}"
     );
-}
-
-/// Renders `text` as the reference binary would: without the failure
-/// ledger `index status` this branch adds. The reference is built at the
-/// merge-base with `main`, which predates the ledger, so
-/// `index_status_output_is_byte_identical` compares modulo it rather than
-/// losing its parity coverage outright. Two shapes carry it, both stripped
-/// here: the `, N failed` column each per-kind text line gained, and the
-/// JSON counterparts — each per-kind object's new `"failed":N` member, and
-/// whichever name the top-level ledger member carries (`"failed_last_run"`
-/// on the reference, renamed to `"failed"` on this branch).
-///
-/// Every strip is an exact-substring removal from the original bytes, so a
-/// formatting change anywhere (compact vs pretty, key order, spacing) still
-/// fails the comparison. Applied to BOTH binaries' output, so nothing
-/// outside the removed spans can hide behind it. The per-kind text and JSON
-/// strips are pinned to the fixture catalog's `0` count — a line or member
-/// carrying a non-zero count is left untouched, so a real difference there
-/// still diverges loudly instead of being silently normalized away.
-///
-/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
-/// it exists, `index_status_output_is_byte_identical` is blind to the
-/// ledger. Once the reference binary includes it (i.e. once this branch is
-/// on `main`), delete this function, [`strip_ledger_member`], and
-/// [`diff_against_ref_normalized`] (unless a later normalizer still needs
-/// it), and point `index_status_output_is_byte_identical` back at
-/// [`diff_against_ref`]. Scheduled as a step of phase 7F Task 15 in
-/// `docs/superpowers/plans/2026-09-14-phase7f-hardening.md`.
-#[cfg(test)]
-fn without_ledger(text: &str) -> String {
-    // `split_inclusive` keeps each line's own newline (and the last line's
-    // absence of one), so a text that never mentions the ledger normalizes
-    // to itself byte for byte.
-    let mut kept = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let (body, newline) = match line.strip_suffix('\n') {
-            Some(body) => (body, "\n"),
-            None => (line, ""),
-        };
-        let body = body.strip_suffix(", 0 failed").unwrap_or(body);
-        let body = strip_ledger_member(body).unwrap_or_else(|| body.to_string());
-        kept.push_str(&body.replace(",\"failed\":0", ""));
-        kept.push_str(newline);
-    }
-    kept
-}
-
-/// Cuts whichever top-level ledger member is present — `"failed":{…}` (this
-/// branch) or `"failed_last_run":{…}` (the reference) — out of a JSON line,
-/// comma included, but ONLY when that member's value is an empty object:
-/// the reference predates the ledger and always hardcodes an empty one
-/// (never varying with real failures), so stripping it unconditionally
-/// would erase genuine content this branch's binary reports and hide a
-/// real divergence behind the strip. `serde_json` is used ONLY to build the
-/// needle (re-serializing that one member's value); the removal itself is
-/// an exact-substring cut from the original bytes, so the line is never
-/// reformatted. `Value::get` looks up a direct child only, so this can't be
-/// fooled by the per-kind objects' own (numeric) `"failed"` members. `None`
-/// when the line isn't a JSON object, carries neither member, or the
-/// member is non-empty — a document with real ledger content, or a
-/// differently-shaped one, therefore passes through unstripped and
-/// diverges loudly instead of being normalized into agreement.
-#[cfg(test)]
-fn strip_ledger_member(line: &str) -> Option<String> {
-    let document: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    let (key, value) = ["failed", "failed_last_run"]
-        .into_iter()
-        .find_map(|key| Some((key, document.get(key)?)))?;
-    if !value.as_object().is_some_and(serde_json::Map::is_empty) {
-        return None;
-    }
-    let needle = format!("\"{key}\":{}", serde_json::to_string(value).ok()?);
-    let mut start = line.find(&needle)?;
-    let mut end = start + needle.len();
-    if line[end..].starts_with(',') {
-        end += 1;
-    } else if line[..start].ends_with(',') {
-        start -= 1;
-    }
-    Some(format!("{}{}", &line[..start], &line[end..]))
-}
-
-#[cfg(test)]
-mod without_ledger_tests {
-    use super::without_ledger;
-
-    /// The new-shape text (each per-kind line ending `, 0 failed`) and the
-    /// old-shape text it replaces (no such column) must normalize to the
-    /// SAME string — the whole point of the normalizer.
-    #[test]
-    fn new_and_old_shape_text_normalize_identically() {
-        let new_shape = "thumbs: 1 done, 2 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
-                          0 need model, 0 failed\n\
-                          embeddings: 0 done, 0 pending, 0 offline, 0 unsupported, \
-                          0 need ffmpeg, 0 need model, 0 failed\n";
-        let old_shape = "thumbs: 1 done, 2 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
-                          0 need model\n\
-                          embeddings: 0 done, 0 pending, 0 offline, 0 unsupported, \
-                          0 need ffmpeg, 0 need model\n";
-        assert_eq!(without_ledger(new_shape), without_ledger(old_shape));
-        // The old shape has nothing to strip, so it must pass through
-        // byte for byte — pins that the normalizer isn't just collapsing
-        // both inputs to some other, unrelated string.
-        assert_eq!(without_ledger(old_shape), old_shape);
-    }
-
-    /// The new-shape JSON (each per-kind object gaining `"failed":N`, the
-    /// top-level member renamed `failed_last_run` -> `failed`) and the
-    /// old-shape JSON it replaces must normalize to the SAME string, on an
-    /// empty (no-failures) ledger — the fixture catalog's actual shape.
-    /// Unlike the text case, the old shape here is NOT already its own
-    /// normal form: it still carries the (always-empty, hardcoded)
-    /// `failed_last_run` member the reference predates the ledger with,
-    /// which the normalizer strips from both sides alike.
-    #[test]
-    fn new_and_old_shape_json_normalize_identically() {
-        let new_shape = "{\"failed\":{},\"thumbs\":{\"done\":1,\"failed\":0,\
-                          \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":2,\
-                          \"unsupported\":0}}\n";
-        let old_shape = "{\"failed_last_run\":{},\"thumbs\":{\"done\":1,\
-                          \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":2,\
-                          \"unsupported\":0}}\n";
-        let expected = "{\"thumbs\":{\"done\":1,\"needs_ffmpeg\":0,\"needs_model\":0,\
-                         \"offline\":0,\"pending\":2,\"unsupported\":0}}\n";
-        assert_eq!(without_ledger(new_shape), without_ledger(old_shape));
-        assert_eq!(without_ledger(old_shape), expected);
-    }
-
-    /// A per-kind line carrying a non-zero failed count is left completely
-    /// unchanged — the normalizer only ever strips the fixture's known `0`,
-    /// so a real failure count still shows up as a divergence.
-    #[test]
-    fn per_kind_line_with_nonzero_failed_count_is_unchanged() {
-        let line = "pdf: 0 done, 0 pending, 0 offline, 0 unsupported, 0 need ffmpeg, \
-                     0 need model, 2 failed\n";
-        assert_eq!(without_ledger(line), line);
-    }
-
-    /// A JSON document whose top-level `failed` ledger is non-empty is left
-    /// completely unchanged: the reference can never produce real ledger
-    /// content (it predates the ledger and hardcodes an empty object), so
-    /// stripping non-empty content here would hide a genuine divergence.
-    #[test]
-    fn json_with_nonempty_top_level_failed_is_unchanged() {
-        let line = "{\"failed\":{\"thumbs\":[{\"asset\":\"xxh3:abc\",\
-                     \"error\":\"boom\"}]},\"thumbs\":{\"done\":0,\"failed\":1,\
-                     \"needs_ffmpeg\":0,\"needs_model\":0,\"offline\":0,\"pending\":0,\
-                     \"unsupported\":0}}\n";
-        assert_eq!(without_ledger(line), line);
-    }
 }
 
 /// Runs `args` once per binary, each against its OWN catalog root/state —
@@ -300,80 +136,6 @@ fn diff_against_ref_with_between(root: &Path, state: &Path, args: &[&str], betwe
     );
 }
 
-/// Renders `text` as the reference binary would: with the search summary
-/// line's exactly-one-hit case still unpluralized. This branch's `maj
-/// search` prints `"1 result"` for a single hit (was `"1 results"`); the
-/// reference predates the fix and always prints the unpluralized form. Only
-/// a line consisting of EXACTLY `"1 result"` is rewritten — an exact
-/// substring/line match, not a regex — so text elsewhere (including a
-/// `"count":1` JSON member) passes through untouched, and a real divergence
-/// still fails loudly.
-///
-/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
-/// it exists, `search_output_is_byte_identical` is blind to this one line.
-/// Once the reference binary includes the fix (i.e. once this branch is on
-/// `main`), delete this function and its test and point
-/// `search_output_is_byte_identical` back at [`diff_against_ref`] — the same
-/// cleanup phase 7F Task 15's Step 4b already schedules for
-/// [`without_ledger`] and [`without_new_doctor_rows`].
-#[cfg(test)]
-fn without_result_pluralization(text: &str) -> String {
-    let mut kept = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let (body, newline) = match line.strip_suffix('\n') {
-            Some(body) => (body, "\n"),
-            None => (line, ""),
-        };
-        kept.push_str(if body == "1 result" {
-            "1 results"
-        } else {
-            body
-        });
-        kept.push_str(newline);
-    }
-    kept
-}
-
-#[cfg(test)]
-mod without_result_pluralization_tests {
-    use super::without_result_pluralization;
-
-    /// The new-shape line (`"1 result"`) and the old-shape line it replaces
-    /// (`"1 results"`) normalize to the SAME string — the whole point of the
-    /// normalizer — and the old shape, having nothing to strip, passes
-    /// through byte for byte.
-    #[test]
-    fn new_and_old_shape_lines_normalize_identically() {
-        let new_shape = "a.txt  [vol1\u{25cb}]\n1 result\n";
-        let old_shape = "a.txt  [vol1\u{25cb}]\n1 results\n";
-        assert_eq!(
-            without_result_pluralization(new_shape),
-            without_result_pluralization(old_shape)
-        );
-        assert_eq!(without_result_pluralization(old_shape), old_shape);
-    }
-
-    /// A multi-hit count is left completely unchanged — the normalizer only
-    /// ever rewrites the exact `"1 result"` line, so a real divergence in
-    /// any other count still shows up.
-    #[test]
-    fn other_counts_are_unchanged() {
-        let line = "0 results\n";
-        assert_eq!(without_result_pluralization(line), line);
-        let line = "2 results\n";
-        assert_eq!(without_result_pluralization(line), line);
-    }
-
-    /// JSON output's `"count":1` member is untouched — the normalizer only
-    /// rewrites a line that is EXACTLY `"1 result"`, not any substring
-    /// containing it.
-    #[test]
-    fn json_count_member_is_unchanged() {
-        let line = "{\"count\":1,\"results\":[]}\n";
-        assert_eq!(without_result_pluralization(line), line);
-    }
-}
-
 #[test]
 fn search_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -385,7 +147,7 @@ fn search_output_is_byte_identical() {
         ["search", "nomatch", "--json"].as_slice(),
         ["searches", "list", "--json"].as_slice(),
     ] {
-        diff_against_ref_normalized(&root, &state, args, without_result_pluralization);
+        diff_against_ref(&root, &state, args);
     }
 }
 
@@ -517,7 +279,7 @@ fn index_status_output_is_byte_identical() {
         ["index", "status", "--json"].as_slice(),
         ["index", "status"].as_slice(),
     ] {
-        diff_against_ref_normalized(&root, &state, args, without_ledger);
+        diff_against_ref(&root, &state, args);
     }
 }
 
@@ -2094,93 +1856,6 @@ fn reference_knows_subcommand(help_text: &str, name: &str) -> bool {
         .any(|line| line.split_whitespace().next() == Some(name))
 }
 
-/// The two doctor rows this branch adds (`failed_items`, `describer`), as
-/// the fixture catalog renders them: no ledger rows and no `describer.toml`,
-/// so both are `Ok` with fixed detail text. Pinned as whole serialized row
-/// objects — a row reporting anything else (a real ledger finding, a
-/// configured describer, a missing `OpenRouter` key) does not match, so it
-/// passes through unstripped and diverges loudly.
-#[cfg(test)]
-const NEW_DOCTOR_ROWS: [&str; 2] = [
-    r#"{"name":"failed_items","status":"ok","detail":"no known failures"}"#,
-    r#"{"name":"describer","status":"ok","detail":"no describer configured — captions off"}"#,
-];
-
-/// Renders a `doctor --json` document as the reference binary would: without
-/// the two rows this branch adds. The reference is built at the merge-base
-/// with `main`, which predates them, so
-/// [`doctor_output_is_byte_identical`] compares modulo those two rows rather
-/// than losing its parity coverage outright.
-///
-/// Each strip is an exact-substring removal (the row object plus the comma
-/// that follows it) from the original bytes, so a formatting change anywhere
-/// — key order, spacing, compact vs pretty — still fails the comparison, and
-/// the reference's output, which carries neither row, normalizes to itself
-/// byte for byte.
-///
-/// Only a trailing comma is consumed, because in the real document neither
-/// row is last — `platform` always follows both. A row that did land last
-/// would keep the comma in front of it and pass through with a dangling
-/// separator, diverging loudly; that is the safe direction for a
-/// normalizer whose whole job is to hide a known difference.
-///
-/// THIS IS TEMPORARY AND MUST BE DELETED, not left to lapse: for as long as
-/// it exists, `doctor_output_is_byte_identical` is blind to these two rows.
-/// Once the reference binary includes them (i.e. once this branch is on
-/// `main`), delete this function and its test and point the parity test back
-/// at [`diff_against_ref`] — the same cleanup phase 7F Task 15's Step 4b
-/// already schedules for [`without_ledger`].
-#[cfg(test)]
-fn without_new_doctor_rows(text: &str) -> String {
-    let mut kept = text.to_string();
-    for row in NEW_DOCTOR_ROWS {
-        let Some(start) = kept.find(row) else {
-            continue;
-        };
-        let mut end = start + row.len();
-        if kept[end..].starts_with(',') {
-            end += 1;
-        }
-        kept = format!("{}{}", &kept[..start], &kept[end..]);
-    }
-    kept
-}
-
-#[cfg(test)]
-mod without_new_doctor_rows_tests {
-    use super::without_new_doctor_rows;
-
-    /// A document carrying the two new rows and the reference's document
-    /// without them normalize to the SAME string — and the reference's,
-    /// having nothing to strip, passes through byte for byte.
-    #[test]
-    fn new_and_old_doctor_documents_normalize_identically() {
-        let new_shape = "{\"checks\":[{\"name\":\"blob_residue\",\"status\":\"ok\",\
-                          \"detail\":\"clean\"},{\"name\":\"failed_items\",\"status\":\"ok\",\
-                          \"detail\":\"no known failures\"},{\"name\":\"describer\",\
-                          \"status\":\"ok\",\"detail\":\"no describer configured — captions \
-                          off\"},{\"name\":\"platform\",\"status\":\"ok\",\
-                          \"detail\":\"macOS\"}]}\n";
-        let old_shape = "{\"checks\":[{\"name\":\"blob_residue\",\"status\":\"ok\",\
-                          \"detail\":\"clean\"},{\"name\":\"platform\",\"status\":\"ok\",\
-                          \"detail\":\"macOS\"}]}\n";
-        assert_eq!(
-            without_new_doctor_rows(new_shape),
-            without_new_doctor_rows(old_shape)
-        );
-        assert_eq!(without_new_doctor_rows(old_shape), old_shape);
-    }
-
-    /// A row reporting a real finding is NOT one of the pinned no-finding
-    /// rows, so it survives normalization and still diverges.
-    #[test]
-    fn a_row_with_real_findings_is_left_alone() {
-        let with_findings = "{\"checks\":[{\"name\":\"failed_items\",\"status\":\"warn\",\
-                              \"detail\":\"2 item(s) skipped\"}]}\n";
-        assert_eq!(without_new_doctor_rows(with_findings), with_findings);
-    }
-}
-
 /// `doctor` is read-only, so a shared root serves both binaries (same
 /// reasoning as `browse_output_is_byte_identical`). Constrained to `--json`
 /// against an already-initialized fixture catalog, passed via doctor's own
@@ -2190,9 +1865,6 @@ mod without_new_doctor_rows_tests {
 /// actually needs pinned is that the catalog-dependent rows (`catalog`,
 /// `state_dir`, `blob_residue`) agree once a real catalog is in play, not
 /// just the environment-only ones.
-///
-/// Compared modulo the two rows this branch adds — see
-/// [`without_new_doctor_rows`], which is temporary.
 ///
 /// Two independent skip reasons, checked in order: the reference binary may
 /// be missing entirely (same as every other row in this file), or it may be
@@ -2222,10 +1894,9 @@ fn doctor_output_is_byte_identical() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
     let catalog_arg = root.to_str().expect("utf8");
-    diff_against_ref_normalized(
+    diff_against_ref(
         &root,
         &state,
         &["doctor", "--catalog", catalog_arg, "--json"],
-        without_new_doctor_rows,
     );
 }

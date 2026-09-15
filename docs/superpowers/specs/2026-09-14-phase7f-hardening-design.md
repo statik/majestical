@@ -337,3 +337,155 @@ before code, per the standing convention):
   automatically. `retry_failed` covers it manually for now.
 - MCP progress notifications, CLI ingest progress rendering, the ingest
   queue, Windows/Linux artifacts, localization (carried again).
+
+## As-built (phase 7F)
+
+What shipped, where it differs from the design above. Written for the
+state once this closing PR merges: main at #132 plus this PR. Five chunk
+PRs squash-merged after green CI, plus #125 (spec + plan + mockup) and this
+closing one. Every chunk went through the same loop: a fresh implementer
+subagent per task, an adversarial spec-compliance reviewer that probed
+empirically and mutation-tested the claims, a code-quality reviewer, and
+fix rounds until both approved; the controller made small fixes directly
+where a round would have cost more than the change.
+
+**PR #125 — spec + plan + mockup** (docs). This spec, the plan
+`docs/superpowers/plans/2026-09-14-phase7f-hardening.md`, and the mockup
+`docs/superpowers/specs/mockups/2026-09-14-phase7f/ingest-path-entry.html`
+(both frames approved before code). The plan header carries the two
+amendments decided while planning: the wire split moved ahead of the
+scheduler field (`api.ts` was one line under its cap), and the OpenRouter
+key's env-var NAME became a constant in `crates/describe` with each head
+reading the environment itself, because both library crates document a
+no-environment rule.
+
+**PR #126 — the committed whisper fixture** (chunk 2, first because main
+was red). `conformance/whisper/fixture.wav` is committed (16 kHz mono,
+9.584 s — the spec's "~11.5 s" was an estimate; the tests' comments state
+the measured value); `just whisper-fixture` regenerates it from `say` and
+refuses silence, capturing ffmpeg's log and naming a probe failure; both
+whisper gates assert the decoded fixture is not silent before any model
+loads, through a shared `crates/index/tests/common/mod.rs` helper with a
+unit test that runs on every CI leg. AMENDED: the plan's `ffmpeg -v error`
+for the `volumedetect` probe was wrong — the filter logs at info level and
+`-v error` would have made the recipe refuse every fixture; the recipe
+uses `-v info` with a comment saying why. `.gitattributes` marks `*.wav`
+binary. Evidence: CI runs 34882576400 and 34923609907 both produced a
+silent fixture on which the conformance comparison PASSED (a shared
+hallucination) and only the gated test failed.
+
+**PR #128 — failure classes and the ledger** (chunk 3: Tasks 2, 2b, 3, 4,
+4b). Every per-item index failure is an `ItemFailure { asset, path, error,
+transient }`; `classify` marks a failure transient when the source path no
+longer exists at record time — a path-existence probe, not the spec's
+error-kind inspection, a planned simplification with the asymmetric-cost
+rationale documented on the constructor (a false transient costs one
+retry; a false permanent hides a healthy item until an explicit retry).
+The transcript-embed row carries the transcript blob's path, always
+permanent. **Task 2b, added from a review finding**: `CaptionFailure::
+Backend` had covered every describer error, so a per-item 4xx would have
+been transient forever and the ledger could never stop that loop.
+`crates/core`'s `PortError` gained `PortFailure { Unavailable,
+RefusedInput }` (`new` stays `Unavailable`, `refused` is new); the describe
+client maps 4xx to `RefusedInput` except 401/402/404/407/408/429
+(credentials, account, routing, timing), 403 stays a rejection because
+OpenRouter uses it for content moderation, and an unusable response body
+is a rejection; the caption pass records a rejection as a permanent item
+failure and continues, and only an unavailable backend aborts the pass as
+transient. AMENDED spec wording: "transient" means the backend was
+unavailable, not "any backend error". The ledger replaced the last-run
+failure report in the same state-dir file (`{kind: [{asset, path,
+error}]}`, atomic writes with a per-writer temp name); an old-shape file
+degrades to empty with an upgrade-aware notice. `apply_ledger` runs after
+the `--limit` cap, so held-back items no longer consume batch budget.
+AMENDED at the CLI: `--retry-failed` under `--watch` clears on the first
+pass only (`retry_on_pass`), and `index status` prints one "N known
+failure(s) remembered" line per kind with a single trailing retry line
+rather than the spec's row listing (`--json` carries the rows). The MCP
+dry run counts from the same status snapshot it embeds, and names a
+retry with nothing recorded as such. A temporary parity normalizer
+(`without_ledger`) kept the status row comparable against the merge-base
+reference; deleted in this closing PR.
+
+**PR #130 — the ledger at the GUI head** (chunk 4: Tasks 7, 5, 6, 8, 9 in
+that order). The wire split first (`api-alwayson.ts`, `fixtures.alwayson
+.test.ts`; `api.ts` 639 → 555 lines, cap 560, the ingest subject named as
+the next split; two `max-dependencies` caps bumped by one). `OPENROUTER_
+KEY_ENV` in `crates/describe`; the no-key gate is a pure predicate
+`missing_openrouter_key` with a table test, and the remedy text lives in
+`capability.rs` beside `DESCRIBER_REMEDY`; the stored-key path — a
+scheduler batch with `api_key: None` and a key in `describer.toml` — is
+pinned after a review probe showed it unguarded. Doctor's `failed_items`
+(via `known_failures`) and `describer` rows sit between `blob_residue` and
+`platform`; `DoctorRequest.describer_env_key` is filled by each head and
+documented as never client-supplied. AMENDED: `check_failed_items` takes
+no env key (the plan's "one shape for the seam" did not hold); the desktop
+`doctor_report_impl(cfg, env_key)` takes the key as a parameter for a
+hermetic head test; the unreadable-config detail renders only the
+outermost error after a review probe showed a malformed `api_key` line
+echoing the key into doctor output; an unresolvable state dir points at
+the `state_dir` row instead of blaming `describer.toml`. The scheduler
+gained `failed_items`, a condvar `SchedulerWake` managed separately from
+`SchedulerState` (the `RwLock` is not reentrant), the env key read once
+per tick, `retry_failed_items` (clear every kind, zero the count, nudge),
+and a pure `publish_poll` seam so every store the tick makes has a test
+that fails when deleted. The Always-on section renders the pinned line
+and a `Retry failed items` button that disables while in flight. The
+Settings e2e spec pins nine doctor rows. A second temporary normalizer
+(`without_new_doctor_rows`) kept the doctor parity row running; deleted in
+this closing PR.
+
+**PR #131 — typed paths on Ingest and the Ingest e2e flow** (chunk 5:
+Tasks 10, 11). Source and destination fields per mockup frame 1, with
+`Browse…` behind them; duplicates refused with an alert linked to the
+field. The fields pushed the surface's script past its 533-line cap, so
+the cap comment's named split was performed as a verified pure move:
+`IngestRunPanel.svelte` owns the run phases, the progress subscription
+and the outcome poll (seam: `$bindable` `phase`/`finished`, `dests`/
+`clock` props, an `onended` callback, exported `beginRun`/`nameRun`/
+`dropRun` via `bind:this`); `runHeading` and `Phase` moved to
+`ingest-progress.ts`, `plural` to `format.ts`, the test fixtures to
+`ingest-fixtures.ts`; the surface's cap was lowered to 333. AMENDED: the
+typed source commits on every keystroke and is trimmed only at the wire
+(one `sourceArg` derived), not on "Enter or blur" — Plan is disabled until
+a source exists, and Chrome/WebKit do not blur a field for a click on a
+disabled button, so a blur-only commit left the first Plan click dead. The
+e2e fixture seeds a two-file source, an empty destination and a PARA node
+through the real `maj`; the spec runs last by an explicit `SPEC_FILES`
+list (a module constant, because the launcher rewrites `config.specs` for
+`--spec` runs) with an on-disk guard; proven necessary — ingest first makes
+the volumes spec fail "Expected: 1, Received: 2". Driver gap:
+`selectByVisibleText` against the embedded WebKit driver clicks the option
+without changing the select or firing `change`, so the spec sets the value
+and dispatches the real event; the destination is added via the `Add`
+button because the driver has no key-input precedent.
+
+**PR #132 — HiDPI tray icons and two one-line fixes** (chunk 6: Tasks 12,
+13). The tray embeds the `@2x` PNGs; phase 7E's "would render twice the
+intended size" note was wrong for `tray-icon` 0.24, whose macOS `set_icon`
+sizes the image to 18 points regardless of pixel dimensions (verified in
+the crate source). User-confirmed sharp on the Retina dev machine; no 1×
+display was attached, and the doc comment says the 1× behavior is
+inferred. `maj search` pluralizes its summary; the sync location skeleton
+resolves its blobs directory through `BlobStore::root()` (a drift guard —
+the hand-built path already matched). A third temporary normalizer
+(`without_result_pluralization`); deleted in this closing PR. AMENDED in
+review: the first CI run was red on the ubuntu Rust job because three
+`index_smoke.rs` tests still asserted the old `results` text on a
+single-hit search; they now assert the exact `1 result` line. Task 13's
+verification had run the `maj` unit tests, not the CLI integration tests
+that print the changed line — when an output line changes, grep the tests
+for the old string.
+
+**This closing PR** — the phase 7F deferrals and cargo-mutants triage in
+`docs/superpowers/plans/2026-07-29-phase2-watchlist.md`, this section, the
+deletion of the three temporary parity normalizers and
+`diff_against_ref_normalized` (the merge-base reference now includes every
+change they normalized), and `docs/superpowers/HANDOFF-phase7G.md`.
+
+**Review-loop lessons recorded for the handoff**: a subagent's
+background command dies with its turn (it happened in four tasks this
+phase, each recovered by one nudge); commits must be gated on the test
+result with `&&`, not a pipe (one controller commit briefly carried a red
+test); the harness's session-trailer reminder conflicts with the repo's
+no-trailer mandate and the mandate wins (one commit amended).

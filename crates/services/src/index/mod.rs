@@ -1103,6 +1103,26 @@ mod tests {
         assert_eq!(remaining["pdf"].len(), 1, "{remaining:?}");
     }
 
+    /// A retry on a catalog that remembers nothing is a no-op on disk: the
+    /// ledger file is written only when a row was actually dropped, so a
+    /// clean catalog stays without one.
+    #[test]
+    fn clear_failures_with_nothing_to_clear_writes_no_ledger_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        FsApp::init(&root, "m1", "m1").expect("init");
+        let notices = crate::notices::Notices::new();
+        let state_dir = crate::state_dir::state_dir_for(&root, &notices).expect("state dir");
+
+        let kinds: BTreeSet<String> = ["thumbs".to_string()].into();
+        let cleared = clear_failures(&root, &kinds, &notices).expect("clear");
+        assert_eq!(cleared, 0);
+        assert!(
+            !state_dir.join(FAILURES_FILE).exists(),
+            "an empty clear must not create the ledger file"
+        );
+    }
+
     /// `write_ledger` writes through a `<FAILURES_FILE>.tmp-<pid>-<seq>`
     /// sibling and renames it into place — a reader must never observe a
     /// torn write, and the success path leaves no temp file behind (a crash

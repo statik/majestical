@@ -2009,6 +2009,189 @@ counter-mutant family is otherwise gone: the two-asset rule held, and
 this phase's new planner pass (`plan_keyframe_images`) shipped with the
 same shape of test, so it contributed no survivors.
 
+## Phase 7F deferrals
+
+Recorded during the phase 7F PR chain (#125, #126, #128, #130, #131, #132)
+and this closing PR. Items marked "(spec)" come from
+`docs/superpowers/specs/2026-09-14-phase7f-hardening-design.md`'s own
+Deferred list; the rest were found during execution, attributed to the PR
+whose review found them.
+
+- **GUI describer settings** (spec). The GUI still has no describer
+  configuration; a GUI-only user cannot get captions without
+  `maj describer set`. A parity gap for a phase of its own, with a mockup.
+- **The root pre-commit hook does not compile the desktop workspace**
+  (spec, carried). The hook-speed tradeoff is still undecided.
+- **Wire-layer codegen** (spec, carried). The split (#130) bought time;
+  `api.ts` sits at 559/560 with the ingest subject named as the next
+  split; codegen from the Rust outcome structs remains the real close.
+- **Ledger pruning** (spec). Rows for assets that later leave the plan are
+  not counted and cost nothing; a retry clears them. Build pruning only if
+  the file ever grows enough to matter.
+- **Ledger keyed finer than `(kind, asset)`** (spec; sharpened by #128).
+  Concrete case found in review: the ledger keys by `--kinds` name, so a
+  permanent Transcribe failure also holds back a later TranscriptEmbed item
+  for the same asset — including one a teammate-synced transcript would
+  enable — and the two OCR kinds share a key the same way. Documented on
+  `apply_ledger`; `--retry-failed` covers it by hand. Since describer
+  rejections became permanent (#128), switching describers also leaves
+  caption rows behind until a retry.
+- **MCP progress notifications, CLI ingest progress rendering, the ingest
+  queue, Windows/Linux artifacts, localization** (spec, carried again).
+- **Invalid, expired or unfunded OpenRouter keys are not named** (#128,
+  #130). The no-key gate covers only an ABSENT key. A bad key arrives as
+  401/402, which the client classes as `Unavailable` (transient) so the
+  ledger never remembers it — correct, but the tray only ever shows the
+  server's own message. Naming the case needs the client to surface the
+  status class, which is one step past this phase's `PortFailure` split.
+- **`Malformed` describer output is a permanent rejection** (#128). A
+  model that never returns parsable tag JSON now costs two round-trips per
+  item once, then a ledger row — rather than aborting the pass as before.
+  Intended; noted because the cost moved.
+- **Unit tests leak state dirs into the user's data dir** (#128, #130).
+  `crates/services` unit tests that open catalogs without `MAJ_STATE_DIR`
+  resolve their state dir through `dirs::data_dir()`; the caption and
+  doctor test helpers added this phase follow the sibling pattern. Measured
+  33,193 directories under `~/Library/Application Support/majestical/
+  catalogs/` on the dev machine on 2026-09-15. Fix: set `MAJ_STATE_DIR` for
+  `cargo test` in the justfile, or thread a `state_dir` seam through the
+  `openrouter_catalog`/`fixture_catalog` helpers.
+- **`crates/sync/src/transfer.rs` still records failures as
+  `Vec<(PathBuf, String)>`** (#128). The sync transfer subsystem was out of
+  the index ledger's scope; its rows carry no class.
+- **The ledger notice can print up to three times per run** (#128). `run`
+  reads the ledger, `record_failures` re-reads it, and a retry's clear reads
+  it once more; a corrupt file is noted at each read.
+- **`build_plan` has five parameters, at the cap** (#128). A sixth should
+  become a `PlanContext` grouping `blobs`/`caps`/`ledger`.
+- **A retry can interleave with a finishing batch's `record_failures`**
+  (#130). Both read-modify-write the ledger file (atomically each); a
+  retry's clear can be overwritten by a batch's pre-clear read. The window
+  is milliseconds, the next poll shows the true count, and clicking again
+  is the remedy — no locking scheme warranted. `clear_failures`' returned
+  count is discarded at the GUI head; a "N items queued again" confirmation
+  would need a wire field.
+- **`run_loop`'s wake wiring is untestable by construction** (#130). The
+  `SchedulerWake::wait` call inside the infinite loop behind an `AppHandle`
+  is the one line in `indexer.rs` with no test that fails on revert; the
+  producer side (nudge, clear, count) is fully pinned.
+- **The Always-on section does not poll** (#130). A retry clears the line
+  immediately; if the items fail again the count returns on the tray's
+  next tick, and on the section only after a throttle change, a retry, or
+  remount. The spec's "next poll" wording refers to the tray.
+- **Doctor row grammar** (#130). The `describer` row's `backend · model ·
+  state` shape is new to `doctor.rs`; every other detail is prose. Fine as
+  a one-off; a second row in that shape should make it the convention or
+  drop it.
+- **Other `{err:#}` renderings of describer-config errors** (#130). The
+  doctor row now renders only the outermost context so a malformed
+  `api_key` line can never echo a key; the MCP `get_describer` tool still
+  renders the full chain. Audit and align.
+- **`check_describer` resolves the state dir twice** (#130). Once via
+  `config_path`, once inside `load_config`; `catalog_paths` is not
+  side-effect-free (it creates the runs dir). Harmless, idempotent.
+- **The Ingest run-panel seam** (#131). `IngestRunPanel.svelte` is driven
+  by three exported methods through `bind:this`; the cleaner shape is the
+  panel owning `start()` with a job prop and an `onfailed` callback. Adopt
+  it when the completion card is split out (the surface's cap comment
+  names that as its next split).
+- **Two alerts can coexist on the Ingest surface** (#131). `destError` and
+  `setupError` both render `role="alert"`; no test creates both today.
+- **A typed path with a genuine trailing space cannot be ingested by
+  typing** (#131). The source is trimmed at the wire; paste artifacts are
+  the far likelier case, so the trade is deliberate.
+- **The visible `Browse…` buttons carry aria-labels that differ from their
+  text** (#131). Per the mockup; a WCAG 2.5.3 nit for a future
+  accessibility pass.
+- **The e2e on-disk spec guard does not abort the launcher** (#131).
+  `onPrepare`'s throw is logged and workers still spawn, each failing on
+  the missing fixture env; the exit code is non-zero and the guard's
+  message is present, but it scrolls above the noise.
+- **e2e still cannot drive a native dialog** (#131, carried from 7E). The
+  typed path is what makes the Ingest flow drivable; `Browse…` itself has
+  no e2e coverage.
+- **Other unconditional plurals in the CLI** (#132). `commands.rs`'s
+  "scanned: {} assets" and "{} items across {} folders", and the keyframe/
+  OCR counters in `index_cmd.rs`, still print a bare `s`. Task 13 fixed the
+  one the spec named.
+- **The 1× tray rendering is inferred, not observed** (#132). The `@2x`
+  icons render sharp on the Retina dev machine (user-confirmed); the
+  "downsampled on a 1× display" claim follows from the library's fixed
+  18-point sizing and no 1× display was attached.
+- **Pre-existing stale numbers in `.oxlintrc.json` comments** (#131). The
+  Ingest outcome suite is 247 lines, not the 243 its override comment says.
+- **`maj index run --help` omits `keyframe-images` from its `--kinds`
+  list, and the CLI's hand-built `index status --json` omits the
+  `transcripts_remedy`/`captions_remedy` members MCP's serde shape carries**
+  (#128, pre-existing).
+- **`index_cmd.rs` prints one error per kind in `index status`, not the
+  rows** (#128). The spec said "lists the rows"; the plan's one-line form
+  shipped, with `--json` carrying the rows.
+
+### cargo-mutants triage (phase 7F)
+
+Three scoped runs, `--in-place`, foreground, one at a time (the standing
+mandate), against the ledger module `crates/services/src/index/mod.rs`,
+`crates/services/src/doctor.rs` (two new rows this phase), and the desktop
+scheduler `apps/desktop/src-tauri/src/indexer.rs` (from the desktop
+workspace, as in phase 7E).
+
+```bash
+cargo mutants --in-place -p majestical-services -f crates/services/src/index/mod.rs
+cargo mutants --in-place -p majestical-services -f crates/services/src/doctor.rs
+cd apps/desktop/src-tauri && cargo mutants --in-place -f src/indexer.rs
+```
+
+The first run was killed by the session harness at 40 of 61 mutants (host
+memory pressure) with the file left mutated in place; the tree was restored
+with `git checkout -- crates/services/src/index/mod.rs`, a mutant-made
+`crates/services/proptest-regressions/` seed was trashed, and the 21
+unreached mutants were run separately with `--re` on the five unreached
+function names. The two halves are summed below. Lesson for the mandate: an
+in-place run that dies leaves a mutant in the tree — check `git status`
+before anything else touches it.
+
+**`crates/services/src/index/mod.rs`**: 61 mutants, **39 caught, 6
+unviable, 16 missed**. Fifteen of the sixteen survivors are in code phase
+7F did not touch and are killed only by the CLI integration tests, which
+run outside `-p majestical-services`: `model_dir_if_present` (2),
+`describer_model_tag` (3), `status_impl`'s two `needs_model > 0` remedy
+gates (6), and `model_fetch_impl`'s `--only` filter (4) — all exercised by
+`crates/cli/tests/index_smoke.rs` (`index_status_reports_needs_model_and_
+offline_honestly`, `model_fetch_only_rejects_unknown_tag`, `model_fetch_
+reports_already_present_without_network`) and the caption suites.
+Disposition: pre-existing, covered at the CLI head, not a gap. The one
+phase 7F survivor — `clear_failures_impl`'s `cleared > 0` write gate
+turned into `>= 0` (rewrites an unchanged ledger, and creates the file on
+a catalog that had none) — is closed in the closing PR by
+`clear_failures_with_nothing_to_clear_writes_no_ledger_file`; a re-run
+scoped to `--re 'in clear_failures_impl$'` reports 5 caught, 0 missed.
+Every ledger function proper (`read_ledger`, `write_ledger`,
+`record_failures`, `merge_ledger`, `permanent_failures`, `apply_ledger`,
+`known_failures`, `rows_for`, `kind_status_mut`) shipped with no survivor.
+
+**`crates/services/src/doctor.rs`**: 24 mutants, **10 caught, 13 unviable,
+1 missed**. The survivor is the same `check_models` `&&` gate recorded as
+an equivalent mutant in the phase 7E triage (its source comment still
+names the condition under which it stops being equivalent). The two rows
+this phase added, `failed_items` and `describer`, had no survivor.
+
+**`apps/desktop/src-tauri/src/indexer.rs`**: 70 mutants, **57 caught, 9
+unviable, 4 missed**. The four are `run_batch`/`run_tick`/`run_loop`/
+`spawn_loop`'s default-value replacements — the loop's own I/O shims,
+untested by design, the same four the phase 7E triage recorded. Phase 7F's
+additions (`failed_items`, `SchedulerWake`, `publish_poll`,
+`retry_failed_items_impl`) had no survivor; `publish_poll` is the pure
+seam that kills every store mutant a hermetic tick test would have needed
+a catalog for.
+
+**Parity, re-run end to end against `/tmp/maj-ref` rebuilt at 9627996 (the
+closing PR's merge-base) with the three temporary normalizers deleted**:
+`services_parity` — 53 passed, 0 skipped; `tauri_parity` — 7 passed, 0
+skipped. Every row the normalizers had covered (`index_status_output_is_
+byte_identical`, `doctor_output_is_byte_identical`,
+`search_output_is_byte_identical`) is byte-identical again unaided.
+
 ## Phase 7E deferrals
 
 Recorded during the phase 7E PR chain (#109-#113, #116, #117, #121, #122)

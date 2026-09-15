@@ -172,10 +172,10 @@ the parity harnesses). What is new:
   Indexing, Paused, and Attention (a badge dot on the idle look — macOS
   template icons render alpha-only, so no tint color survives; `last_
   error.is_some()` sets it, overriding whichever of the other three a
-  decision would otherwise pick). Only the `@1x` (22×22) PNGs load at
-  runtime; `@2x` files are generated and committed by the root `just
-  tray-icons` recipe (ImageMagick, byte-stable output) for a future
-  HiDPI pass. Hide-to-tray and the activation-policy switch live in
+  decision would otherwise pick). Since phase 7F the `@2x` (44×44) PNGs are the ones
+  embedded (the tray library sizes them to 18 pt itself, so they render
+  at 2× density on Retina); both sets are generated and committed by the
+  root `just tray-icons` recipe (ImageMagick, byte-stable output). Hide-to-tray and the activation-policy switch live in
   `lib.rs`'s `on_window_event`, not in this module. Quit is an immediate
   `app.exit(0)` — the scheduler never holds a transaction open across a
   tick, so nothing tears.

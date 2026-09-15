@@ -1227,7 +1227,7 @@ for dir in [events, blobs] {
   (add: "the ledger remembers only permanent failures; a transient
   failure must never be written to it").
 - [ ] **Step 4:** Update the memory index entry for the project state.
-- [ ] **Step 4b (added in execution, chunks 3 and 4):** delete the TEMPORARY
+- [ ] **Step 4b (added in execution, chunks 3, 4 and 6):** delete the TEMPORARY
   parity normalizers once chunks 3 and 4 are on main — in
   `crates/cli/tests/services_parity.rs`: `without_ledger`,
   `strip_ledger_member` (chunk 3, `index_status_output_is_byte_identical`)

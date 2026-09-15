@@ -8,6 +8,7 @@
 //! this module hands back one [`IndexRunOutcome`] per pass and never
 //! prints.
 use crate::app::FsApp;
+use crate::capability::OPENROUTER_KEY_MISSING_REASON;
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
 use crate::error::ServiceError;
@@ -16,7 +17,7 @@ use anyhow::{Context, Result};
 use majestical_core::media_kind::{MediaKind, media_kind};
 use majestical_core::ports::{Describer, PortError, PortFailure, TagSubject};
 use majestical_core::projection::Projection;
-use majestical_describe::{BackendKind, HttpDescriber};
+use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 use majestical_index::blob::{BlobStore, Derivation};
 use majestical_index::chunk::chunk_segments;
 use majestical_index::encoder::{Encoder, EncoderOptions};
@@ -1570,16 +1571,12 @@ const MAX_DESCRIBED_KEYFRAMES: usize = 12;
 /// backend failure in a pass — see [`run_caption_items`]'s abort policy.
 const DESCRIBER_SKIPPED_REASON: &str = "describer unavailable — skipped after first failure";
 
-/// Recorded for every caption item in a pass when `OpenRouter` is configured
-/// but no key is available from the config file or the environment —
-/// before any request is made. Transient: operator-fixable, not the item's
-/// fault, so the ledger never remembers it.
-///
-/// It names [`majestical_describe::config::OPENROUTER_KEY_ENV`] in prose and
-/// so cannot be built from it at const time; `the_no_key_reason_names_the_key_env_var`
-/// keeps the two from drifting.
-pub const OPENROUTER_KEY_MISSING_REASON: &str =
-    "OpenRouter needs an API key — set it with `maj describer set --api-key` or MAJ_OPENROUTER_KEY";
+/// True when captions cannot be attempted at all: `OpenRouter` is configured
+/// and neither the file nor the head supplied a key. Every other backend
+/// sends whatever the file holds, including nothing.
+fn missing_openrouter_key(config: &DescriberConfig, env_key: Option<String>) -> bool {
+    config.backend == BackendKind::OpenRouter && config.effective_api_key(env_key).is_none()
+}
 
 /// Why one caption item failed, split by what the failure says about the
 /// remaining items.
@@ -1644,9 +1641,7 @@ fn run_caption_items(
             return outcome;
         }
     };
-    if config.backend == BackendKind::OpenRouter
-        && config.effective_api_key(env.api_key.clone()).is_none()
-    {
+    if missing_openrouter_key(&config, env.api_key.clone()) {
         for item in items {
             outcome
                 .failed
@@ -2197,7 +2192,11 @@ mod tests {
     /// rejection, a model that will not take images) is not an outage. Each
     /// row is a permanent verdict on that item, and the pass must work every
     /// remaining item instead of abandoning them, or the always-on scheduler
-    /// retries the same rejected bytes forever.
+    /// retries the same rejected bytes forever. This config's `Ollama`
+    /// backend carries no key either, which is also what keeps
+    /// `missing_openrouter_key`'s gate from firing for local backends
+    /// (`missing_openrouter_key_across_backend_and_key_sources` now pins
+    /// that directly, but the coupling is worth naming here).
     #[test]
     fn caption_rejected_by_the_backend_is_permanent_and_the_pass_continues() {
         use httpmock::prelude::{MockServer, POST};
@@ -2267,14 +2266,16 @@ mod tests {
         mock.assert_calls(items.len());
     }
 
-    /// Arranges a catalog whose describer is `OpenRouter` with no key in the
-    /// file, pointed at `base_url`, plus two caption items whose sources and
-    /// thumbnail blobs are on disk — everything a caption pass needs except
-    /// a key.
+    /// Arranges a catalog whose describer is `OpenRouter`, pointed at
+    /// `base_url` with `api_key` written into the file (`None` to leave the
+    /// file keyless), plus two caption items whose sources and thumbnail
+    /// blobs are on disk — everything a caption pass needs except whatever
+    /// key `api_key` withholds.
     fn openrouter_catalog(
         dir: &Path,
         base_url: String,
         notices: &crate::notices::Notices,
+        api_key: Option<&str>,
     ) -> (PathBuf, BlobStore, Vec<work::WorkItem>) {
         let root = dir.join("cat");
         std::fs::create_dir_all(&root).expect("mkdir");
@@ -2284,7 +2285,7 @@ mod tests {
             backend: BackendKind::OpenRouter,
             base_url,
             model: "test-model".to_string(),
-            api_key: None,
+            api_key: api_key.map(str::to_string),
         }
         .store(&config_path)
         .expect("store describer config");
@@ -2320,7 +2321,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let notices = crate::notices::Notices::new();
-        let (root, blobs, items) = openrouter_catalog(dir.path(), server.base_url(), &notices);
+        let (root, blobs, items) =
+            openrouter_catalog(dir.path(), server.base_url(), &notices, None);
         let env = PassEnv {
             catalog_root: &root,
             notices: &notices,
@@ -2365,7 +2367,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let notices = crate::notices::Notices::new();
-        let (root, blobs, items) = openrouter_catalog(dir.path(), server.base_url(), &notices);
+        let (root, blobs, items) =
+            openrouter_catalog(dir.path(), server.base_url(), &notices, None);
         let env = PassEnv {
             catalog_root: &root,
             notices: &notices,
@@ -2392,15 +2395,93 @@ mod tests {
         mock.assert_calls(items.len());
     }
 
-    /// The reason text names the environment variable in prose, so it cannot
-    /// be built from [`majestical_describe::config::OPENROUTER_KEY_ENV`] at
-    /// const time. This is what keeps the two from drifting apart.
+    /// The gate must also read the file's key when the environment supplies
+    /// none — the desktop scheduler's normal path (a login-item launch has
+    /// no shell environment, so `PassEnv.api_key` is always `None` there,
+    /// and the only key available is whatever `describer.toml` holds). A
+    /// predicate that only checked the environment would wrongly take the
+    /// no-key branch here and never send a request.
     #[test]
-    fn the_no_key_reason_names_the_key_env_var() {
+    fn openrouter_with_only_the_file_key_does_not_take_the_no_key_branch() {
+        use httpmock::prelude::{MockServer, POST};
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400)
+                .json_body(serde_json::json!({"error": "image too large"}));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = crate::notices::Notices::new();
+        let (root, blobs, items) =
+            openrouter_catalog(dir.path(), server.base_url(), &notices, Some("sk-file"));
+        let env = PassEnv {
+            catalog_root: &root,
+            notices: &notices,
+            vocab: Vec::new(),
+            api_key: None,
+        };
+
+        let outcome = run_caption_items(&blobs, &items, &env);
+
+        assert_eq!(outcome.failed.len(), items.len(), "{:?}", outcome.failed);
         assert!(
-            OPENROUTER_KEY_MISSING_REASON.contains(majestical_describe::config::OPENROUTER_KEY_ENV),
-            "{OPENROUTER_KEY_MISSING_REASON}"
+            outcome
+                .failed
+                .iter()
+                .all(|failure| failure.error != OPENROUTER_KEY_MISSING_REASON),
+            "a key from the file must not read as no key: {:?}",
+            outcome.failed
         );
+        mock.assert_calls(items.len());
+    }
+
+    /// Table test for [`missing_openrouter_key`]: only `OpenRouter` with no
+    /// key from either source is a gate hit. Every other backend sends
+    /// whatever the file holds — including nothing — so it never gates.
+    #[test]
+    fn missing_openrouter_key_across_backend_and_key_sources() {
+        let config = |backend: BackendKind, file_key: Option<&str>| DescriberConfig {
+            backend,
+            base_url: "http://example.invalid".to_string(),
+            model: "test-model".to_string(),
+            api_key: file_key.map(str::to_string),
+        };
+
+        assert!(
+            missing_openrouter_key(&config(BackendKind::OpenRouter, None), None),
+            "OpenRouter with no key anywhere must gate"
+        );
+        assert!(
+            !missing_openrouter_key(&config(BackendKind::OpenRouter, Some("sk-file")), None),
+            "OpenRouter with only the file key must not gate"
+        );
+        assert!(
+            !missing_openrouter_key(
+                &config(BackendKind::OpenRouter, None),
+                Some("sk-env".to_string())
+            ),
+            "OpenRouter with only the env key must not gate"
+        );
+        assert!(
+            !missing_openrouter_key(
+                &config(BackendKind::OpenRouter, Some("sk-file")),
+                Some("sk-env".to_string())
+            ),
+            "OpenRouter with both keys must not gate"
+        );
+
+        for backend in [BackendKind::Ollama, BackendKind::LmStudio] {
+            assert!(
+                !missing_openrouter_key(&config(backend, None), None),
+                "{backend:?} with no key must never gate — it is OpenRouter-only"
+            );
+            assert!(
+                !missing_openrouter_key(&config(backend, None), Some("sk-env".to_string())),
+                "{backend:?} with an env key must never gate"
+            );
+        }
     }
 
     #[test]

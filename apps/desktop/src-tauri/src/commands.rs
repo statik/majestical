@@ -46,9 +46,13 @@ const DEFAULT_LIMIT: usize = 50;
 
 /// The describer API key from the environment — the same variable the CLI
 /// reads, so a GUI launched from a shell honors the same override. A
-/// login-item launch has no shell environment and falls back to the key
-/// stored in `describer.toml`.
-#[expect(dead_code, reason = "wired into the scheduler by the next task")]
+/// login-item launch has no shell environment, so this returns `None`; the
+/// caller's `effective_api_key` then falls back to the key stored in
+/// `describer.toml` — that fallback is the client's, not this function's.
+#[expect(
+    dead_code,
+    reason = "first consumer is doctor_report_impl (task 6); the scheduler follows (task 8)"
+)]
 pub(crate) fn env_api_key() -> Option<String> {
     std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
         .ok()

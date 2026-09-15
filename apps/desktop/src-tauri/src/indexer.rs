@@ -427,7 +427,7 @@ mod tests {
         ThrottleOverride, batch_outcome_pace, batch_request, pending_items, set_throttle_impl,
         success_pace, total_failures,
     };
-    use majestical_services::index::{IndexRunOutcome, KindStatusRow};
+    use majestical_services::index::{IndexRunOutcome, ItemFailure, KindStatusRow};
     use std::time::Duration;
 
     fn kind_row(pending: u64) -> KindStatusRow {
@@ -526,7 +526,12 @@ mod tests {
     #[test]
     fn total_failures_counts_every_kind_including_both_transcript_stages() {
         let mut outcome = IndexRunOutcome::default();
-        let failure = || (std::path::PathBuf::from("/media/x"), "failed".to_string());
+        let failure = || ItemFailure {
+            asset: "xxh3:aa11".to_string(),
+            path: std::path::PathBuf::from("/media/x"),
+            error: "failed".to_string(),
+            transient: false,
+        };
         outcome.thumbs.failed.push(failure());
         outcome.embed.failed.push(failure());
         outcome.keyframes.failed.push(failure());
@@ -542,14 +547,18 @@ mod tests {
     #[test]
     fn batch_outcome_pace_holds_and_names_the_failure_count_when_nothing_progressed() {
         let mut outcome = IndexRunOutcome::default();
-        outcome.thumbs.failed.push((
-            std::path::PathBuf::from("/media/broken.jpg"),
-            "decode failed".to_string(),
-        ));
-        outcome.pdf.failed.push((
-            std::path::PathBuf::from("/media/broken.pdf"),
-            "not a valid pdf".to_string(),
-        ));
+        outcome.thumbs.failed.push(ItemFailure {
+            asset: "xxh3:aa11".to_string(),
+            path: std::path::PathBuf::from("/media/broken.jpg"),
+            error: "decode failed".to_string(),
+            transient: false,
+        });
+        outcome.pdf.failed.push(ItemFailure {
+            asset: "xxh3:bb22".to_string(),
+            path: std::path::PathBuf::from("/media/broken.pdf"),
+            error: "not a valid pdf".to_string(),
+            transient: false,
+        });
         let (last_error, pace) = batch_outcome_pace(SchedulerDecision::RunFull, &outcome);
         assert_eq!(pace, super::TICK);
         let message = last_error.expect("a no-progress batch must report why");

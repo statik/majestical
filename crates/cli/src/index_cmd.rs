@@ -9,7 +9,7 @@ use anyhow::Result;
 use majestical_services::app::FsApp;
 use majestical_services::index::{IndexRunOutcome, IndexRunReq, VALID_KINDS};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Args for `maj index run`, bundled to keep `cmd_index_run`'s own signature
 /// within the house 5-positional-parameter limit.
@@ -36,50 +36,43 @@ fn parse_kinds(kinds: Option<&[String]>) -> Result<BTreeSet<String>> {
     Ok(kinds.iter().cloned().collect())
 }
 
-fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
-    failed
-        .iter()
-        .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
-        .collect()
-}
-
 fn run_result_json(o: &IndexRunOutcome) -> serde_json::Value {
     serde_json::json!({
-        "thumbnails": { "written": o.thumbs.written, "failed": failed_json(&o.thumbs.failed) },
+        "thumbnails": { "written": o.thumbs.written, "failed": o.thumbs.failed },
         "embeddings": {
             "written": o.embed.written,
             "loaded_from_blobs": o.embed.loaded,
-            "failed": failed_json(&o.embed.failed),
+            "failed": o.embed.failed,
         },
         "keyframes": {
             "videos_done": o.keyframes.videos_done,
             "keyframes_written": o.keyframes.keyframes_written,
             "keyframes_failed": o.keyframes.keyframes_failed,
-            "failed": failed_json(&o.keyframes.failed),
+            "failed": o.keyframes.failed,
         },
         "keyframe-images": {
             "videos_done": o.keyframe_images.videos_done,
             "images_written": o.keyframe_images.images_written,
             "images_skipped": o.keyframe_images.images_skipped,
-            "failed": failed_json(&o.keyframe_images.failed),
+            "failed": o.keyframe_images.failed,
         },
         "transcripts": {
             "transcribed": o.transcribe.written,
             "chunks_written": o.transcript_embed.chunks_written,
             "chunks_loaded_from_blobs": o.transcript_embed.loaded,
             "chunks_empty": o.transcript_embed.empty,
-            "failed": failed_json(&o.transcript_failures()),
+            "failed": o.transcript_failures(),
         },
         "ocr": {
             "images_written": o.ocr.images_written,
             "videos_done": o.ocr.videos_done,
             "keyframes_written": o.ocr.keyframes_written,
-            "failed": failed_json(&o.ocr.failed),
+            "failed": o.ocr.failed,
         },
-        "pdf": { "written": o.pdf.written, "failed": failed_json(&o.pdf.failed) },
+        "pdf": { "written": o.pdf.written, "failed": o.pdf.failed },
         "captions": {
             "written": o.captions.written,
-            "failed": failed_json(&o.captions.failed),
+            "failed": o.captions.failed,
         },
     })
 }
@@ -143,7 +136,7 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
     // No path prefix here: every `IndexError` display already embeds the
     // path it failed on (the structured path is still available in the
     // `--json` branch above, for callers that want it out-of-band).
-    for (_, err) in o
+    for failure in o
         .thumbs
         .failed
         .iter()
@@ -156,7 +149,11 @@ fn print_run_result(o: &IndexRunOutcome, json: bool) {
         .chain(&o.pdf.failed)
         .chain(&o.captions.failed)
     {
-        eprintln!("failed: {err}");
+        if failure.transient {
+            eprintln!("failed (transient): {}", failure.error);
+        } else {
+            eprintln!("failed: {}", failure.error);
+        }
     }
 }
 

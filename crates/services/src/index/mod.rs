@@ -16,7 +16,7 @@ mod heal;
 mod run;
 
 pub use run::{
-    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, KeyframeImageOutcome,
+    CaptionOutcome, EmbedOutcome, IndexRunOutcome, IndexRunReq, ItemFailure, KeyframeImageOutcome,
     KeyframeOutcome, OcrOutcome, PdfOutcome, ThumbOutcome, TranscribeOutcome,
     TranscriptEmbedOutcome, run,
 };
@@ -185,13 +185,19 @@ pub fn read_failure_report(
     }
 }
 
-/// One kind's per-item failures as `{path, error}` rows — shared by
-/// [`failure_report_json`]'s per-kind map and (independently) the CLI's own
-/// `--json` rendering of a run's failures.
-fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
+/// One kind's per-item failures as the `{path, error}` rows the on-disk
+/// failure report (and `index status`, which reads it back) has always
+/// carried — the `transient` class an [`ItemFailure`] also carries is a
+/// runtime decision, not part of this marker.
+fn failed_json(failed: &[ItemFailure]) -> Vec<serde_json::Value> {
     failed
         .iter()
-        .map(|(path, err)| serde_json::json!({ "path": path.display().to_string(), "error": err }))
+        .map(|failure| {
+            serde_json::json!({
+                "path": failure.path.display().to_string(),
+                "error": failure.error,
+            })
+        })
         .collect()
 }
 
@@ -200,7 +206,7 @@ fn failed_json(failed: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
 /// first folds it over the previous report so a `--kinds`-filtered run only
 /// speaks for the kinds it actually worked.
 fn failure_report_json(o: &IndexRunOutcome) -> serde_json::Value {
-    let kinds: [(&str, Vec<(PathBuf, String)>); 8] = [
+    let kinds: [(&str, Vec<ItemFailure>); 8] = [
         ("thumbs", o.thumbs.failed.clone()),
         ("embeddings", o.embed.failed.clone()),
         ("keyframes", o.keyframes.failed.clone()),
@@ -723,7 +729,12 @@ mod tests {
             ocr: OcrOutcome::default(),
             pdf: PdfOutcome {
                 written: 0,
-                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+                failed: vec![ItemFailure {
+                    asset: "xxh3:aa11".to_string(),
+                    path: PathBuf::from("/media/broken.pdf"),
+                    error: "not a valid pdf".to_string(),
+                    transient: false,
+                }],
             },
             captions: CaptionOutcome::default(),
             notices: Vec::new(),
@@ -780,7 +791,12 @@ mod tests {
         let outcome = IndexRunOutcome {
             pdf: PdfOutcome {
                 written: 0,
-                failed: vec![(PathBuf::from("/media/broken.pdf"), "not a valid pdf".into())],
+                failed: vec![ItemFailure {
+                    asset: "xxh3:aa11".to_string(),
+                    path: PathBuf::from("/media/broken.pdf"),
+                    error: "not a valid pdf".to_string(),
+                    transient: false,
+                }],
             },
             ..IndexRunOutcome::default()
         };

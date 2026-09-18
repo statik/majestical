@@ -154,14 +154,19 @@ fn set_impl(
     Ok(to_view(&config))
 }
 
-/// What `describer test` learned about the key. `NotChecked` covers a
-/// backend with no key endpoint, no key to check, and a key endpoint that
-/// could not be reached (a notice says which).
+/// What `describer test` learned about the key.
+///
+/// `Missing` is `OpenRouter` with no key from the caller or the file — the
+/// state in which a caption pass fails every item before any request, so no
+/// request is made here either. `NotChecked` is a backend with no key
+/// endpoint, or a key endpoint that did not judge the key (unreachable, or
+/// any answer but success or 401); only that last case pushes a notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyCheck {
     Accepted,
     Rejected,
+    Missing,
     NotChecked,
 }
 
@@ -205,16 +210,16 @@ fn test_impl(
     };
     let base_url = config.base_url.clone();
     let model = config.model.clone();
-    let has_key_to_check = config.backend == BackendKind::OpenRouter
-        && config.effective_api_key(api_key.clone()).is_some();
+    // Asked before `HttpDescriber::new` consumes `config` and `api_key`.
+    let has_key = config.effective_api_key(api_key.clone()).is_some();
     let describer = HttpDescriber::new(config, api_key);
     let report = describer
         .probe()
         .with_context(|| format!("describer test against {base_url}"))?;
-    let key = if has_key_to_check {
-        check_key(&describer, notices)
-    } else {
-        KeyCheck::NotChecked
+    let key = match (describer.backend(), has_key) {
+        (BackendKind::OpenRouter, true) => check_key(&describer, notices),
+        (BackendKind::OpenRouter, false) => KeyCheck::Missing,
+        (BackendKind::Ollama | BackendKind::LmStudio, true | false) => KeyCheck::NotChecked,
     };
     Ok(DescriberProbe {
         model,
@@ -345,6 +350,7 @@ mod tests {
         for (key, wire) in [
             (KeyCheck::Accepted, "accepted"),
             (KeyCheck::Rejected, "rejected"),
+            (KeyCheck::Missing, "missing"),
             (KeyCheck::NotChecked, "not_checked"),
         ] {
             let probe = DescriberProbe {
@@ -455,7 +461,7 @@ mod tests {
     /// the probe still succeeds, and a notice says the key went unchecked —
     /// without carrying the key.
     #[test]
-    fn test_with_an_unreachable_key_endpoint_is_not_checked_with_a_notice() {
+    fn test_with_a_key_endpoint_that_judges_nothing_is_not_checked_with_a_notice() {
         let server = httpmock::MockServer::start();
         serve_models(&server);
         let key = serve_key(&server, 500);
@@ -479,8 +485,10 @@ mod tests {
         assert_eq!(about_the_key.len(), 1, "{all:?}");
     }
 
-    /// With no key from the caller or the file there is nothing to judge,
-    /// and a keyless request would only earn a 401 that reads as `Rejected`.
+    /// With no key from the caller or the file there is nothing to judge —
+    /// a keyless request would only earn a 401 that reads as `Rejected` —
+    /// but the next caption pass would fail every item for want of a key, so
+    /// the probe says `Missing` rather than the harmless-looking `NotChecked`.
     #[test]
     fn test_without_a_key_does_not_call_the_key_endpoint() {
         let server = httpmock::MockServer::start();
@@ -492,7 +500,7 @@ mod tests {
 
         let probe = test(dir.path(), None, &notices).expect("test");
 
-        assert_eq!(probe.key, KeyCheck::NotChecked);
+        assert_eq!(probe.key, KeyCheck::Missing);
         key.assert_calls(0);
         assert!(key_notices(&notices).is_empty());
     }

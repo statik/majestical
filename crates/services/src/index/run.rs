@@ -1600,7 +1600,7 @@ fn missing_openrouter_key(config: &DescriberConfig, env_key: Option<String>) -> 
 /// ([`PortFailure::CredentialsRejected`]) is a `Backend` failure too: the next
 /// item would be refused for the same key, and the operator — not the item's
 /// bytes — is what changes the answer. Only its reason text differs, see
-/// [`credentials_reason`].
+/// [`openrouter_credentials_reason`].
 enum CaptionFailure {
     Backend(String),
     Item(String),
@@ -1616,30 +1616,31 @@ fn caption_failure(error: &PortError, backend: BackendKind) -> CaptionFailure {
     match error.failure {
         PortFailure::Unavailable => CaptionFailure::Backend(error.to_string()),
         PortFailure::RefusedInput => CaptionFailure::Item(error.to_string()),
-        PortFailure::CredentialsRejected(problem) => {
-            CaptionFailure::Backend(credentials_reason(problem, backend, error))
-        }
+        PortFailure::CredentialsRejected(problem) => CaptionFailure::Backend(
+            openrouter_credentials_reason(problem, backend)
+                .map_or_else(|| error.to_string(), str::to_string),
+        ),
     }
 }
 
 /// The named reason applies to `OpenRouter` only: a 401 from a local LM
-/// Studio is not about an `OpenRouter` key, so it keeps the server's text.
-fn credentials_reason(
+/// Studio is not about an `OpenRouter` key, so it has none and the caller
+/// keeps the server's text.
+fn openrouter_credentials_reason(
     problem: CredentialsProblem,
     backend: BackendKind,
-    error: &PortError,
-) -> String {
+) -> Option<&'static str> {
     match (backend, problem) {
         (BackendKind::OpenRouter, CredentialsProblem::KeyRejected) => {
-            OPENROUTER_KEY_REJECTED_REASON.to_string()
+            Some(OPENROUTER_KEY_REJECTED_REASON)
         }
         (BackendKind::OpenRouter, CredentialsProblem::OutOfCredit) => {
-            OPENROUTER_OUT_OF_CREDIT_REASON.to_string()
+            Some(OPENROUTER_OUT_OF_CREDIT_REASON)
         }
         (
             BackendKind::Ollama | BackendKind::LmStudio,
             CredentialsProblem::KeyRejected | CredentialsProblem::OutOfCredit,
-        ) => error.to_string(),
+        ) => None,
     }
 }
 
@@ -2551,29 +2552,41 @@ mod tests {
                 CredentialsProblem::KeyRejected,
                 CredentialsProblem::OutOfCredit,
             ] {
-                let error = PortError::credentials("caption", Denied, problem);
                 assert_eq!(
-                    credentials_reason(problem, backend, &error),
-                    error.to_string(),
+                    openrouter_credentials_reason(problem, backend),
+                    None,
                     "{backend:?} {problem:?}"
                 );
             }
         }
+
+        let error = PortError::credentials("caption", Denied, CredentialsProblem::KeyRejected);
+        match caption_failure(&error, BackendKind::LmStudio) {
+            CaptionFailure::Backend(reason) => assert_eq!(reason, error.to_string()),
+            CaptionFailure::Item(reason) => panic!("a local 401 must abort the pass: {reason}"),
+        }
     }
 
     /// The ledger remembers every `Item` failure, so a credentials failure
-    /// routed there would make one bad key a permanent row for every item.
+    /// routed there would make one bad key a permanent row for every item —
+    /// on any backend, a local one's 401 included.
     #[test]
     fn a_credentials_failure_is_a_backend_failure_never_an_item_failure() {
-        for problem in [
-            CredentialsProblem::KeyRejected,
-            CredentialsProblem::OutOfCredit,
+        for backend in [
+            BackendKind::OpenRouter,
+            BackendKind::LmStudio,
+            BackendKind::Ollama,
         ] {
-            let error = PortError::credentials("caption", Denied, problem);
-            match caption_failure(&error, BackendKind::OpenRouter) {
-                CaptionFailure::Backend(_) => {}
-                CaptionFailure::Item(reason) => {
-                    panic!("{problem:?} must abort the pass, not fail the item: {reason}")
+            for problem in [
+                CredentialsProblem::KeyRejected,
+                CredentialsProblem::OutOfCredit,
+            ] {
+                let error = PortError::credentials("caption", Denied, problem);
+                match caption_failure(&error, backend) {
+                    CaptionFailure::Backend(_) => {}
+                    CaptionFailure::Item(reason) => panic!(
+                        "{backend:?} {problem:?} must abort the pass, not fail the item: {reason}"
+                    ),
                 }
             }
         }

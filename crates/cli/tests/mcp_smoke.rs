@@ -2919,6 +2919,14 @@ fn test_describer_dry_run_then_confirm_against_an_unreachable_backend_is_iserror
         serde_json::json!(false),
         "{structured}"
     );
+    assert_eq!(
+        structured["would"],
+        serde_json::json!(
+            "probe the configured backend's connectivity, model presence, and vision \
+             capability, and (OpenRouter with a key) ask whether the key is accepted"
+        ),
+        "{structured}"
+    );
 
     let confirmed = mcp.call_tool("test_describer", &serde_json::json!({"confirm": true}));
     assert_eq!(

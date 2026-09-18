@@ -193,3 +193,61 @@ fn describer_test_reports_an_accepted_key() {
     assert!(!stdout.contains("sk-test"), "{stdout}");
     assert!(!stderr.contains("sk-test"), "{stderr}");
 }
+
+/// `OpenRouter` with no key anywhere: the next caption pass would fail every
+/// item for want of one, so `describer test` says so and withholds the
+/// promise — without asking the key endpoint about a key it does not have.
+#[test]
+fn describer_test_without_a_key_says_so_and_does_not_promise_captions() {
+    use httpmock::prelude::{GET, MockServer};
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200)
+            .json_body(serde_json::json!({"data": [{"id": "m"}]}));
+    });
+    let key = server.mock(|when, then| {
+        when.method(GET).path("/v1/key");
+        then.status(401).json_body(serde_json::json!({}));
+    });
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("cat");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    maj(&root, &state)
+        .args(["catalog", "init"])
+        .assert()
+        .success();
+    maj(&root, &state)
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "open-router",
+            "--model",
+            "m",
+            "--base-url",
+            &server.base_url(),
+        ])
+        .assert()
+        .success();
+
+    let out = maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "test"])
+        .output()
+        .expect("run maj describer test");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+
+    assert!(
+        stdout.lines().any(|line| line
+            == "key: MISSING — save one in Settings → Captions, or set it with \
+                `maj describer set --api-key` or MAJ_OPENROUTER_KEY"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("will run on the next"), "{stdout}");
+    key.assert_calls(0);
+}

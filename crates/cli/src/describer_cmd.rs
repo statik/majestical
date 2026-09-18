@@ -74,16 +74,24 @@ fn key_line(key: KeyCheck) -> Option<&'static str> {
     match key {
         KeyCheck::Accepted => Some("key: accepted"),
         KeyCheck::Rejected => Some("key: REJECTED — OpenRouter answered 401; set a new key"),
+        KeyCheck::Missing => Some(
+            "key: MISSING — save one in Settings → Captions, or set it with \
+             `maj describer set --api-key` or MAJ_OPENROUTER_KEY",
+        ),
         KeyCheck::NotChecked => None,
     }
 }
 
-/// Whether `describer test` may promise caption work: every line above the
-/// promise has to have been good news, the key's included.
+/// Whether `describer test` may promise caption work. Three things withhold
+/// the promise: the backend does not list the model, the model reports no
+/// vision support, or `OpenRouter`'s key is rejected or missing — each one
+/// fails every caption item on the next pass. A key that was not checked
+/// withholds nothing: local backends need none, and an `OpenRouter` key
+/// endpoint that judged nothing says nothing against the key.
 fn will_run(probe: &DescriberProbe) -> bool {
     let key_usable = match probe.key {
         KeyCheck::Accepted | KeyCheck::NotChecked => true,
-        KeyCheck::Rejected => false,
+        KeyCheck::Rejected | KeyCheck::Missing => false,
     };
     probe.model_listed && probe.vision != Some(false) && key_usable
 }
@@ -103,13 +111,20 @@ mod tests {
     use super::*;
 
     /// A key that was not checked says nothing, rather than something that
-    /// reads as a verdict.
+    /// reads as a verdict; every other state gets its line.
     #[test]
-    fn key_line_speaks_only_for_a_checked_key() {
+    fn key_line_is_silent_only_for_a_key_that_was_not_checked() {
         assert_eq!(key_line(KeyCheck::Accepted), Some("key: accepted"));
         assert_eq!(
             key_line(KeyCheck::Rejected),
             Some("key: REJECTED — OpenRouter answered 401; set a new key")
+        );
+        assert_eq!(
+            key_line(KeyCheck::Missing),
+            Some(
+                "key: MISSING — save one in Settings → Captions, or set it with \
+                 `maj describer set --api-key` or MAJ_OPENROUTER_KEY"
+            )
         );
         assert_eq!(key_line(KeyCheck::NotChecked), None);
     }
@@ -144,6 +159,7 @@ mod tests {
                 false,
             ),
             ("key rejected", probe(true, None, KeyCheck::Rejected), false),
+            ("key missing", probe(true, None, KeyCheck::Missing), false),
             (
                 "key not checked",
                 probe(true, None, KeyCheck::NotChecked),

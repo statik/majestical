@@ -421,18 +421,30 @@ mod tests {
         key.assert_calls(1);
     }
 
-    /// Only `OpenRouter` has a key endpoint: a local backend handed a key
-    /// must not be asked about it.
+    /// Only `OpenRouter` has a key endpoint: a local backend that HAS a key
+    /// must not be asked about it. The key sits in the file because that is
+    /// the only place a local backend's key is read from — a caller's key is
+    /// ignored for it, which would leave this gate untested.
     #[test]
     fn test_does_not_check_a_key_for_ollama() {
         let server = httpmock::MockServer::start();
         serve_models(&server);
         let key = serve_key(&server, 200);
         let dir = tempfile::tempdir().expect("tempdir");
-        configure(dir.path(), BackendKind::Ollama, &server);
+        set(
+            dir.path(),
+            &SetArgs {
+                backend: BackendKind::Ollama,
+                model: "m".to_string(),
+                base_url: Some(server.base_url()),
+                api_key: Some("sk-test".to_string()),
+            },
+            &Notices::new(),
+        )
+        .expect("set");
         let notices = Notices::new();
 
-        let probe = test(dir.path(), Some("sk-test".into()), &notices).expect("test");
+        let probe = test(dir.path(), None, &notices).expect("test");
 
         assert_eq!(probe.key, KeyCheck::NotChecked);
         key.assert_calls(0);

@@ -4,7 +4,9 @@
 
 use std::path::Path;
 
-use majestical_services::describer_config::{self, DescriberConfigView, KeyCheck, SetArgs};
+use majestical_services::describer_config::{
+    self, DescriberConfigView, DescriberProbe, KeyCheck, SetArgs,
+};
 use majestical_services::notices::Notices;
 
 pub(crate) fn env_api_key() -> Option<String> {
@@ -60,7 +62,7 @@ pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
     if let Some(line) = key_line(probe.key) {
         println!("{line}");
     }
-    if probe.model_listed && probe.vision != Some(false) && probe.key != KeyCheck::Rejected {
+    if will_run(&probe) {
         println!("caption and tag-suggestion work will run on the next `maj index run`");
     }
     Ok(())
@@ -74,6 +76,16 @@ fn key_line(key: KeyCheck) -> Option<&'static str> {
         KeyCheck::Rejected => Some("key: REJECTED — OpenRouter answered 401; set a new key"),
         KeyCheck::NotChecked => None,
     }
+}
+
+/// Whether `describer test` may promise caption work: every line above the
+/// promise has to have been good news, the key's included.
+fn will_run(probe: &DescriberProbe) -> bool {
+    let key_usable = match probe.key {
+        KeyCheck::Accepted | KeyCheck::NotChecked => true,
+        KeyCheck::Rejected => false,
+    };
+    probe.model_listed && probe.vision != Some(false) && key_usable
 }
 
 fn print_view(view: &DescriberConfigView) {
@@ -100,5 +112,45 @@ mod tests {
             Some("key: REJECTED — OpenRouter answered 401; set a new key")
         );
         assert_eq!(key_line(KeyCheck::NotChecked), None);
+    }
+
+    fn probe(model_listed: bool, vision: Option<bool>, key: KeyCheck) -> DescriberProbe {
+        DescriberProbe {
+            model: "m".to_string(),
+            model_listed,
+            vision,
+            key,
+        }
+    }
+
+    /// The closing line is a promise, so anything the lines above it
+    /// reported as broken — a rejected key included — must withhold it.
+    #[test]
+    fn will_run_only_when_nothing_above_it_said_no() {
+        for (case, probe, expected) in [
+            (
+                "all good",
+                probe(true, Some(true), KeyCheck::Accepted),
+                true,
+            ),
+            (
+                "model not listed",
+                probe(false, Some(true), KeyCheck::Accepted),
+                false,
+            ),
+            (
+                "no vision",
+                probe(true, Some(false), KeyCheck::Accepted),
+                false,
+            ),
+            ("key rejected", probe(true, None, KeyCheck::Rejected), false),
+            (
+                "key not checked",
+                probe(true, None, KeyCheck::NotChecked),
+                true,
+            ),
+        ] {
+            assert_eq!(will_run(&probe), expected, "{case}");
+        }
     }
 }

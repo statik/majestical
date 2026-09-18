@@ -1636,7 +1636,10 @@ fn credentials_reason(
         (BackendKind::OpenRouter, CredentialsProblem::OutOfCredit) => {
             OPENROUTER_OUT_OF_CREDIT_REASON.to_string()
         }
-        (BackendKind::Ollama | BackendKind::LmStudio, _) => error.to_string(),
+        (
+            BackendKind::Ollama | BackendKind::LmStudio,
+            CredentialsProblem::KeyRejected | CredentialsProblem::OutOfCredit,
+        ) => error.to_string(),
     }
 }
 

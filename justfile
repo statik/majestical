@@ -2,8 +2,10 @@ check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
 
+# MAJ_STATE_DIR keeps tests from writing state under the user's real
+# platform data dir — see crates/services/src/state_dir.rs.
 test:
-    cargo test --workspace
+    MAJ_STATE_DIR="$(mktemp -d)" cargo test --workspace
 
 ci: check test
 
@@ -26,7 +28,10 @@ gui-build:
 # without one that test skips (loudly) and the rest still run.
 gui-test:
     cargo build -p majestical-cli
+    # MAJ_STATE_DIR keeps tests from writing state under the user's real
+    # platform data dir — see crates/services/src/state_dir.rs.
     MAJ_BIN="{{justfile_directory()}}/target/debug/maj" \
+        MAJ_STATE_DIR="$(mktemp -d)" \
         cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 # The GUI workspace carries its own copy of the root lint table (a standalone

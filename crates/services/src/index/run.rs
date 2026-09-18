@@ -8,14 +8,16 @@
 //! this module hands back one [`IndexRunOutcome`] per pass and never
 //! prints.
 use crate::app::FsApp;
-use crate::capability::OPENROUTER_KEY_MISSING_REASON;
+use crate::capability::{
+    OPENROUTER_KEY_MISSING_REASON, OPENROUTER_KEY_REJECTED_REASON, OPENROUTER_OUT_OF_CREDIT_REASON,
+};
 use crate::catalog::open_catalog;
 use crate::describer_config::load_config;
 use crate::error::ServiceError;
 use crate::index::heal::heal_text_fts;
 use anyhow::{Context, Result};
 use majestical_core::media_kind::{MediaKind, media_kind};
-use majestical_core::ports::{Describer, PortError, PortFailure, TagSubject};
+use majestical_core::ports::{CredentialsProblem, Describer, PortError, PortFailure, TagSubject};
 use majestical_core::projection::Projection;
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
 use majestical_index::blob::{BlobStore, Derivation};
@@ -1593,6 +1595,12 @@ fn missing_openrouter_key(config: &DescriberConfig, env_key: Option<String>) -> 
 /// unusable response body). The pass records the row and continues with the
 /// next item, and the row is permanent: the same bytes will fail the same
 /// way next pass.
+///
+/// A describer that rejected the caller's key or account
+/// ([`PortFailure::CredentialsRejected`]) is a `Backend` failure too: the next
+/// item would be refused for the same key, and the operator — not the item's
+/// bytes — is what changes the answer. Only its reason text differs, see
+/// [`openrouter_credentials_reason`].
 enum CaptionFailure {
     Backend(String),
     Item(String),
@@ -1601,11 +1609,38 @@ enum CaptionFailure {
 /// Routes a describer port error into the two caption classes. A port that
 /// refused THIS input is an item failure (recorded, permanent, the pass
 /// continues); a port that is unavailable is a backend failure (transient,
-/// the pass aborts).
-fn caption_failure(error: &PortError) -> CaptionFailure {
+/// the pass aborts). A port that rejected the caller's credentials is a
+/// backend failure as well — never an item failure, or one bad key becomes a
+/// permanent ledger row for every item — worded per `backend`.
+fn caption_failure(error: &PortError, backend: BackendKind) -> CaptionFailure {
     match error.failure {
         PortFailure::Unavailable => CaptionFailure::Backend(error.to_string()),
         PortFailure::RefusedInput => CaptionFailure::Item(error.to_string()),
+        PortFailure::CredentialsRejected(problem) => CaptionFailure::Backend(
+            openrouter_credentials_reason(problem, backend)
+                .map_or_else(|| error.to_string(), str::to_string),
+        ),
+    }
+}
+
+/// The named reason applies to `OpenRouter` only: a 401 from a local LM
+/// Studio is not about an `OpenRouter` key, so it has none and the caller
+/// keeps the server's text.
+fn openrouter_credentials_reason(
+    problem: CredentialsProblem,
+    backend: BackendKind,
+) -> Option<&'static str> {
+    match (backend, problem) {
+        (BackendKind::OpenRouter, CredentialsProblem::KeyRejected) => {
+            Some(OPENROUTER_KEY_REJECTED_REASON)
+        }
+        (BackendKind::OpenRouter, CredentialsProblem::OutOfCredit) => {
+            Some(OPENROUTER_OUT_OF_CREDIT_REASON)
+        }
+        (
+            BackendKind::Ollama | BackendKind::LmStudio,
+            CredentialsProblem::KeyRejected | CredentialsProblem::OutOfCredit,
+        ) => None,
     }
 }
 
@@ -1710,13 +1745,15 @@ fn caption_still(
     })?;
     let caption_path = blobs.path_for(&item.asset_hex, &Derivation::Caption { model_tag });
     if !caption_path.is_file() {
-        let caption = describer.caption(&webp).map_err(|e| caption_failure(&e))?;
+        let caption = describer
+            .caption(&webp)
+            .map_err(|e| caption_failure(&e, describer.backend()))?;
         write_caption_blob(blobs, &item.asset_hex, model_tag, &caption)
             .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     }
     let suggestions = describer
         .suggest_tags(TagSubject::Image(&webp), vocab)
-        .map_err(|e| caption_failure(&e))?;
+        .map_err(|e| caption_failure(&e, describer.backend()))?;
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
 }
@@ -1746,7 +1783,7 @@ fn caption_video(
     } else {
         describer
             .suggest_tags(TagSubject::Captions(&texts), &env.vocab)
-            .map_err(|e| caption_failure(&e))?
+            .map_err(|e| caption_failure(&e, describer.backend()))?
     };
     write_tags_blob(blobs, &item.asset_hex, model_tag, &suggestions)
         .map_err(|e| CaptionFailure::Item(e.to_string()))
@@ -1825,7 +1862,9 @@ fn caption_video_frame(
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
     let webp = majestical_index::thumbs::thumbnail_webp(&frame)
         .map_err(|e| CaptionFailure::Item(e.to_string()))?;
-    describer.caption(&webp).map_err(|e| caption_failure(&e))
+    describer
+        .caption(&webp)
+        .map_err(|e| caption_failure(&e, describer.backend()))
 }
 
 /// Up to [`MAX_DESCRIBED_KEYFRAMES`] timestamps, evenly spaced across the
@@ -2435,6 +2474,122 @@ mod tests {
             outcome.failed
         );
         mock.assert_calls(items.len());
+    }
+
+    /// Runs a two-item `OpenRouter` pass against a server that answers every
+    /// caption request with `status`, and returns the rows it recorded — after
+    /// asserting the pass stopped at the first request.
+    fn openrouter_pass_answered_with(status: u16) -> Vec<ItemFailure> {
+        use httpmock::prelude::{MockServer, POST};
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(status)
+                .json_body(serde_json::json!({"error": "credentials"}));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = crate::notices::Notices::new();
+        let (root, blobs, items) =
+            openrouter_catalog(dir.path(), server.base_url(), &notices, Some("sk-test"));
+        let env = PassEnv {
+            catalog_root: &root,
+            notices: &notices,
+            vocab: Vec::new(),
+            api_key: None,
+        };
+
+        let outcome = run_caption_items(&blobs, &items, &env);
+
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.failed.len(), items.len(), "{:?}", outcome.failed);
+        mock.assert_calls(1);
+        outcome.failed
+    }
+
+    /// A rejected key is the operator's to fix, not any item's fault: the
+    /// pass aborts at the first 401 like an outage, the row names the remedy,
+    /// and every row is transient — a permanent row here would put every
+    /// item in the ledger over one bad key.
+    #[test]
+    fn a_401_from_openrouter_aborts_the_pass_with_the_named_reason() {
+        let failed = openrouter_pass_answered_with(401);
+
+        assert_eq!(failed[0].error, OPENROUTER_KEY_REJECTED_REASON);
+        assert_eq!(failed[1].error, DESCRIBER_SKIPPED_REASON);
+        assert!(
+            failed.iter().all(|failure| failure.transient),
+            "a rejected key must record only transient rows: {failed:?}"
+        );
+    }
+
+    /// The 402 twin: the key is fine and the account is empty.
+    #[test]
+    fn a_402_from_openrouter_names_the_empty_account() {
+        let failed = openrouter_pass_answered_with(402);
+
+        assert_eq!(failed[0].error, OPENROUTER_OUT_OF_CREDIT_REASON);
+        assert_eq!(failed[1].error, DESCRIBER_SKIPPED_REASON);
+        assert!(
+            failed.iter().all(|failure| failure.transient),
+            "an empty account must record only transient rows: {failed:?}"
+        );
+    }
+
+    /// A stand-in source for a [`PortError`] built by hand.
+    #[derive(Debug, thiserror::Error)]
+    #[error("HTTP 401")]
+    struct Denied;
+
+    /// A 401 from a local LM Studio (or a proxied Ollama) is not about an
+    /// `OpenRouter` key, so naming one would send the operator to the wrong
+    /// setting — the server's own text stands.
+    #[test]
+    fn a_401_from_a_local_backend_keeps_the_servers_text() {
+        for backend in [BackendKind::LmStudio, BackendKind::Ollama] {
+            for problem in [
+                CredentialsProblem::KeyRejected,
+                CredentialsProblem::OutOfCredit,
+            ] {
+                assert_eq!(
+                    openrouter_credentials_reason(problem, backend),
+                    None,
+                    "{backend:?} {problem:?}"
+                );
+            }
+        }
+
+        let error = PortError::credentials("caption", Denied, CredentialsProblem::KeyRejected);
+        match caption_failure(&error, BackendKind::LmStudio) {
+            CaptionFailure::Backend(reason) => assert_eq!(reason, error.to_string()),
+            CaptionFailure::Item(reason) => panic!("a local 401 must abort the pass: {reason}"),
+        }
+    }
+
+    /// The ledger remembers every `Item` failure, so a credentials failure
+    /// routed there would make one bad key a permanent row for every item —
+    /// on any backend, a local one's 401 included.
+    #[test]
+    fn a_credentials_failure_is_a_backend_failure_never_an_item_failure() {
+        for backend in [
+            BackendKind::OpenRouter,
+            BackendKind::LmStudio,
+            BackendKind::Ollama,
+        ] {
+            for problem in [
+                CredentialsProblem::KeyRejected,
+                CredentialsProblem::OutOfCredit,
+            ] {
+                let error = PortError::credentials("caption", Denied, problem);
+                match caption_failure(&error, backend) {
+                    CaptionFailure::Backend(_) => {}
+                    CaptionFailure::Item(reason) => panic!(
+                        "{backend:?} {problem:?} must abort the pass, not fail the item: {reason}"
+                    ),
+                }
+            }
+        }
     }
 
     /// Table test for [`missing_openrouter_key`]: only `OpenRouter` with no

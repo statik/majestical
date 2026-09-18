@@ -4,20 +4,36 @@ use crate::event::{AssetId, Event};
 use crate::projection::Projection;
 use std::collections::BTreeSet;
 
+/// What a port's credentials failure was about. Both are the operator's to
+/// fix and say nothing about the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialsProblem {
+    /// The port did not accept the caller's key (HTTP 401).
+    KeyRejected,
+    /// The key is fine and the account behind it cannot pay (HTTP 402).
+    OutOfCredit,
+}
+
 /// Why a port call failed: the port could not do its job at all (unreachable,
-/// timed out, overloaded — retrying later may succeed), or it answered and
+/// timed out, overloaded — retrying later may succeed), it answered and
 /// refused THIS input (a 4xx, an unusable response body — retrying the same
-/// input will fail the same way).
+/// input will fail the same way), or it answered and rejected the caller's
+/// credentials or account rather than this input.
 ///
 /// Callers that remember failures need the split: an `Unavailable` port says
-/// nothing about the item that happened to be in flight, while a
-/// `RefusedInput` is a verdict on that input and worth remembering.
+/// nothing about the item that happened to be in flight, a `RefusedInput` is
+/// a verdict on that input and worth remembering, and a
+/// `CredentialsRejected` is the operator's to fix, not the item's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortFailure {
     /// The port itself is the problem — nothing was learned about the input.
     Unavailable,
     /// The port worked and rejected this particular input.
     RefusedInput,
+    /// The port answered, and the problem is the caller's key or account —
+    /// not this input, and not an outage. Transient like `Unavailable`
+    /// (the same input succeeds once the operator fixes it), but nameable.
+    CredentialsRejected(CredentialsProblem),
 }
 
 /// Adapter errors crossing a port boundary keep their message, source and
@@ -36,7 +52,8 @@ impl PortError {
     /// A port that could not do its job: [`PortFailure::Unavailable`]. This
     /// is the default reading of an adapter error — an adapter that can tell
     /// a rejected input apart from a broken port uses [`Self::refused`] for
-    /// the former and this for everything else.
+    /// the former, [`Self::credentials`] when it can tell the caller's key or
+    /// account was the problem, and this for everything else.
     #[must_use]
     pub fn new(
         context: impl Into<String>,
@@ -61,6 +78,21 @@ impl PortError {
             context: context.into(),
             source: Box::new(source),
             failure: PortFailure::RefusedInput,
+        }
+    }
+
+    /// A port that answered and did not accept the caller's credentials or
+    /// account: [`PortFailure::CredentialsRejected`].
+    #[must_use]
+    pub fn credentials(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+        problem: CredentialsProblem,
+    ) -> Self {
+        Self {
+            context: context.into(),
+            source: Box::new(source),
+            failure: PortFailure::CredentialsRejected(problem),
         }
     }
 }
@@ -314,16 +346,24 @@ mod tests {
     #[error("backend said no")]
     struct Refusal;
 
-    /// The two constructors are the whole classification API: `new` is the
+    /// The three constructors are the whole classification API: `new` is the
     /// conservative default every existing adapter already uses, `refused`
     /// the opt-in an adapter reaches for when it can tell the input was the
-    /// problem. A mutant swapping either class must fail here.
+    /// problem, `credentials` the opt-in for a port that can tell the
+    /// caller's key or account was the problem. A mutant swapping any class
+    /// must fail here.
     #[test]
     fn port_error_constructors_carry_their_failure_class() {
         let unavailable = PortError::new("caption", Refusal);
         let refused = PortError::refused("caption", Refusal);
+        let credentials =
+            PortError::credentials("caption", Refusal, CredentialsProblem::OutOfCredit);
         assert_eq!(unavailable.failure, PortFailure::Unavailable);
         assert_eq!(refused.failure, PortFailure::RefusedInput);
+        assert_eq!(
+            credentials.failure,
+            PortFailure::CredentialsRejected(CredentialsProblem::OutOfCredit)
+        );
     }
 
     #[test]

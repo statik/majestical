@@ -2919,6 +2919,14 @@ fn test_describer_dry_run_then_confirm_against_an_unreachable_backend_is_iserror
         serde_json::json!(false),
         "{structured}"
     );
+    assert_eq!(
+        structured["would"],
+        serde_json::json!(
+            "probe the configured backend's connectivity, model presence, and vision \
+             capability, and (OpenRouter with a key) ask whether the key is accepted"
+        ),
+        "{structured}"
+    );
 
     let confirmed = mcp.call_tool("test_describer", &serde_json::json!({"confirm": true}));
     assert_eq!(
@@ -2930,6 +2938,58 @@ fn test_describer_dry_run_then_confirm_against_an_unreachable_backend_is_iserror
         .as_str()
         .expect("error text");
     assert!(text.contains("127.0.0.1:1"), "{text}");
+}
+
+/// The confirmed probe carries the key verdict as a structured member, so
+/// an agent reads a rejected key the same way the CLI prints one. The key
+/// reaches the server through its environment only and never comes back.
+#[test]
+fn test_describer_confirmed_reports_a_rejected_key() {
+    use httpmock::prelude::{GET, MockServer};
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200)
+            .json_body(serde_json::json!({"data": [{"id": "m"}]}));
+    });
+    let key = server.mock(|when, then| {
+        when.method(GET).path("/v1/key");
+        then.status(401).json_body(serde_json::json!({}));
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "open-router",
+            "--model",
+            "m",
+            "--base-url",
+            &server.base_url(),
+        ])
+        .assert()
+        .success();
+
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", "sk-test")]);
+    let confirmed = mcp.call_tool("test_describer", &serde_json::json!({"confirm": true}));
+
+    assert_ne!(
+        confirmed["result"]["isError"],
+        serde_json::json!(true),
+        "{confirmed}"
+    );
+    let structured = &confirmed["result"]["structuredContent"];
+    assert_eq!(
+        structured["key"],
+        serde_json::json!("rejected"),
+        "{structured}"
+    );
+    assert!(!confirmed.to_string().contains("sk-test"), "{confirmed}");
+    key.assert_calls(1);
 }
 
 /// Closes the cargo-mutants gap on `inbox_dry_run`'s `Ok(Default::default())`

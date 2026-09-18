@@ -1225,17 +1225,29 @@ mod tests {
     /// Random passes, small asset alphabet so the same id recurs across
     /// kinds and within one kind: the ledger a pass contributes is exactly
     /// its permanent failures, one row per asset per kind, and no transient
-    /// failure ever reaches it.
+    /// failure ever reaches it. Some transient rows carry the credentials
+    /// reasons the caption pass records for a rejected key or an empty
+    /// account — the rows this ledger must never remember.
     #[test]
     fn no_transient_failure_ever_reaches_the_ledger() {
+        use crate::capability::{OPENROUTER_KEY_REJECTED_REASON, OPENROUTER_OUT_OF_CREDIT_REASON};
         use proptest::prelude::*;
+
+        fn row() -> impl Strategy<Value = (&'static str, bool)> {
+            prop_oneof![
+                Just(("boom", false)),
+                Just(("boom", true)),
+                Just((OPENROUTER_KEY_REJECTED_REASON, true)),
+                Just((OPENROUTER_OUT_OF_CREDIT_REASON, true)),
+            ]
+        }
 
         fn failures() -> impl Strategy<Value = Vec<ItemFailure>> {
             prop::collection::vec(
-                ("xxh3:[a-d]", any::<bool>()).prop_map(|(asset, transient)| ItemFailure {
+                ("xxh3:[a-d]", row()).prop_map(|(asset, (error, transient))| ItemFailure {
                     asset,
                     path: PathBuf::from("/media/x"),
-                    error: "boom".to_string(),
+                    error: error.to_string(),
                     transient,
                 }),
                 0..5usize,
@@ -1260,6 +1272,12 @@ mod tests {
             for (kind, rows) in &ledger {
                 let assets: BTreeSet<String> = rows.iter().map(|r| r.asset.clone()).collect();
                 prop_assert_eq!(assets.len(), rows.len(), "one row per asset: {:?}", rows);
+                prop_assert!(
+                    rows.iter().all(|r| r.error != OPENROUTER_KEY_REJECTED_REASON
+                        && r.error != OPENROUTER_OUT_OF_CREDIT_REASON),
+                    "a credentials reason reached the ledger: {:?}",
+                    rows
+                );
                 actual.insert(kind.clone(), assets);
             }
             prop_assert_eq!(actual, expected);

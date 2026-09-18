@@ -1198,7 +1198,8 @@ fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_
     let configured = majestical_services::describer_config::show(catalog, &notices)?;
     if !confirm {
         let would = if configured.is_some() {
-            "probe the configured backend's connectivity, model presence, and vision capability"
+            "probe the configured backend's connectivity, model presence, and vision \
+             capability, and (OpenRouter with a key) ask whether the key is accepted"
         } else {
             "fail: no describer configured yet"
         };
@@ -1579,7 +1580,9 @@ impl MajServer {
     }
 
     /// Probes the configured describer backend's connectivity, model
-    /// presence, and (LM Studio only) vision capability. `false` reports
+    /// presence, and (LM Studio only) vision capability, and (`OpenRouter`
+    /// only) asks whether the key is accepted — `key` in the result is
+    /// `accepted`, `rejected`, `missing` or `not_checked`. `false` reports
     /// whether a describer is configured without contacting it; `true`
     /// actually probes the live backend — the reason this tool is
     /// confirm-gated at all, unlike every other read-only-looking probe in

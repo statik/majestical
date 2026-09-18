@@ -33,8 +33,17 @@ pub const DESCRIBER_REMEDY: &str = "run `maj describer set` to configure a backe
 /// It names [`majestical_describe::config::OPENROUTER_KEY_ENV`] in prose and
 /// so cannot be built from it at const time; `the_no_key_reason_names_the_key_env_var`
 /// keeps the two from drifting.
-pub const OPENROUTER_KEY_MISSING_REASON: &str =
-    "OpenRouter needs an API key — set it with `maj describer set --api-key` or MAJ_OPENROUTER_KEY";
+pub const OPENROUTER_KEY_MISSING_REASON: &str = "OpenRouter needs an API key — save one in \
+    Settings → Captions, or set it with `maj describer set --api-key` or MAJ_OPENROUTER_KEY";
+
+/// Recorded when `OpenRouter` answers 401. Transient: the operator replaces
+/// the key and the same items succeed, so the ledger never remembers it.
+pub const OPENROUTER_KEY_REJECTED_REASON: &str = "OpenRouter rejected the API key (HTTP 401) — \
+    save a new one in Settings → Captions or with `maj describer set --api-key`";
+
+/// Recorded when `OpenRouter` answers 402. Transient for the same reason.
+pub const OPENROUTER_OUT_OF_CREDIT_REASON: &str = "OpenRouter reports the account is out of \
+    credit (HTTP 402) — add credit at openrouter.ai and captions resume on their own";
 
 /// The `model fetch` remedy for the transcript pipeline, naming exactly the
 /// missing models — `None` when both are installed. Shared by `index

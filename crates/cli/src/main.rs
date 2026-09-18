@@ -386,7 +386,8 @@ enum DescriberCmd {
     },
     /// Show the current configuration (key redacted).
     Show,
-    /// Probe the backend: connectivity, model presence, vision capability.
+    /// Probe the backend: connectivity, model presence, vision capability, and
+    /// (`OpenRouter`) whether the key is accepted.
     Test,
 }
 

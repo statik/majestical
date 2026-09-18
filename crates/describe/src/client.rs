@@ -814,7 +814,8 @@ mod tests {
 
         let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
         let describer = HttpDescriber::new(config, None);
-        assert!(describer.check_key().is_err());
+        let error = describer.check_key().expect_err("500 must be an error");
+        assert_eq!(error.failure, PortFailure::Unavailable);
         mock.assert_calls(1);
 
         let dead_config = DescriberConfig {
@@ -824,7 +825,46 @@ mod tests {
             api_key: Some("sk-test".into()),
         };
         let dead_describer = HttpDescriber::new(dead_config, None);
-        assert!(dead_describer.check_key().is_err());
+        let dead_error = dead_describer
+            .check_key()
+            .expect_err("a dead port must be an error");
+        assert_eq!(dead_error.failure, PortFailure::Unavailable);
+    }
+
+    /// 402 says the key is fine and the account is empty — that is not a
+    /// verdict on the key, so `check_key` must not report it as `Rejected`.
+    #[test]
+    fn check_key_does_not_judge_the_key_on_a_402() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/key");
+            then.status(402)
+                .json_body(serde_json::json!({"error": "no"}));
+        });
+
+        let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        let describer = HttpDescriber::new(config, None);
+        let error = describer.check_key().expect_err("402 must be an error");
+
+        assert_eq!(error.failure, PortFailure::Unavailable);
+        mock.assert_calls(1);
+    }
+
+    #[test]
+    fn check_key_trims_a_trailing_slash_from_the_base_url() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/key");
+            then.status(200).json_body(serde_json::json!({"data": {}}));
+        });
+
+        let mut config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        config.base_url = format!("{}/", server.base_url());
+        let describer = HttpDescriber::new(config, None);
+        let verdict = describer.check_key().expect("check_key");
+
+        assert_eq!(verdict, KeyVerdict::Accepted);
+        mock.assert_calls(1);
     }
 
     /// A key never appears in an error's rendered text, even the debug form

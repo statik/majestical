@@ -17,9 +17,31 @@ fn state_base() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("MAJ_STATE_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    default_base()
+}
+
+/// Where state lives when `MAJ_STATE_DIR` is unset: the platform data dir.
+#[cfg(not(test))]
+fn default_base() -> Result<PathBuf> {
     let data =
         dirs::data_dir().context("no platform data directory; set MAJ_STATE_DIR explicitly")?;
     Ok(data.join("majestical"))
+}
+
+/// This crate's own unit tests open catalogs without setting
+/// `MAJ_STATE_DIR` (it is process-global, and they run in parallel), so
+/// the test build falls back to the system temp dir instead of the user's
+/// real data dir. `cfg(test)` is off when another crate's tests link this
+/// one, which is why the justfile and CI set `MAJ_STATE_DIR` for those
+/// suites. Nothing cleans the directory up; it is left for the OS temp
+/// reaper.
+#[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the non-test build's fallible fallback"
+)]
+fn default_base() -> Result<PathBuf> {
+    Ok(std::env::temp_dir().join("majestical-test-state"))
 }
 
 fn state_dir_with_base(base: &Path, catalog_root: &Path) -> Result<PathBuf> {
@@ -146,6 +168,19 @@ fn migrate_legacy_journals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_test_build_base_is_never_the_platform_data_dir() {
+        // Tests the fallback itself, not `state_base`'s override branch, so
+        // it holds whether or not `MAJ_STATE_DIR` is set in the environment.
+        let base = default_base().expect("base");
+        let data = dirs::data_dir().expect("data dir");
+        assert!(
+            !base.starts_with(&data),
+            "test builds must not write under {}",
+            data.display()
+        );
+    }
 
     #[test]
     fn same_root_same_dir_different_roots_differ() {

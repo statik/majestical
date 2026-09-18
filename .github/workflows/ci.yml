@@ -228,8 +228,12 @@ jobs:
       # lives in the other workspace and would cost a second full compile of
       # the services graph to produce here — it skips loudly in this job and
       # runs locally through `just gui-test`.
+      # MAJ_STATE_DIR keeps tests from writing state under the runner's real
+      # platform data dir — see crates/services/src/state_dir.rs.
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
         if: runner.os == 'macOS'
+        env:
+          MAJ_STATE_DIR: ${{ runner.temp }}/maj-state
   gui-e2e:
     name: GUI e2e (WebDriver smoke)
     runs-on: macos-latest

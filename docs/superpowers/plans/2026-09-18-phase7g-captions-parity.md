@@ -106,6 +106,12 @@ spec's as-built section at close.
   switch changes whether the backend is OpenRouter).
 - **Eight PR chunks, not seven**: the Keychain work is two chunks so each
   stays at 1-2 tasks.
+- **`KeyCheck` has a fourth state, `missing`** (added in chunk 3's quality
+  review): OpenRouter with no effective key. `describer test` used to
+  promise caption work in that case and the next `index run` failed every
+  item. The wire type in Task 8 and `testLines` in Task 9 carry it; the GUI
+  line reuses the approved "No key" status string, so the mockup gains no
+  new wording.
 
 ## File structure (created/modified across the phase)
 
@@ -1163,7 +1169,7 @@ export interface DescriberSettingsOutcome {
 }
 
 /** `describer_config::KeyCheck`, serialized snake_case. */
-export type KeyCheck = "accepted" | "rejected" | "not_checked";
+export type KeyCheck = "accepted" | "rejected" | "missing" | "not_checked";
 
 /** `captions::DescriberProbeOutcome` — the probe, flattened, plus notices.
  *  `vision` is `null` for every backend but LM Studio. */
@@ -1287,6 +1293,7 @@ export function testLines(probe: DescriberProbeOutcome): TestLine[] {
       text: "Key rejected — OpenRouter answered 401. Save a new key.",
     });
   }
+  if (probe.key === "missing") lines.push({ good: false, text: keyStatusLine("none") });
   return lines;
 }
 ```
@@ -1340,7 +1347,8 @@ a cap is a ratchet. `SettingsView.test.ts` gains the same one mock line.
   - `captions-status.test.ts`: `keyStatusLine` for all four sources
     (byte-exact); `removeKeyVisible` truth table; `keyPlaceholder` both
     arms; `testLines` for: all-good OpenRouter (three lines, exact), model
-    not listed + key rejected, LM Studio vision yes / vision no, Ollama
+    not listed + key rejected, key missing (the line equals
+    `keyStatusLine("none")`), LM Studio vision yes / vision no, Ollama
     (`key: "not_checked"`, `vision: null` → exactly two lines).
   - `CaptionsSection.test.ts` with `mockCommands`/`rejectCommand` from
     `test-support`:

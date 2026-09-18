@@ -52,7 +52,8 @@ impl PortError {
     /// A port that could not do its job: [`PortFailure::Unavailable`]. This
     /// is the default reading of an adapter error — an adapter that can tell
     /// a rejected input apart from a broken port uses [`Self::refused`] for
-    /// the former and this for everything else.
+    /// the former, [`Self::credentials`] when it can tell the caller's key or
+    /// account was the problem, and this for everything else.
     #[must_use]
     pub fn new(
         context: impl Into<String>,
@@ -345,16 +346,24 @@ mod tests {
     #[error("backend said no")]
     struct Refusal;
 
-    /// The two constructors are the whole classification API: `new` is the
+    /// The three constructors are the whole classification API: `new` is the
     /// conservative default every existing adapter already uses, `refused`
     /// the opt-in an adapter reaches for when it can tell the input was the
-    /// problem. A mutant swapping either class must fail here.
+    /// problem, `credentials` the opt-in for a port that can tell the
+    /// caller's key or account was the problem. A mutant swapping any class
+    /// must fail here.
     #[test]
     fn port_error_constructors_carry_their_failure_class() {
         let unavailable = PortError::new("caption", Refusal);
         let refused = PortError::refused("caption", Refusal);
+        let credentials =
+            PortError::credentials("caption", Refusal, CredentialsProblem::OutOfCredit);
         assert_eq!(unavailable.failure, PortFailure::Unavailable);
         assert_eq!(refused.failure, PortFailure::RefusedInput);
+        assert_eq!(
+            credentials.failure,
+            PortFailure::CredentialsRejected(CredentialsProblem::OutOfCredit)
+        );
     }
 
     #[test]

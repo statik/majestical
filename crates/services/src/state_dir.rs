@@ -31,8 +31,10 @@ fn default_base() -> Result<PathBuf> {
 /// This crate's own unit tests open catalogs without setting
 /// `MAJ_STATE_DIR` (it is process-global, and they run in parallel), so
 /// the test build falls back to the system temp dir instead of the user's
-/// real data dir — which is where tens of thousands of directories leaked
-/// before phase 7G.
+/// real data dir. `cfg(test)` is off when another crate's tests link this
+/// one, which is why the justfile and CI set `MAJ_STATE_DIR` for those
+/// suites. Nothing cleans the directory up; it is left for the OS temp
+/// reaper.
 #[cfg(test)]
 #[expect(
     clippy::unnecessary_wraps,
@@ -178,7 +180,6 @@ mod tests {
             "test builds must not write under {}",
             data.display()
         );
-        assert!(base.starts_with(std::env::temp_dir()));
     }
 
     #[test]

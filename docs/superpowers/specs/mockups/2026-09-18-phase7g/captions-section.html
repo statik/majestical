@@ -1,0 +1,238 @@
+<title>Majestical — Settings (Captions)</title>
+<style>
+  /* Custom properties cribbed from apps/desktop/src/app.css's :root block —
+     same names, same values, so each frame reads as a crop of the app. */
+  :root {
+    color-scheme: light dark;
+    --edge: color-mix(in srgb, currentcolor 15%, transparent);
+    --sunken: color-mix(in srgb, currentcolor 6%, transparent);
+    --muted: color-mix(in srgb, currentcolor 60%, transparent);
+    --alert: light-dark(#b3261e, #f2b8b5);
+    --ok: light-dark(#1a7f37, #6fce8a);
+    --attention: light-dark(#b45309, #e8a33d);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 1.5rem 1rem 3rem;
+    background: Canvas;
+    color: CanvasText;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+  }
+  h1 { max-width: 760px; margin: 0 auto .25rem; font-size: 1.1rem; }
+  .lede { max-width: 760px; margin: 0 auto 1.5rem; color: var(--muted); }
+
+  /* Mockup chrome: one captioned frame per state. Not part of the app. */
+  .frame {
+    max-width: 760px;
+    margin: 0 auto 1.75rem;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .frame-cap {
+    margin: 0;
+    padding: .45rem .9rem;
+    border-bottom: 1px solid var(--edge);
+    background: var(--sunken);
+    color: var(--muted);
+    font-size: .75rem;
+  }
+  .frame-cap b { color: CanvasText; }
+  .frame-body { padding: 1rem; }
+
+  /* Below: the app's own classes. `.settings-section*` and `.ctl-btn` exist
+     today (Health, Always-on); `.captions-*` is new this phase. */
+  .settings-section { display: flex; flex-direction: column; gap: .5rem; }
+  .settings-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+  .settings-section-head h3 { margin: 0; font-size: .9rem; }
+  .settings-section-sub { margin: .15rem 0 0; color: var(--muted); font-size: .8rem; }
+  .ctl-btn {
+    flex: none;
+    padding: .25rem .6rem;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .8rem;
+    cursor: pointer;
+  }
+  .ctl-btn[disabled] { opacity: .45; cursor: default; }
+  .error { margin: .25rem 0 0; color: var(--alert); }
+  .notice { margin: .25rem 0 0; color: var(--muted); }
+
+  .captions-form {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    gap: .5rem .75rem;
+    align-items: center;
+    margin-top: .25rem;
+  }
+  .captions-form label { color: var(--muted); font-size: .8rem; }
+  .captions-form input, .captions-form select {
+    width: 100%;
+    padding: .3rem .45rem;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .85rem;
+  }
+  .captions-key-status { grid-column: 2; margin: -.2rem 0 0; color: var(--muted); font-size: .8rem; }
+  .captions-actions { display: flex; align-items: center; gap: .5rem; margin-top: .5rem; }
+  .captions-actions .spacer { flex: 1; }
+  .captions-saved { color: var(--ok); font-size: .8rem; }
+  .captions-results { margin: .5rem 0 0; padding: 0; list-style: none; font-size: .85rem; }
+  .captions-results li { padding: .15rem 0; }
+  .captions-results .good::before { content: "✓ "; color: var(--ok); }
+  .captions-results .bad::before { content: "✕ "; color: var(--alert); }
+</style>
+
+<h1>Settings → Captions</h1>
+<p class="lede">
+  A new section between Health and Always-on. Each frame is one state of the
+  same section. Every string shown inside a frame is pinned byte-for-byte in
+  the component tests.
+</p>
+
+<!-- 1 -->
+<div class="frame">
+  <p class="frame-cap"><b>1. Unconfigured.</b> Nothing stored. Ollama is preselected with its default URL; Test is disabled until a describer is saved.</p>
+  <div class="frame-body">
+    <section class="settings-section">
+      <div class="settings-section-head">
+        <div>
+          <h3>Captions</h3>
+          <p class="settings-section-sub">The service that writes captions and suggests tags. Ollama and LM Studio run on this Mac; OpenRouter is a hosted API.</p>
+        </div>
+      </div>
+      <p class="notice">No describer is configured — captions are off.</p>
+      <div class="captions-form">
+        <label for="b1">Backend</label>
+        <select id="b1"><option selected>Ollama</option><option>LM Studio</option><option>OpenRouter</option></select>
+        <label for="u1">Base URL</label>
+        <input id="u1" value="http://localhost:11434">
+        <label for="m1">Model</label>
+        <input id="m1" placeholder="The model's name as the backend lists it">
+      </div>
+      <div class="captions-actions">
+        <button class="ctl-btn" disabled>Save</button>
+        <button class="ctl-btn" disabled>Test</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 2 -->
+<div class="frame">
+  <p class="frame-cap"><b>2. Ollama configured, just saved.</b> No key field for a local backend. "Saved." clears on the next edit.</p>
+  <div class="frame-body">
+    <section class="settings-section">
+      <div class="settings-section-head"><div><h3>Captions</h3></div></div>
+      <div class="captions-form">
+        <label>Backend</label>
+        <select><option selected>Ollama</option><option>LM Studio</option><option>OpenRouter</option></select>
+        <label>Base URL</label>
+        <input value="http://localhost:11434">
+        <label>Model</label>
+        <input value="llava">
+      </div>
+      <div class="captions-actions">
+        <button class="ctl-btn">Save</button>
+        <button class="ctl-btn">Test</button>
+        <span class="captions-saved">Saved.</span>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 3 -->
+<div class="frame">
+  <p class="frame-cap"><b>3. OpenRouter, key in the Keychain.</b> The field is always empty on load: the key is never read back. Remove key shows when the source is the Keychain or the file.</p>
+  <div class="frame-body">
+    <section class="settings-section">
+      <div class="settings-section-head"><div><h3>Captions</h3></div></div>
+      <div class="captions-form">
+        <label>Backend</label>
+        <select><option>Ollama</option><option>LM Studio</option><option selected>OpenRouter</option></select>
+        <label>Base URL</label>
+        <input value="https://openrouter.ai/api">
+        <label>Model</label>
+        <input value="google/gemini-2.5-flash">
+        <label>API key</label>
+        <input type="password" placeholder="Leave empty to keep the stored key">
+        <p class="captions-key-status">A key is stored in the macOS Keychain.</p>
+      </div>
+      <div class="captions-actions">
+        <button class="ctl-btn">Save</button>
+        <button class="ctl-btn">Test</button>
+        <span class="spacer"></span>
+        <button class="ctl-btn">Remove key</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 4 -->
+<div class="frame">
+  <p class="frame-cap"><b>4. The other three key status lines.</b> Same layout as frame 3; only the line under the field and Remove key's presence change.</p>
+  <div class="frame-body">
+    <div class="captions-form">
+      <label>No key</label>
+      <p class="captions-key-status" style="grid-column:2;margin:0">No key. Captions cannot run until one is saved.</p>
+      <label>Env override</label>
+      <p class="captions-key-status" style="grid-column:2;margin:0">MAJ_OPENROUTER_KEY supplies the key and overrides a stored one.</p>
+      <label>Key in the file</label>
+      <p class="captions-key-status" style="grid-column:2;margin:0">A key is stored in describer.toml. Save a key here to move it to the Keychain.</p>
+    </div>
+    <p class="notice" style="margin-top:.75rem">Remove key is hidden for "No key" and for the env override (the app cannot unset an environment variable), and shown for the file. With no key stored, the field's placeholder is "sk-or-…".</p>
+  </div>
+</div>
+
+<!-- 5 -->
+<div class="frame">
+  <p class="frame-cap"><b>5. Test, all good</b> (OpenRouter). The vision line appears for LM Studio only, as at the CLI.</p>
+  <div class="frame-body">
+    <div class="captions-actions" style="margin-top:0">
+      <button class="ctl-btn">Save</button>
+      <button class="ctl-btn" disabled>Test</button>
+    </div>
+    <ul class="captions-results">
+      <li class="good">Backend reachable.</li>
+      <li class="good">Model google/gemini-2.5-flash is listed.</li>
+      <li class="good">Key accepted.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- 6 -->
+<div class="frame">
+  <p class="frame-cap"><b>6. Test, the two named problems.</b> Either line can appear alone.</p>
+  <div class="frame-body">
+    <ul class="captions-results" style="margin-top:0">
+      <li class="good">Backend reachable.</li>
+      <li class="bad">Model gemini-flash is not listed — check the name.</li>
+      <li class="bad">Key rejected — OpenRouter answered 401. Save a new key.</li>
+    </ul>
+    <p class="notice" style="margin-top:.75rem">LM Studio adds one of: "✓ Vision: yes" · "✕ Vision: no — captions will not run with this model".</p>
+  </div>
+</div>
+
+<!-- 7 -->
+<div class="frame">
+  <p class="frame-cap"><b>7. Test, backend unreachable.</b> The command's own error, where every surface renders errors.</p>
+  <div class="frame-body">
+    <p class="error" role="alert" style="margin-top:0">describer test against http://localhost:11434: probe: request to http://localhost:11434/v1/models: Connection refused</p>
+  </div>
+</div>
+
+<!-- 8 -->
+<div class="frame">
+  <p class="frame-cap"><b>8. Save failed at the Keychain.</b> Nothing was written to describer.toml. The typed key stays in the field so the operator can retry.</p>
+  <div class="frame-body">
+    <p class="error" role="alert" style="margin-top:0">Could not store the key in the macOS Keychain — nothing was saved.</p>
+  </div>
+</div>

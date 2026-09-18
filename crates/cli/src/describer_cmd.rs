@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use majestical_services::describer_config::{self, DescriberConfigView, SetArgs};
+use majestical_services::describer_config::{self, DescriberConfigView, KeyCheck, SetArgs};
 use majestical_services::notices::Notices;
 
 pub(crate) fn env_api_key() -> Option<String> {
@@ -57,10 +57,23 @@ pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
         }
         None => println!("vision capability: unknown (reported by LM Studio only)"),
     }
-    if probe.model_listed && probe.vision != Some(false) {
+    if let Some(line) = key_line(probe.key) {
+        println!("{line}");
+    }
+    if probe.model_listed && probe.vision != Some(false) && probe.key != KeyCheck::Rejected {
         println!("caption and tag-suggestion work will run on the next `maj index run`");
     }
     Ok(())
+}
+
+/// The key line of `describer test`, or `None` when the key was not checked
+/// (a notice already said so if the check was attempted and failed).
+fn key_line(key: KeyCheck) -> Option<&'static str> {
+    match key {
+        KeyCheck::Accepted => Some("key: accepted"),
+        KeyCheck::Rejected => Some("key: REJECTED — OpenRouter answered 401; set a new key"),
+        KeyCheck::NotChecked => None,
+    }
 }
 
 fn print_view(view: &DescriberConfigView) {
@@ -70,5 +83,22 @@ fn print_view(view: &DescriberConfigView) {
     match &view.api_key {
         Some(_) => println!("api-key:  (redacted)"),
         None => println!("api-key:  (none)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key that was not checked says nothing, rather than something that
+    /// reads as a verdict.
+    #[test]
+    fn key_line_speaks_only_for_a_checked_key() {
+        assert_eq!(key_line(KeyCheck::Accepted), Some("key: accepted"));
+        assert_eq!(
+            key_line(KeyCheck::Rejected),
+            Some("key: REJECTED — OpenRouter answered 401; set a new key")
+        );
+        assert_eq!(key_line(KeyCheck::NotChecked), None);
     }
 }

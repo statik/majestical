@@ -4,7 +4,7 @@
 //! Moved from `crates/cli/src/describer_cmd.rs`.
 use crate::error::ServiceError;
 use anyhow::{Context as _, Result, bail};
-use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber};
+use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber, KeyVerdict};
 use std::path::{Path, PathBuf};
 
 // A real enum rather than a free string so the MCP JSON schema (and a future
@@ -154,17 +154,29 @@ fn set_impl(
     Ok(to_view(&config))
 }
 
+/// What `describer test` learned about the key. `NotChecked` covers a
+/// backend with no key endpoint, no key to check, and a key endpoint that
+/// could not be reached (a notice says which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCheck {
+    Accepted,
+    Rejected,
+    NotChecked,
+}
+
 /// Everything `maj describer test` renders: the configured model, whether
-/// the live backend actually lists it, and (LM Studio only) whether it
-/// reports vision support. `reachable` isn't carried here — [`test`]
-/// returns an error instead when the backend can't be reached at all,
-/// so by the time a [`DescriberProbe`] exists reachability is already a
-/// given.
+/// the live backend actually lists it, (LM Studio only) whether it reports
+/// vision support, and (`OpenRouter` only) what it said about the key.
+/// `reachable` isn't carried here — [`test`] returns an error instead when
+/// the backend can't be reached at all, so by the time a [`DescriberProbe`]
+/// exists reachability is already a given.
 #[derive(Debug, serde::Serialize)]
 pub struct DescriberProbe {
     pub model: String,
     pub model_listed: bool,
     pub vision: Option<bool>,
+    pub key: KeyCheck,
 }
 
 /// `maj describer test`: live-probes the configured backend. `api_key`
@@ -193,15 +205,37 @@ fn test_impl(
     };
     let base_url = config.base_url.clone();
     let model = config.model.clone();
+    let has_key_to_check = config.backend == BackendKind::OpenRouter
+        && config.effective_api_key(api_key.clone()).is_some();
     let describer = HttpDescriber::new(config, api_key);
     let report = describer
         .probe()
         .with_context(|| format!("describer test against {base_url}"))?;
+    let key = if has_key_to_check {
+        check_key(&describer, notices)
+    } else {
+        KeyCheck::NotChecked
+    };
     Ok(DescriberProbe {
         model,
         model_listed: report.model_listed,
         vision: report.vision,
+        key,
     })
+}
+
+/// Asks the backend about the key. An endpoint that judged nothing is a
+/// notice, not an error: the probe itself succeeded. The error renders
+/// outermost-only (`{err}`), which names the URL and never the key.
+fn check_key(describer: &HttpDescriber, notices: &crate::notices::Notices) -> KeyCheck {
+    match describer.check_key() {
+        Ok(KeyVerdict::Accepted) => KeyCheck::Accepted,
+        Ok(KeyVerdict::Rejected) => KeyCheck::Rejected,
+        Err(err) => {
+            notices.push(format!("note: the key was not checked ({err})"));
+            KeyCheck::NotChecked
+        }
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +336,161 @@ mod tests {
         )
         .expect("set");
         assert_eq!(view.base_url, BackendKind::LmStudio.default_base_url());
+    }
+
+    /// The MCP `test_describer` tool serializes the probe as-is, so this is
+    /// the wire shape a client reads the key verdict from.
+    #[test]
+    fn the_probe_carries_the_key_check_in_snake_case() {
+        for (key, wire) in [
+            (KeyCheck::Accepted, "accepted"),
+            (KeyCheck::Rejected, "rejected"),
+            (KeyCheck::NotChecked, "not_checked"),
+        ] {
+            let probe = DescriberProbe {
+                model: "m".to_string(),
+                model_listed: true,
+                vision: None,
+                key,
+            };
+            assert_eq!(
+                serde_json::to_value(&probe).expect("ser")["key"],
+                serde_json::json!(wire)
+            );
+        }
+    }
+
+    /// Configures `backend` against `server` with no key in the file, so
+    /// the only key a test can see is the one it passes to [`test`].
+    fn configure(root: &Path, backend: BackendKind, server: &httpmock::MockServer) {
+        set(
+            root,
+            &SetArgs {
+                backend,
+                model: "m".to_string(),
+                base_url: Some(server.base_url()),
+                api_key: None,
+            },
+            &Notices::new(),
+        )
+        .expect("set");
+    }
+
+    /// Serves the model list [`test`] probes before it looks at the key.
+    fn serve_models(server: &httpmock::MockServer) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({"data": [{"id": "m"}]}));
+        });
+    }
+
+    fn serve_key(server: &httpmock::MockServer, status: u16) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/key");
+            then.status(status).json_body(serde_json::json!({}));
+        })
+    }
+
+    #[test]
+    fn test_reports_an_accepted_key() {
+        let server = httpmock::MockServer::start();
+        serve_models(&server);
+        let key = serve_key(&server, 200);
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, &server);
+
+        let probe = test(dir.path(), Some("sk-test".into()), &Notices::new()).expect("test");
+
+        assert!(probe.model_listed);
+        assert_eq!(probe.key, KeyCheck::Accepted);
+        key.assert_calls(1);
+    }
+
+    #[test]
+    fn test_reports_a_rejected_key() {
+        let server = httpmock::MockServer::start();
+        serve_models(&server);
+        let key = serve_key(&server, 401);
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, &server);
+
+        let probe = test(dir.path(), Some("sk-test".into()), &Notices::new()).expect("test");
+
+        assert_eq!(probe.key, KeyCheck::Rejected);
+        key.assert_calls(1);
+    }
+
+    /// Only `OpenRouter` has a key endpoint: a local backend handed a key
+    /// must not be asked about it.
+    #[test]
+    fn test_does_not_check_a_key_for_ollama() {
+        let server = httpmock::MockServer::start();
+        serve_models(&server);
+        let key = serve_key(&server, 200);
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::Ollama, &server);
+        let notices = Notices::new();
+
+        let probe = test(dir.path(), Some("sk-test".into()), &notices).expect("test");
+
+        assert_eq!(probe.key, KeyCheck::NotChecked);
+        key.assert_calls(0);
+        assert!(key_notices(&notices).is_empty());
+    }
+
+    /// A key endpoint that answers neither success nor 401 judged nothing:
+    /// the probe still succeeds, and a notice says the key went unchecked —
+    /// without carrying the key.
+    #[test]
+    fn test_with_an_unreachable_key_endpoint_is_not_checked_with_a_notice() {
+        let server = httpmock::MockServer::start();
+        serve_models(&server);
+        let key = serve_key(&server, 500);
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, &server);
+        let notices = Notices::new();
+
+        let probe = test(dir.path(), Some("sk-test".into()), &notices).expect("test");
+
+        assert_eq!(probe.key, KeyCheck::NotChecked);
+        key.assert_calls(1);
+        let all = notices.drain();
+        assert!(
+            all.iter().all(|notice| !notice.contains("sk-test")),
+            "{all:?}"
+        );
+        let about_the_key: Vec<&String> = all
+            .iter()
+            .filter(|notice| notice.starts_with("note: the key was not checked ("))
+            .collect();
+        assert_eq!(about_the_key.len(), 1, "{all:?}");
+    }
+
+    /// With no key from the caller or the file there is nothing to judge,
+    /// and a keyless request would only earn a 401 that reads as `Rejected`.
+    #[test]
+    fn test_without_a_key_does_not_call_the_key_endpoint() {
+        let server = httpmock::MockServer::start();
+        serve_models(&server);
+        let key = serve_key(&server, 401);
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, &server);
+        let notices = Notices::new();
+
+        let probe = test(dir.path(), None, &notices).expect("test");
+
+        assert_eq!(probe.key, KeyCheck::NotChecked);
+        key.assert_calls(0);
+        assert!(key_notices(&notices).is_empty());
+    }
+
+    fn key_notices(notices: &Notices) -> Vec<String> {
+        notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains("key"))
+            .collect()
     }
 
     #[test]

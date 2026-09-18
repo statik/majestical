@@ -150,6 +150,12 @@ impl HttpDescriber {
         }
     }
 
+    /// The configured backend, for callers that word a failure per backend.
+    #[must_use]
+    pub fn backend(&self) -> BackendKind {
+        self.config.backend
+    }
+
     fn chat_url(&self) -> String {
         format!(
             "{}/v1/chat/completions",

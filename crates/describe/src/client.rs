@@ -2,7 +2,9 @@
 //! backend's dialect quirks kept explicit and pinned by tests.
 
 use base64::Engine as _;
-use majestical_core::ports::{Caption, Describer, PortError, TagSubject, TagSuggestion};
+use majestical_core::ports::{
+    Caption, CredentialsProblem, Describer, PortError, TagSubject, TagSuggestion,
+};
 
 use crate::config::{BackendKind, DescriberConfig};
 
@@ -27,27 +29,50 @@ fn tags_prompt(vocab: &[String]) -> String {
     )
 }
 
-/// Splits this client's errors into the two port classes. A backend that
+/// Splits this client's errors into the three port classes. A backend that
 /// answered — a 4xx on this request, a body we cannot use — refused THIS
-/// input, and sending the same bytes again gets the same answer; everything
-/// else (no connection, a timeout, a 5xx, a 429) is the backend being
-/// unavailable and says nothing about the input.
+/// input, and sending the same bytes again gets the same answer; 401/402 are
+/// taken by the credentials arm first and become `CredentialsRejected`, not
+/// `Unavailable`; everything else (no connection, a timeout, a 5xx, a 429) is
+/// the backend being unavailable and says nothing about the input.
 fn to_port_error(context: impl Into<String>, error: DescribeHttpError) -> PortError {
     match error {
         DescribeHttpError::Request { .. } => PortError::new(context, error),
         DescribeHttpError::Rejected { .. }
         | DescribeHttpError::Malformed { .. }
         | DescribeHttpError::Shape => PortError::refused(context, error),
+        DescribeHttpError::Credentials { problem, .. } => {
+            PortError::credentials(context, error, problem)
+        }
     }
+}
+
+/// Maps a status to the credentials problem it names, or `None` when it is
+/// not a credentials status at all.
+fn credentials_problem(status: u16) -> Option<CredentialsProblem> {
+    match status {
+        401 => Some(CredentialsProblem::KeyRejected),
+        402 => Some(CredentialsProblem::OutOfCredit),
+        _ => None,
+    }
+}
+
+/// What the backend's key endpoint said about the configured key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyVerdict {
+    Accepted,
+    Rejected,
 }
 
 /// The 4xx statuses that are about the caller's credentials (401, 407),
 /// account (402), routing (404), or timing (408, 429) rather than the
 /// payload: the same input is expected to succeed once the operator fixes
-/// the cause, so these stay `Unavailable` — an expired key must not turn
-/// every item into a permanent ledger row. 403 is deliberately NOT here:
-/// `OpenRouter` answers a bad key with 401 and a content-moderation refusal
-/// with 403, so 403 is a verdict on the input.
+/// the cause, so these stay out of `is_client_rejection` — an expired key
+/// must not turn every item into a permanent ledger row. 401 and 402 are
+/// taken by the credentials arm before this list is even consulted, and
+/// become `CredentialsRejected` rather than `Unavailable`. 403 is
+/// deliberately NOT here: `OpenRouter` answers a bad key with 401 and a
+/// content-moderation refusal with 403, so 403 is a verdict on the input.
 const NOT_ABOUT_THE_PAYLOAD: [u16; 6] = [401, 402, 404, 407, 408, 429];
 
 /// HTTP statuses that mean "this request was wrong" rather than "this
@@ -78,6 +103,12 @@ enum DescribeHttpError {
         url: String,
         status: u16,
         message: String,
+    },
+    #[error("backend did not accept the credentials for {url} (HTTP {status})")]
+    Credentials {
+        url: String,
+        status: u16,
+        problem: CredentialsProblem,
     },
     #[error("backend returned malformed JSON after retry: {snippet}")]
     Malformed { snippet: String },
@@ -146,13 +177,19 @@ impl HttpDescriber {
         // `http_status_as_error` is ureq's default, so a 4xx/5xx arrives here
         // as `Error::StatusCode` rather than as a response to inspect.
         let mut response = request.send_json(body).map_err(|error| match error {
-            ureq::Error::StatusCode(status) if is_client_rejection(status) => {
-                DescribeHttpError::Rejected {
+            ureq::Error::StatusCode(status) => match credentials_problem(status) {
+                Some(problem) => DescribeHttpError::Credentials {
+                    url: url.clone(),
+                    status,
+                    problem,
+                },
+                None if is_client_rejection(status) => DescribeHttpError::Rejected {
                     url: url.clone(),
                     status,
                     message: error.to_string(),
-                }
-            }
+                },
+                None => error_at(error.to_string()),
+            },
             other => error_at(other.to_string()),
         })?;
         let value: serde_json::Value = response
@@ -243,6 +280,28 @@ impl HttpDescriber {
         })
     }
 
+    /// Asks the backend's key endpoint whether the configured key is accepted.
+    /// OpenRouter-specific (`GET {base_url}/v1/key`); callers gate on the
+    /// backend.
+    ///
+    /// # Errors
+    /// Returns `PortError` when the endpoint cannot be reached or answers
+    /// anything other than success or 401 — the key was not judged.
+    pub fn check_key(&self) -> Result<KeyVerdict, PortError> {
+        let url = format!("{}/v1/key", self.config.base_url.trim_end_matches('/'));
+        match self.authorize(self.agent.get(&url)).call() {
+            Ok(_) => Ok(KeyVerdict::Accepted),
+            Err(ureq::Error::StatusCode(401)) => Ok(KeyVerdict::Rejected),
+            Err(other) => Err(PortError::new(
+                "key check",
+                DescribeHttpError::Request {
+                    url,
+                    message: other.to_string(),
+                },
+            )),
+        }
+    }
+
     fn lm_studio_vision(&self, base: &str) -> Option<bool> {
         let url = format!("{}/api/v1/models", base.trim_end_matches('/'));
         let body = self.get_json(&url).ok()?;
@@ -300,7 +359,7 @@ mod tests {
     use super::*;
     use crate::config::{BackendKind, DescriberConfig};
     use httpmock::prelude::*;
-    use majestical_core::ports::{Describer, PortFailure, TagSubject};
+    use majestical_core::ports::{CredentialsProblem, Describer, PortFailure, TagSubject};
 
     fn config_for(server: &MockServer, backend: BackendKind, key: Option<&str>) -> DescriberConfig {
         DescriberConfig {
@@ -619,12 +678,11 @@ mod tests {
         assert_eq!(caption_failure_for_status(429), PortFailure::Unavailable);
     }
 
-    /// The 4xx statuses about credentials, the account, routing, or timing
-    /// say nothing about the input either; 403 (moderation on `OpenRouter`)
-    /// does.
+    /// The 4xx statuses about routing or timing say nothing about the
+    /// input either; 403 (moderation on `OpenRouter`) does.
     #[test]
-    fn credential_account_routing_and_timing_4xx_are_unavailable() {
-        for status in [401, 402, 404, 407, 408] {
+    fn routing_and_timing_4xx_are_unavailable() {
+        for status in [404, 407, 408, 429] {
             assert_eq!(
                 caption_failure_for_status(status),
                 PortFailure::Unavailable,
@@ -632,6 +690,21 @@ mod tests {
             );
         }
         assert_eq!(caption_failure_for_status(403), PortFailure::RefusedInput);
+    }
+
+    /// 401 and 402 are the backend answering about the caller's key or
+    /// account, not about this input — they get their own class rather than
+    /// folding into `Unavailable`.
+    #[test]
+    fn a_401_is_a_rejected_key_and_a_402_is_an_empty_account() {
+        assert_eq!(
+            caption_failure_for_status(401),
+            PortFailure::CredentialsRejected(CredentialsProblem::KeyRejected)
+        );
+        assert_eq!(
+            caption_failure_for_status(402),
+            PortFailure::CredentialsRejected(CredentialsProblem::OutOfCredit)
+        );
     }
 
     /// A 200 whose body has no `choices[0].message.content`: the backend
@@ -693,6 +766,88 @@ mod tests {
             .caption(b"fake-image-bytes")
             .expect_err("a dead port must be an error");
         assert_eq!(error.failure, PortFailure::Unavailable);
+    }
+
+    #[test]
+    fn check_key_accepts_on_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/key")
+                .header("authorization", "Bearer sk-test");
+            then.status(200).json_body(serde_json::json!({"data": {}}));
+        });
+
+        let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        let describer = HttpDescriber::new(config, None);
+        let verdict = describer.check_key().expect("check_key");
+
+        assert_eq!(verdict, KeyVerdict::Accepted);
+        mock.assert_calls(1);
+    }
+
+    #[test]
+    fn check_key_rejects_on_401() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/key");
+            then.status(401)
+                .json_body(serde_json::json!({"error": "no"}));
+        });
+
+        let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        let describer = HttpDescriber::new(config, None);
+        let verdict = describer.check_key().expect("check_key");
+
+        assert_eq!(verdict, KeyVerdict::Rejected);
+        mock.assert_calls(1);
+    }
+
+    #[test]
+    fn check_key_is_an_error_on_500_and_on_a_dead_port() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/key");
+            then.status(500)
+                .json_body(serde_json::json!({"error": "no"}));
+        });
+
+        let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        let describer = HttpDescriber::new(config, None);
+        assert!(describer.check_key().is_err());
+        mock.assert_calls(1);
+
+        let dead_config = DescriberConfig {
+            backend: BackendKind::OpenRouter,
+            base_url: "http://127.0.0.1:1".into(),
+            model: "test-model".into(),
+            api_key: Some("sk-test".into()),
+        };
+        let dead_describer = HttpDescriber::new(dead_config, None);
+        assert!(dead_describer.check_key().is_err());
+    }
+
+    /// A key never appears in an error's rendered text, even the debug form
+    /// — the credentials variant carries the status and the problem class,
+    /// never the key.
+    #[test]
+    fn a_credentials_error_never_renders_the_key() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(401)
+                .json_body(serde_json::json!({"error": "no"}));
+        });
+
+        let config = config_for(&server, BackendKind::OpenRouter, Some("sk-test"));
+        let describer = HttpDescriber::new(config, None);
+        let error = describer
+            .caption(b"fake-image-bytes")
+            .expect_err("401 must be an error");
+
+        assert!(!error.to_string().contains("sk-test"));
+        assert!(!format!("{error:?}").contains("sk-test"));
+        mock.assert_calls(1);
     }
 
     #[test]

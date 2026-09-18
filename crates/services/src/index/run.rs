@@ -1604,8 +1604,10 @@ enum CaptionFailure {
 /// the pass aborts).
 fn caption_failure(error: &PortError) -> CaptionFailure {
     match error.failure {
-        PortFailure::Unavailable => CaptionFailure::Backend(error.to_string()),
         PortFailure::RefusedInput => CaptionFailure::Item(error.to_string()),
+        PortFailure::Unavailable | PortFailure::CredentialsRejected(_) => {
+            CaptionFailure::Backend(error.to_string())
+        }
     }
 }
 

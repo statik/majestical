@@ -8,6 +8,17 @@ phase draws from are the "Phase 7F deferrals" section of
 approved before code, per the standing convention):
 `docs/superpowers/specs/mockups/2026-09-18-phase7g/captions-section.html`.
 
+**Amended at planning (2026-09-18).** Reading the code for the plan changed
+eight details — the adapter is a `KeyStore` trait, the credentials class
+carries which problem it was, `DoctorRequest` takes key presence, `set`
+returns nothing, the state-dir leak has a second source needing a justfile
+env, the section imports its wire module directly, `App.test.ts` gets its
+promised split, and delivery is eight chunks. They are listed under
+"Planning-time amendments to the spec" in
+`docs/superpowers/plans/2026-09-18-phase7g-captions-parity.md`; where that
+list and this document disagree, the list wins until the as-built section
+is written.
+
 ## Scope decisions (from design session)
 
 - **Shape: a parity phase**, chosen over platform reach (Windows/Linux

@@ -25,11 +25,11 @@ gui-build:
 
 # `tauri_parity`'s cross-binary test compares the GUI's search rows against
 # `maj search --json`, so build a `maj` first and point MAJ_BIN at it —
-# without one that test skips (loudly) and the rest still run.
+# without one that test skips (loudly) and the rest still run. MAJ_STATE_DIR
+# keeps tests from writing state under the user's real platform data dir —
+# see crates/services/src/state_dir.rs.
 gui-test:
     cargo build -p majestical-cli
-    # MAJ_STATE_DIR keeps tests from writing state under the user's real
-    # platform data dir — see crates/services/src/state_dir.rs.
     MAJ_BIN="{{justfile_directory()}}/target/debug/maj" \
         MAJ_STATE_DIR="$(mktemp -d)" \
         cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml

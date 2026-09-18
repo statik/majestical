@@ -169,12 +169,9 @@ mod tests {
 
     #[test]
     fn the_test_build_base_is_never_the_platform_data_dir() {
-        // Only meaningful when the override is absent, which is how every
-        // unit test in this crate runs.
-        if std::env::var_os("MAJ_STATE_DIR").is_some() {
-            return;
-        }
-        let base = state_base().expect("base");
+        // Tests the fallback itself, not `state_base`'s override branch, so
+        // it holds whether or not `MAJ_STATE_DIR` is set in the environment.
+        let base = default_base().expect("base");
         let data = dirs::data_dir().expect("data dir");
         assert!(
             !base.starts_with(&data),

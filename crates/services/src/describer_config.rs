@@ -149,8 +149,8 @@ pub enum FileKey {
     /// Carry the existing file's key forward — but only when the backend is
     /// unchanged. A stored key belongs to the backend that was configured
     /// when it was written, so a `set` that switches backends drops it
-    /// rather than sending one service's credential to another; see
-    /// [`set`].
+    /// rather than sending one service's credential to another; `carried_key`
+    /// holds that rule and the reasoning behind it.
     Keep,
     Set(String),
     Clear,
@@ -869,11 +869,9 @@ mod tests {
     }
 
     /// A key in the file belongs to the backend that was configured when it
-    /// was stored. Switching backends without supplying a new one must NOT
-    /// carry it over: a pre-7G `describer.toml` holds an `OpenRouter` key in
-    /// `api_key`, so carrying it would hand a paid hosted key to whatever
-    /// local process the new `base_url` points at — and the reverse sends a
-    /// local proxy's token to openrouter.ai.
+    /// was stored, so switching backends without supplying a new one must
+    /// NOT carry it over — see `carried_key` for why that would hand a
+    /// credential to a host the user never entered it for.
     #[test]
     fn switching_backends_without_a_new_key_does_not_carry_the_old_one_over() {
         for (stored_backend, next) in [

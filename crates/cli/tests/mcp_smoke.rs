@@ -875,6 +875,83 @@ fn get_describer_matches() {
     );
 }
 
+/// Calls `tool` over a `describer.toml` broken on the line that holds a key
+/// — the line a TOML parse error would quote back — and returns the whole
+/// response, having checked that the key is nowhere in it. `set` writes
+/// three lines, so the broken one is line 4.
+#[cfg(test)]
+fn call_over_a_broken_describer_config(tool: &str, args: &serde_json::Value) -> String {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::maj(&root, &state)
+        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
+        .assert()
+        .success();
+    let paths = common::walkdir_find(&state, "describer.toml");
+    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths[0])
+        .expect("open describer.toml");
+    file.write_all(b"api_key = \"sk-test\" oops\n")
+        .expect("break describer.toml");
+    drop(file);
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(tool, args).to_string();
+    assert!(!resp.contains("sk-test"), "{tool}: {resp}");
+    resp
+}
+
+/// Every describer tool that reads the file fails on a broken one with the
+/// whole error chain (`tool_error` renders `{err:#}`), so the chain has to
+/// name the line without quoting it.
+#[test]
+fn describer_tools_over_a_broken_config_name_the_line_and_never_quote_it() {
+    for (tool, args) in [
+        ("get_describer", serde_json::json!({})),
+        ("test_describer", serde_json::json!({})),
+        ("test_describer", serde_json::json!({"confirm": true})),
+        (
+            "set_describer",
+            serde_json::json!({"backend": "ollama", "model": "m2"}),
+        ),
+        (
+            "set_describer",
+            serde_json::json!({"backend": "ollama", "model": "m2", "confirm": true}),
+        ),
+    ] {
+        let resp = call_over_a_broken_describer_config(tool, &args);
+        let parsed: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            parsed["result"]["isError"],
+            serde_json::json!(true),
+            "{tool} {args}: {resp}"
+        );
+        assert!(
+            resp.contains("describer.toml: line 4: "),
+            "{tool} {args}: {resp}"
+        );
+    }
+}
+
+/// `index_status` degrades a broken describer config to a notice instead of
+/// failing; the notice carries the same chain.
+#[test]
+fn index_status_over_a_broken_describer_config_names_the_line_and_never_quotes_it() {
+    let resp = call_over_a_broken_describer_config("index_status", &serde_json::json!({}));
+    let parsed: serde_json::Value = serde_json::from_str(&resp).expect("json");
+    assert_ne!(
+        parsed["result"]["isError"],
+        serde_json::json!(true),
+        "{resp}"
+    );
+    assert!(resp.contains("ignoring broken describer config"), "{resp}");
+    assert!(resp.contains("describer.toml: line 4: "), "{resp}");
+}
+
 #[test]
 fn suggest_tags_review_matches() {
     let dir = tempfile::tempdir().expect("tempdir");

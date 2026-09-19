@@ -236,9 +236,7 @@ pub fn set(
 
 fn set_impl(catalog_root: &Path, args: &SetArgs, notices: &crate::notices::Notices) -> Result<()> {
     let api_key = match &args.file_key {
-        FileKey::Keep => {
-            load_for_key_edit(catalog_root, notices)?.and_then(|stored| stored.api_key)
-        }
+        FileKey::Keep => load_config(catalog_root, notices)?.and_then(|stored| stored.api_key),
         FileKey::Set(key) => Some(key.clone()),
         FileKey::Clear => None,
     };
@@ -296,7 +294,7 @@ pub fn clear_file_key(
 }
 
 fn clear_file_key_impl(catalog_root: &Path, notices: &crate::notices::Notices) -> Result<bool> {
-    let Some(config) = load_for_key_edit(catalog_root, notices)? else {
+    let Some(config) = load_config(catalog_root, notices)? else {
         return Ok(false);
     };
     if config.api_key.is_none() {
@@ -311,25 +309,6 @@ fn clear_file_key_impl(catalog_root: &Path, notices: &crate::notices::Notices) -
         .store(&path)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(true)
-}
-
-/// [`load_config`] for the two verbs that rewrite the file's key. A file
-/// that can't be read or parsed is reported by name only, with no source
-/// chained behind it: the cause can be a `toml::de::Error`, which quotes the
-/// offending source line back — and that line can be `api_key = "sk-…"`. A
-/// head that renders the whole chain (`{err:#}`) must find nothing there.
-fn load_for_key_edit(
-    catalog_root: &Path,
-    notices: &crate::notices::Notices,
-) -> Result<Option<DescriberConfig>> {
-    let path = config_path(catalog_root, notices)?;
-    DescriberConfig::load(&path).map_err(|_| {
-        anyhow::anyhow!(
-            "load {}: the file can't be read or parsed, so its key was left alone — \
-             fix or remove it",
-            path.display()
-        )
-    })
 }
 
 /// What `describer test` learned about the key.

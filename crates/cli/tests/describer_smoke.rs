@@ -299,3 +299,88 @@ fn describer_test_without_a_key_says_so_and_does_not_promise_captions() {
     assert!(!stdout.contains("will run on the next"), "{stdout}");
     key.assert_calls(0);
 }
+
+/// Configures a describer, then breaks `describer.toml` on the line that
+/// holds a key — the line a TOML parse error would quote back. `set` writes
+/// three lines, so the broken one is line 4.
+#[cfg(test)]
+fn catalog_with_a_broken_config(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::io::Write as _;
+
+    let (root, state) = init_catalog(tmp);
+    maj(&root, &state)
+        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
+        .assert()
+        .success();
+    let paths = common::walkdir_find(&state, "describer.toml");
+    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths[0])
+        .expect("open describer.toml");
+    file.write_all(b"api_key = \"sk-test\" oops\n")
+        .expect("break describer.toml");
+    (root, state)
+}
+
+/// Runs `maj` with `args` over the broken config and returns
+/// `(succeeded, stdout, stderr)`, having checked that neither stream
+/// carries the key.
+#[cfg(test)]
+fn run_over_a_broken_config(args: &[&str]) -> (bool, String, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = catalog_with_a_broken_config(tmp.path());
+    let out = maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(args)
+        .output()
+        .expect("run maj");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8 stderr");
+    assert!(!stdout.contains("sk-test"), "{args:?} stdout: {stdout}");
+    assert!(!stderr.contains("sk-test"), "{args:?} stderr: {stderr}");
+    (out.status.success(), stdout, stderr)
+}
+
+#[test]
+fn describer_show_on_a_broken_config_names_the_line_and_never_quotes_it() {
+    let (succeeded, _, stderr) = run_over_a_broken_config(&["describer", "show"]);
+    assert!(!succeeded);
+    assert!(stderr.contains("describer.toml: line 4: "), "{stderr}");
+}
+
+#[test]
+fn describer_test_on_a_broken_config_names_the_line_and_never_quotes_it() {
+    let (succeeded, _, stderr) = run_over_a_broken_config(&["describer", "test"]);
+    assert!(!succeeded);
+    assert!(stderr.contains("describer.toml: line 4: "), "{stderr}");
+}
+
+/// `set` without `--api-key` would have to carry the file's key forward, so
+/// it refuses a file it can't parse rather than dropping that key.
+#[test]
+fn describer_set_on_a_broken_config_names_the_line_and_never_quotes_it() {
+    let (succeeded, _, stderr) =
+        run_over_a_broken_config(&["describer", "set", "--backend", "ollama", "--model", "m2"]);
+    assert!(!succeeded);
+    assert!(stderr.contains("describer.toml: line 4: "), "{stderr}");
+}
+
+/// A broken describer config degrades captions rather than failing `index
+/// status`, which reports it as a notice: on stderr, and in `--json` among
+/// the outcome's `notices`.
+#[test]
+fn index_status_on_a_broken_config_names_the_line_and_never_quotes_it() {
+    let (succeeded, _, stderr) = run_over_a_broken_config(&["index", "status"]);
+    assert!(succeeded, "{stderr}");
+    assert!(stderr.contains("describer.toml: line 4: "), "{stderr}");
+
+    let (succeeded, stdout, stderr) = run_over_a_broken_config(&["index", "status", "--json"]);
+    assert!(succeeded, "{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("describer.toml: line 4: "),
+        "{stdout}{stderr}"
+    );
+}

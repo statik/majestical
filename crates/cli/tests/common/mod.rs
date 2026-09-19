@@ -87,7 +87,7 @@ pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBu
 }
 
 // Not every integration-test binary that pulls in this module calls
-// `walkdir_find` directly (describer_smoke.rs uses only `maj`), and each
+// `walkdir_find` directly (doctor_smoke.rs never does), and each
 // `tests/*.rs` file is its own crate, so dead-code reachability is judged
 // per binary. This in-module test gives every binary a real caller so the
 // helper never trips `dead_code`, without reaching for `#[allow]` (denied)

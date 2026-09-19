@@ -2,15 +2,31 @@
 //! the state dir). Never synced: endpoints and API keys are machine-local.
 
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Ollama,
     LmStudio,
     OpenRouter,
+}
+
+/// Hand-written because the derived error for a value outside the set
+/// ("unknown variant `…`") quotes the value back, and a key pasted into the
+/// wrong field of `describer.toml` would ride out in it.
+impl<'de> serde::Deserialize<'de> for BackendKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "ollama" => Ok(Self::Ollama),
+            "lm-studio" => Ok(Self::LmStudio),
+            "open-router" => Ok(Self::OpenRouter),
+            _ => Err(serde::de::Error::custom(
+                "unknown backend — expected one of ollama, lm-studio, open-router",
+            )),
+        }
+    }
 }
 
 impl BackendKind {
@@ -39,7 +55,7 @@ impl BackendKind {
 /// so a head can supply the key some other way.
 pub const OPENROUTER_KEY_ENV: &str = "MAJ_OPENROUTER_KEY";
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DescriberConfig {
     pub backend: BackendKind,
     pub base_url: String,
@@ -48,6 +64,19 @@ pub struct DescriberConfig {
     /// `env_key`) overrides so the file can stay keyless — but only when
     /// `backend` is `OpenRouter`; see `effective_api_key`.
     pub api_key: Option<String>,
+}
+
+/// Hand-written because `api_key` is a real key, which must never reach a
+/// log, a panic message, or a test failure.
+impl std::fmt::Debug for DescriberConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriberConfig")
+            .field("backend", &self.backend)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,10 +91,19 @@ pub enum ConfigError {
         path: String,
         source: std::io::Error,
     },
-    #[error("parse {path}: {source}")]
+    /// Carries no `toml::de::Error`, neither rendered nor chained: its
+    /// Display quotes the offending source line and its Debug holds the whole
+    /// file, and that line can be `api_key = "sk-…"`. `message` is the parser's
+    /// own text without the snippet. It can still quote a well-formed value
+    /// of the wrong type ("invalid type: integer `5`, expected a string") —
+    /// never a string, which is what a key is. A string is refused by one
+    /// field only, `backend`, and [`BackendKind`]'s `Deserialize` keeps that
+    /// refusal from quoting it.
+    #[error("parse {path}: line {line}: {message}")]
     Parse {
         path: String,
-        source: toml::de::Error,
+        line: usize,
+        message: String,
     },
     #[error("serialize describer config: {0}")]
     Serialize(#[from] toml::ser::Error),
@@ -87,16 +125,25 @@ impl DescriberConfig {
                 });
             }
         };
-        let config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let config = toml::from_str(&text).map_err(|error| ConfigError::Parse {
             path: path.display().to_string(),
-            source,
+            line: line_of(&text, error.span()),
+            message: error.message().to_string(),
         })?;
         Ok(Some(config))
     }
 
-    /// Write config to `path`, created with 0600 permissions from the start
-    /// (may hold an API key, so it must never exist world/group-readable
-    /// even for the instant between create and chmod).
+    /// Write config to `path` via a same-directory `<path>.tmp` + rename, so
+    /// a run killed mid-write never leaves a truncated file — the key in it
+    /// may exist nowhere else. The temp file is created with 0600 permissions
+    /// from the start (may hold an API key, so it must never exist
+    /// world/group-readable even for the instant between create and chmod),
+    /// and being a fresh file it replaces an older, wider one's mode too.
+    ///
+    /// The temp name is fixed rather than per-writer: a leftover from a
+    /// crashed run can hold a key, and a fixed name is the one the next store
+    /// removes. Overlapping stores are not guarded against: only a settings
+    /// save writes this file.
     ///
     /// # Errors
     /// Returns `ConfigError` when serialization or the write fails.
@@ -106,15 +153,19 @@ impl DescriberConfig {
             path: path.display().to_string(),
             source,
         };
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(write_error)?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(write_error(source)),
+        }
+        let mut file = create_private(&tmp).map_err(write_error)?;
         file.write_all(text.as_bytes()).map_err(write_error)?;
-        Ok(())
+        file.sync_all().map_err(write_error)?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(write_error)
     }
 
     /// The key to send: the environment override wins, but only for
@@ -141,6 +192,26 @@ impl DescriberConfig {
             .collect();
         format!("describe-{sanitized}")
     }
+}
+
+/// The 1-based line `span` starts on; 1 when the parser gave no position or
+/// one that is not inside `text`.
+fn line_of(text: &str, span: Option<std::ops::Range<usize>>) -> usize {
+    span.and_then(|span| text.get(..span.start))
+        .map_or(1, |before| before.matches('\n').count() + 1)
+}
+
+/// Creates `path` anew, refusing an existing file: `mode` applies only on
+/// create, so an existing file would keep whatever mode it had.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -181,6 +252,265 @@ mod tests {
         assert_eq!(loaded, config);
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "describer.toml must be 0600");
+    }
+
+    const VALID_HEAD: &str =
+        "backend = \"open-router\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"m\"\n\n";
+
+    fn load_error_of(text: &str) -> ConfigError {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        std::fs::write(&path, text).expect("plant config");
+        DescriberConfig::load(&path).expect_err("must not parse")
+    }
+
+    /// Every rendering a head can reach: Display, Debug, and the whole chain
+    /// as `majestical-services` wraps it (`{:#}` and `{:?}` of an anyhow
+    /// error with a context on top).
+    fn renderings_of(err: ConfigError) -> Vec<String> {
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        let wrapped = anyhow::Error::from(err).context("load describer.toml");
+        vec![
+            display,
+            debug,
+            format!("{wrapped:#}"),
+            format!("{wrapped:?}"),
+        ]
+    }
+
+    /// The broken line is the one holding the key, because that is the line
+    /// a TOML parse error would quote back.
+    #[test]
+    fn a_parse_error_names_the_line_and_never_quotes_it() {
+        let err = load_error_of(&format!("{VALID_HEAD}api_key = \"sk-test\" oops\n"));
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        let display = err.to_string();
+        assert!(display.contains("describer.toml: line 5: "), "{display}");
+        for rendering in renderings_of(err) {
+            assert!(!rendering.contains("sk-test"), "{rendering}");
+        }
+    }
+
+    #[test]
+    fn a_parse_error_counts_lines_without_a_trailing_newline_and_across_crlf() {
+        let bare = load_error_of(&format!("{VALID_HEAD}api_key = \"sk-test\" oops"));
+        assert!(bare.to_string().contains(": line 5: "), "{bare}");
+
+        let crlf = format!("{VALID_HEAD}api_key = \"sk-test\" oops\n").replace('\n', "\r\n");
+        let crlf = load_error_of(&crlf);
+        assert!(crlf.to_string().contains(": line 5: "), "{crlf}");
+        for rendering in renderings_of(crlf) {
+            assert!(!rendering.contains("sk-test"), "{rendering}");
+        }
+
+        let first = load_error_of("api_key = \"sk-test\" oops\nmodel = \"m\"\n");
+        assert!(first.to_string().contains(": line 1: "), "{first}");
+    }
+
+    /// However the key's own line is garbled, no rendering carries it.
+    #[test]
+    fn a_garbled_api_key_line_is_never_quoted() {
+        for line in [
+            "api_key = \"sk-test\" oops",
+            "api_key = \"sk-test",
+            "api_key = sk-test",
+            "api_key \"sk-test\"",
+            "api_key = 'sk-test' 'again'",
+            "api_key = [\"sk-test\"]",
+            "api_key = \"sk-test\"\napi_key = \"sk-test\"",
+        ] {
+            let err = load_error_of(&format!("{VALID_HEAD}{line}\n"));
+            for rendering in renderings_of(err) {
+                assert!(!rendering.contains("sk-test"), "{line}: {rendering}");
+            }
+        }
+    }
+
+    /// A key pasted into the wrong field: `backend` has a closed value set,
+    /// and the error for a value outside it lists the set, not the value.
+    #[test]
+    fn a_wrong_backend_value_is_never_quoted() {
+        let err = load_error_of("backend = \"sk-test\"\nbase_url = \"u\"\nmodel = \"m\"\n");
+        let display = err.to_string();
+        assert!(display.contains(": line 1: "), "{display}");
+        assert!(
+            display.contains("expected one of ollama, lm-studio, open-router"),
+            "{display}"
+        );
+        for rendering in renderings_of(err) {
+            assert!(!rendering.contains("sk-test"), "{rendering}");
+        }
+    }
+
+    /// What is left of the parser quoting the file: a number where a string
+    /// belongs is named in the message. A key is a string, and no string
+    /// value is ever quoted.
+    #[test]
+    fn a_wrong_typed_number_is_the_one_value_still_quoted() {
+        let err = load_error_of("backend = \"ollama\"\nbase_url = \"u\"\nmodel = 12345\n");
+        let display = err.to_string();
+        assert!(display.contains(": line 3: "), "{display}");
+        assert!(display.contains("12345"), "{display}");
+
+        let err = load_error_of("backend = \"ollama\"\nbase_url = [\"sk-test\"]\nmodel = \"m\"\n");
+        for rendering in renderings_of(err) {
+            assert!(!rendering.contains("sk-test"), "{rendering}");
+        }
+    }
+
+    /// A missing field belongs to no line; the parser points at the table's
+    /// start, which for this file is line 1.
+    #[test]
+    fn a_missing_field_is_reported_on_line_1_by_name() {
+        let err = load_error_of("backend = \"ollama\"\nbase_url = \"u\"\n");
+        let display = err.to_string();
+        assert!(display.contains(": line 1: "), "{display}");
+        assert!(display.contains("model"), "{display}");
+    }
+
+    /// A span is the parser's claim about `text`, so one that is absent,
+    /// past the end, or inside a multi-byte character is line 1, not a panic.
+    #[test]
+    fn line_of_counts_newlines_before_the_span_and_falls_back_to_1() {
+        let text = "a\nb\né\n";
+        assert_eq!(line_of(text, Some(0..1)), 1);
+        assert_eq!(line_of(text, Some(2..3)), 2);
+        assert_eq!(line_of(text, Some(4..6)), 3);
+        assert_eq!(line_of(text, Some(text.len()..text.len())), 4);
+        assert_eq!(line_of(text, None), 1);
+        assert_eq!(line_of(text, Some(5..6)), 1, "inside `é`");
+        assert_eq!(line_of(text, Some(99..100)), 1, "past the end");
+    }
+
+    #[test]
+    fn every_backend_round_trips_through_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        for backend in [
+            BackendKind::Ollama,
+            BackendKind::LmStudio,
+            BackendKind::OpenRouter,
+        ] {
+            let config = DescriberConfig {
+                backend,
+                base_url: "u".into(),
+                model: "m".into(),
+                api_key: None,
+            };
+            config.store(&path).expect("store");
+            let text = std::fs::read_to_string(&path).expect("read back");
+            assert!(
+                text.contains(&format!("backend = \"{}\"", backend.as_str())),
+                "{text}"
+            );
+            assert_eq!(DescriberConfig::load(&path).expect("load"), Some(config));
+        }
+    }
+
+    fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".tmp");
+        name.into()
+    }
+
+    fn keyed_config() -> DescriberConfig {
+        DescriberConfig {
+            backend: BackendKind::OpenRouter,
+            base_url: "https://openrouter.ai/api".into(),
+            model: "m".into(),
+            api_key: Some("sk-test".into()),
+        }
+    }
+
+    #[test]
+    fn store_replaces_the_file_atomically_and_leaves_no_tmp_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        std::fs::write(&path, "an older file").expect("plant");
+        #[cfg(unix)]
+        let inode_before = file_id(&path);
+
+        keyed_config().store(&path).expect("store");
+
+        assert!(!tmp_sibling(&path).exists());
+        assert_eq!(
+            DescriberConfig::load(&path).expect("load"),
+            Some(keyed_config())
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            file_id(&path),
+            inode_before,
+            "the target is replaced by rename, never truncated in place"
+        );
+    }
+
+    #[cfg(unix)]
+    fn file_id(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).expect("meta").ino()
+    }
+
+    /// `.mode()` applies only when a file is created, so a rewrite in place
+    /// would leave an older, wider file as wide as it was.
+    #[cfg(unix)]
+    #[test]
+    fn store_over_a_world_readable_file_leaves_it_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        std::fs::write(&path, "an older file").expect("plant");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        keyed_config().store(&path).expect("store");
+
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// A run killed between create and rename leaves `<path>.tmp` behind;
+    /// the next store must neither trip on it nor inherit its permissions.
+    #[test]
+    fn store_survives_a_stale_tmp_from_a_crashed_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        let tmp = tmp_sibling(&path);
+        std::fs::write(&tmp, "half a fi").expect("plant stale tmp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        }
+
+        keyed_config().store(&path).expect("store");
+
+        assert!(!tmp.exists());
+        assert_eq!(
+            DescriberConfig::load(&path).expect("load"),
+            Some(keyed_config())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_describer_config_never_debug_prints_the_key() {
+        let rendered = format!("{:?}", keyed_config());
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+        assert!(
+            rendered.contains("api_key: Some(\"<redacted>\")"),
+            "{rendered}"
+        );
+        let keyless = DescriberConfig {
+            api_key: None,
+            ..keyed_config()
+        };
+        assert!(format!("{keyless:?}").contains("api_key: None"));
     }
 
     #[test]

@@ -1131,8 +1131,9 @@ fn index_run_exec(
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
 
-/// Params for `set_describer`.
-#[derive(Debug, Deserialize, JsonSchema)]
+/// Params for `set_describer`. No `Debug`, unlike its siblings: `api_key` is
+/// a real key, and nothing formats this struct.
+#[derive(Deserialize, JsonSchema)]
 struct SetDescriberArgs {
     /// Which describer service to talk to.
     backend: majestical_services::describer_config::DescriberBackend,

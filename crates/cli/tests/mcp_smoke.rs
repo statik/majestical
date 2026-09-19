@@ -2879,6 +2879,103 @@ fn set_describer_dry_run_then_confirm_is_visible_via_get_describer() {
     );
 }
 
+/// `set_describer` echoes the view `get_describer` would return: the key's
+/// source, never the key. A local backend's key can only come from the
+/// file, so this holds whatever `MAJ_OPENROUTER_KEY` is in the ambient
+/// environment. A second `set_describer` without `api_key` keeps the key.
+#[test]
+fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+
+    let keyed = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({
+            "backend": "ollama", "model": "first", "api_key": "sk-test", "confirm": true
+        }),
+    );
+    assert_ne!(
+        keyed["result"]["isError"],
+        serde_json::json!(true),
+        "{keyed}"
+    );
+    assert!(!keyed.to_string().contains("sk-test"), "{keyed}");
+    let structured = &keyed["result"]["structuredContent"];
+    assert_eq!(
+        structured["key_source"],
+        serde_json::json!("file"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["api_key"],
+        serde_json::json!(null),
+        "{structured}"
+    );
+
+    let dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "second"}),
+    );
+    assert_eq!(
+        dry["result"]["structuredContent"]["current"]["key_source"],
+        serde_json::json!("file"),
+        "{dry}"
+    );
+
+    let rekeyed = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "second", "confirm": true}),
+    );
+    let structured = &rekeyed["result"]["structuredContent"];
+    assert_eq!(
+        structured["model"],
+        serde_json::json!("second"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["key_source"],
+        serde_json::json!("file"),
+        "{structured}"
+    );
+
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert!(!described.to_string().contains("sk-test"), "{described}");
+    assert_eq!(
+        described["result"]["structuredContent"]["describer"]["key_source"],
+        serde_json::json!("file"),
+        "{described}"
+    );
+}
+
+/// With `OpenRouter` and the key in this head's environment, the source is
+/// the environment.
+#[test]
+fn get_describer_names_the_env_as_the_openrouter_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", "sk-test")]);
+
+    let set = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+    assert!(!set.to_string().contains("sk-test"), "{set}");
+    assert_eq!(
+        set["result"]["structuredContent"]["key_source"],
+        serde_json::json!("env"),
+        "{set}"
+    );
+
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert!(!described.to_string().contains("sk-test"), "{described}");
+    assert_eq!(
+        described["result"]["structuredContent"]["describer"]["key_source"],
+        serde_json::json!("env"),
+        "{described}"
+    );
+}
+
 /// Closes the cargo-mutants gap on `test_describer_result`'s
 /// `Ok(Default::default())`/`delete !` survivors and the
 /// `MajServer::test_describer` wrapper survivor. Pins the actual confirmed

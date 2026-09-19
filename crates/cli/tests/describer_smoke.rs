@@ -3,39 +3,87 @@ use common::maj;
 use predicates::prelude::*;
 use predicates::str::contains;
 
-#[test]
-fn describer_set_show_round_trip_redacts_key() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path().join("cat");
-    let state = tmp.path().join("state");
+/// A fresh catalog under `tmp`, returned as `(root, state)`. `#[cfg(test)]`
+/// for the clippy in-test detection `common/mod.rs` explains.
+#[cfg(test)]
+fn init_catalog(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = tmp.join("cat");
+    let state = tmp.join("state");
     std::fs::create_dir_all(&root).expect("mkdir");
     maj(&root, &state)
         .args(["catalog", "init"])
         .assert()
         .success();
+    (root, state)
+}
 
-    maj(&root, &state)
-        .args([
-            "describer",
-            "set",
-            "--backend",
-            "open-router",
-            "--model",
-            "qwen/qwen3-vl-8b",
-            "--api-key",
-            "sk-secret",
-        ])
-        .assert()
+fn set_openrouter(root: &std::path::Path, state: &std::path::Path, model: &str, key: Option<&str>) {
+    let mut cmd = maj(root, state);
+    cmd.env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "set", "--backend", "open-router", "--model"])
+        .arg(model);
+    if let Some(key) = key {
+        cmd.args(["--api-key", key]);
+    }
+    cmd.assert()
         .success()
-        .stdout(contains("open-router").and(contains("qwen/qwen3-vl-8b")));
+        .stdout(contains("open-router").and(contains(model)))
+        .stdout(contains("sk-test").not());
+}
+
+#[test]
+fn describer_set_show_round_trip_names_the_file_and_never_the_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    set_openrouter(&root, &state, "qwen/qwen3-vl-8b", Some("sk-test"));
 
     maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
         .args(["describer", "show"])
         .assert()
         .success()
         .stdout(contains("open-router"))
-        .stdout(contains("(redacted)"))
-        .stdout(contains("sk-secret").not());
+        .stdout(contains("api-key:  (from file)"))
+        .stdout(contains("sk-test").not());
+}
+
+/// `set` without `--api-key` changes the model and leaves the stored key
+/// where it was, rather than silently dropping it.
+#[test]
+fn describer_set_without_a_key_keeps_the_stored_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    set_openrouter(&root, &state, "first-model", Some("sk-test"));
+    set_openrouter(&root, &state, "second-model", None);
+
+    maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("second-model"))
+        .stdout(contains("api-key:  (from file)"));
+}
+
+#[test]
+fn describer_show_names_the_env_as_the_keys_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    set_openrouter(&root, &state, "some-model", None);
+
+    maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (none)"));
+    maj(&root, &state)
+        .env("MAJ_OPENROUTER_KEY", "sk-test")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (from env)"))
+        .stdout(contains("sk-test").not());
 }
 
 #[test]

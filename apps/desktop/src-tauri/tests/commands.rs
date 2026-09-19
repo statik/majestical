@@ -510,8 +510,11 @@ fn list_saved_searches_carries_notices() {
 #[test]
 fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
     with_state_dir(|| {
-        let outcome = majestical_desktop::commands::doctor_report_impl(None, None)
-            .expect("doctor must run with no catalog selected");
+        let outcome = majestical_desktop::commands::doctor_report_impl(
+            None,
+            majestical_services::describer_config::KeyPresence::default(),
+        )
+        .expect("doctor must run with no catalog selected");
         let status_of = |name: &str| {
             outcome
                 .checks
@@ -536,13 +539,15 @@ fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
     });
 }
 
-/// The env key the impl is handed is the one the describer row resolves
-/// against: the same catalog, with an `OpenRouter` describer and no stored
-/// key, `Fail`s without a key and is `Ok` with one. Hermetic — the
-/// environment is never read, which is exactly why the impl takes the key
-/// as an argument.
+/// The key presence the impl is handed is the one the describer row
+/// resolves against: the same catalog, with an `OpenRouter` describer and no
+/// stored key, `Fail`s without a key and is `Ok` — naming the source — with
+/// one. Hermetic — the environment is never read, which is exactly why the
+/// impl takes the presence as an argument.
 #[test]
 fn doctor_report_resolves_the_describer_key_from_the_argument() {
+    use majestical_services::describer_config::{FileKey, KeyPresence};
+
     with_state_dir(|| {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = seeded_cfg(dir.path());
@@ -552,32 +557,36 @@ fn doctor_report_resolves_the_describer_key_from_the_argument() {
                 backend: majestical_describe::BackendKind::OpenRouter,
                 model: "test-model".into(),
                 base_url: None,
-                api_key: None,
+                file_key: FileKey::Keep,
             },
             &majestical_services::notices::Notices::new(),
         )
         .expect("store describer config");
 
-        let describer_status = |env_key: Option<String>| {
-            majestical_desktop::commands::doctor_report_impl(Some(&cfg), env_key)
+        let describer_row = |presence: KeyPresence| {
+            majestical_desktop::commands::doctor_report_impl(Some(&cfg), presence)
                 .expect("doctor")
                 .checks
-                .iter()
+                .into_iter()
                 .find(|c| c.name == "describer")
                 .unwrap_or_else(|| panic!("no `describer` row"))
-                .status
         };
 
         assert_eq!(
-            describer_status(None),
+            describer_row(KeyPresence::default()).status,
             majestical_services::doctor::CheckStatus::Fail,
             "no key anywhere must fail the describer row"
         );
+        let from_env = describer_row(KeyPresence {
+            env: true,
+            keychain: false,
+        });
         assert_eq!(
-            describer_status(Some("sk".into())),
+            from_env.status,
             majestical_services::doctor::CheckStatus::Ok,
-            "the key passed to the impl must reach the describer row"
+            "the presence passed to the impl must reach the describer row"
         );
+        assert_eq!(from_env.detail, "open-router · test-model · key from env");
     });
 }
 

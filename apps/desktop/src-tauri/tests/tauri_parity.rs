@@ -398,7 +398,7 @@ fn doctor_matches_cli_json() {
         let cfg = seeded_cfg(dir.path().join("cat"));
         let outcome = majestical_desktop::commands::doctor_report_impl(
             Some(&cfg),
-            majestical_desktop::commands::env_api_key(),
+            majestical_desktop::commands::key_presence(),
         )
         .expect("command");
         assert_eq!(

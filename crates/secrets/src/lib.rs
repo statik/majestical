@@ -162,17 +162,49 @@ mod tests {
         }
     }
 
+    /// Proves a "never read" claim: in production a read is a macOS prompt.
+    struct PanickingStore;
+
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the panic is the assertion: any call is the test's failure"
+    )]
+    impl KeyStore for PanickingStore {
+        fn supported(&self) -> bool {
+            true
+        }
+
+        fn read(&self) -> Result<Option<String>, SecretError> {
+            panic!("the store must not be touched");
+        }
+
+        fn store(&self, _key: &str) -> Result<(), SecretError> {
+            panic!("the store must not be touched");
+        }
+
+        fn delete(&self) -> Result<bool, SecretError> {
+            panic!("the store must not be touched");
+        }
+    }
+
     #[test]
     fn env_wins_and_the_store_is_never_read() {
-        let resolved = resolve(Some("sk-test".to_string()), true, &failing("denied"));
+        let resolved = resolve(Some("sk-test".to_string()), true, &PanickingStore);
         assert_eq!(resolved.source, HeadKeySource::Env);
         assert_eq!(resolved.key.as_deref(), Some("sk-test"));
         assert_eq!(resolved.notice, None);
     }
 
     #[test]
+    fn env_wins_over_a_stored_key() {
+        let resolved = resolve(Some("sk-test".to_string()), true, &holding("sk-test-2"));
+        assert_eq!(resolved.source, HeadKeySource::Env);
+        assert_eq!(resolved.key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
     fn the_store_is_not_read_for_a_local_backend() {
-        let resolved = resolve(None, false, &failing("denied"));
+        let resolved = resolve(None, false, &PanickingStore);
         assert_eq!(resolved.source, HeadKeySource::None);
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.notice, None);

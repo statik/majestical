@@ -92,6 +92,25 @@ mod tests {
         format!("majestical-test-{}", std::process::id())
     }
 
+    /// Deletes the throwaway item even when an assertion fails midway, so a
+    /// failed run leaves nothing in the login Keychain.
+    struct Cleanup(String);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = super::delete_item(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_system_store_is_switched_on() {
+        use crate::KeyStore;
+        assert_eq!(
+            (super::SUPPORTED, super::SystemKeyStore.supported()),
+            (true, true)
+        );
+    }
+
     // Talks to the real login Keychain, under the throwaway per-process
     // service name above. It can take about a minute when `target/debug/deps`
     // is very large, because the Security framework scans the calling
@@ -100,6 +119,7 @@ mod tests {
     #[test]
     fn store_read_overwrite_delete_round_trip() {
         let service = service();
+        let _cleanup = Cleanup(service.clone());
         assert_eq!(super::read_item(&service).expect("read"), None);
         super::store_item(&service, "sk-test").expect("store");
         assert_eq!(
@@ -113,6 +133,19 @@ mod tests {
         );
         assert!(super::delete_item(&service).expect("delete"));
         assert!(!super::delete_item(&service).expect("second delete"));
+    }
+
+    #[test]
+    fn a_stored_value_that_is_not_utf8_is_a_fixed_error_without_its_bytes() {
+        let service = format!("majestical-test-nonutf8-{}", std::process::id());
+        let _cleanup = Cleanup(service.clone());
+        super::set_generic_password(&service, super::ACCOUNT, b"sk-\xff\xfetest").expect("store");
+        let read = super::read_item(&service);
+        assert!(super::delete_item(&service).expect("delete"));
+        let Err(crate::SecretError::Store(message)) = read else {
+            panic!("expected a Store error");
+        };
+        assert_eq!(message, "the stored key is not UTF-8");
     }
 }
 

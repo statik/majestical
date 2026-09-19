@@ -384,3 +384,41 @@ fn index_status_on_a_broken_config_names_the_line_and_never_quotes_it() {
         "{stdout}{stderr}"
     );
 }
+
+/// A key pasted into the wrong field: `backend` is the one field that
+/// refuses a string, and its refusal lists the set, not the value.
+#[test]
+fn describer_show_with_a_key_pasted_into_backend_never_quotes_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    maj(&root, &state)
+        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
+        .assert()
+        .success();
+    let paths = common::walkdir_find(&state, "describer.toml");
+    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
+    std::fs::write(
+        &paths[0],
+        "model = \"m\"\nbackend = \"sk-test\"\nbase_url = \"u\"\n",
+    )
+    .expect("rewrite describer.toml");
+
+    let out = maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .output()
+        .expect("run maj describer show");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8 stderr");
+
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains(
+            "describer.toml: line 2: unknown backend — expected one of ollama, lm-studio, \
+             open-router"
+        ),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("sk-test"), "{stdout}");
+    assert!(!stderr.contains("sk-test"), "{stderr}");
+}

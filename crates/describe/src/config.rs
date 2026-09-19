@@ -94,11 +94,12 @@ pub enum ConfigError {
     /// Carries no `toml::de::Error`, neither rendered nor chained: its
     /// Display quotes the offending source line and its Debug holds the whole
     /// file, and that line can be `api_key = "sk-…"`. `message` is the parser's
-    /// own text without the snippet. It can still quote a well-formed value
-    /// of the wrong type ("invalid type: integer `5`, expected a string") —
-    /// never a string, which is what a key is. A string is refused by one
-    /// field only, `backend`, and [`BackendKind`]'s `Deserialize` keeps that
-    /// refusal from quoting it.
+    /// own text without the snippet and without any value from the file: a
+    /// value of the wrong type is named by kind only ("invalid type: integer,
+    /// expected a string" — see `without_echoed_values`), and a `backend`
+    /// outside its set gets [`BackendKind`]'s fixed text. What the message
+    /// does show is the line number, field names ("missing field `model`")
+    /// and the tokens the parser wanted ("expected newline, `#`").
     #[error("parse {path}: line {line}: {message}")]
     Parse {
         path: String,
@@ -128,7 +129,7 @@ impl DescriberConfig {
         let config = toml::from_str(&text).map_err(|error| ConfigError::Parse {
             path: path.display().to_string(),
             line: line_of(&text, error.span()),
-            message: error.message().to_string(),
+            message: without_echoed_values(error.message()),
         })?;
         Ok(Some(config))
     }
@@ -140,10 +141,11 @@ impl DescriberConfig {
     /// world/group-readable even for the instant between create and chmod),
     /// and being a fresh file it replaces an older, wider one's mode too.
     ///
-    /// The temp name is fixed rather than per-writer: a leftover from a
-    /// crashed run can hold a key, and a fixed name is the one the next store
-    /// removes. Overlapping stores are not guarded against: only a settings
-    /// save writes this file.
+    /// A store that fails once the temp file exists removes it before
+    /// returning. The temp name is fixed rather than per-writer for the case
+    /// that can't clean up after itself: a leftover from a killed run can hold
+    /// a key, and a fixed name is the one the next store removes. Overlapping
+    /// stores are not guarded against: only a settings save writes this file.
     ///
     /// # Errors
     /// Returns `ConfigError` when serialization or the write fails.
@@ -162,10 +164,16 @@ impl DescriberConfig {
             Err(source) => return Err(write_error(source)),
         }
         let mut file = create_private(&tmp).map_err(write_error)?;
-        file.write_all(text.as_bytes()).map_err(write_error)?;
-        file.sync_all().map_err(write_error)?;
+        let written = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all());
         drop(file);
-        std::fs::rename(&tmp, path).map_err(write_error)
+        let stored = written.and_then(|()| std::fs::rename(&tmp, path));
+        if stored.is_err() {
+            // Best effort: the error worth reporting is the store's own.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        stored.map_err(write_error)
     }
 
     /// The key to send: the environment override wins, but only for
@@ -199,6 +207,31 @@ impl DescriberConfig {
 fn line_of(text: &str, span: Option<std::ops::Range<usize>>) -> usize {
     span.and_then(|span| text.get(..span.start))
         .map_or(1, |before| before.matches('\n').count() + 1)
+}
+
+/// `message` without the value a type error quotes back: serde renders an
+/// unexpected scalar as its kind plus the value in backticks ("integer
+/// `5`"), ahead of ", expected …". Only that part is touched, and only in
+/// those messages — elsewhere backticks name fields and tokens. An unpaired
+/// backtick drops everything after it.
+fn without_echoed_values(message: &str) -> String {
+    if !(message.starts_with("invalid type:") || message.starts_with("invalid value:")) {
+        return message.to_string();
+    }
+    let (found, expected) = match message.find(", expected ") {
+        Some(at) => message.split_at(at),
+        None => (message, ""),
+    };
+    let mut kept = String::new();
+    for (index, piece) in found.split('`').enumerate() {
+        if index % 2 == 0 {
+            kept.push_str(piece);
+        } else {
+            kept.truncate(kept.trim_end().len());
+        }
+    }
+    kept.truncate(kept.trim_end().len());
+    kept + expected
 }
 
 /// Creates `path` anew, refusing an existing file: `mode` applies only on
@@ -343,15 +376,68 @@ mod tests {
         }
     }
 
-    /// What is left of the parser quoting the file: a number where a string
-    /// belongs is named in the message. A key is a string, and no string
-    /// value is ever quoted.
+    /// A well-formed value of the wrong type is named by kind only. The file's
+    /// key serves every backend, so an all-digit token pasted without quotes
+    /// is a key like any other.
     #[test]
-    fn a_wrong_typed_number_is_the_one_value_still_quoted() {
-        let err = load_error_of("backend = \"ollama\"\nbase_url = \"u\"\nmodel = 12345\n");
-        let display = err.to_string();
-        assert!(display.contains(": line 3: "), "{display}");
-        assert!(display.contains("12345"), "{display}");
+    fn a_wrong_typed_value_is_never_echoed() {
+        let keyless = "backend = \"ollama\"\nbase_url = \"u\"\n";
+        for (text, line, kind, echoes) in [
+            (
+                format!("{VALID_HEAD}api_key = 12345\n"),
+                5,
+                "integer",
+                vec!["12345"],
+            ),
+            (
+                format!("{VALID_HEAD}api_key = 1.5\n"),
+                5,
+                "floating point",
+                vec!["1.5"],
+            ),
+            (
+                format!("{VALID_HEAD}api_key = true\n"),
+                5,
+                "boolean",
+                vec!["true"],
+            ),
+            (
+                format!("{VALID_HEAD}api_key = 123456789012345678901234\n"),
+                5,
+                "integer",
+                vec!["1234567890", "901234"],
+            ),
+            (
+                format!("{VALID_HEAD}api_key = 0xfeed42\n"),
+                5,
+                "integer",
+                vec!["feed42", "16706882"],
+            ),
+            (
+                format!("{keyless}model = 12345\n"),
+                3,
+                "integer",
+                vec!["12345"],
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("describer.toml");
+            std::fs::write(&path, &text).expect("plant config");
+            let err = DescriberConfig::load(&path).expect_err("must not parse");
+            let display = err.to_string();
+            assert!(
+                display.contains(&format!("describer.toml: line {line}: ")),
+                "{display}"
+            );
+            assert!(display.contains(kind), "{display}");
+            for rendering in renderings_of(err) {
+                // The temp dir's own name holds digits.
+                let rendering = rendering.replace(&dir.path().display().to_string(), "<dir>");
+                for echo in &echoes {
+                    assert!(!rendering.contains(echo), "{text}: {rendering}");
+                }
+            }
+        }
 
         let err = load_error_of("backend = \"ollama\"\nbase_url = [\"sk-test\"]\nmodel = \"m\"\n");
         for rendering in renderings_of(err) {
@@ -406,6 +492,55 @@ mod tests {
             );
             assert_eq!(DescriberConfig::load(&path).expect("load"), Some(config));
         }
+    }
+
+    #[test]
+    fn without_echoed_values_drops_what_a_type_error_quotes_and_nothing_else() {
+        assert_eq!(
+            without_echoed_values("invalid type: integer `12345`, expected a string"),
+            "invalid type: integer, expected a string"
+        );
+        assert_eq!(
+            without_echoed_values("invalid value: integer `7`, expected one of `1`, `2`"),
+            "invalid value: integer, expected one of `1`, `2`"
+        );
+        assert_eq!(
+            without_echoed_values("invalid type: integer `12` as `i128`, expected a string"),
+            "invalid type: integer as, expected a string"
+        );
+        assert_eq!(
+            without_echoed_values("invalid type: integer `12345, expected a string"),
+            "invalid type: integer, expected a string",
+            "an unpaired backtick still takes the value with it"
+        );
+        assert_eq!(
+            without_echoed_values("invalid type: character ```"),
+            "invalid type: character"
+        );
+        for untouched in [
+            "invalid type: map, expected a string",
+            "missing field `backend`",
+            "invalid string, expected `\"`, `'`",
+            "unknown backend — expected one of ollama, lm-studio, open-router",
+        ] {
+            assert_eq!(without_echoed_values(untouched), untouched);
+        }
+    }
+
+    /// A store that fails after its temp file exists must not leave it — it
+    /// can hold a key. The target is a non-empty directory, which a file
+    /// cannot be renamed over.
+    #[test]
+    fn a_failed_store_leaves_no_tmp_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        std::fs::create_dir(&path).expect("mkdir");
+        std::fs::write(path.join("occupant"), "x").expect("occupy");
+
+        let err = keyed_config().store(&path).expect_err("rename must fail");
+
+        assert!(matches!(err, ConfigError::Write { .. }), "{err}");
+        assert!(!tmp_sibling(&path).exists());
     }
 
     fn tmp_sibling(path: &Path) -> std::path::PathBuf {

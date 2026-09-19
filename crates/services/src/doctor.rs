@@ -489,10 +489,10 @@ fn check_failed_items(catalog: Option<&Path>, notices: &Notices) -> DoctorCheck 
 /// broken `describer.toml`, and must not be answered with "rewrite that
 /// file" — the `state_dir` row already `Fail`s for that cause.
 ///
-/// The `Warn` detail renders the error with `{err}`, never `{err:#}`:
-/// walking the chain reaches `toml::de::Error`, which quotes the offending
-/// source line back — and that line can be `api_key = "sk-…"`. The
-/// outermost context names the file, which is all the reader needs.
+/// The `Warn` detail renders the error with `{err}`, not `{err:#}`: the
+/// outermost context names the file, which is all the row needs. The parse
+/// error behind it names a line and never quotes the file (see
+/// `majestical_describe::ConfigError::Parse`); `maj describer show` prints it.
 fn check_describer(
     catalog: Option<&Path>,
     presence: KeyPresence,
@@ -855,12 +855,11 @@ mod tests {
         assert_eq!(check.detail, "no catalog selected");
     }
 
-    /// The malformed line is the one holding the key, because that is the
-    /// line `toml::de::Error` quotes back: the detail must name the file
-    /// and stop there. A `{err:#}` detail would carry `SUPERSECRET` into
-    /// CLI/MCP/GUI output and repeat the parse message the
-    /// `ConfigError::Parse` Display already embeds — hence the
-    /// exactly-once count of the path, which two chain links would double.
+    /// The malformed line is the one holding the key: the detail names the
+    /// file and stops there. The chain behind it no longer quotes the line
+    /// either, but a `{err:#}` detail would name the path once per link —
+    /// the `load` context and `ConfigError::Parse` both carry it — hence
+    /// the exactly-once count.
     #[test]
     fn describer_warns_on_an_unreadable_config() {
         let dir = tempfile::tempdir().expect("tempdir");

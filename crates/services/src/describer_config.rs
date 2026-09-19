@@ -146,7 +146,11 @@ fn show_impl(
 /// What `set` does with the key field of `describer.toml`.
 #[derive(Clone, PartialEq, Eq)]
 pub enum FileKey {
-    /// Carry the existing file's key forward, if it has one.
+    /// Carry the existing file's key forward — but only when the backend is
+    /// unchanged. A stored key belongs to the backend that was configured
+    /// when it was written, so a `set` that switches backends drops it
+    /// rather than sending one service's credential to another; see
+    /// [`set`].
     Keep,
     Set(String),
     Clear,
@@ -175,8 +179,9 @@ pub struct SetArgs {
 
 /// Where a newly supplied key goes. An `OpenRouter` key goes to a supported
 /// Keychain and the file is written keyless; every other key goes to the
-/// file. No key supplied means nothing about the key changes. `keychain` is
-/// written before `file`; see [`plan_key_write`].
+/// file. No key supplied leaves the stored key alone, unless `set` is also
+/// switching backends — see [`FileKey::Keep`]. `keychain` is written before
+/// `file`; see [`plan_key_write`].
 pub struct KeyWrite {
     pub keychain: Option<String>,
     pub file: FileKey,
@@ -250,17 +255,26 @@ pub fn set(
 }
 
 fn set_impl(catalog_root: &Path, args: &SetArgs, notices: &crate::notices::Notices) -> Result<()> {
+    // Resolved once: `set` replaces the whole config, so an omitted
+    // `base_url` is a reset to the backend's default, not "leave it alone" —
+    // and [`carried_key`] has to compare what will actually be stored.
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| args.backend.default_base_url().to_string());
     let api_key = match &args.file_key {
-        FileKey::Keep => load_config(catalog_root, notices)?.and_then(|stored| stored.api_key),
+        FileKey::Keep => carried_key(
+            load_config(catalog_root, notices)?,
+            args.backend,
+            &base_url,
+            notices,
+        ),
         FileKey::Set(key) => Some(key.clone()),
         FileKey::Clear => None,
     };
     let config = DescriberConfig {
         backend: args.backend,
-        base_url: args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| args.backend.default_base_url().to_string()),
+        base_url,
         model: args.model.clone(),
         api_key,
     };
@@ -268,6 +282,51 @@ fn set_impl(catalog_root: &Path, args: &SetArgs, notices: &crate::notices::Notic
     config
         .store(&path)
         .with_context(|| format!("write {}", path.display()))
+}
+
+/// The file key [`FileKey::Keep`] carries into the newly stored config: the
+/// stored one when the backend is unchanged, and nothing when it changed.
+///
+/// A key in `describer.toml` is a credential for the backend that was
+/// configured when it was written, and `base_url` moves with the backend.
+/// Carrying it across a switch would send it to a different host — a
+/// pre-phase-7G config holds an `OpenRouter` key in `api_key`, so one
+/// `describer set --backend lm-studio` would hand a paid hosted key to
+/// whatever local process the new URL names, and the reverse would send a
+/// local proxy's token to openrouter.ai. Dropping it is not silent: the
+/// notice says which backend it belonged to, and never the key itself.
+/// A changed `base_url` under the SAME backend is a warning, not a drop.
+/// It can be a port move on the same machine, and because `set` replaces the
+/// whole config an omitted `--base-url` already resets a custom URL to the
+/// default — so dropping here would destroy the key on a bare `--model`
+/// change, the very case [`FileKey::Keep`] exists for. The key is carried
+/// and the notice names where it will now be sent.
+fn carried_key(
+    stored: Option<DescriberConfig>,
+    backend: BackendKind,
+    base_url: &str,
+    notices: &crate::notices::Notices,
+) -> Option<String> {
+    let stored = stored?;
+    let key = stored.api_key?;
+    if stored.backend != backend {
+        notices.push(format!(
+            "note: the stored API key belonged to {} and was not carried over to {} — \
+             set one with `--api-key` if {} needs it",
+            stored.backend.as_str(),
+            backend.as_str(),
+            backend.as_str()
+        ));
+        return None;
+    }
+    if stored.base_url != base_url {
+        notices.push(format!(
+            "note: the stored API key is now being sent to {base_url} (was {}) — \
+             remove it with `describer clear-key` if that is not intended",
+            stored.base_url
+        ));
+    }
+    Some(key)
 }
 
 /// What a head reports after `clear-key`. Built by the head (it owns the
@@ -668,6 +727,95 @@ mod tests {
         assert_eq!(stored.model, "llava");
         assert_eq!(stored.base_url, BackendKind::Ollama.default_base_url());
         assert_eq!(stored.api_key.as_deref(), Some("sk-test"));
+    }
+
+    /// A host change under the same backend keeps the key — it is usually a
+    /// port move, and an omitted `--base-url` resets to the default on its
+    /// own — but it must say where the key is now going.
+    #[test]
+    fn moving_the_same_backend_to_another_url_keeps_the_key_and_says_where_it_goes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = Notices::new();
+        let mut first = set_args(
+            BackendKind::LmStudio,
+            "first",
+            FileKey::Set("sk-test".to_string()),
+        );
+        first.base_url = Some("http://127.0.0.1:1234".to_string());
+        set(dir.path(), &first, &notices).expect("set with a key");
+        // Nothing this first `set` said is under test; start the move clean.
+        drop(notices.drain());
+
+        let mut moved = set_args(BackendKind::LmStudio, "second", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:1235".to_string());
+        set(dir.path(), &moved, &notices).expect("set at a new url");
+
+        let after = stored(dir.path());
+        assert_eq!(after.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(after.base_url, "http://127.0.0.1:1235");
+        let said: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains("now being sent to"))
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:1235"), "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:1234"), "{said:?}");
+        assert!(!said[0].contains("sk-test"), "{said:?}");
+
+        // Same backend, same url: nothing to say.
+        set(dir.path(), &moved, &notices).expect("set again");
+        assert_eq!(stored(dir.path()).api_key.as_deref(), Some("sk-test"));
+        assert!(
+            !notices.drain().iter().any(|n| n.contains("now being sent")),
+            "an unchanged url must not warn"
+        );
+    }
+
+    /// A key in the file belongs to the backend that was configured when it
+    /// was stored. Switching backends without supplying a new one must NOT
+    /// carry it over: a pre-7G `describer.toml` holds an `OpenRouter` key in
+    /// `api_key`, so carrying it would hand a paid hosted key to whatever
+    /// local process the new `base_url` points at — and the reverse sends a
+    /// local proxy's token to openrouter.ai.
+    #[test]
+    fn switching_backends_without_a_new_key_does_not_carry_the_old_one_over() {
+        for (stored_backend, next) in [
+            (BackendKind::OpenRouter, BackendKind::LmStudio),
+            (BackendKind::LmStudio, BackendKind::OpenRouter),
+            (BackendKind::Ollama, BackendKind::LmStudio),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let notices = Notices::new();
+            set(
+                dir.path(),
+                &set_args(stored_backend, "first", FileKey::Set("sk-test".to_string())),
+                &notices,
+            )
+            .expect("set with a key");
+
+            set(
+                dir.path(),
+                &set_args(next, "second", FileKey::Keep),
+                &notices,
+            )
+            .expect("set after switching backend");
+
+            let stored = stored(dir.path());
+            assert_eq!(stored.backend, next, "{stored_backend:?} -> {next:?}");
+            assert_eq!(stored.api_key, None, "{stored_backend:?} -> {next:?}");
+            let dropped: Vec<String> = notices
+                .drain()
+                .into_iter()
+                .filter(|notice| notice.contains("was not carried over"))
+                .collect();
+            assert_eq!(dropped.len(), 1, "{dropped:?}");
+            assert!(!dropped[0].contains("sk-test"), "{dropped:?}");
+            assert!(
+                dropped[0].contains(stored_backend.as_str()) && dropped[0].contains(next.as_str()),
+                "{dropped:?}"
+            );
+        }
     }
 
     #[test]

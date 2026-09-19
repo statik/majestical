@@ -1160,15 +1160,31 @@ struct SetDescriberArgs {
 
 /// What a confirmed `set_describer` would do with the key, as the tail of
 /// the dry run's `would` sentence. A supplied key goes where
-/// `describer_key::store` would put it. Without one, `set` touches no stored
-/// key — true whichever source a run would use — and with no describer
-/// configured yet there is no stored key to speak of.
-fn key_effect(api_key: Option<&str>, keychain_supported: bool, configured: bool) -> &'static str {
-    match (api_key, keychain_supported, configured) {
-        (Some(_), true, _) => ", storing the key in the macOS Keychain",
-        (Some(_), false, _) => ", storing the key in describer.toml",
-        (None, _, true) => ", leaving any stored key unchanged",
-        (None, _, false) => "",
+/// `describer_key::store` would put it. Without one, a stored key is left
+/// alone — EXCEPT when this `set` also switches backends, which drops it
+/// (`describer_config`'s `FileKey::Keep` rule); saying "unchanged" there
+/// would promise the opposite of what the confirmed call does. With no
+/// describer configured yet there is no stored key to speak of.
+fn key_effect(
+    api_key: Option<&str>,
+    keychain_supported: bool,
+    current: Option<&majestical_services::describer_config::DescriberConfigView>,
+    backend: majestical_describe::BackendKind,
+) -> &'static str {
+    // Only the FILE's key is dropped by a backend switch, and only if there
+    // is one: a Keychain key belongs to `OpenRouter`, not to the config.
+    let drops = current.is_some_and(|view| {
+        view.backend != backend.as_str()
+            && view.key_source == majestical_services::describer_config::KeySource::File
+    });
+    match (api_key, keychain_supported, current, drops) {
+        (Some(_), true, _, _) => ", storing the key in the macOS Keychain",
+        (Some(_), false, _, _) => ", storing the key in describer.toml",
+        (None, _, Some(_), true) => {
+            ", dropping describer.toml's key, which belongs to the old backend"
+        }
+        (None, _, Some(_), false) => ", leaving any stored key unchanged",
+        (None, _, None, _) => "",
     }
 }
 
@@ -1196,7 +1212,8 @@ fn set_describer_result(
                     key_effect(
                         args.api_key.as_deref(),
                         sources.store.supported(),
-                        current.is_some(),
+                        current.as_ref(),
+                        backend,
                     ),
                 ),
             }),
@@ -1907,8 +1924,46 @@ mod tests {
         assert_eq!(
             would(None, &keychain),
             "configure the describer backend to open-router model 'm', \
-             leaving any stored key unchanged"
+             leaving any stored key unchanged",
+            "an ollama config with no key of its own loses nothing"
         );
+
+        // With a key in describer.toml, the same switch DOES drop it — the
+        // dry run must not promise the opposite of the confirmed call.
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::Ollama, Some("sk-test"), true),
+            &no_env(&fileonly),
+        )
+        .expect("set a local key");
+        assert_eq!(file_key_source(dir.path()), Some(KeySource::File));
+        assert_eq!(
+            would(None, &fileonly),
+            "configure the describer backend to open-router model 'm', \
+             dropping describer.toml's key, which belongs to the old backend"
+        );
+        assert_eq!(
+            file_key_source(dir.path()),
+            Some(KeySource::File),
+            "dry run wrote"
+        );
+
+        // And the confirmed call does exactly what the dry run promised:
+        // a dry run that described the opposite is the bug this pins.
+        let confirmed = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, None, true),
+            &no_env(&fileonly),
+        )
+        .expect("confirmed set");
+        assert_eq!(
+            file_key_source(dir.path()),
+            Some(KeySource::Absent),
+            "{confirmed}"
+        );
+        let notices = confirmed["notices"].to_string();
+        assert!(notices.contains("was not carried over"), "{confirmed}");
+        assert!(!confirmed.to_string().contains("sk-test"), "{confirmed}");
     }
 
     fn clear_dry(root: &Path, sources: &KeySources<'_>) -> serde_json::Value {

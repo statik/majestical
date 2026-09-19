@@ -81,6 +81,14 @@ fn no_test_names_the_binary_without_a_throwaway_keychain_service() {
         sources.len() > 10,
         "looked in the wrong place: {tests_dir:?}"
     );
+    // The walk really recurses: `common/mod.rs` is the only file in a
+    // subdirectory today, so without this a shallow walk would look just as
+    // healthy right up until someone adds a `tests/<dir>/mod.rs` that spawns
+    // the binary.
+    assert!(
+        sources.iter().any(|(name, _)| name.contains('/')),
+        "the walk stopped at the top level of {tests_dir:?}"
+    );
     for (name, source) in sources {
         if name == SEAM {
             continue;

@@ -1165,6 +1165,13 @@ struct SetDescriberArgs {
 /// (`describer_config`'s `FileKey::Keep` rule); saying "unchanged" there
 /// would promise the opposite of what the confirmed call does. With no
 /// describer configured yet there is no stored key to speak of.
+///
+/// One deliberate imprecision: with `MAJ_OPENROUTER_KEY` set, `key_source`
+/// reads `Env` even though `describer.toml` may still hold a key a switch
+/// would drop, so this says "unchanged" where the confirmed call drops it.
+/// That errs toward under-promising a destructive act — the dangerous
+/// direction is the opposite — and the confirmed call still says so in its
+/// notices.
 fn key_effect(
     api_key: Option<&str>,
     keychain_supported: bool,

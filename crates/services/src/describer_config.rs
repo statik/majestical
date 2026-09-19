@@ -812,6 +812,31 @@ mod tests {
         // It must not claim a key exists: this function cannot know.
         assert!(said[0].contains("any stored API key"), "{said:?}");
 
+        // An omitted `--base-url` is a reset to the backend's default, so
+        // the notice must name the RESOLVED url, not the `None` it was
+        // given. Nothing else exercises that branch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut custom = set_args(BackendKind::OpenRouter, "m", FileKey::Clear);
+        custom.base_url = Some("http://127.0.0.1:18717".to_string());
+        set(dir.path(), &custom, &notices).expect("set at a custom url");
+        drop(notices.drain());
+        set(
+            dir.path(),
+            &set_args(BackendKind::OpenRouter, "m", FileKey::Keep),
+            &notices,
+        )
+        .expect("set with no --base-url");
+        let reset: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains("now being sent to"))
+            .collect();
+        assert_eq!(reset.len(), 1, "{reset:?}");
+        assert!(
+            reset[0].contains(BackendKind::OpenRouter.default_base_url()),
+            "{reset:?}"
+        );
+
         // A local backend with no file key has nothing to warn about: its
         // key could only ever have been the file's.
         let dir = tempfile::tempdir().expect("tempdir");

@@ -8,6 +8,8 @@ use security_framework::passwords::{
 #[cfg(target_os = "macos")]
 use security_framework_sys::base::errSecItemNotFound;
 
+/// Whether this build has a real secret store (macOS only). For UI that
+/// must decide before it holds a store.
 pub const SUPPORTED: bool = cfg!(target_os = "macos");
 
 /// The real store. Platform selection is `cfg(target_os)`, never a feature.
@@ -87,9 +89,11 @@ fn delete_item(service: &str) -> Result<bool, SecretError> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     // A throwaway service per test process so a crashed run cannot collide
-    // with the next, and the user's real item is never touched.
-    fn service() -> String {
-        format!("majestical-test-{}", std::process::id())
+    // with the next, and the user's real item is never touched. The two
+    // Keychain tests need distinct names (the tag) because they run as
+    // threads of one process.
+    fn service(tag: &str) -> String {
+        format!("majestical-test-{tag}-{}", std::process::id())
     }
 
     /// Deletes the throwaway item even when an assertion fails midway, so a
@@ -105,6 +109,7 @@ mod tests {
     #[test]
     fn the_system_store_is_switched_on() {
         use crate::KeyStore;
+        // A tuple: a bare assert! on a const trips clippy::assertions_on_constants.
         assert_eq!(
             (super::SUPPORTED, super::SystemKeyStore.supported()),
             (true, true)
@@ -112,13 +117,14 @@ mod tests {
     }
 
     // Talks to the real login Keychain, under the throwaway per-process
-    // service name above. It can take about a minute when `target/debug/deps`
-    // is very large, because the Security framework scans the calling
-    // binary's directory (measured 2026-09-18: 60 s from a deps dir with
-    // 1.8 M entries, 0.1 s from anywhere else).
+    // service name above. Slow when the test binary sits in a huge directory:
+    // 60 s from a `target/debug/deps` with 1.8 M entries against 0.1 s for the
+    // same binary copied to an empty dir (measured 2026-09-18; the cause looks
+    // like Security.framework scanning the caller's directory). To run it
+    // fast, copy the test executable to a `mktemp -d` dir and run the copy.
     #[test]
-    fn store_read_overwrite_delete_round_trip() {
-        let service = service();
+    fn the_keychain_round_trips_a_key_and_reports_whether_delete_found_one() {
+        let service = service("roundtrip");
         let _cleanup = Cleanup(service.clone());
         assert_eq!(super::read_item(&service).expect("read"), None);
         super::store_item(&service, "sk-test").expect("store");
@@ -137,7 +143,7 @@ mod tests {
 
     #[test]
     fn a_stored_value_that_is_not_utf8_is_a_fixed_error_without_its_bytes() {
-        let service = format!("majestical-test-nonutf8-{}", std::process::id());
+        let service = service("nonutf8");
         let _cleanup = Cleanup(service.clone());
         super::set_generic_password(&service, super::ACCOUNT, b"sk-\xff\xfetest").expect("store");
         let read = super::read_item(&service);
@@ -155,8 +161,11 @@ mod tests {
 
     #[test]
     fn the_stub_is_unsupported_everywhere() {
-        assert!(!super::SUPPORTED);
-        assert!(!SystemKeyStore.supported());
+        // A tuple: a bare assert! on a const trips clippy::assertions_on_constants.
+        assert_eq!(
+            (super::SUPPORTED, SystemKeyStore.supported()),
+            (false, false)
+        );
         assert!(matches!(
             SystemKeyStore.read(),
             Err(SecretError::Unsupported)

@@ -1,14 +1,18 @@
 //! The one place a secret store is touched. Head-side only: `services`
 //! and `describe` never depend on this crate — the heads resolve a key
-//! here and pass it in, exactly as they pass the environment's.
+//! here and pass it in, exactly as they pass the environment's. No library
+//! crate may depend on this one: the only permitted dependents are the
+//! three heads (CLI, MCP server, desktop app).
 mod system;
 pub use system::{SUPPORTED, SystemKeyStore};
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+/// Why a secret store call failed. Neither variant ever holds the secret.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
+    /// This build has no real store: every platform but macOS.
     #[error("this platform has no supported secret store")]
     Unsupported,
     /// The store's own message. Never contains the secret.
@@ -18,6 +22,8 @@ pub enum SecretError {
 
 /// One stored secret: the `OpenRouter` API key.
 pub trait KeyStore {
+    /// False means every other call returns `Unsupported`; callers hide the
+    /// save/remove UI.
     fn supported(&self) -> bool;
     /// # Errors
     /// `Unsupported` off macOS; `Store` when the Keychain refuses (locked,
@@ -34,8 +40,14 @@ pub trait KeyStore {
 
 /// The in-memory test double: the heads' tests exercise their read and
 /// write paths over this, never over a real Keychain.
+///
+/// Public and compiled into every build on purpose: the CLI and the desktop
+/// app are separate cargo workspaces and both test over it, and this repo
+/// never selects test code with a feature. It derives no `Debug`, so the
+/// held key cannot be printed.
 #[derive(Default)]
 pub struct MemoryKeyStore {
+    /// The stored key, if any. Tests seed it and inspect it directly.
     pub key: Mutex<Option<String>>,
     /// When set, every call returns `SecretError::Store(fail)`.
     pub fail: Option<String>,
@@ -84,14 +96,23 @@ impl MemoryKeyStore {
 /// Where the head found the key it will pass to services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadKeySource {
+    /// `MAJ_OPENROUTER_KEY` was set; the store was never consulted.
     Env,
+    /// The secret store held a key.
     Keychain,
-    None,
+    /// No key anywhere the head may look.
+    Absent,
 }
 
+/// What a head resolved: the key if any, where it came from, and a notice
+/// to push if the store failed.
+///
+/// Never derive `Serialize`: this type must not cross the Tauri IPC boundary.
 #[derive(Clone)]
 pub struct ResolvedKey {
+    /// The key itself. `Debug` renders it redacted.
     pub key: Option<String>,
+    /// Where `key` came from; `Absent` exactly when `key` is `None`.
     pub source: HeadKeySource,
     /// Set when the store was consulted and failed; the head pushes it as
     /// a notice. Never contains a key.
@@ -122,13 +143,13 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
             notice: None,
         };
     }
-    let none = |notice| ResolvedKey {
+    let absent = |notice| ResolvedKey {
         key: None,
-        source: HeadKeySource::None,
+        source: HeadKeySource::Absent,
         notice,
     };
     if !wants_keychain || !store.supported() {
-        return none(None);
+        return absent(None);
     }
     match store.read() {
         Ok(Some(key)) => ResolvedKey {
@@ -136,8 +157,10 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
             source: HeadKeySource::Keychain,
             notice: None,
         },
-        Ok(None) | Err(SecretError::Unsupported) => none(None),
-        Err(SecretError::Store(message)) => none(Some(format!(
+        Ok(None) | Err(SecretError::Unsupported) => absent(None),
+        // Names the macOS Keychain because it is the only real store;
+        // revisit with a second backend.
+        Err(SecretError::Store(message)) => absent(Some(format!(
             "note: the macOS Keychain could not be read ({message}) — \
              set MAJ_OPENROUTER_KEY to supply the key without it"
         ))),
@@ -205,7 +228,7 @@ mod tests {
     #[test]
     fn the_store_is_not_read_for_a_local_backend() {
         let resolved = resolve(None, false, &PanickingStore);
-        assert_eq!(resolved.source, HeadKeySource::None);
+        assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.notice, None);
     }
@@ -221,7 +244,7 @@ mod tests {
     #[test]
     fn an_empty_store_resolves_as_none() {
         let resolved = resolve(None, true, &MemoryKeyStore::default());
-        assert_eq!(resolved.source, HeadKeySource::None);
+        assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.notice, None);
     }
@@ -229,7 +252,7 @@ mod tests {
     #[test]
     fn a_store_failure_is_a_notice_not_an_error_and_names_the_env_var() {
         let resolved = resolve(None, true, &failing("denied"));
-        assert_eq!(resolved.source, HeadKeySource::None);
+        assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         let notice = resolved.notice.expect("a notice");
         assert!(notice.contains("MAJ_OPENROUTER_KEY"), "{notice}");
@@ -243,7 +266,7 @@ mod tests {
             ..holding("sk-test")
         };
         let resolved = resolve(None, true, &store);
-        assert_eq!(resolved.source, HeadKeySource::None);
+        assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.notice, None);
     }

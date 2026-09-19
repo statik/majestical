@@ -30,7 +30,8 @@ impl<'de> serde::Deserialize<'de> for BackendKind {
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 3] = [Self::Ollama, Self::LmStudio, Self::OpenRouter];
+    /// Every backend, once: what `Deserialize` searches and the tests walk.
+    const ALL: [Self; 3] = [Self::Ollama, Self::LmStudio, Self::OpenRouter];
 
     #[must_use]
     pub fn default_base_url(self) -> &'static str {
@@ -390,6 +391,11 @@ mod tests {
             display.contains("expected one of ollama, lm-studio, open-router"),
             "{display}"
         );
+        // The fixed text is hand-written, so a backend added to `ALL` and
+        // forgotten here would go unnamed without this.
+        for backend in BackendKind::ALL {
+            assert!(display.contains(backend.as_str()), "{display}");
+        }
         for rendering in renderings_of(err) {
             assert!(!rendering.contains("sk-test"), "{rendering}");
         }
@@ -452,6 +458,9 @@ mod tests {
         let planted = [
             (toml::Value::String("sk-test".into()), "sk-test"),
             (toml::Value::Integer(8_675_309), "8675309"),
+            // Negative, so a `u32` field refuses it as an `invalid value:`
+            // rather than an `invalid type:` — the other prefix.
+            (toml::Value::Integer(-8_675_309), "8675309"),
             (toml::Value::Float(86753.09), "86753"),
         ];
         for field in table.keys() {

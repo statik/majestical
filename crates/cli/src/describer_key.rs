@@ -157,27 +157,8 @@ pub(crate) fn clear(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majestical_secrets::{MemoryKeyStore, SecretError};
+    use majestical_secrets::{MemoryKeyStore, PanickingKeyStore};
     use majestical_services::describer_config::{KeySource, SetArgs};
-    use std::sync::Mutex;
-
-    fn holding(key: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            key: Mutex::new(Some(key.to_string())),
-            ..MemoryKeyStore::default()
-        }
-    }
-
-    fn failing(message: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            fail: Some(message.to_string()),
-            ..MemoryKeyStore::default()
-        }
-    }
-
-    fn held(store: &MemoryKeyStore) -> Option<String> {
-        store.key.lock().expect("lock").clone()
-    }
 
     fn no_env(store: &dyn KeyStore) -> KeySources<'_> {
         KeySources { env: None, store }
@@ -204,31 +185,6 @@ mod tests {
             .key_source
     }
 
-    /// Proves a "never touched" claim: in production a read is a macOS prompt.
-    struct PanickingStore;
-
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "the panic is the assertion: any call is the test's failure"
-    )]
-    impl KeyStore for PanickingStore {
-        fn supported(&self) -> bool {
-            true
-        }
-
-        fn read(&self) -> Result<Option<String>, SecretError> {
-            panic!("the store must not be touched");
-        }
-
-        fn store(&self, _key: &str) -> Result<(), SecretError> {
-            panic!("the store must not be touched");
-        }
-
-        fn delete(&self) -> Result<bool, SecretError> {
-            panic!("the store must not be touched");
-        }
-    }
-
     #[test]
     fn store_puts_the_key_in_a_supported_store_and_clears_the_file_key() {
         let keychain = MemoryKeyStore::default();
@@ -239,7 +195,7 @@ mod tests {
         )
         .expect("store");
         assert_eq!(file_key, FileKey::Clear);
-        assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
+        assert_eq!(keychain.held().as_deref(), Some("sk-test"));
     }
 
     #[test]
@@ -255,21 +211,21 @@ mod tests {
         )
         .expect("store");
         assert_eq!(file_key, FileKey::Set("sk-test".to_string()));
-        assert_eq!(held(&keychain), None);
+        assert_eq!(keychain.held(), None);
     }
 
     #[test]
     fn store_without_a_key_changes_nothing() {
         assert_eq!(
-            store(BackendKind::OpenRouter, None, &PanickingStore).expect("store"),
+            store(BackendKind::OpenRouter, None, &PanickingKeyStore).expect("store"),
             FileKey::Keep
         );
-        let keychain = holding("sk-test");
+        let keychain = MemoryKeyStore::holding("sk-test");
         assert_eq!(
             store(BackendKind::OpenRouter, None, &keychain).expect("store"),
             FileKey::Keep
         );
-        assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
+        assert_eq!(keychain.held().as_deref(), Some("sk-test"));
     }
 
     /// A local backend only ever uses the file's key, and the one Keychain
@@ -279,7 +235,7 @@ mod tests {
     fn a_local_backends_key_goes_to_the_file_and_never_touches_the_store() {
         for backend in [BackendKind::Ollama, BackendKind::LmStudio] {
             let file_key =
-                store(backend, Some("sk-test".to_string()), &PanickingStore).expect("store");
+                store(backend, Some("sk-test".to_string()), &PanickingKeyStore).expect("store");
             assert_eq!(file_key, FileKey::Set("sk-test".to_string()), "{backend:?}");
         }
     }
@@ -301,7 +257,7 @@ mod tests {
             resolve_for_index(
                 dir.path(),
                 &kinds(&every_other_kind),
-                &no_env(&PanickingStore),
+                &no_env(&PanickingKeyStore),
                 &notices
             ),
             None
@@ -310,7 +266,7 @@ mod tests {
             resolve_for_index(
                 dir.path(),
                 &kinds(&["thumbs", CAPTIONS_KIND]),
-                &no_env(&holding("sk-test")),
+                &no_env(&MemoryKeyStore::holding("sk-test")),
                 &notices
             )
             .as_deref(),
@@ -327,10 +283,10 @@ mod tests {
         let path = describer_config::config_path(dir.path(), &Notices::new()).expect("path");
         std::fs::write(&path, "backend = oops\n").expect("break describer.toml");
 
-        let keychain = holding("sk-test");
+        let keychain = MemoryKeyStore::holding("sk-test");
         let err = clear(dir.path(), &no_env(&keychain), &Notices::new()).expect_err("broken");
         assert!(format!("{err:#}").contains("describer.toml"), "{err:#}");
-        assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
+        assert_eq!(keychain.held().as_deref(), Some("sk-test"));
     }
 
     #[test]
@@ -338,7 +294,7 @@ mod tests {
         let err = store(
             BackendKind::OpenRouter,
             Some("sk-test".to_string()),
-            &failing("denied"),
+            &MemoryKeyStore::failing("denied"),
         )
         .expect_err("refused");
         let rendered = format!("{err} {err:#} {err:?}");
@@ -352,12 +308,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         configure(dir.path(), BackendKind::Ollama, FileKey::Keep);
         let notices = Notices::new();
-        let resolved = resolve(dir.path(), &no_env(&PanickingStore), &notices);
+        let resolved = resolve(dir.path(), &no_env(&PanickingKeyStore), &notices);
         assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(notices.drain(), Vec::<String>::new());
 
         configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
-        let resolved = resolve(dir.path(), &no_env(&holding("sk-test")), &notices);
+        let resolved = resolve(
+            dir.path(),
+            &no_env(&MemoryKeyStore::holding("sk-test")),
+            &notices,
+        );
         assert_eq!(resolved.source, HeadKeySource::Keychain);
         assert_eq!(resolved.key.as_deref(), Some("sk-test"));
         assert_eq!(presence(&resolved), KeyPresence::Keychain);
@@ -367,7 +327,7 @@ mod tests {
     #[test]
     fn resolve_without_a_config_never_touches_the_store() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let resolved = resolve(dir.path(), &no_env(&PanickingStore), &Notices::new());
+        let resolved = resolve(dir.path(), &no_env(&PanickingKeyStore), &Notices::new());
         assert_eq!(resolved.source, HeadKeySource::Absent);
     }
 
@@ -377,7 +337,7 @@ mod tests {
         configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
         let sources = KeySources {
             env: Some("sk-test".to_string()),
-            store: &PanickingStore,
+            store: &PanickingKeyStore,
         };
         let resolved = resolve(dir.path(), &sources, &Notices::new());
         assert_eq!(resolved.source, HeadKeySource::Env);
@@ -390,7 +350,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
         let notices = Notices::new();
-        let resolved = resolve(dir.path(), &no_env(&failing("denied")), &notices);
+        let resolved = resolve(
+            dir.path(),
+            &no_env(&MemoryKeyStore::failing("denied")),
+            &notices,
+        );
         assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(presence(&resolved), KeyPresence::Absent);
         let notices = notices.drain();
@@ -403,12 +367,12 @@ mod tests {
     fn doctor_without_a_catalog_asks_the_environment_alone() {
         let notices = Notices::new();
         assert_eq!(
-            doctor_key_presence(None, &no_env(&PanickingStore), &notices),
+            doctor_key_presence(None, &no_env(&PanickingKeyStore), &notices),
             KeyPresence::Absent
         );
         let sources = KeySources {
             env: Some("sk-test".to_string()),
-            store: &PanickingStore,
+            store: &PanickingKeyStore,
         };
         assert_eq!(
             doctor_key_presence(None, &sources, &notices),
@@ -423,7 +387,7 @@ mod tests {
         assert_eq!(
             doctor_key_presence(
                 Some(dir.path()),
-                &no_env(&holding("sk-test")),
+                &no_env(&MemoryKeyStore::holding("sk-test")),
                 &Notices::new()
             ),
             KeyPresence::Keychain
@@ -438,7 +402,7 @@ mod tests {
             BackendKind::OpenRouter,
             FileKey::Set("sk-test".to_string()),
         );
-        let keychain = holding("sk-test-2");
+        let keychain = MemoryKeyStore::holding("sk-test-2");
         let sources = KeySources {
             env: Some("sk-test".to_string()),
             store: &keychain,
@@ -447,7 +411,7 @@ mod tests {
         assert!(outcome.keychain_cleared);
         assert!(outcome.file_cleared);
         assert!(outcome.env_still_supplies);
-        assert_eq!(held(&keychain), None);
+        assert_eq!(keychain.held(), None);
         assert_eq!(key_source(dir.path()), KeySource::Absent);
     }
 
@@ -487,8 +451,12 @@ mod tests {
             BackendKind::OpenRouter,
             FileKey::Set("sk-test".to_string()),
         );
-        let err =
-            clear(dir.path(), &no_env(&failing("denied")), &Notices::new()).expect_err("refused");
+        let err = clear(
+            dir.path(),
+            &no_env(&MemoryKeyStore::failing("denied")),
+            &Notices::new(),
+        )
+        .expect_err("refused");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("Keychain"), "{rendered}");
         assert!(rendered.contains("denied"), "{rendered}");

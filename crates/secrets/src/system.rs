@@ -13,8 +13,8 @@ use security_framework_sys::base::errSecItemNotFound;
 pub const SUPPORTED: bool = cfg!(target_os = "macos");
 
 /// The environment variable a HEAD reads to override the Keychain service
-/// name — for tests, which must never touch the user's real item, and for
-/// keeping separate profiles. This crate itself never reads the environment:
+/// name. It exists for the tests, which must never touch the user's real
+/// item. This crate itself never reads the environment:
 /// the head reads the variable and hands the value to [`SystemKeyStore::new`].
 pub const SERVICE_ENV: &str = "MAJ_KEYCHAIN_SERVICE";
 

@@ -1106,6 +1106,11 @@ fn index_run_dry(
 /// reusing the caller's already-open `FsApp` across the thread boundary
 /// would fail to compile for exactly that reason (correctly — nothing about
 /// `FsApp` promises safe concurrent access from two threads at once).
+///
+/// The closure captures the whole `&MajServer` (bundled to stay inside the
+/// five-parameter limit) rather than the three scalars it reads. If
+/// `MajServer` ever gains a non-`Sync` field the break lands here, as a
+/// `Send` error several frames from its cause.
 fn index_run_exec(
     server: &MajServer,
     kinds: &BTreeSet<String>,
@@ -1791,17 +1796,6 @@ mod tests {
     use majestical_secrets::MemoryKeyStore;
     use majestical_services::describer_config::{DescriberBackend, KeyPresence};
 
-    fn holding(key: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            key: std::sync::Mutex::new(Some(key.to_string())),
-            ..MemoryKeyStore::default()
-        }
-    }
-
-    fn held(store: &MemoryKeyStore) -> Option<String> {
-        store.key.lock().expect("lock").clone()
-    }
-
     fn no_env(store: &MemoryKeyStore) -> KeySources<'_> {
         KeySources { env: None, store }
     }
@@ -1839,7 +1833,7 @@ mod tests {
         .expect("set");
         assert_eq!(echo["key_source"], json!("keychain"), "{echo}");
         assert!(!echo.to_string().contains("sk-test"), "{echo}");
-        assert_eq!(held(&store).as_deref(), Some("sk-test"));
+        assert_eq!(store.held().as_deref(), Some("sk-test"));
         assert_eq!(file_key_source(dir.path()), Some(KeySource::Absent));
     }
 
@@ -1858,7 +1852,7 @@ mod tests {
         .expect("set");
         assert_eq!(echo["key_source"], json!("file"), "{echo}");
         assert!(!echo.to_string().contains("sk-test"), "{echo}");
-        assert_eq!(held(&store), None);
+        assert_eq!(store.held(), None);
     }
 
     /// The echo names the key's source for the backend `set` just stored,
@@ -1866,7 +1860,7 @@ mod tests {
     #[test]
     fn switching_to_openrouter_echoes_the_key_already_in_the_keychain() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = holding("sk-test");
+        let store = MemoryKeyStore::holding("sk-test");
         let local = set_describer_result(
             dir.path(),
             &set_args(DescriberBackend::Ollama, None, true),
@@ -1945,7 +1939,7 @@ mod tests {
             "configure the describer backend to ollama model 'm', \
              storing the key in describer.toml"
         );
-        assert_eq!(held(&keychain), None);
+        assert_eq!(keychain.held(), None);
         assert_eq!(file_key_source(dir.path()), None);
 
         set_describer_result(
@@ -2017,7 +2011,7 @@ mod tests {
         )
         .expect("set a file key");
 
-        let store = holding("sk-test-2");
+        let store = MemoryKeyStore::holding("sk-test-2");
         let dry = clear_dry(dir.path(), &no_env(&store));
         assert_eq!(
             dry["would"],
@@ -2025,7 +2019,7 @@ mod tests {
         );
         assert_eq!(dry["current"]["key_source"], json!("keychain"), "{dry}");
         assert!(!dry.to_string().contains("sk-test"), "{dry}");
-        assert_eq!(held(&store).as_deref(), Some("sk-test-2"));
+        assert_eq!(store.held().as_deref(), Some("sk-test-2"));
         assert_eq!(file_key_source(dir.path()), Some(KeySource::File));
 
         let empty = MemoryKeyStore::default();
@@ -2050,7 +2044,7 @@ mod tests {
     #[test]
     fn the_clear_dry_run_says_so_when_there_is_nothing_or_it_did_not_look() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = holding("sk-test");
+        let store = MemoryKeyStore::holding("sk-test");
         // No describer yet: the Keychain is not read, so its item is unseen.
         assert_eq!(
             clear_dry(dir.path(), &no_env(&store))["would"],
@@ -2101,7 +2095,7 @@ mod tests {
             clear_dry(dir.path(), &no_env(&fileonly))["would"],
             json!("no stored key to remove")
         );
-        assert_eq!(held(&store).as_deref(), Some("sk-test"));
+        assert_eq!(store.held().as_deref(), Some("sk-test"));
     }
 
     #[test]
@@ -2119,7 +2113,7 @@ mod tests {
             cleared,
             json!({"keychain_cleared": true, "file_cleared": false, "env_still_supplies": false})
         );
-        assert_eq!(held(&store), None);
+        assert_eq!(store.held(), None);
         let again = clear_describer_key_result(dir.path(), true, &no_env(&store)).expect("clear");
         assert_eq!(again["keychain_cleared"], json!(false), "{again}");
     }
@@ -2127,7 +2121,7 @@ mod tests {
     #[test]
     fn test_describers_dry_run_names_the_keychain_as_the_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = holding("sk-test");
+        let store = MemoryKeyStore::holding("sk-test");
         set_describer_result(
             dir.path(),
             &set_args(DescriberBackend::OpenRouter, None, true),
@@ -2159,7 +2153,7 @@ mod tests {
             then.status(200).json_body(json!({"data": {}}));
         });
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = holding("sk-test");
+        let store = MemoryKeyStore::holding("sk-test");
         set_describer_result(
             dir.path(),
             &SetDescriberArgs {

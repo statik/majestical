@@ -6,6 +6,10 @@
 //! which sets a throwaway service (pinned by `common`'s own
 //! `every_child_gets_its_own_throwaway_keychain_service`); this test fails
 //! when a file goes around it.
+//!
+//! One limit worth knowing: an allow-listed file satisfies the check with a
+//! SINGLE `.env(SERVICE_ENV, ..)` anywhere in it, so a second spawn site
+//! added to the same file rides along unchecked.
 
 /// How a test names the binary. `cargo_bin` is the bare token, so it covers
 /// `Command::cargo_bin(..)` and the `cargo_bin!`/`cargo_bin_cmd!` macros
@@ -27,8 +31,9 @@ const SEAM: &str = "common/mod.rs";
 
 /// Drops `//` line and `/* */` block comments, so a mention of the token or
 /// of `SERVICE_ENV` in prose neither trips the guard nor satisfies it. Not a
-/// Rust lexer: a token inside a string literal still counts, which errs
-/// toward failing rather than passing.
+/// Rust lexer, and the two ways that shows differ: a token inside a string
+/// literal still counts, which errs toward failing; a `//` inside a string
+/// (a URL, say) truncates the rest of that line, which errs toward passing.
 #[cfg(test)]
 fn without_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());

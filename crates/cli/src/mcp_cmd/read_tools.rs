@@ -458,18 +458,11 @@ mod tests {
         .expect("set");
     }
 
-    fn holding(key: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            key: std::sync::Mutex::new(Some(key.to_string())),
-            ..MemoryKeyStore::default()
-        }
-    }
-
     #[test]
     fn get_describer_names_the_keychain_and_never_the_key() {
         let dir = tempfile::tempdir().expect("tempdir");
         configure(dir.path(), BackendKind::OpenRouter);
-        let store = holding("sk-test");
+        let store = MemoryKeyStore::holding("sk-test");
         let sources = KeySources {
             env: None,
             store: &store,

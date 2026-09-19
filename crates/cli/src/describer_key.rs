@@ -2,9 +2,11 @@
 //! `MAJ_OPENROUTER_KEY`, then the Keychain, through `majestical_secrets`.
 //! Services is handed the result and never looks for itself.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Context as _;
+use majestical_describe::BackendKind;
 use majestical_secrets::{HeadKeySource, KeyStore, ResolvedKey, SystemKeyStore};
 use majestical_services::describer_config::{self, ClearKeyOutcome, FileKey, KeyPresence};
 use majestical_services::notices::Notices;
@@ -79,14 +81,20 @@ pub(crate) fn presence(resolved: &ResolvedKey) -> KeyPresence {
     }
 }
 
-/// Executes `describer_config::plan_key_write`: the Keychain write comes
-/// FIRST and its failure stops everything, so the file and the Keychain
-/// never disagree. Returns what `set` should do with the file's key.
+/// Executes `describer_config::plan_key_write` for the `backend` being set:
+/// the Keychain write comes FIRST and its failure stops everything, so the
+/// file and the Keychain never disagree. Only an `OpenRouter` key goes to the
+/// Keychain; a local backend's is the file's, and the store is not touched.
+/// Returns what `set` should do with the file's key.
 ///
 /// # Errors
 /// The Keychain refused the write. The message never contains the key.
-pub(crate) fn store(key: Option<String>, store: &dyn KeyStore) -> anyhow::Result<FileKey> {
-    let write = describer_config::plan_key_write(store.supported(), key);
+pub(crate) fn store(
+    backend: BackendKind,
+    key: Option<String>,
+    store: &dyn KeyStore,
+) -> anyhow::Result<FileKey> {
+    let write = describer_config::plan_key_write(backend, store.supported(), key);
     if let Some(key) = &write.keychain {
         store
             .store(key)
@@ -95,17 +103,41 @@ pub(crate) fn store(key: Option<String>, store: &dyn KeyStore) -> anyhow::Result
     Ok(write.file)
 }
 
+/// The kind of `index run` work that calls the describer, as
+/// `majestical_services::index::VALID_KINDS` names it.
+const CAPTION_KIND: &str = "captions";
+
+/// The key an `index run` over `kinds` passes to services. Resolved only
+/// when the kinds include caption work — nothing else uses a key, and a
+/// Keychain read can be a macOS prompt.
+pub(crate) fn resolve_for_index(
+    catalog_root: &Path,
+    kinds: &BTreeSet<String>,
+    sources: &KeySources<'_>,
+    notices: &Notices,
+) -> Option<String> {
+    if !kinds.contains(CAPTION_KIND) {
+        return None;
+    }
+    resolve(catalog_root, sources, notices).key
+}
+
 /// Removes the stored key from both places it can live: the Keychain first,
 /// so a refusal leaves `describer.toml` as it was.
 ///
+/// An unreadable `describer.toml` stops the whole thing before the store is
+/// touched: clearing the Keychain and then failing on the file would delete
+/// the one copy of a key while reporting an error that never says so.
+///
 /// # Errors
-/// The Keychain refused the delete, or `describer.toml` could not be
-/// rewritten.
+/// `describer.toml` could not be read, the Keychain refused the delete, or
+/// `describer.toml` could not be rewritten.
 pub(crate) fn clear(
     catalog_root: &Path,
     sources: &KeySources<'_>,
     notices: &Notices,
 ) -> anyhow::Result<ClearKeyOutcome> {
+    describer_config::load_config(catalog_root, notices)?;
     let keychain_cleared = if sources.store.supported() {
         sources
             .store
@@ -125,7 +157,6 @@ pub(crate) fn clear(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majestical_describe::BackendKind;
     use majestical_secrets::{MemoryKeyStore, SecretError};
     use majestical_services::describer_config::{KeySource, SetArgs};
     use std::sync::Mutex;
@@ -201,7 +232,12 @@ mod tests {
     #[test]
     fn store_puts_the_key_in_a_supported_store_and_clears_the_file_key() {
         let keychain = MemoryKeyStore::default();
-        let file_key = store(Some("sk-test".to_string()), &keychain).expect("store");
+        let file_key = store(
+            BackendKind::OpenRouter,
+            Some("sk-test".to_string()),
+            &keychain,
+        )
+        .expect("store");
         assert_eq!(file_key, FileKey::Clear);
         assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
     }
@@ -212,22 +248,100 @@ mod tests {
             unsupported: true,
             ..MemoryKeyStore::default()
         };
-        let file_key = store(Some("sk-test".to_string()), &keychain).expect("store");
+        let file_key = store(
+            BackendKind::OpenRouter,
+            Some("sk-test".to_string()),
+            &keychain,
+        )
+        .expect("store");
         assert_eq!(file_key, FileKey::Set("sk-test".to_string()));
         assert_eq!(held(&keychain), None);
     }
 
     #[test]
     fn store_without_a_key_changes_nothing() {
-        assert_eq!(store(None, &PanickingStore).expect("store"), FileKey::Keep);
+        assert_eq!(
+            store(BackendKind::OpenRouter, None, &PanickingStore).expect("store"),
+            FileKey::Keep
+        );
         let keychain = holding("sk-test");
-        assert_eq!(store(None, &keychain).expect("store"), FileKey::Keep);
+        assert_eq!(
+            store(BackendKind::OpenRouter, None, &keychain).expect("store"),
+            FileKey::Keep
+        );
+        assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
+    }
+
+    /// A local backend only ever uses the file's key, and the one Keychain
+    /// item is `OpenRouter`'s: a local token must neither vanish into it nor
+    /// overwrite it.
+    #[test]
+    fn a_local_backends_key_goes_to_the_file_and_never_touches_the_store() {
+        for backend in [BackendKind::Ollama, BackendKind::LmStudio] {
+            let file_key =
+                store(backend, Some("sk-test".to_string()), &PanickingStore).expect("store");
+            assert_eq!(file_key, FileKey::Set("sk-test".to_string()), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn index_run_resolves_a_key_only_for_caption_work() {
+        assert!(majestical_services::index::VALID_KINDS.contains(&CAPTION_KIND));
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
+        let kinds = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        };
+        let notices = Notices::new();
+        let every_other_kind: Vec<&str> = majestical_services::index::VALID_KINDS
+            .iter()
+            .copied()
+            .filter(|kind| *kind != CAPTION_KIND)
+            .collect();
+        assert_eq!(
+            resolve_for_index(
+                dir.path(),
+                &kinds(&every_other_kind),
+                &no_env(&PanickingStore),
+                &notices
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_for_index(
+                dir.path(),
+                &kinds(&["thumbs", CAPTION_KIND]),
+                &no_env(&holding("sk-test")),
+                &notices
+            )
+            .as_deref(),
+            Some("sk-test")
+        );
+    }
+
+    /// The Keychain item must outlive a `clear` that cannot finish: with an
+    /// unreadable `describer.toml` nothing is deleted anywhere.
+    #[test]
+    fn clear_over_a_broken_config_fails_before_touching_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
+        let path = describer_config::config_path(dir.path(), &Notices::new()).expect("path");
+        std::fs::write(&path, "backend = oops\n").expect("break describer.toml");
+
+        let keychain = holding("sk-test");
+        let err = clear(dir.path(), &no_env(&keychain), &Notices::new()).expect_err("broken");
+        assert!(format!("{err:#}").contains("describer.toml"), "{err:#}");
         assert_eq!(held(&keychain).as_deref(), Some("sk-test"));
     }
 
     #[test]
     fn a_refused_keychain_write_is_an_error_without_the_key_in_it() {
-        let err = store(Some("sk-test".to_string()), &failing("denied")).expect_err("refused");
+        let err = store(
+            BackendKind::OpenRouter,
+            Some("sk-test".to_string()),
+            &failing("denied"),
+        )
+        .expect_err("refused");
         let rendered = format!("{err} {err:#} {err:?}");
         assert!(!rendered.contains("sk-test"), "{rendered}");
         assert!(rendered.contains("Keychain"), "{rendered}");

@@ -173,10 +173,10 @@ pub struct SetArgs {
     pub file_key: FileKey,
 }
 
-/// Where a newly supplied key goes. With a supported Keychain the key goes
-/// there and the file is written keyless; otherwise the file holds it. No
-/// key supplied means nothing about the key changes. `keychain` is written
-/// before `file`; see [`plan_key_write`].
+/// Where a newly supplied key goes. An `OpenRouter` key goes to a supported
+/// Keychain and the file is written keyless; every other key goes to the
+/// file. No key supplied means nothing about the key changes. `keychain` is
+/// written before `file`; see [`plan_key_write`].
 pub struct KeyWrite {
     pub keychain: Option<String>,
     pub file: FileKey,
@@ -195,12 +195,27 @@ impl std::fmt::Debug for KeyWrite {
 /// The one rule for a key a user hands to any head; the head executes the
 /// Keychain half and passes [`KeyWrite::file`] to [`set`].
 ///
+/// `backend` is the backend BEING SET. The Keychain is the destination only
+/// for `OpenRouter`: the head's key applies to `OpenRouter` alone
+/// (`effective_api_key`'s rule), so a local backend's token is only ever
+/// read from the file — and the one machine-wide Keychain item must not be
+/// overwritten by it, or a later switch to `OpenRouter` would send a local
+/// proxy's token to openrouter.ai.
+///
 /// The head MUST write `keychain` first and stop on failure: `file` is
 /// `Clear` in that case, so writing the file first and then failing the
 /// Keychain write would leave no key anywhere.
 #[must_use]
-pub fn plan_key_write(keychain_supported: bool, key: Option<String>) -> KeyWrite {
-    match (key, keychain_supported) {
+pub fn plan_key_write(
+    backend: BackendKind,
+    keychain_supported: bool,
+    key: Option<String>,
+) -> KeyWrite {
+    let to_keychain = match backend {
+        BackendKind::OpenRouter => keychain_supported,
+        BackendKind::Ollama | BackendKind::LmStudio => false,
+    };
+    match (key, to_keychain) {
         (None, _) => KeyWrite {
             keychain: None,
             file: FileKey::Keep,
@@ -580,21 +595,35 @@ mod tests {
     }
 
     #[test]
-    fn a_new_key_goes_to_the_keychain_when_there_is_one_and_to_the_file_otherwise() {
-        let nothing = plan_key_write(true, None);
-        assert!(nothing.keychain.is_none());
-        assert_eq!(nothing.file, FileKey::Keep);
-        let nothing = plan_key_write(false, None);
-        assert!(nothing.keychain.is_none());
-        assert_eq!(nothing.file, FileKey::Keep);
+    fn only_an_openrouter_key_goes_to_a_supported_keychain() {
+        for backend in [
+            BackendKind::Ollama,
+            BackendKind::LmStudio,
+            BackendKind::OpenRouter,
+        ] {
+            for supported in [true, false] {
+                let nothing = plan_key_write(backend, supported, None);
+                assert!(nothing.keychain.is_none(), "{backend:?} {supported}");
+                assert_eq!(nothing.file, FileKey::Keep, "{backend:?} {supported}");
 
-        let keychain = plan_key_write(true, Some("sk-test".to_string()));
-        assert_eq!(keychain.keychain.as_deref(), Some("sk-test"));
-        assert_eq!(keychain.file, FileKey::Clear);
-
-        let file = plan_key_write(false, Some("sk-test".to_string()));
-        assert!(file.keychain.is_none());
-        assert_eq!(file.file, FileKey::Set("sk-test".to_string()));
+                let write = plan_key_write(backend, supported, Some("sk-test".to_string()));
+                let to_keychain = match backend {
+                    BackendKind::OpenRouter => supported,
+                    BackendKind::Ollama | BackendKind::LmStudio => false,
+                };
+                if to_keychain {
+                    assert_eq!(write.keychain.as_deref(), Some("sk-test"));
+                    assert_eq!(write.file, FileKey::Clear);
+                } else {
+                    assert!(write.keychain.is_none(), "{backend:?} {supported}");
+                    assert_eq!(
+                        write.file,
+                        FileKey::Set("sk-test".to_string()),
+                        "{backend:?} {supported}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -607,10 +636,16 @@ mod tests {
 
     #[test]
     fn a_key_write_never_debug_prints_the_key() {
-        let to_keychain = format!("{:?}", plan_key_write(true, Some("sk-test".to_string())));
+        let to_keychain = format!(
+            "{:?}",
+            plan_key_write(BackendKind::OpenRouter, true, Some("sk-test".to_string()))
+        );
         assert!(!to_keychain.contains("sk-test"), "{to_keychain}");
         assert!(to_keychain.contains("<redacted>"), "{to_keychain}");
-        let to_file = format!("{:?}", plan_key_write(false, Some("sk-test".to_string())));
+        let to_file = format!(
+            "{:?}",
+            plan_key_write(BackendKind::OpenRouter, false, Some("sk-test".to_string()))
+        );
         assert!(!to_file.contains("sk-test"), "{to_file}");
         assert!(to_file.contains("<redacted>"), "{to_file}");
     }

@@ -181,6 +181,9 @@ mod tests {
         let service = service("trait");
         let _cleanup = Cleanup(service.clone());
         let store = super::SystemKeyStore::new(Some(service.clone()));
+        // Before any Keychain call: were `new` to ignore the name, every
+        // line below would address the developer's real item instead.
+        assert_eq!(store.service, service);
         assert_eq!(store.read().expect("read"), None);
         store.store("sk-test").expect("store");
         assert_eq!(store.read().expect("read").as_deref(), Some("sk-test"));

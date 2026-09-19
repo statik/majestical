@@ -217,21 +217,25 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
         );
     }
     let store = crate::describer_key::system_store();
+    // Resolved ONCE, above the loop, and only when the kinds include caption
+    // work: reading the Keychain is a macOS access check that a denied
+    // prompt does not remember, so a per-pass read could prompt — or repeat
+    // its failure notice — every five seconds under `--watch`. The cost is
+    // that a key saved mid-watch needs a restart, which is what the desktop
+    // head's cached key already settles for.
+    let api_key = crate::describer_key::resolve_for_index(
+        catalog_dir,
+        &kinds,
+        &crate::describer_key::KeySources::ambient(&store),
+        app.notices(),
+    );
     let mut first_pass = true;
     loop {
-        // Rebuilt every pass (not hoisted above the loop): the describer API
-        // key is resolved fresh each time, as `describer.toml` itself is, so a
-        // key saved while `--watch` runs is picked up by the next pass.
-        let resolved = crate::describer_key::resolve(
-            catalog_dir,
-            &crate::describer_key::KeySources::ambient(&store),
-            app.notices(),
-        );
         let req = IndexRunReq {
             kinds: kinds.clone(),
             limit: args.limit,
             threads: args.threads,
-            api_key: resolved.key,
+            api_key: api_key.clone(),
             retry_failed: retry_on_pass(first_pass, args.retry_failed),
         };
         run_once(app, catalog_dir, &req, args.json)?;

@@ -24,9 +24,12 @@ pub(crate) struct SetRequest {
 /// Key first, then the config, then the echo: the Keychain write must
 /// precede the file's (see `describer_key::store`), and the echo names the
 /// key's source for the backend `set` just stored.
-pub(crate) fn cmd_set(catalog_root: &Path, request: SetRequest) -> anyhow::Result<()> {
-    let store = describer_key::system_store();
-    let file_key = describer_key::store(request.api_key, &store)?;
+pub(crate) fn cmd_set(
+    catalog_root: &Path,
+    request: SetRequest,
+    sources: &KeySources<'_>,
+) -> anyhow::Result<()> {
+    let file_key = describer_key::store(request.backend, request.api_key, sources.store)?;
     let notices = Notices::new();
     let stored = describer_config::set(
         catalog_root,
@@ -40,13 +43,12 @@ pub(crate) fn cmd_set(catalog_root: &Path, request: SetRequest) -> anyhow::Resul
     );
     crate::drain_notices(&notices);
     stored?;
-    cmd_show(catalog_root)
+    cmd_show(catalog_root, sources)
 }
 
-pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_show(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let store = describer_key::system_store();
-    let resolved = describer_key::resolve(catalog_root, &KeySources::ambient(&store), &notices);
+    let resolved = describer_key::resolve(catalog_root, sources, &notices);
     let shown = describer_config::show(catalog_root, describer_key::presence(&resolved), &notices);
     crate::drain_notices(&notices);
     match shown? {
@@ -58,10 +60,9 @@ pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_clear_key(catalog_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_clear_key(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let store = describer_key::system_store();
-    let cleared = describer_key::clear(catalog_root, &KeySources::ambient(&store), &notices);
+    let cleared = describer_key::clear(catalog_root, sources, &notices);
     crate::drain_notices(&notices);
     for line in clear_key_lines(&cleared?) {
         println!("{line}");
@@ -85,10 +86,9 @@ fn clear_key_lines(outcome: &ClearKeyOutcome) -> Vec<&'static str> {
     lines
 }
 
-pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_test(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let store = describer_key::system_store();
-    let resolved = describer_key::resolve(catalog_root, &KeySources::ambient(&store), &notices);
+    let resolved = describer_key::resolve(catalog_root, sources, &notices);
     let probe = describer_config::test(catalog_root, resolved.key, &notices);
     crate::drain_notices(&notices);
     let probe = probe?;
@@ -172,6 +172,34 @@ mod tests {
         assert_eq!(key_source_label(KeySource::Keychain), "(from keychain)");
         assert_eq!(key_source_label(KeySource::File), "(from file)");
         assert_eq!(key_source_label(KeySource::Absent), "(none)");
+    }
+
+    /// The write order, at this head: a Keychain that refuses the key stops
+    /// `set` before `describer.toml` exists, so no keyless config is left
+    /// behind claiming a key that was never stored.
+    #[test]
+    fn a_refused_keychain_write_fails_cli_set_before_the_config_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = majestical_secrets::MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..majestical_secrets::MemoryKeyStore::default()
+        };
+        let sources = KeySources {
+            env: None,
+            store: &store,
+        };
+        let request = SetRequest {
+            backend: majestical_describe::BackendKind::OpenRouter,
+            model: "m".to_string(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+        };
+        let err = cmd_set(dir.path(), request, &sources).expect_err("refused");
+        let rendered = format!("{err} {err:#} {err:?}");
+        assert!(rendered.contains("Keychain"), "{rendered}");
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+        let path = describer_config::config_path(dir.path(), &Notices::new()).expect("path");
+        assert!(!path.exists(), "{}", path.display());
     }
 
     #[test]

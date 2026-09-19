@@ -606,6 +606,8 @@ fn dispatch_index(app: &FsApp, catalog: &Path, cmd: IndexCmd) -> Result<()> {
 /// stay under the crate's max-function-length lint, matching
 /// [`dispatch_index`].
 fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
+    let store = describer_key::system_store();
+    let sources = describer_key::KeySources::ambient(&store);
     match cmd {
         DescriberCmd::Set {
             backend,
@@ -620,10 +622,11 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
                 base_url,
                 api_key,
             },
+            &sources,
         ),
-        DescriberCmd::Show => describer_cmd::cmd_show(catalog),
-        DescriberCmd::Test => describer_cmd::cmd_test(catalog),
-        DescriberCmd::ClearKey => describer_cmd::cmd_clear_key(catalog),
+        DescriberCmd::Show => describer_cmd::cmd_show(catalog, &sources),
+        DescriberCmd::Test => describer_cmd::cmd_test(catalog, &sources),
+        DescriberCmd::ClearKey => describer_cmd::cmd_clear_key(catalog, &sources),
     }
 }
 

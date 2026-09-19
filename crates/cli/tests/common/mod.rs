@@ -250,10 +250,15 @@ mod tests {
         assert!(!super::keychain_item_exists(&first));
     }
 
+    /// Never name the real service here. If the guard's own assertion ever
+    /// regressed, the value would be constructed and its `Drop` would run
+    /// `security delete-generic-password` against whatever this names — so
+    /// naming the real service would delete the developer's key in exactly
+    /// the failure this test exists to catch.
     #[test]
     #[should_panic(expected = "not a throwaway Keychain service")]
-    fn the_cleanup_refuses_the_real_service_name() {
-        let _cleanup = KeychainCleanup::new("majestical");
+    fn the_cleanup_refuses_a_name_that_is_not_a_throwaway() {
+        let _cleanup = KeychainCleanup::new("not-a-throwaway");
     }
 
     #[test]

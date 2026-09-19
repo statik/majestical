@@ -1114,13 +1114,15 @@ fn index_run_exec(
 ) -> anyhow::Result<serde_json::Value> {
     let catalog = server.catalog.as_path();
     let notices = Notices::new();
-    let resolved = describer_key::resolve(catalog, sources, &notices);
+    // The same kind-gated resolution the CLI head uses: only caption work
+    // needs a key, and reading the Keychain can be a macOS access check.
+    let api_key = describer_key::resolve_for_index(catalog, kinds, sources, &notices);
     let key_notices = notices.drain();
     let req = majestical_services::index::IndexRunReq {
         kinds: kinds.clone(),
         limit: args.limit,
         threads: args.threads,
-        api_key: resolved.key,
+        api_key,
         retry_failed: args.retry_failed,
     };
     let mut outcome = majestical_services::runtime::run_off_tokio_runtime(|| {
@@ -1201,7 +1203,7 @@ fn set_describer_result(
             notices.drain(),
         ));
     }
-    let file_key = describer_key::store(args.api_key.clone(), sources.store)?;
+    let file_key = describer_key::store(backend, args.api_key.clone(), sources.store)?;
     majestical_services::describer_config::set(
         catalog,
         &majestical_services::describer_config::SetArgs {
@@ -2035,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_describer_passes_the_keychain_key_to_the_probe() {
+    fn test_describers_dry_run_names_the_keychain_as_the_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = holding("sk-test");
         set_describer_result(
@@ -2047,6 +2049,49 @@ mod tests {
         let dry = test_describer_result(dir.path(), false, &no_env(&store)).expect("dry run");
         assert_eq!(dry["configured"]["key_source"], json!("keychain"), "{dry}");
         assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    }
+
+    /// The dry run above only reads the config. This one pins the thing the
+    /// Keychain exists for: the CONFIRMED probe sends the stored key as its
+    /// bearer token. Both mocks refuse any other `Authorization`, so a probe
+    /// that resolved no key — or the wrong one — cannot reach them.
+    #[test]
+    fn a_confirmed_test_describer_sends_the_keychain_key_as_its_bearer() {
+        let server = httpmock::MockServer::start();
+        let models = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/models")
+                .header("authorization", "Bearer sk-test");
+            then.status(200).json_body(json!({"data": [{"id": "m"}]}));
+        });
+        let key_check = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/key")
+                .header("authorization", "Bearer sk-test");
+            then.status(200).json_body(json!({"data": {}}));
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = holding("sk-test");
+        set_describer_result(
+            dir.path(),
+            &SetDescriberArgs {
+                backend: DescriberBackend::OpenRouter,
+                model: "m".to_string(),
+                base_url: Some(server.base_url()),
+                api_key: None,
+                confirm: true,
+            },
+            &no_env(&store),
+        )
+        .expect("set");
+
+        let probed = test_describer_result(dir.path(), true, &no_env(&store)).expect("probe");
+
+        assert_eq!(probed["key"], json!("accepted"), "{probed}");
+        assert_eq!(probed["model_listed"], json!(true), "{probed}");
+        models.assert_calls(1);
+        key_check.assert_calls(1);
+        assert!(!probed.to_string().contains("sk-test"), "{probed}");
     }
 
     #[test]

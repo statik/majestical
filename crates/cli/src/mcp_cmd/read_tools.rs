@@ -427,7 +427,7 @@ fn doctor_result(
 ) -> Result<majestical_services::doctor::DoctorOutcome, majestical_services::error::ServiceError> {
     let catalog = catalog.map(std::path::PathBuf::from);
     let notices = Notices::new();
-    let describer_key = describer_key::presence_for(catalog.as_deref(), sources, &notices);
+    let describer_key = describer_key::doctor_key_presence(catalog.as_deref(), sources, &notices);
     let req = majestical_services::doctor::DoctorRequest {
         catalog,
         describer_key,

@@ -786,7 +786,7 @@ fn print_ingest_outcome_text(
 pub(crate) fn cmd_doctor(catalog: Option<PathBuf>, json: bool) -> Result<()> {
     let notices = majestical_services::notices::Notices::new();
     let store = crate::describer_key::system_store();
-    let describer_key = crate::describer_key::presence_for(
+    let describer_key = crate::describer_key::doctor_key_presence(
         catalog.as_deref(),
         &crate::describer_key::KeySources::ambient(&store),
         &notices,

@@ -238,7 +238,9 @@ pub fn plan_key_write(
 
 /// `maj describer set`: stores this machine's describer backend config,
 /// defaulting `base_url` to the backend's own default when not given. The
-/// file's key follows [`SetArgs::file_key`]. Returns no view: a view names
+/// file's key follows [`SetArgs::file_key`] — note a [`FileKey::Keep`] that
+/// switches backends DROPS the file's key with a notice, and a host move
+/// under the same backend carries it with a warning. Returns no view: a view names
 /// the key's source, which depends on what the head found, so the head
 /// calls [`show`] for its echo.
 ///

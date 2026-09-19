@@ -1163,13 +1163,16 @@ struct SetDescriberArgs {
 /// [`majestical_services::describer_config::plan_key_write`]'s own answer,
 /// not a second guess at it: the confirmed call routes the key through that
 /// function, and a dry run that named the other destination would be
-/// describing something that will not happen. Without one, a stored key is left
-/// alone — EXCEPT when this `set` also switches backends, which drops it
+/// describing something that will not happen. Without a supplied key, a
+/// stored key is left alone — EXCEPT when this `set` also switches backends, which drops it
 /// (`describer_config`'s `FileKey::Keep` rule); saying "unchanged" there
 /// would promise the opposite of what the confirmed call does. With no
 /// describer configured yet there is no stored key to speak of.
 ///
-/// One deliberate imprecision: with `MAJ_OPENROUTER_KEY` set, `key_source`
+/// Two deliberate imprecisions. First, a `base_url` move under the same
+/// backend is not mentioned here, though the confirmed call emits
+/// `carried_key`'s host-move notice for it. Second, with
+/// `MAJ_OPENROUTER_KEY` set, `key_source`
 /// reads `Env` even though `describer.toml` may still hold a key a switch
 /// would drop, so this says "unchanged" where the confirmed call drops it.
 /// That errs toward under-promising a destructive act — the dangerous
@@ -1271,12 +1274,12 @@ struct ClearDescriberKeyArgs {
     confirm: bool,
 }
 
-/// The dry run's `would` sentence. `consulted` is whether the Keychain was
+/// The dry run's `would` sentence. `nothing_unseen` is whether the Keychain was
 /// read to build `source`: it is not for a local backend, while
 /// `MAJ_OPENROUTER_KEY` is set, or when the read failed — and then an item
 /// this view cannot see may still be there for a confirmed call to remove.
-fn clear_key_would(source: KeySource, consulted: bool) -> &'static str {
-    match (source, consulted) {
+fn clear_key_would(source: KeySource, nothing_unseen: bool) -> &'static str {
+    match (source, nothing_unseen) {
         (KeySource::Env, _) => {
             "remove the stored key, if any — MAJ_OPENROUTER_KEY would still supply a key"
         }
@@ -1311,9 +1314,9 @@ fn clear_describer_key_result(
         .as_ref()
         .map_or(KeySource::Absent, |view| view.key_source);
     // An unsupported store holds nothing, so there is nothing unseen in it.
-    let consulted = (wants && resolved.notice.is_none()) || !sources.store.supported();
+    let nothing_unseen = (wants && resolved.notice.is_none()) || !sources.store.supported();
     Ok(super::with_notices(
-        json!({"current": current, "would": clear_key_would(source, consulted)}),
+        json!({"current": current, "would": clear_key_would(source, nothing_unseen)}),
         notices.drain(),
     ))
 }

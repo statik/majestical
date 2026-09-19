@@ -135,10 +135,32 @@ mod tests {
     /// failed run leaves nothing in the login Keychain.
     struct Cleanup(String);
 
+    impl Cleanup {
+        /// Panics on any name but a throwaway one. This is the type nearest
+        /// the destructive call — `Drop` deletes whatever it names — so it
+        /// refuses the developer's real item here rather than trusting
+        /// every caller to pass the right thing.
+        fn new(service: &str) -> Self {
+            assert!(
+                service.starts_with("majestical-test-"),
+                "not a throwaway Keychain service: {service}"
+            );
+            Self(service.to_string())
+        }
+    }
+
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = super::delete_item(&self.0);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "not a throwaway Keychain service")]
+    fn the_cleanup_refuses_a_name_that_is_not_a_throwaway() {
+        // Never the real service name: a regressed guard would construct the
+        // value and its `Drop` would delete whatever this names.
+        let _cleanup = Cleanup::new("not-a-throwaway");
     }
 
     #[test]
@@ -179,7 +201,7 @@ mod tests {
     fn a_named_store_round_trips_through_the_trait() {
         use crate::KeyStore;
         let service = service("trait");
-        let _cleanup = Cleanup(service.clone());
+        let _cleanup = Cleanup::new(&service);
         let store = super::SystemKeyStore::new(Some(service.clone()));
         // Before any Keychain call: were `new` to ignore the name, every
         // line below would address the developer's real item instead.
@@ -205,7 +227,7 @@ mod tests {
     #[test]
     fn the_keychain_round_trips_a_key_and_reports_whether_delete_found_one() {
         let service = service("roundtrip");
-        let _cleanup = Cleanup(service.clone());
+        let _cleanup = Cleanup::new(&service);
         assert_eq!(super::read_item(&service).expect("read"), None);
         super::store_item(&service, "sk-test").expect("store");
         assert_eq!(
@@ -224,7 +246,7 @@ mod tests {
     #[test]
     fn a_stored_value_that_is_not_utf8_is_a_fixed_error_without_its_bytes() {
         let service = service("nonutf8");
-        let _cleanup = Cleanup(service.clone());
+        let _cleanup = Cleanup::new(&service);
         super::set_generic_password(&service, super::ACCOUNT, b"sk-\xff\xfetest").expect("store");
         let read = super::read_item(&service);
         assert!(super::delete_item(&service).expect("delete"));

@@ -9,6 +9,10 @@ use anyhow::Context as _;
 use majestical_describe::BackendKind;
 use majestical_secrets::{HeadKeySource, KeyStore, ResolvedKey, SystemKeyStore};
 use majestical_services::describer_config::{self, ClearKeyOutcome, FileKey, KeyPresence};
+// The kind of `index run` work that calls the describer, taken from services
+// rather than spelled again here: a renamed kind is then a compile error,
+// not a key that quietly stops being resolved.
+use majestical_services::index::CAPTIONS_KIND;
 use majestical_services::notices::Notices;
 
 /// Where this head looks for a key outside `describer.toml`. A struct so a
@@ -61,7 +65,7 @@ pub(crate) fn resolve(
 /// What doctor's describer row is told. With no catalog there is no backend
 /// to ask about, so the environment alone answers and the store is never
 /// touched.
-pub(crate) fn presence_for(
+pub(crate) fn doctor_key_presence(
     catalog: Option<&Path>,
     sources: &KeySources<'_>,
     notices: &Notices,
@@ -103,10 +107,6 @@ pub(crate) fn store(
     Ok(write.file)
 }
 
-/// The kind of `index run` work that calls the describer, as
-/// `majestical_services::index::VALID_KINDS` names it.
-const CAPTION_KIND: &str = "captions";
-
 /// The key an `index run` over `kinds` passes to services. Resolved only
 /// when the kinds include caption work — nothing else uses a key, and a
 /// Keychain read can be a macOS prompt.
@@ -116,7 +116,7 @@ pub(crate) fn resolve_for_index(
     sources: &KeySources<'_>,
     notices: &Notices,
 ) -> Option<String> {
-    if !kinds.contains(CAPTION_KIND) {
+    if !kinds.contains(CAPTIONS_KIND) {
         return None;
     }
     resolve(catalog_root, sources, notices).key
@@ -286,7 +286,6 @@ mod tests {
 
     #[test]
     fn index_run_resolves_a_key_only_for_caption_work() {
-        assert!(majestical_services::index::VALID_KINDS.contains(&CAPTION_KIND));
         let dir = tempfile::tempdir().expect("tempdir");
         configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
         let kinds = |names: &[&str]| -> BTreeSet<String> {
@@ -296,7 +295,7 @@ mod tests {
         let every_other_kind: Vec<&str> = majestical_services::index::VALID_KINDS
             .iter()
             .copied()
-            .filter(|kind| *kind != CAPTION_KIND)
+            .filter(|kind| *kind != CAPTIONS_KIND)
             .collect();
         assert_eq!(
             resolve_for_index(
@@ -310,7 +309,7 @@ mod tests {
         assert_eq!(
             resolve_for_index(
                 dir.path(),
-                &kinds(&["thumbs", CAPTION_KIND]),
+                &kinds(&["thumbs", CAPTIONS_KIND]),
                 &no_env(&holding("sk-test")),
                 &notices
             )
@@ -404,14 +403,17 @@ mod tests {
     fn doctor_without_a_catalog_asks_the_environment_alone() {
         let notices = Notices::new();
         assert_eq!(
-            presence_for(None, &no_env(&PanickingStore), &notices),
+            doctor_key_presence(None, &no_env(&PanickingStore), &notices),
             KeyPresence::Absent
         );
         let sources = KeySources {
             env: Some("sk-test".to_string()),
             store: &PanickingStore,
         };
-        assert_eq!(presence_for(None, &sources, &notices), KeyPresence::Env);
+        assert_eq!(
+            doctor_key_presence(None, &sources, &notices),
+            KeyPresence::Env
+        );
     }
 
     #[test]
@@ -419,7 +421,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         configure(dir.path(), BackendKind::OpenRouter, FileKey::Keep);
         assert_eq!(
-            presence_for(
+            doctor_key_presence(
                 Some(dir.path()),
                 &no_env(&holding("sk-test")),
                 &Notices::new()

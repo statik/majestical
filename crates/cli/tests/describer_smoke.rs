@@ -3,13 +3,10 @@ use common::maj;
 use predicates::prelude::*;
 use predicates::str::contains;
 
-/// A fresh catalog under `tmp`, returned as `(root, state)`. `#[cfg(test)]`
-/// for the clippy in-test detection `common/mod.rs` explains.
-#[cfg(test)]
+/// A fresh catalog under `tmp`, returned as `(root, state)`.
 fn init_catalog(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let root = tmp.join("cat");
     let state = tmp.join("state");
-    std::fs::create_dir_all(&root).expect("mkdir");
     maj(&root, &state)
         .args(["catalog", "init"])
         .assert()
@@ -25,10 +22,13 @@ fn set_openrouter(root: &std::path::Path, state: &std::path::Path, model: &str, 
     if let Some(key) = key {
         cmd.args(["--api-key", key]);
     }
-    cmd.assert()
+    let echo = cmd
+        .assert()
         .success()
-        .stdout(contains("open-router").and(contains(model)))
-        .stdout(contains("sk-test").not());
+        .stdout(contains("open-router").and(contains(model)));
+    if let Some(key) = key {
+        echo.stdout(contains(key).not());
+    }
 }
 
 #[test]

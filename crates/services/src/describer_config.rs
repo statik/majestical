@@ -1,7 +1,8 @@
-//! The configured describer backend (`describer.toml`), read by
-//! `maj describer show|test`, `index run`/`index status`, and `search`'s
-//! caption coverage remedy — plus `maj describer set`/`test` themselves.
-//! Moved from `crates/cli/src/describer_cmd.rs`.
+//! The configured describer backend (`describer.toml`): loading it, and the
+//! `show`/`set`/`test` verbs over it — plus the pure key-placement decisions
+//! (where a caption run's key comes from, where a new key goes, what `set`
+//! does with the file's key) that the heads execute. Nothing here reads the
+//! environment or the Keychain; a head reports what it found.
 use crate::error::ServiceError;
 use anyhow::{Context as _, Result, bail};
 use majestical_describe::{BackendKind, DescriberConfig, HttpDescriber, KeyVerdict};
@@ -54,15 +55,19 @@ pub fn load_config(
     DescriberConfig::load(&path).with_context(|| format!("load {}", path.display()))
 }
 
-/// What the head found outside the config file. Services never looks.
+/// Which head-side source supplied a key. Services never looks; the head
+/// reports what its own resolution (`MAJ_OPENROUTER_KEY`, then the
+/// Keychain) found. The ordering between the two lives in the head.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KeyPresence {
-    pub env: bool,
-    pub keychain: bool,
+pub enum KeyPresence {
+    Env,
+    Keychain,
+    #[default]
+    Absent,
 }
 
 /// Where the key a caption run would use comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeySource {
     Env,
@@ -74,20 +79,20 @@ pub enum KeySource {
     Absent,
 }
 
-/// The same order the run resolves in: the head's key (env, then
-/// Keychain) applies to `OpenRouter` only — `effective_api_key`'s rule —
-/// and the file's key is last.
+/// The same order the run resolves in: the head's key applies to
+/// `OpenRouter` only — `effective_api_key`'s rule — and the file's key is
+/// last.
 #[must_use]
 pub fn key_source(config: &DescriberConfig, presence: KeyPresence) -> KeySource {
     let head = match config.backend {
-        BackendKind::OpenRouter if presence.env => Some(KeySource::Env),
-        BackendKind::OpenRouter if presence.keychain => Some(KeySource::Keychain),
-        BackendKind::OpenRouter | BackendKind::Ollama | BackendKind::LmStudio => None,
+        BackendKind::OpenRouter => presence,
+        BackendKind::Ollama | BackendKind::LmStudio => KeyPresence::Absent,
     };
     match (head, &config.api_key) {
-        (Some(source), _) => source,
-        (None, Some(_)) => KeySource::File,
-        (None, None) => KeySource::Absent,
+        (KeyPresence::Env, _) => KeySource::Env,
+        (KeyPresence::Keychain, _) => KeySource::Keychain,
+        (KeyPresence::Absent, Some(_)) => KeySource::File,
+        (KeyPresence::Absent, None) => KeySource::Absent,
     }
 }
 
@@ -170,7 +175,8 @@ pub struct SetArgs {
 
 /// Where a newly supplied key goes. With a supported Keychain the key goes
 /// there and the file is written keyless; otherwise the file holds it. No
-/// key supplied means nothing about the key changes.
+/// key supplied means nothing about the key changes. `keychain` is written
+/// before `file`; see [`plan_key_write`].
 pub struct KeyWrite {
     pub keychain: Option<String>,
     pub file: FileKey,
@@ -188,6 +194,10 @@ impl std::fmt::Debug for KeyWrite {
 
 /// The one rule for a key a user hands to any head; the head executes the
 /// Keychain half and passes [`KeyWrite::file`] to [`set`].
+///
+/// The head MUST write `keychain` first and stop on failure: `file` is
+/// `Clear` in that case, so writing the file first and then failing the
+/// Keychain write would leave no key anywhere.
 #[must_use]
 pub fn plan_key_write(keychain_supported: bool, key: Option<String>) -> KeyWrite {
     match (key, keychain_supported) {
@@ -258,8 +268,9 @@ pub struct ClearKeyOutcome {
 }
 
 /// True when the stored config's backend is `OpenRouter` — the head's cue to
-/// consult the Keychain. Unconfigured or unreadable is `false`: there is
-/// nothing a key would be used for.
+/// consult the Keychain. Unconfigured is `false`: there is nothing a key
+/// would be used for. Unreadable is `false` too: the verb that follows
+/// reports the error, and nothing can run meanwhile.
 #[must_use]
 pub fn wants_keychain(catalog_root: &Path, notices: &crate::notices::Notices) -> bool {
     match load_config(catalog_root, notices) {
@@ -439,7 +450,7 @@ mod tests {
     fn show_of_an_unconfigured_catalog_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
-            show(dir.path(), NEITHER, &Notices::new())
+            show(dir.path(), KeyPresence::Absent, &Notices::new())
                 .expect("show")
                 .is_none()
         );
@@ -469,32 +480,15 @@ mod tests {
             .expect("a config must be stored")
     }
 
-    const ENV: KeyPresence = KeyPresence {
-        env: true,
-        keychain: false,
-    };
-    const KEYCHAIN: KeyPresence = KeyPresence {
-        env: false,
-        keychain: true,
-    };
-    const BOTH: KeyPresence = KeyPresence {
-        env: true,
-        keychain: true,
-    };
-    const NEITHER: KeyPresence = KeyPresence {
-        env: false,
-        keychain: false,
-    };
-
     #[test]
-    fn the_key_source_of_openrouter_is_env_then_keychain_then_file() {
+    fn the_key_source_of_openrouter_is_the_heads_key_then_the_file() {
         for (presence, file_key, source) in [
-            (ENV, None, KeySource::Env),
-            (KEYCHAIN, None, KeySource::Keychain),
-            (NEITHER, Some("sk-test"), KeySource::File),
-            (NEITHER, None, KeySource::Absent),
-            (BOTH, Some("sk-test"), KeySource::Env),
-            (KEYCHAIN, Some("sk-test"), KeySource::Keychain),
+            (KeyPresence::Env, None, KeySource::Env),
+            (KeyPresence::Keychain, None, KeySource::Keychain),
+            (KeyPresence::Absent, Some("sk-test"), KeySource::File),
+            (KeyPresence::Absent, None, KeySource::Absent),
+            (KeyPresence::Env, Some("sk-test"), KeySource::Env),
+            (KeyPresence::Keychain, Some("sk-test"), KeySource::Keychain),
         ] {
             assert_eq!(
                 key_source(&config(BackendKind::OpenRouter, file_key), presence),
@@ -510,21 +504,59 @@ mod tests {
     #[test]
     fn the_key_source_of_a_local_backend_is_only_ever_the_file() {
         assert_eq!(
-            key_source(&config(BackendKind::Ollama, None), ENV),
+            key_source(&config(BackendKind::Ollama, None), KeyPresence::Env),
             KeySource::Absent
         );
         assert_eq!(
-            key_source(&config(BackendKind::Ollama, Some("sk-test")), BOTH),
+            key_source(
+                &config(BackendKind::Ollama, Some("sk-test")),
+                KeyPresence::Env
+            ),
             KeySource::File
         );
         assert_eq!(
-            key_source(&config(BackendKind::LmStudio, None), KEYCHAIN),
+            key_source(&config(BackendKind::LmStudio, None), KeyPresence::Keychain),
             KeySource::Absent
         );
     }
 
+    /// [`key_source`] restates `effective_api_key`'s precedence rather than
+    /// calling it (it never holds the head's key), so this pins the two
+    /// together: a source is named exactly when a run would have a key, and
+    /// it is the file exactly when the run's key is the file's.
     #[test]
-    fn the_key_source_serializes_in_snake_case() {
+    fn the_key_source_agrees_with_the_key_a_run_would_use() {
+        for backend in [
+            BackendKind::Ollama,
+            BackendKind::LmStudio,
+            BackendKind::OpenRouter,
+        ] {
+            for presence in [KeyPresence::Env, KeyPresence::Keychain, KeyPresence::Absent] {
+                for file_key in [Some("sk-test"), None] {
+                    let config = config(backend, file_key);
+                    let head_key = match presence {
+                        KeyPresence::Env | KeyPresence::Keychain => Some("sk-test-2".to_string()),
+                        KeyPresence::Absent => None,
+                    };
+                    let effective = config.effective_api_key(head_key);
+                    let source = key_source(&config, presence);
+                    let case = format!(
+                        "{backend:?}, {presence:?}, file key: {}",
+                        file_key.is_some()
+                    );
+                    assert_eq!(source == KeySource::Absent, effective.is_none(), "{case}");
+                    assert_eq!(
+                        source == KeySource::File,
+                        effective.is_some() && effective.as_deref() == file_key,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_key_source_wire_strings_are_pinned() {
         for (source, wire) in [
             (KeySource::Env, "env"),
             (KeySource::Keychain, "keychain"),
@@ -540,7 +572,10 @@ mod tests {
 
     #[test]
     fn the_view_carries_a_source_and_never_a_key() {
-        let view = to_view(&config(BackendKind::OpenRouter, Some("sk-test")), NEITHER);
+        let view = to_view(
+            &config(BackendKind::OpenRouter, Some("sk-test")),
+            KeyPresence::Absent,
+        );
         let wire = serde_json::to_string(&view).expect("ser");
         assert!(!wire.contains("sk-test"), "{wire}");
         assert!(!wire.contains("api_key"), "{wire}");
@@ -559,7 +594,7 @@ mod tests {
             &Notices::new(),
         )
         .expect("set");
-        let view = show(dir.path(), KEYCHAIN, &Notices::new())
+        let view = show(dir.path(), KeyPresence::Keychain, &Notices::new())
             .expect("show")
             .expect("configured");
         assert_eq!(view.key_source, KeySource::Keychain);

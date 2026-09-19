@@ -18,9 +18,10 @@ pub(crate) fn env_api_key() -> Option<String> {
 /// What this head found outside `describer.toml`, for the views and the
 /// doctor row that name the key's source.
 pub(crate) fn key_presence() -> KeyPresence {
-    KeyPresence {
-        env: env_api_key().is_some(),
-        keychain: false,
+    if env_api_key().is_some() {
+        KeyPresence::Env
+    } else {
+        KeyPresence::Absent
     }
 }
 

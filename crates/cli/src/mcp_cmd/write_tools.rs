@@ -56,6 +56,7 @@ use super::MajServer;
 use anyhow::Context as _;
 use majestical_core::event::AssetId;
 use majestical_services::app::FsApp;
+use majestical_services::describer_config::KeySource;
 use majestical_services::error::ServiceError;
 use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1138,12 +1139,23 @@ struct SetDescriberArgs {
     model: String,
     #[serde(default)]
     base_url: Option<String>,
+    /// The `OpenRouter` API key to store. Omit to keep the stored key.
     #[serde(default)]
     api_key: Option<String>,
     /// `false` (default) returns a dry-run description of what would
     /// happen; `true` executes.
     #[serde(default)]
     confirm: bool,
+}
+
+/// What a confirmed `set_describer` would do with the key, as the tail of
+/// the dry run's `would` sentence; empty when there is no key to speak of.
+fn key_effect(api_key: Option<&str>, current: Option<KeySource>) -> &'static str {
+    match (api_key, current) {
+        (Some(_), _) => ", storing the key in describer.toml",
+        (None, Some(KeySource::File)) => ", keeping the stored key",
+        (None, Some(KeySource::Env | KeySource::Keychain | KeySource::Absent) | None) => "",
+    }
 }
 
 fn set_describer_result(
@@ -1162,8 +1174,13 @@ fn set_describer_result(
                 "base_url": args.base_url,
                 "current": current,
                 "would": format!(
-                    "configure the describer backend to {} model '{}'",
-                    backend.as_str(), args.model
+                    "configure the describer backend to {} model '{}'{}",
+                    backend.as_str(),
+                    args.model,
+                    key_effect(
+                        args.api_key.as_deref(),
+                        current.as_ref().map(|view| view.key_source),
+                    ),
                 ),
             }),
             notices.drain(),

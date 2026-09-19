@@ -512,7 +512,7 @@ fn doctor_report_runs_with_no_catalog_and_warns_on_catalog_rows() {
     with_state_dir(|| {
         let outcome = majestical_desktop::commands::doctor_report_impl(
             None,
-            majestical_services::describer_config::KeyPresence::default(),
+            majestical_services::describer_config::KeyPresence::Absent,
         )
         .expect("doctor must run with no catalog selected");
         let status_of = |name: &str| {
@@ -573,14 +573,11 @@ fn doctor_report_resolves_the_describer_key_from_the_argument() {
         };
 
         assert_eq!(
-            describer_row(KeyPresence::default()).status,
+            describer_row(KeyPresence::Absent).status,
             majestical_services::doctor::CheckStatus::Fail,
             "no key anywhere must fail the describer row"
         );
-        let from_env = describer_row(KeyPresence {
-            env: true,
-            keychain: false,
-        });
+        let from_env = describer_row(KeyPresence::Env);
         assert_eq!(
             from_env.status,
             majestical_services::doctor::CheckStatus::Ok,

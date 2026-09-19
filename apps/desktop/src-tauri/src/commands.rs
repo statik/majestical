@@ -65,9 +65,10 @@ pub fn env_api_key() -> Option<String> {
 /// names the key's source. `pub` for the same reason as [`env_api_key`].
 #[must_use]
 pub fn key_presence() -> KeyPresence {
-    KeyPresence {
-        env: env_api_key().is_some(),
-        keychain: false,
+    if env_api_key().is_some() {
+        KeyPresence::Env
+    } else {
+        KeyPresence::Absent
     }
 }
 

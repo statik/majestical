@@ -381,6 +381,7 @@ enum DescriberCmd {
         model: String,
         #[arg(long)]
         base_url: Option<String>,
+        /// The `OpenRouter` API key to store. Omit to keep the stored key.
         #[arg(long)]
         api_key: Option<String>,
     },

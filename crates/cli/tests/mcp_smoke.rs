@@ -2889,6 +2889,31 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     let (root, state) = common::fixture_catalog(dir.path());
     let mut mcp = Mcp::spawn(&root, &state);
 
+    // The dry run says what would happen to the key, and nothing when
+    // nothing would.
+    let keyless_dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "first"}),
+    );
+    assert_eq!(
+        keyless_dry["result"]["structuredContent"]["would"],
+        serde_json::json!("configure the describer backend to ollama model 'first'"),
+        "{keyless_dry}"
+    );
+    let keyed_dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "first", "api_key": "sk-test"}),
+    );
+    assert!(!keyed_dry.to_string().contains("sk-test"), "{keyed_dry}");
+    assert_eq!(
+        keyed_dry["result"]["structuredContent"]["would"],
+        serde_json::json!(
+            "configure the describer backend to ollama model 'first', \
+             storing the key in describer.toml"
+        ),
+        "{keyed_dry}"
+    );
+
     let keyed = mcp.call_tool(
         "set_describer",
         &serde_json::json!({
@@ -2920,6 +2945,13 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     assert_eq!(
         dry["result"]["structuredContent"]["current"]["key_source"],
         serde_json::json!("file"),
+        "{dry}"
+    );
+    assert_eq!(
+        dry["result"]["structuredContent"]["would"],
+        serde_json::json!(
+            "configure the describer backend to ollama model 'second', keeping the stored key"
+        ),
         "{dry}"
     );
 
@@ -2973,6 +3005,76 @@ fn get_describer_names_the_env_as_the_openrouter_keys_source() {
         described["result"]["structuredContent"]["describer"]["key_source"],
         serde_json::json!("env"),
         "{described}"
+    );
+}
+
+/// `test_describer`'s dry run shows the same view `get_describer` would,
+/// so its key source is this head's reading too.
+#[test]
+fn test_describer_dry_run_names_the_env_as_the_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", "sk-test")]);
+    mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+
+    let dry = mcp.call_tool("test_describer", &serde_json::json!({}));
+
+    assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    assert_eq!(
+        dry["result"]["structuredContent"]["configured"]["key_source"],
+        serde_json::json!("env"),
+        "{dry}"
+    );
+}
+
+/// The MCP `doctor` tool's describer row for an `OpenRouter` config, with
+/// `MAJ_OPENROUTER_KEY` as given — an empty value reads as unset, which
+/// keeps the keyless case independent of the ambient environment.
+#[cfg(test)]
+fn mcp_doctor_describer_row(env_key: &str) -> serde_json::Value {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", env_key)]);
+    mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+    let resp = mcp.call_tool(
+        "doctor",
+        &serde_json::json!({"catalog": root.to_str().expect("utf8")}),
+    );
+    assert!(!resp.to_string().contains("sk-test"), "{resp}");
+    resp["result"]["structuredContent"]["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"] == serde_json::json!("describer"))
+        .unwrap_or_else(|| panic!("no `describer` row in {resp}"))
+        .clone()
+}
+
+#[test]
+fn doctor_tool_names_the_env_as_the_openrouter_keys_source() {
+    let row = mcp_doctor_describer_row("sk-test");
+    assert_eq!(row["status"], serde_json::json!("ok"), "{row}");
+    assert_eq!(
+        row["detail"],
+        serde_json::json!("open-router · m · key from env"),
+        "{row}"
+    );
+}
+
+#[test]
+fn doctor_tool_fails_the_describer_row_without_a_key() {
+    let row = mcp_doctor_describer_row("");
+    assert_eq!(row["status"], serde_json::json!("fail"), "{row}");
+    assert_eq!(
+        row["detail"],
+        serde_json::json!("open-router · m · no API key"),
+        "{row}"
     );
 }
 

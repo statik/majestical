@@ -312,7 +312,7 @@ fn carried_key(
         if stored.api_key.is_some() {
             notices.push(format!(
                 "note: the stored API key belonged to {} and was not carried over to {} — \
-                 set one with `--api-key` if {} needs it",
+                 supply a new key if {} needs one",
                 stored.backend.as_str(),
                 backend.as_str(),
                 backend.as_str()
@@ -324,12 +324,17 @@ fn carried_key(
     // cannot see: an `OpenRouter` key lives in the Keychain and leaves the
     // file keyless, and it is the costliest key to send somewhere new. The
     // wording therefore never asserts that a key exists.
-    if stored.base_url != base_url
-        && (stored.api_key.is_some() || backend == BackendKind::OpenRouter)
-    {
+    // `key_source`'s rule: only `OpenRouter` takes a head-side key, so only
+    // there can one exist that this function cannot see. A match, not an
+    // `==`: a fourth backend must not answer "nothing unseen" by default.
+    let may_hold_an_unseen_key = match backend {
+        BackendKind::OpenRouter => true,
+        BackendKind::Ollama | BackendKind::LmStudio => false,
+    };
+    if stored.base_url != base_url && (stored.api_key.is_some() || may_hold_an_unseen_key) {
         notices.push(format!(
-            "note: any stored API key is now being sent to {base_url} (was {}) — \
-             remove it with `describer clear-key` if that is not intended",
+            "note: any stored API key will now be sent to {base_url} (was {}) — \
+             clear the stored key if that is not intended",
             stored.base_url
         ));
     }
@@ -533,6 +538,11 @@ mod tests {
             file_key,
         }
     }
+
+    /// The substring that selects `carried_key`'s host-move notice. One
+    /// place, so a reworded notice cannot quietly stop matching in four
+    /// tests at once.
+    const MOVED: &str = "will now be sent to";
 
     fn stored(root: &Path) -> DescriberConfig {
         load_config(root, &Notices::new())
@@ -763,7 +773,7 @@ mod tests {
         let said: Vec<String> = notices
             .drain()
             .into_iter()
-            .filter(|notice| notice.contains("now being sent to"))
+            .filter(|notice| notice.contains(MOVED))
             .collect();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("http://127.0.0.1:1235"), "{said:?}");
@@ -774,7 +784,7 @@ mod tests {
         set(dir.path(), &moved, &notices).expect("set again");
         assert_eq!(stored(dir.path()).api_key.as_deref(), Some("sk-test"));
         assert!(
-            !notices.drain().iter().any(|n| n.contains("now being sent")),
+            !notices.drain().iter().any(|n| n.contains(MOVED)),
             "an unchanged url must not warn"
         );
     }
@@ -805,7 +815,7 @@ mod tests {
         let said: Vec<String> = notices
             .drain()
             .into_iter()
-            .filter(|notice| notice.contains("now being sent to"))
+            .filter(|notice| notice.contains(MOVED))
             .collect();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("http://127.0.0.1:18716"), "{said:?}");
@@ -829,7 +839,7 @@ mod tests {
         let reset: Vec<String> = notices
             .drain()
             .into_iter()
-            .filter(|notice| notice.contains("now being sent to"))
+            .filter(|notice| notice.contains(MOVED))
             .collect();
         assert_eq!(reset.len(), 1, "{reset:?}");
         assert!(
@@ -851,7 +861,7 @@ mod tests {
         moved.base_url = Some("http://127.0.0.1:1235".to_string());
         set(dir.path(), &moved, &notices).expect("move local");
         assert!(
-            !notices.drain().iter().any(|n| n.contains("now being sent")),
+            !notices.drain().iter().any(|n| n.contains(MOVED)),
             "a local backend with no stored key must stay quiet"
         );
     }

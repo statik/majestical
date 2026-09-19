@@ -1159,8 +1159,11 @@ struct SetDescriberArgs {
 }
 
 /// What a confirmed `set_describer` would do with the key, as the tail of
-/// the dry run's `would` sentence. A supplied key goes where
-/// `describer_key::store` would put it. Without one, a stored key is left
+/// the dry run's `would` sentence. `to_keychain` is
+/// [`majestical_services::describer_config::plan_key_write`]'s own answer,
+/// not a second guess at it: the confirmed call routes the key through that
+/// function, and a dry run that named the other destination would be
+/// describing something that will not happen. Without one, a stored key is left
 /// alone — EXCEPT when this `set` also switches backends, which drops it
 /// (`describer_config`'s `FileKey::Keep` rule); saying "unchanged" there
 /// would promise the opposite of what the confirmed call does. With no
@@ -1174,7 +1177,7 @@ struct SetDescriberArgs {
 /// notices.
 fn key_effect(
     api_key: Option<&str>,
-    keychain_supported: bool,
+    to_keychain: bool,
     current: Option<&majestical_services::describer_config::DescriberConfigView>,
     backend: majestical_describe::BackendKind,
 ) -> &'static str {
@@ -1184,7 +1187,7 @@ fn key_effect(
         view.backend != backend.as_str()
             && view.key_source == majestical_services::describer_config::KeySource::File
     });
-    match (api_key, keychain_supported, current, drops) {
+    match (api_key, to_keychain, current, drops) {
         (Some(_), true, _, _) => ", storing the key in the macOS Keychain",
         (Some(_), false, _, _) => ", storing the key in describer.toml",
         (None, _, Some(_), true) => {
@@ -1218,7 +1221,17 @@ fn set_describer_result(
                     args.model,
                     key_effect(
                         args.api_key.as_deref(),
-                        sources.store.supported(),
+                        // Read off the plan rather than recomputed: only an
+                        // `OpenRouter` key goes to the Keychain, and the dry
+                        // run must not name a destination the confirmed call
+                        // would not use.
+                        majestical_services::describer_config::plan_key_write(
+                            backend,
+                            sources.store.supported(),
+                            args.api_key.clone(),
+                        )
+                        .keychain
+                        .is_some(),
                         current.as_ref(),
                         backend,
                     ),
@@ -1890,15 +1903,18 @@ mod tests {
     #[test]
     fn the_set_dry_run_says_where_the_key_would_go_and_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let would = |api_key: Option<&str>, store: &MemoryKeyStore| {
+        let would_for = |backend, api_key: Option<&str>, store: &MemoryKeyStore| {
             let dry = set_describer_result(
                 dir.path(),
-                &set_args(DescriberBackend::OpenRouter, api_key, false),
+                &set_args(backend, api_key, false),
                 &no_env(store),
             )
             .expect("dry run");
             assert!(!dry.to_string().contains("sk-test"), "{dry}");
             dry["would"].as_str().expect("would").to_string()
+        };
+        let would = |api_key: Option<&str>, store: &MemoryKeyStore| {
+            would_for(DescriberBackend::OpenRouter, api_key, store)
         };
         let keychain = MemoryKeyStore::default();
         let fileonly = MemoryKeyStore {
@@ -1918,6 +1934,13 @@ mod tests {
         assert_eq!(
             would(None, &keychain),
             "configure the describer backend to open-router model 'm'"
+        );
+        // A local backend's key never reaches the Keychain, however
+        // supported it is, so the dry run must not promise it there.
+        assert_eq!(
+            would_for(DescriberBackend::Ollama, Some("sk-test"), &keychain),
+            "configure the describer backend to ollama model 'm', \
+             storing the key in describer.toml"
         );
         assert_eq!(held(&keychain), None);
         assert_eq!(file_key_source(dir.path()), None);

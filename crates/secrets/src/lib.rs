@@ -4,7 +4,7 @@
 //! crate may depend on this one: the only permitted dependents are the
 //! three heads (CLI, MCP server, desktop app).
 mod system;
-pub use system::{SUPPORTED, SystemKeyStore};
+pub use system::{SERVICE_ENV, SUPPORTED, SystemKeyStore};
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -53,6 +53,66 @@ pub struct MemoryKeyStore {
     pub fail: Option<String>,
     /// When true, `supported()` is false and every call is `Unsupported`.
     pub unsupported: bool,
+}
+
+impl MemoryKeyStore {
+    /// A store already holding `key`.
+    #[must_use]
+    pub fn holding(key: &str) -> Self {
+        Self {
+            key: Mutex::new(Some(key.to_string())),
+            ..Self::default()
+        }
+    }
+
+    /// A store whose every call fails with `message`.
+    #[must_use]
+    pub fn failing(message: &str) -> Self {
+        Self {
+            fail: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// What the store holds now. Tests assert on this rather than reaching
+    /// through the `Mutex` themselves.
+    #[must_use]
+    pub fn held(&self) -> Option<String> {
+        self.key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// A [`KeyStore`] that panics on any call: the way a test asserts a store
+/// was NEVER touched, which no return value can express. Lives here beside
+/// [`MemoryKeyStore`], and for the same reason — three crates' tests need
+/// it, and this repo never selects test code with a feature.
+pub struct PanickingKeyStore;
+
+#[expect(
+    clippy::panic_in_result_fn,
+    clippy::panic,
+    reason = "the panic IS this type: it exists so a test can assert the \
+              store was never touched, which no return value can express"
+)]
+impl KeyStore for PanickingKeyStore {
+    fn supported(&self) -> bool {
+        true
+    }
+
+    fn read(&self) -> Result<Option<String>, SecretError> {
+        panic!("the store must not be touched");
+    }
+
+    fn store(&self, _key: &str) -> Result<(), SecretError> {
+        panic!("the store must not be touched");
+    }
+
+    fn delete(&self) -> Result<bool, SecretError> {
+        panic!("the store must not be touched");
+    }
 }
 
 impl KeyStore for MemoryKeyStore {
@@ -170,50 +230,14 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
 
 #[cfg(test)]
 mod tests {
-    use super::{HeadKeySource, KeyStore, MemoryKeyStore, ResolvedKey, SecretError, resolve};
-
-    fn holding(key: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            key: std::sync::Mutex::new(Some(key.to_string())),
-            ..MemoryKeyStore::default()
-        }
-    }
-
-    fn failing(message: &str) -> MemoryKeyStore {
-        MemoryKeyStore {
-            fail: Some(message.to_string()),
-            ..MemoryKeyStore::default()
-        }
-    }
-
-    /// Proves a "never read" claim: in production a read is a macOS prompt.
-    struct PanickingStore;
-
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "the panic is the assertion: any call is the test's failure"
-    )]
-    impl KeyStore for PanickingStore {
-        fn supported(&self) -> bool {
-            true
-        }
-
-        fn read(&self) -> Result<Option<String>, SecretError> {
-            panic!("the store must not be touched");
-        }
-
-        fn store(&self, _key: &str) -> Result<(), SecretError> {
-            panic!("the store must not be touched");
-        }
-
-        fn delete(&self) -> Result<bool, SecretError> {
-            panic!("the store must not be touched");
-        }
-    }
+    use super::{
+        HeadKeySource, KeyStore, MemoryKeyStore, PanickingKeyStore, ResolvedKey, SecretError,
+        resolve,
+    };
 
     #[test]
     fn env_wins_and_the_store_is_never_read() {
-        let resolved = resolve(Some("sk-test".to_string()), true, &PanickingStore);
+        let resolved = resolve(Some("sk-test".to_string()), true, &PanickingKeyStore);
         assert_eq!(resolved.source, HeadKeySource::Env);
         assert_eq!(resolved.key.as_deref(), Some("sk-test"));
         assert_eq!(resolved.notice, None);
@@ -221,14 +245,18 @@ mod tests {
 
     #[test]
     fn env_wins_over_a_stored_key() {
-        let resolved = resolve(Some("sk-test".to_string()), true, &holding("sk-test-2"));
+        let resolved = resolve(
+            Some("sk-test".to_string()),
+            true,
+            &MemoryKeyStore::holding("sk-test-2"),
+        );
         assert_eq!(resolved.source, HeadKeySource::Env);
         assert_eq!(resolved.key.as_deref(), Some("sk-test"));
     }
 
     #[test]
     fn the_store_is_not_read_for_a_local_backend() {
-        let resolved = resolve(None, false, &PanickingStore);
+        let resolved = resolve(None, false, &PanickingKeyStore);
         assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.notice, None);
@@ -236,7 +264,7 @@ mod tests {
 
     #[test]
     fn a_stored_key_resolves_as_keychain() {
-        let resolved = resolve(None, true, &holding("sk-test"));
+        let resolved = resolve(None, true, &MemoryKeyStore::holding("sk-test"));
         assert_eq!(resolved.source, HeadKeySource::Keychain);
         assert_eq!(resolved.key.as_deref(), Some("sk-test"));
         assert_eq!(resolved.notice, None);
@@ -252,7 +280,7 @@ mod tests {
 
     #[test]
     fn a_store_failure_is_a_notice_not_an_error_and_names_the_env_var() {
-        let resolved = resolve(None, true, &failing("denied"));
+        let resolved = resolve(None, true, &MemoryKeyStore::failing("denied"));
         assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
         let notice = resolved.notice.expect("a notice");
@@ -264,7 +292,7 @@ mod tests {
     fn an_unsupported_store_is_silent() {
         let store = MemoryKeyStore {
             unsupported: true,
-            ..holding("sk-test")
+            ..MemoryKeyStore::holding("sk-test")
         };
         let resolved = resolve(None, true, &store);
         assert_eq!(resolved.source, HeadKeySource::Absent);
@@ -308,7 +336,7 @@ mod tests {
 
     #[test]
     fn the_memory_store_fails_or_is_unsupported_on_every_call_when_told_to() {
-        let store = failing("denied");
+        let store = MemoryKeyStore::failing("denied");
         assert!(store.supported());
         assert!(matches!(store.read(), Err(SecretError::Store(m)) if m == "denied"));
         assert!(matches!(store.store("sk-test"), Err(SecretError::Store(m)) if m == "denied"));

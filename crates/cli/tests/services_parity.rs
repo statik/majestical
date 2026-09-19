@@ -19,7 +19,7 @@ fn diff_against_ref(root: &Path, state: &Path, args: &[&str]) {
         let mut c = if bin == "ref" {
             Command::new(reference)
         } else {
-            Command::cargo_bin("maj").expect("bin")
+            common::maj_bin()
         };
         c.env("MAJ_CATALOG", root)
             .env("MAJ_MACHINE_ID", "test-machine")
@@ -110,7 +110,7 @@ fn diff_against_ref_with_between(root: &Path, state: &Path, args: &[&str], betwe
         let mut c = if bin == "ref" {
             Command::new(reference)
         } else {
-            Command::cargo_bin("maj").expect("bin")
+            common::maj_bin()
         };
         c.env("MAJ_CATALOG", root)
             .env("MAJ_MACHINE_ID", "test-machine")

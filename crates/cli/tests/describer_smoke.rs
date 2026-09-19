@@ -1,7 +1,7 @@
 mod common;
 use common::maj;
 use predicates::prelude::*;
-use predicates::str::contains;
+use predicates::str::{contains, diff};
 
 /// A fresh catalog under `tmp`, returned as `(root, state)`.
 fn init_catalog(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -14,8 +14,24 @@ fn init_catalog(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBu
     (root, state)
 }
 
-fn set_openrouter(root: &std::path::Path, state: &std::path::Path, model: &str, key: Option<&str>) {
-    let mut cmd = maj(root, state);
+/// Where `describer set --api-key` puts a key on this platform, as
+/// `describer show` names it: the Keychain on macOS, the file elsewhere.
+const STORED_KEY_LINE: &str = if cfg!(target_os = "macos") {
+    "api-key:  (from keychain)"
+} else {
+    "api-key:  (from file)"
+};
+
+/// `maj describer set --backend open-router` under `service` — the throwaway
+/// Keychain service a key lands in, which the caller's later invocations
+/// must share to find it again (and whose `KeychainCleanup` the caller holds).
+fn set_openrouter(
+    (root, state): (&std::path::Path, &std::path::Path),
+    service: &str,
+    model: &str,
+    key: Option<&str>,
+) {
+    let mut cmd = common::maj_with_keychain(root, state, service);
     cmd.env_remove("MAJ_OPENROUTER_KEY")
         .args(["describer", "set", "--backend", "open-router", "--model"])
         .arg(model);
@@ -31,20 +47,203 @@ fn set_openrouter(root: &std::path::Path, state: &std::path::Path, model: &str, 
     }
 }
 
+/// `describer.toml`'s text, wherever the CLI put it under `state`.
+#[cfg(test)]
+fn describer_toml(state: &std::path::Path) -> String {
+    let paths = common::walkdir_find(state, "describer.toml");
+    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
+    std::fs::read_to_string(&paths[0]).expect("read describer.toml")
+}
+
 #[test]
-fn describer_set_show_round_trip_names_the_file_and_never_the_key() {
+fn describer_set_show_round_trip_names_the_source_and_never_the_key() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root, state) = init_catalog(tmp.path());
-    set_openrouter(&root, &state, "qwen/qwen3-vl-8b", Some("sk-test"));
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    set_openrouter(
+        (&root, &state),
+        &service,
+        "qwen/qwen3-vl-8b",
+        Some("sk-test"),
+    );
 
-    maj(&root, &state)
+    common::maj_with_keychain(&root, &state, &service)
         .env_remove("MAJ_OPENROUTER_KEY")
         .args(["describer", "show"])
         .assert()
         .success()
         .stdout(contains("open-router"))
-        .stdout(contains("api-key:  (from file)"))
+        .stdout(contains(STORED_KEY_LINE))
         .stdout(contains("sk-test").not());
+}
+
+/// The key goes to the Keychain and `describer.toml` is written without one.
+/// The item's VALUE is proven by use, not by `security … -w` (a read by a
+/// binary that did not store the item raises a macOS prompt): `describer
+/// test` sends whatever it resolved as a Bearer token, and the mock accepts
+/// only `sk-test`.
+#[cfg(target_os = "macos")]
+#[test]
+fn describer_set_stores_the_key_in_the_keychain_and_leaves_the_file_keyless() {
+    use httpmock::prelude::{GET, MockServer};
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200)
+            .json_body(serde_json::json!({"data": [{"id": "m"}]}));
+    });
+    let keyed = server.mock(|when, then| {
+        when.method(GET)
+            .path("/v1/key")
+            .header("authorization", "Bearer sk-test");
+        then.status(200).json_body(serde_json::json!({}));
+    });
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "open-router",
+            "--model",
+            "m",
+        ])
+        .args(["--api-key", "sk-test", "--base-url", &server.base_url()])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (from keychain)"))
+        .stdout(contains("sk-test").not());
+
+    let toml = describer_toml(&state);
+    assert!(!toml.contains("api_key"), "{toml}");
+    assert!(!toml.contains("sk-test"), "{toml}");
+    assert!(common::keychain_item_exists(&service));
+
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (from keychain)"))
+        .stdout(contains("sk-test").not());
+    let out = common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "test"])
+        .output()
+        .expect("run maj describer test");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(
+        stdout.lines().any(|line| line == "key: accepted"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sk-test"), "{stdout}");
+    keyed.assert_calls(1);
+
+    // A different service is a different item: the key is nowhere else.
+    maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (none)"));
+}
+
+/// Off macOS there is no Keychain, so the file holds the key as it always did.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn describer_set_stores_the_key_in_the_file_where_there_is_no_keychain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    let service = common::throwaway_keychain_service();
+    set_openrouter((&root, &state), &service, "m", Some("sk-test"));
+    assert!(describer_toml(&state).contains("api_key = \"sk-test\""));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn describer_clear_key_removes_the_keychain_item() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    set_openrouter((&root, &state), &service, "m", Some("sk-test"));
+    assert!(common::keychain_item_exists(&service));
+
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "clear-key"])
+        .assert()
+        .success()
+        .stdout(diff("removed the key from the Keychain\n"));
+    assert!(!common::keychain_item_exists(&service));
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (none)"));
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "clear-key"])
+        .assert()
+        .success()
+        .stdout(diff("no stored key to remove\n"));
+}
+
+/// A key a pre-Keychain `maj` left in `describer.toml` is removed too, on
+/// every platform.
+#[test]
+fn describer_clear_key_removes_the_files_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    set_openrouter((&root, &state), &service, "m", None);
+    let paths = common::walkdir_find(&state, "describer.toml");
+    let keyless = describer_toml(&state);
+    std::fs::write(&paths[0], format!("{keyless}api_key = \"sk-test\"\n")).expect("plant a key");
+
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "show"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (from file)"));
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["describer", "clear-key"])
+        .assert()
+        .success()
+        .stdout(diff("removed the key from describer.toml\n"));
+    assert_eq!(describer_toml(&state), keyless);
+}
+
+#[test]
+fn clear_key_says_the_env_still_supplies_a_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (root, state) = init_catalog(tmp.path());
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    set_openrouter((&root, &state), &service, "m", None);
+
+    let out = common::maj_with_keychain(&root, &state, &service)
+        .env("MAJ_OPENROUTER_KEY", "sk-test")
+        .args(["describer", "clear-key"])
+        .output()
+        .expect("run maj describer clear-key");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf-8 stdout"),
+        "no stored key to remove\nMAJ_OPENROUTER_KEY is set and still supplies a key\n"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("sk-test"));
 }
 
 /// `set` without `--api-key` changes the model and leaves the stored key
@@ -53,23 +252,26 @@ fn describer_set_show_round_trip_names_the_file_and_never_the_key() {
 fn describer_set_without_a_key_keeps_the_stored_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root, state) = init_catalog(tmp.path());
-    set_openrouter(&root, &state, "first-model", Some("sk-test"));
-    set_openrouter(&root, &state, "second-model", None);
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    set_openrouter((&root, &state), &service, "first-model", Some("sk-test"));
+    set_openrouter((&root, &state), &service, "second-model", None);
 
-    maj(&root, &state)
+    common::maj_with_keychain(&root, &state, &service)
         .env_remove("MAJ_OPENROUTER_KEY")
         .args(["describer", "show"])
         .assert()
         .success()
         .stdout(contains("second-model"))
-        .stdout(contains("api-key:  (from file)"));
+        .stdout(contains(STORED_KEY_LINE));
 }
 
 #[test]
 fn describer_show_names_the_env_as_the_keys_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root, state) = init_catalog(tmp.path());
-    set_openrouter(&root, &state, "some-model", None);
+    let service = common::throwaway_keychain_service();
+    set_openrouter((&root, &state), &service, "some-model", None);
 
     maj(&root, &state)
         .env_remove("MAJ_OPENROUTER_KEY")

@@ -4474,6 +4474,7 @@ dependencies = [
  "majestical-describe",
  "majestical-index",
  "majestical-ingest",
+ "majestical-secrets",
  "majestical-services",
  "majestical-sync",
  "plist",

@@ -784,9 +784,17 @@ fn print_ingest_outcome_text(
 /// ran, even when every row is Fail, so `?` here never turns a bad
 /// environment into a nonzero exit — findings are rows, not CLI errors.
 pub(crate) fn cmd_doctor(catalog: Option<PathBuf>, json: bool) -> Result<()> {
+    let notices = majestical_services::notices::Notices::new();
+    let store = crate::describer_key::system_store();
+    let describer_key = crate::describer_key::doctor_key_presence(
+        catalog.as_deref(),
+        &crate::describer_key::KeySources::ambient(&store),
+        &notices,
+    );
+    crate::drain_notices(&notices);
     let req = majestical_services::doctor::DoctorRequest {
         catalog,
-        describer_key: crate::describer_cmd::key_presence(),
+        describer_key,
     };
     let outcome = majestical_services::doctor::doctor(&req)?;
     crate::print_notices(&outcome.notices);

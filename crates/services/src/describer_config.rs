@@ -146,7 +146,11 @@ fn show_impl(
 /// What `set` does with the key field of `describer.toml`.
 #[derive(Clone, PartialEq, Eq)]
 pub enum FileKey {
-    /// Carry the existing file's key forward, if it has one.
+    /// Carry the existing file's key forward — but only when the backend is
+    /// unchanged. A stored key belongs to the backend that was configured
+    /// when it was written, so a `set` that switches backends drops it
+    /// rather than sending one service's credential to another; `carried_key`
+    /// holds that rule and the reasoning behind it.
     Keep,
     Set(String),
     Clear,
@@ -173,10 +177,11 @@ pub struct SetArgs {
     pub file_key: FileKey,
 }
 
-/// Where a newly supplied key goes. With a supported Keychain the key goes
-/// there and the file is written keyless; otherwise the file holds it. No
-/// key supplied means nothing about the key changes. `keychain` is written
-/// before `file`; see [`plan_key_write`].
+/// Where a newly supplied key goes. An `OpenRouter` key goes to a supported
+/// Keychain and the file is written keyless; every other key goes to the
+/// file. No key supplied leaves the stored key alone, unless `set` is also
+/// switching backends — see [`FileKey::Keep`]. `keychain` is written before
+/// `file`; see [`plan_key_write`].
 pub struct KeyWrite {
     pub keychain: Option<String>,
     pub file: FileKey,
@@ -195,12 +200,27 @@ impl std::fmt::Debug for KeyWrite {
 /// The one rule for a key a user hands to any head; the head executes the
 /// Keychain half and passes [`KeyWrite::file`] to [`set`].
 ///
+/// `backend` is the backend BEING SET. The Keychain is the destination only
+/// for `OpenRouter`: the head's key applies to `OpenRouter` alone
+/// (`effective_api_key`'s rule), so a local backend's token is only ever
+/// read from the file — and the one machine-wide Keychain item must not be
+/// overwritten by it, or a later switch to `OpenRouter` would send a local
+/// proxy's token to openrouter.ai.
+///
 /// The head MUST write `keychain` first and stop on failure: `file` is
 /// `Clear` in that case, so writing the file first and then failing the
 /// Keychain write would leave no key anywhere.
 #[must_use]
-pub fn plan_key_write(keychain_supported: bool, key: Option<String>) -> KeyWrite {
-    match (key, keychain_supported) {
+pub fn plan_key_write(
+    backend: BackendKind,
+    keychain_supported: bool,
+    key: Option<String>,
+) -> KeyWrite {
+    let to_keychain = match backend {
+        BackendKind::OpenRouter => keychain_supported,
+        BackendKind::Ollama | BackendKind::LmStudio => false,
+    };
+    match (key, to_keychain) {
         (None, _) => KeyWrite {
             keychain: None,
             file: FileKey::Keep,
@@ -218,7 +238,9 @@ pub fn plan_key_write(keychain_supported: bool, key: Option<String>) -> KeyWrite
 
 /// `maj describer set`: stores this machine's describer backend config,
 /// defaulting `base_url` to the backend's own default when not given. The
-/// file's key follows [`SetArgs::file_key`]. Returns no view: a view names
+/// file's key follows [`SetArgs::file_key`] — note a [`FileKey::Keep`] that
+/// switches backends DROPS the file's key with a notice, and a host move
+/// under the same backend carries it with a warning. Returns no view: a view names
 /// the key's source, which depends on what the head found, so the head
 /// calls [`show`] for its echo.
 ///
@@ -235,17 +257,26 @@ pub fn set(
 }
 
 fn set_impl(catalog_root: &Path, args: &SetArgs, notices: &crate::notices::Notices) -> Result<()> {
+    // Resolved once: `set` replaces the whole config, so an omitted
+    // `base_url` is a reset to the backend's default, not "leave it alone" —
+    // and [`carried_key`] has to compare what will actually be stored.
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| args.backend.default_base_url().to_string());
     let api_key = match &args.file_key {
-        FileKey::Keep => load_config(catalog_root, notices)?.and_then(|stored| stored.api_key),
+        FileKey::Keep => carried_key(
+            load_config(catalog_root, notices)?,
+            args.backend,
+            &base_url,
+            notices,
+        ),
         FileKey::Set(key) => Some(key.clone()),
         FileKey::Clear => None,
     };
     let config = DescriberConfig {
         backend: args.backend,
-        base_url: args
-            .base_url
-            .clone()
-            .unwrap_or_else(|| args.backend.default_base_url().to_string()),
+        base_url,
         model: args.model.clone(),
         api_key,
     };
@@ -253,6 +284,63 @@ fn set_impl(catalog_root: &Path, args: &SetArgs, notices: &crate::notices::Notic
     config
         .store(&path)
         .with_context(|| format!("write {}", path.display()))
+}
+
+/// The file key [`FileKey::Keep`] carries into the newly stored config: the
+/// stored one when the backend is unchanged, and nothing when it changed.
+///
+/// A key in `describer.toml` is a credential for the backend that was
+/// configured when it was written, and `base_url` moves with the backend.
+/// Carrying it across a switch would send it to a different host — a
+/// pre-phase-7G config holds an `OpenRouter` key in `api_key`, so one
+/// `describer set --backend lm-studio` would hand a paid hosted key to
+/// whatever local process the new URL names, and the reverse would send a
+/// local proxy's token to openrouter.ai. Dropping it is not silent: the
+/// notice says which backend it belonged to, and never the key itself.
+/// A changed `base_url` under the SAME backend is a warning, not a drop.
+/// It can be a port move on the same machine, and because `set` replaces the
+/// whole config an omitted `--base-url` already resets a custom URL to the
+/// default — so dropping here would destroy the key on a bare `--model`
+/// change, the very case [`FileKey::Keep`] exists for. The key is carried
+/// and the notice names where it will now be sent.
+fn carried_key(
+    stored: Option<DescriberConfig>,
+    backend: BackendKind,
+    base_url: &str,
+    notices: &crate::notices::Notices,
+) -> Option<String> {
+    let stored = stored?;
+    if stored.backend != backend {
+        if stored.api_key.is_some() {
+            notices.push(format!(
+                "note: the stored API key belonged to {} and was not carried over to {} — \
+                 supply a new key if {} needs one",
+                stored.backend.as_str(),
+                backend.as_str(),
+                backend.as_str()
+            ));
+        }
+        return None;
+    }
+    // Before reading the file's key, because there may be one this function
+    // cannot see: an `OpenRouter` key lives in the Keychain and leaves the
+    // file keyless, and it is the costliest key to send somewhere new. The
+    // wording therefore never asserts that a key exists.
+    // `key_source`'s rule: only `OpenRouter` takes a head-side key, so only
+    // there can one exist that this function cannot see. A match, not an
+    // `==`: a fourth backend must not answer "nothing unseen" by default.
+    let may_hold_an_unseen_key = match backend {
+        BackendKind::OpenRouter => true,
+        BackendKind::Ollama | BackendKind::LmStudio => false,
+    };
+    if stored.base_url != base_url && (stored.api_key.is_some() || may_hold_an_unseen_key) {
+        notices.push(format!(
+            "note: any stored API key will now be sent to {base_url} (was {}) — \
+             clear the stored key if that is not intended",
+            stored.base_url
+        ));
+    }
+    stored.api_key
 }
 
 /// What a head reports after `clear-key`. Built by the head (it owns the
@@ -453,6 +541,11 @@ mod tests {
         }
     }
 
+    /// The substring that selects `carried_key`'s host-move notice. One
+    /// place, so a reworded notice cannot quietly stop matching in four
+    /// tests at once.
+    const MOVED: &str = "will now be sent to";
+
     fn stored(root: &Path) -> DescriberConfig {
         load_config(root, &Notices::new())
             .expect("load_config")
@@ -580,21 +673,35 @@ mod tests {
     }
 
     #[test]
-    fn a_new_key_goes_to_the_keychain_when_there_is_one_and_to_the_file_otherwise() {
-        let nothing = plan_key_write(true, None);
-        assert!(nothing.keychain.is_none());
-        assert_eq!(nothing.file, FileKey::Keep);
-        let nothing = plan_key_write(false, None);
-        assert!(nothing.keychain.is_none());
-        assert_eq!(nothing.file, FileKey::Keep);
+    fn only_an_openrouter_key_goes_to_a_supported_keychain() {
+        for backend in [
+            BackendKind::Ollama,
+            BackendKind::LmStudio,
+            BackendKind::OpenRouter,
+        ] {
+            for supported in [true, false] {
+                let nothing = plan_key_write(backend, supported, None);
+                assert!(nothing.keychain.is_none(), "{backend:?} {supported}");
+                assert_eq!(nothing.file, FileKey::Keep, "{backend:?} {supported}");
 
-        let keychain = plan_key_write(true, Some("sk-test".to_string()));
-        assert_eq!(keychain.keychain.as_deref(), Some("sk-test"));
-        assert_eq!(keychain.file, FileKey::Clear);
-
-        let file = plan_key_write(false, Some("sk-test".to_string()));
-        assert!(file.keychain.is_none());
-        assert_eq!(file.file, FileKey::Set("sk-test".to_string()));
+                let write = plan_key_write(backend, supported, Some("sk-test".to_string()));
+                let to_keychain = match backend {
+                    BackendKind::OpenRouter => supported,
+                    BackendKind::Ollama | BackendKind::LmStudio => false,
+                };
+                if to_keychain {
+                    assert_eq!(write.keychain.as_deref(), Some("sk-test"));
+                    assert_eq!(write.file, FileKey::Clear);
+                } else {
+                    assert!(write.keychain.is_none(), "{backend:?} {supported}");
+                    assert_eq!(
+                        write.file,
+                        FileKey::Set("sk-test".to_string()),
+                        "{backend:?} {supported}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -607,10 +714,16 @@ mod tests {
 
     #[test]
     fn a_key_write_never_debug_prints_the_key() {
-        let to_keychain = format!("{:?}", plan_key_write(true, Some("sk-test".to_string())));
+        let to_keychain = format!(
+            "{:?}",
+            plan_key_write(BackendKind::OpenRouter, true, Some("sk-test".to_string()))
+        );
         assert!(!to_keychain.contains("sk-test"), "{to_keychain}");
         assert!(to_keychain.contains("<redacted>"), "{to_keychain}");
-        let to_file = format!("{:?}", plan_key_write(false, Some("sk-test".to_string())));
+        let to_file = format!(
+            "{:?}",
+            plan_key_write(BackendKind::OpenRouter, false, Some("sk-test".to_string()))
+        );
         assert!(!to_file.contains("sk-test"), "{to_file}");
         assert!(to_file.contains("<redacted>"), "{to_file}");
     }
@@ -633,6 +746,170 @@ mod tests {
         assert_eq!(stored.model, "llava");
         assert_eq!(stored.base_url, BackendKind::Ollama.default_base_url());
         assert_eq!(stored.api_key.as_deref(), Some("sk-test"));
+    }
+
+    /// A host change under the same backend keeps the key — it is usually a
+    /// port move, and an omitted `--base-url` resets to the default on its
+    /// own — but it must say where the key is now going.
+    #[test]
+    fn moving_the_same_backend_to_another_url_keeps_the_key_and_says_where_it_goes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = Notices::new();
+        let mut first = set_args(
+            BackendKind::LmStudio,
+            "first",
+            FileKey::Set("sk-test".to_string()),
+        );
+        first.base_url = Some("http://127.0.0.1:1234".to_string());
+        set(dir.path(), &first, &notices).expect("set with a key");
+        // Nothing this first `set` said is under test; start the move clean.
+        drop(notices.drain());
+
+        let mut moved = set_args(BackendKind::LmStudio, "second", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:1235".to_string());
+        set(dir.path(), &moved, &notices).expect("set at a new url");
+
+        let after = stored(dir.path());
+        assert_eq!(after.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(after.base_url, "http://127.0.0.1:1235");
+        let said: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains(MOVED))
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:1235"), "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:1234"), "{said:?}");
+        assert!(!said[0].contains("sk-test"), "{said:?}");
+
+        // Same backend, same url: nothing to say.
+        set(dir.path(), &moved, &notices).expect("set again");
+        assert_eq!(stored(dir.path()).api_key.as_deref(), Some("sk-test"));
+        assert!(
+            !notices.drain().iter().any(|n| n.contains(MOVED)),
+            "an unchanged url must not warn"
+        );
+    }
+
+    /// The costliest key is the one this function cannot see: an
+    /// `OpenRouter` key lives in the Keychain and leaves `describer.toml`
+    /// keyless, so an early return on the file's key would move a paid
+    /// hosted token to a new host in silence.
+    #[test]
+    fn moving_openrouter_warns_even_though_its_key_is_not_in_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = Notices::new();
+        // Exactly what a macOS `describer set --api-key` leaves behind: the
+        // key is in the Keychain, the file has none.
+        set(
+            dir.path(),
+            &set_args(BackendKind::OpenRouter, "m", FileKey::Clear),
+            &notices,
+        )
+        .expect("set keyless");
+        assert_eq!(stored(dir.path()).api_key, None);
+        drop(notices.drain());
+
+        let mut moved = set_args(BackendKind::OpenRouter, "m", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:18716".to_string());
+        set(dir.path(), &moved, &notices).expect("set at a new url");
+
+        let said: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains(MOVED))
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:18716"), "{said:?}");
+        // It must not claim a key exists: this function cannot know.
+        assert!(said[0].contains("any stored API key"), "{said:?}");
+
+        // An omitted `--base-url` is a reset to the backend's default, so
+        // the notice must name the RESOLVED url, not the `None` it was
+        // given. Nothing else exercises that branch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut custom = set_args(BackendKind::OpenRouter, "m", FileKey::Clear);
+        custom.base_url = Some("http://127.0.0.1:18717".to_string());
+        set(dir.path(), &custom, &notices).expect("set at a custom url");
+        drop(notices.drain());
+        set(
+            dir.path(),
+            &set_args(BackendKind::OpenRouter, "m", FileKey::Keep),
+            &notices,
+        )
+        .expect("set with no --base-url");
+        let reset: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains(MOVED))
+            .collect();
+        assert_eq!(reset.len(), 1, "{reset:?}");
+        assert!(
+            reset[0].contains(BackendKind::OpenRouter.default_base_url()),
+            "{reset:?}"
+        );
+
+        // A local backend with no file key has nothing to warn about: its
+        // key could only ever have been the file's.
+        let dir = tempfile::tempdir().expect("tempdir");
+        set(
+            dir.path(),
+            &set_args(BackendKind::LmStudio, "m", FileKey::Clear),
+            &notices,
+        )
+        .expect("set keyless local");
+        drop(notices.drain());
+        let mut moved = set_args(BackendKind::LmStudio, "m", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:1235".to_string());
+        set(dir.path(), &moved, &notices).expect("move local");
+        assert!(
+            !notices.drain().iter().any(|n| n.contains(MOVED)),
+            "a local backend with no stored key must stay quiet"
+        );
+    }
+
+    /// A key in the file belongs to the backend that was configured when it
+    /// was stored, so switching backends without supplying a new one must
+    /// NOT carry it over — see `carried_key` for why that would hand a
+    /// credential to a host the user never entered it for.
+    #[test]
+    fn switching_backends_without_a_new_key_does_not_carry_the_old_one_over() {
+        for (stored_backend, next) in [
+            (BackendKind::OpenRouter, BackendKind::LmStudio),
+            (BackendKind::LmStudio, BackendKind::OpenRouter),
+            (BackendKind::Ollama, BackendKind::LmStudio),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let notices = Notices::new();
+            set(
+                dir.path(),
+                &set_args(stored_backend, "first", FileKey::Set("sk-test".to_string())),
+                &notices,
+            )
+            .expect("set with a key");
+
+            set(
+                dir.path(),
+                &set_args(next, "second", FileKey::Keep),
+                &notices,
+            )
+            .expect("set after switching backend");
+
+            let stored = stored(dir.path());
+            assert_eq!(stored.backend, next, "{stored_backend:?} -> {next:?}");
+            assert_eq!(stored.api_key, None, "{stored_backend:?} -> {next:?}");
+            let dropped: Vec<String> = notices
+                .drain()
+                .into_iter()
+                .filter(|notice| notice.contains("was not carried over"))
+                .collect();
+            assert_eq!(dropped.len(), 1, "{dropped:?}");
+            assert!(!dropped[0].contains("sk-test"), "{dropped:?}");
+            assert!(
+                dropped[0].contains(stored_backend.as_str()) && dropped[0].contains(next.as_str()),
+                "{dropped:?}"
+            );
+        }
     }
 
     #[test]

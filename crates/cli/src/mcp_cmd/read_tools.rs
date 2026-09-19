@@ -5,6 +5,7 @@
 //! it neither opens nor guards `self.catalog`, taking its own optional
 //! `catalog` param instead (see that tool's own doc for why).
 use super::MajServer;
+use crate::describer_key::{self, KeySources};
 use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -324,20 +325,9 @@ impl MajServer {
         if let Err(result) = self.ensure_catalog() {
             return result;
         }
-        let notices = Notices::new();
-        let presence = crate::describer_cmd::key_presence();
-        match majestical_services::describer_config::show(&self.catalog, presence, &notices) {
-            Ok(Some(view)) => match serde_json::to_value(&view) {
-                Ok(describer) => CallToolResult::structured(super::with_notices(
-                    json!({ "configured": true, "describer": describer }),
-                    notices.drain(),
-                )),
-                Err(err) => super::tool_error(err),
-            },
-            Ok(None) => CallToolResult::structured(super::with_notices(
-                json!({ "configured": false }),
-                notices.drain(),
-            )),
+        let store = describer_key::system_store();
+        match get_describer_result(&self.catalog, &KeySources::ambient(&store)) {
+            Ok(value) => CallToolResult::structured(value),
             Err(err) => super::tool_error(err),
         }
     }
@@ -403,13 +393,131 @@ impl MajServer {
     #[expect(clippy::unused_self, reason = "required by the #[tool] dispatch shape")]
     #[tool]
     fn doctor(&self, Parameters(args): Parameters<DoctorArgs>) -> CallToolResult {
-        let req = majestical_services::doctor::DoctorRequest {
-            catalog: args.catalog.map(std::path::PathBuf::from),
-            describer_key: crate::describer_cmd::key_presence(),
-        };
-        match majestical_services::doctor::doctor(&req) {
+        let store = describer_key::system_store();
+        match doctor_result(args.catalog, &KeySources::ambient(&store)) {
             Ok(outcome) => super::structured_ok(&outcome),
             Err(err) => super::tool_error(err),
         }
+    }
+}
+
+fn get_describer_result(
+    catalog: &std::path::Path,
+    sources: &KeySources<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    let notices = Notices::new();
+    let resolved = describer_key::resolve(catalog, sources, &notices);
+    let shown = majestical_services::describer_config::show(
+        catalog,
+        describer_key::presence(&resolved),
+        &notices,
+    )?;
+    let body = match shown {
+        Some(view) => json!({ "configured": true, "describer": serde_json::to_value(&view)? }),
+        None => json!({ "configured": false }),
+    };
+    Ok(super::with_notices(body, notices.drain()))
+}
+
+/// The key's presence is this head's own finding (see `DoctorRequest`), and
+/// a Keychain that could not be read is a notice ahead of doctor's own.
+fn doctor_result(
+    catalog: Option<String>,
+    sources: &KeySources<'_>,
+) -> Result<majestical_services::doctor::DoctorOutcome, majestical_services::error::ServiceError> {
+    let catalog = catalog.map(std::path::PathBuf::from);
+    let notices = Notices::new();
+    let describer_key = describer_key::doctor_key_presence(catalog.as_deref(), sources, &notices);
+    let req = majestical_services::doctor::DoctorRequest {
+        catalog,
+        describer_key,
+    };
+    let mut outcome = majestical_services::doctor::doctor(&req)?;
+    outcome.notices.splice(0..0, notices.drain());
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majestical_describe::BackendKind;
+    use majestical_secrets::MemoryKeyStore;
+    use majestical_services::describer_config::{FileKey, SetArgs};
+
+    fn configure(root: &std::path::Path, backend: BackendKind) {
+        majestical_services::describer_config::set(
+            root,
+            &SetArgs {
+                backend,
+                model: "m".to_string(),
+                base_url: None,
+                file_key: FileKey::Keep,
+            },
+            &Notices::new(),
+        )
+        .expect("set");
+    }
+
+    #[test]
+    fn get_describer_names_the_keychain_and_never_the_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter);
+        let store = MemoryKeyStore::holding("sk-test");
+        let sources = KeySources {
+            env: None,
+            store: &store,
+        };
+        let described = get_describer_result(dir.path(), &sources).expect("get");
+        assert_eq!(described["describer"]["key_source"], json!("keychain"));
+        assert!(!described.to_string().contains("sk-test"), "{described}");
+    }
+
+    #[test]
+    fn a_keychain_that_cannot_be_read_is_a_notice_on_get_describer_and_doctor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure(dir.path(), BackendKind::OpenRouter);
+        let store = MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..MemoryKeyStore::default()
+        };
+        let sources = KeySources {
+            env: None,
+            store: &store,
+        };
+        let described = get_describer_result(dir.path(), &sources).expect("get");
+        assert_eq!(described["describer"]["key_source"], json!("none"));
+        assert!(
+            described["notices"][0]
+                .as_str()
+                .is_some_and(|notice| notice.contains("denied")),
+            "{described}"
+        );
+
+        let catalog = dir.path().to_str().expect("utf-8").to_string();
+        let outcome = doctor_result(Some(catalog), &sources).expect("doctor");
+        assert!(
+            outcome.notices[0].contains("denied"),
+            "{:?}",
+            outcome.notices
+        );
+    }
+
+    #[test]
+    fn doctor_without_a_catalog_never_touches_the_store() {
+        // A failing store would push a notice if it were read.
+        let store = MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..MemoryKeyStore::default()
+        };
+        let sources = KeySources {
+            env: None,
+            store: &store,
+        };
+        let outcome = doctor_result(None, &sources).expect("doctor");
+        assert!(
+            !outcome.notices.iter().any(|n| n.contains("denied")),
+            "{:?}",
+            outcome.notices
+        );
     }
 }

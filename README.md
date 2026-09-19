@@ -31,10 +31,10 @@ with:
 } } }
 ```
 
-The server exposes 33 tools mirroring the CLI's verbs: 13 read-only tools
+The server exposes 36 tools mirroring the CLI's verbs: 15 read-only tools
 (search, get_asset, browse the folder tree/listing, list
 volumes/saved-searches/sync-locations/tags, sync/index status, review pending
-AI tag suggestions, etc.) plus 20 mutating tools
+AI tag suggestions, etc.) plus 21 mutating tools
 covering tagging, tag rename/merge/bulk-assign, PARA moves and filing,
 metadata, scanning, verification, ingest, sync, and describer configuration.
 Mutating tools

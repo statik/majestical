@@ -112,7 +112,8 @@ pub enum HeadKeySource {
 pub struct ResolvedKey {
     /// The key itself. `Debug` renders it redacted.
     pub key: Option<String>,
-    /// Where `key` came from; `Absent` exactly when `key` is `None`.
+    /// Where `key` came from. [`resolve`] sets `Absent` exactly when `key`
+    /// is `None`.
     pub source: HeadKeySource,
     /// Set when the store was consulted and failed; the head pushes it as
     /// a notice. Never contains a key.
@@ -242,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_store_resolves_as_none() {
+    fn an_empty_store_resolves_as_absent() {
         let resolved = resolve(None, true, &MemoryKeyStore::default());
         assert_eq!(resolved.source, HeadKeySource::Absent);
         assert_eq!(resolved.key, None);
@@ -285,6 +286,7 @@ mod tests {
         assert!(rendered.contains("a notice"));
         let absent = ResolvedKey {
             key: None,
+            source: HeadKeySource::Absent,
             ..resolved
         };
         assert!(!format!("{absent:?}").contains("<redacted>"));

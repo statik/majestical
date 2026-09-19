@@ -580,7 +580,7 @@ pub trait KeyStore {
 
 /// Where the head found the key it will pass to services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadKeySource { Env, Keychain, None }
+pub enum HeadKeySource { Env, Keychain, Absent }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedKey {
@@ -600,9 +600,9 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
     if let Some(key) = env {
         return ResolvedKey { key: Some(key), source: HeadKeySource::Env, notice: None };
     }
-    let none = |notice| ResolvedKey { key: None, source: HeadKeySource::None, notice };
+    let absent = |notice| ResolvedKey { key: None, source: HeadKeySource::Absent, notice };
     if !wants_keychain || !store.supported() {
-        return none(None);
+        return absent(None);
     }
     match store.read() {
         Ok(Some(key)) => ResolvedKey {
@@ -610,8 +610,8 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
             source: HeadKeySource::Keychain,
             notice: None,
         },
-        Ok(None) | Err(SecretError::Unsupported) => none(None),
-        Err(SecretError::Store(message)) => none(Some(format!(
+        Ok(None) | Err(SecretError::Unsupported) => absent(None),
+        Err(SecretError::Store(message)) => absent(Some(format!(
             "note: the macOS Keychain could not be read ({message}) — \
              set MAJ_OPENROUTER_KEY to supply the key without it"
         ))),
@@ -888,7 +888,7 @@ pub(crate) fn presence(resolved: &ResolvedKey) -> KeyPresence {
     match resolved.source {
         HeadKeySource::Env => KeyPresence { env: true, keychain: false },
         HeadKeySource::Keychain => KeyPresence { env: false, keychain: true },
-        HeadKeySource::None => KeyPresence::default(),
+        HeadKeySource::Absent => KeyPresence::default(),
     }
 }
 

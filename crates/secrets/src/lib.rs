@@ -4,7 +4,7 @@
 //! crate may depend on this one: the only permitted dependents are the
 //! three heads (CLI, MCP server, desktop app).
 mod system;
-pub use system::{SUPPORTED, SystemKeyStore};
+pub use system::{SERVICE_ENV, SUPPORTED, SystemKeyStore};
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};

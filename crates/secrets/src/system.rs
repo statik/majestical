@@ -12,13 +12,48 @@ use security_framework_sys::base::errSecItemNotFound;
 /// must decide before it holds a store.
 pub const SUPPORTED: bool = cfg!(target_os = "macos");
 
+/// The environment variable a HEAD reads to override the Keychain service
+/// name — for tests, which must never touch the user's real item, and for
+/// keeping separate profiles. This crate itself never reads the environment:
+/// the head reads the variable and hands the value to [`SystemKeyStore::new`].
+pub const SERVICE_ENV: &str = "MAJ_KEYCHAIN_SERVICE";
+
 /// The real store. Platform selection is `cfg(target_os)`, never a feature.
-pub struct SystemKeyStore;
+pub struct SystemKeyStore {
+    #[cfg(target_os = "macos")]
+    service: String,
+}
 
 #[cfg(target_os = "macos")]
 const SERVICE: &str = "majestical";
 #[cfg(target_os = "macos")]
 const ACCOUNT: &str = "openrouter-api-key";
+
+impl SystemKeyStore {
+    /// The store under `service`'s Keychain item; `None` or a blank name
+    /// means the default, `majestical`. Off macOS the name is ignored.
+    #[must_use]
+    pub fn new(service: Option<String>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let service = service
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| SERVICE.to_string());
+            Self { service }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            drop(service);
+            Self {}
+        }
+    }
+}
+
+impl Default for SystemKeyStore {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl KeyStore for SystemKeyStore {
@@ -27,15 +62,15 @@ impl KeyStore for SystemKeyStore {
     }
 
     fn read(&self) -> Result<Option<String>, SecretError> {
-        read_item(SERVICE)
+        read_item(&self.service)
     }
 
     fn store(&self, key: &str) -> Result<(), SecretError> {
-        store_item(SERVICE, key)
+        store_item(&self.service, key)
     }
 
     fn delete(&self) -> Result<bool, SecretError> {
-        delete_item(SERVICE)
+        delete_item(&self.service)
     }
 }
 
@@ -111,9 +146,51 @@ mod tests {
         use crate::KeyStore;
         // A tuple: a bare assert! on a const trips clippy::assertions_on_constants.
         assert_eq!(
-            (super::SUPPORTED, super::SystemKeyStore.supported()),
+            (
+                super::SUPPORTED,
+                super::SystemKeyStore::default().supported()
+            ),
             (true, true)
         );
+    }
+
+    #[test]
+    fn no_name_or_a_blank_one_means_the_default_service() {
+        use super::SystemKeyStore;
+        assert_eq!(SystemKeyStore::default().service, "majestical");
+        assert_eq!(SystemKeyStore::new(None).service, "majestical");
+        assert_eq!(
+            SystemKeyStore::new(Some(String::new())).service,
+            "majestical"
+        );
+        assert_eq!(
+            SystemKeyStore::new(Some("  \t".to_string())).service,
+            "majestical"
+        );
+        assert_eq!(
+            SystemKeyStore::new(Some("majestical-other".to_string())).service,
+            "majestical-other"
+        );
+    }
+
+    // The trait methods, under a throwaway service: the named store is the
+    // only way a test may reach them, since the default one is the user's.
+    #[test]
+    fn a_named_store_round_trips_through_the_trait() {
+        use crate::KeyStore;
+        let service = service("trait");
+        let _cleanup = Cleanup(service.clone());
+        let store = super::SystemKeyStore::new(Some(service.clone()));
+        assert_eq!(store.read().expect("read"), None);
+        store.store("sk-test").expect("store");
+        assert_eq!(store.read().expect("read").as_deref(), Some("sk-test"));
+        assert_eq!(
+            super::read_item(&service).expect("read").as_deref(),
+            Some("sk-test")
+        );
+        assert!(store.delete().expect("delete"));
+        assert!(!store.delete().expect("second delete"));
+        assert_eq!(store.read().expect("read"), None);
     }
 
     // Talks to the real login Keychain, under the throwaway per-process
@@ -163,20 +240,15 @@ mod tests {
     fn the_stub_is_unsupported_everywhere() {
         // A tuple: a bare assert! on a const trips clippy::assertions_on_constants.
         assert_eq!(
-            (super::SUPPORTED, SystemKeyStore.supported()),
+            (super::SUPPORTED, SystemKeyStore::default().supported()),
             (false, false)
         );
+        let store = SystemKeyStore::new(Some("ignored-off-macos".to_string()));
+        assert!(matches!(store.read(), Err(SecretError::Unsupported)));
         assert!(matches!(
-            SystemKeyStore.read(),
+            store.store("sk-test"),
             Err(SecretError::Unsupported)
         ));
-        assert!(matches!(
-            SystemKeyStore.store("sk-test"),
-            Err(SecretError::Unsupported)
-        ));
-        assert!(matches!(
-            SystemKeyStore.delete(),
-            Err(SecretError::Unsupported)
-        ));
+        assert!(matches!(store.delete(), Err(SecretError::Unsupported)));
     }
 }

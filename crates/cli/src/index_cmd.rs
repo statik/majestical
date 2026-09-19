@@ -216,17 +216,22 @@ pub(crate) fn cmd_index_run(app: &FsApp, catalog_dir: &Path, args: &IndexRunArgs
             "--kinds {kind} requires ffmpeg/ffprobe on PATH (brew install ffmpeg)"
         );
     }
+    let store = crate::describer_key::system_store();
     let mut first_pass = true;
     loop {
         // Rebuilt every pass (not hoisted above the loop): the describer API
-        // key is read fresh each time, same as before this extraction, when
-        // `run_caption_items` read it via `crate::describer_cmd::env_api_key()`
-        // on every `run_once` call.
+        // key is resolved fresh each time, as `describer.toml` itself is, so a
+        // key saved while `--watch` runs is picked up by the next pass.
+        let resolved = crate::describer_key::resolve(
+            catalog_dir,
+            &crate::describer_key::KeySources::ambient(&store),
+            app.notices(),
+        );
         let req = IndexRunReq {
             kinds: kinds.clone(),
             limit: args.limit,
             threads: args.threads,
-            api_key: crate::describer_cmd::env_api_key(),
+            api_key: resolved.key,
             retry_failed: retry_on_pass(first_pass, args.retry_failed),
         };
         run_once(app, catalog_dir, &req, args.json)?;

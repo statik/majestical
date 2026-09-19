@@ -18,11 +18,108 @@ use assert_cmd::Command;
 // one place the full rationale is spelled out.
 #[cfg(test)]
 pub fn maj_as(catalog: &std::path::Path, state: &std::path::Path, machine_id: &str) -> Command {
-    let mut c = Command::cargo_bin("maj").unwrap();
+    let mut c = maj_bin();
     c.env("MAJ_CATALOG", catalog)
         .env("MAJ_MACHINE_ID", machine_id)
         .env("MAJ_STATE_DIR", state);
     c
+}
+
+/// The bare `maj` binary, and the ONE place these suites may name it: every
+/// child gets a throwaway Keychain service, so no test can read, write or
+/// delete the item the developer's own `maj` keeps under the default name.
+/// `keychain_guard.rs` fails the build of any test that goes around this.
+#[cfg(test)]
+pub fn maj_bin() -> Command {
+    let mut c = Command::cargo_bin("maj").unwrap();
+    c.env(
+        majestical_secrets::SERVICE_ENV,
+        throwaway_keychain_service(),
+    );
+    c
+}
+
+/// A Keychain service name no other test, process or run shares.
+#[cfg(test)]
+pub fn throwaway_keychain_service() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        "{THROWAWAY_SERVICE_PREFIX}{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+#[cfg(test)]
+const THROWAWAY_SERVICE_PREFIX: &str = "majestical-test-";
+
+/// Like [`maj`], for invocations that must SHARE one throwaway Keychain item
+/// — a `describer set --api-key` and the `show` that reads it back. Hold a
+/// [`KeychainCleanup`] for `service` for as long as the item may exist.
+#[cfg(test)]
+pub fn maj_with_keychain(
+    catalog: &std::path::Path,
+    state: &std::path::Path,
+    service: &str,
+) -> Command {
+    let mut c = maj(catalog, state);
+    c.env(majestical_secrets::SERVICE_ENV, service);
+    c
+}
+
+/// Deletes a throwaway service's Keychain item when dropped, so a test that
+/// stored one leaves nothing in the login Keychain even when it fails midway.
+#[cfg(test)]
+pub struct KeychainCleanup(String);
+
+#[cfg(test)]
+impl KeychainCleanup {
+    /// Panics on any name but a throwaway one: this type must never be
+    /// pointed at the developer's real item.
+    pub fn new(service: &str) -> Self {
+        assert!(
+            service.starts_with(THROWAWAY_SERVICE_PREFIX),
+            "not a throwaway Keychain service: {service}"
+        );
+        Self(service.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeychainCleanup {
+    fn drop(&mut self) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        // A failed delete is the usual case — most tests store nothing — so
+        // its status only picks the word logged (shown with `--nocapture`).
+        let deleted = std::process::Command::new("security")
+            .args(["delete-generic-password", "-s", &self.0])
+            .args(["-a", "openrouter-api-key"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        let found = if deleted { "deleted" } else { "nothing stored" };
+        eprintln!("keychain cleanup: {}: {found}", self.0);
+    }
+}
+
+/// Whether `service` holds a Keychain item. Asks for the item's attributes
+/// only, never its secret (`-w`): that would raise a macOS prompt, since
+/// `security` is not the binary that stored it.
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+pub fn keychain_item_exists(service: &str) -> bool {
+    assert!(
+        service.starts_with(THROWAWAY_SERVICE_PREFIX),
+        "not a throwaway Keychain service: {service}"
+    );
+    std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service])
+        .args(["-a", "openrouter-api-key"])
+        .output()
+        .expect("run security")
+        .status
+        .success()
 }
 
 #[cfg(test)]
@@ -116,9 +213,48 @@ pub fn break_describer_config(root: &std::path::Path, state: &std::path::Path, c
 #[cfg(test)]
 mod tests {
     use super::{
-        DESCRIBER_CONFIG_HEAD, asset_id_of, break_describer_config, first_asset_id,
-        fixture_catalog, maj, walkdir_find,
+        DESCRIBER_CONFIG_HEAD, KeychainCleanup, asset_id_of, break_describer_config,
+        first_asset_id, fixture_catalog, maj, maj_with_keychain, throwaway_keychain_service,
+        walkdir_find,
     };
+
+    // Gives every binary compiling this module a real call site for the
+    // Keychain seam, same `dead_code` rationale as the tests below. It
+    // spawns nothing and stores nothing.
+    #[test]
+    fn every_child_gets_its_own_throwaway_keychain_service() {
+        let first = throwaway_keychain_service();
+        let second = throwaway_keychain_service();
+        assert_ne!(first, second);
+        assert!(first.starts_with("majestical-test-"), "{first}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, state) = (dir.path().join("cat"), dir.path().join("state"));
+        let service_of = |command: &assert_cmd::Command| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == majestical_secrets::SERVICE_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let plain = service_of(&maj(&root, &state)).expect("maj sets a service");
+        assert!(plain.starts_with("majestical-test-"), "{plain}");
+        assert_ne!(Some(plain), service_of(&maj(&root, &state)));
+
+        let _cleanup = KeychainCleanup::new(&first);
+        assert_eq!(
+            service_of(&maj_with_keychain(&root, &state, &first)),
+            Some(first.clone())
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!super::keychain_item_exists(&first));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a throwaway Keychain service")]
+    fn the_cleanup_refuses_the_real_service_name() {
+        let _cleanup = KeychainCleanup::new("majestical");
+    }
 
     #[test]
     fn walkdir_find_returns_empty_when_name_absent() {

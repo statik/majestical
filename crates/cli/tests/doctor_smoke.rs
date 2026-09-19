@@ -60,8 +60,7 @@ fn doctor_human_shows_a_stable_warn_line_for_no_catalog() {
 /// `cli_smoke.rs`), it must still run rather than fail at dispatch.
 #[test]
 fn doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all() {
-    let out = assert_cmd::Command::cargo_bin("maj")
-        .expect("bin")
+    let out = common::maj_bin()
         .env_remove("MAJ_CATALOG")
         .env_remove("MAJ_MACHINE_ID")
         .arg("doctor")
@@ -73,8 +72,7 @@ fn doctor_runs_with_neither_catalog_nor_machine_id_configured_at_all() {
         "{out:?}"
     );
 
-    assert_cmd::Command::cargo_bin("maj")
-        .expect("bin")
+    common::maj_bin()
         .env_remove("MAJ_CATALOG")
         .env_remove("MAJ_MACHINE_ID")
         .args(["doctor", "--json"])
@@ -157,6 +155,46 @@ fn doctor_names_the_env_as_the_openrouter_keys_source() {
     assert!(out.status.success(), "{stderr}");
     assert!(
         stdout.contains("open-router · m · key from env"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sk-test") && !stderr.contains("sk-test"));
+}
+
+/// The key `describer set --api-key` put in the Keychain reaches the
+/// describer row, as a source and never as the key.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_names_the_keychain_as_the_openrouter_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "open-router",
+            "--model",
+            "m",
+        ])
+        .args(["--api-key", "sk-test"])
+        .assert()
+        .success();
+
+    let out = common::maj_with_keychain(&root, &state, &service)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args(["doctor", "--catalog", root.to_str().expect("utf8")])
+        .output()
+        .expect("run");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("open-router · m · key from keychain"),
         "{stdout}"
     );
     assert!(!stdout.contains("sk-test") && !stderr.contains("sk-test"));

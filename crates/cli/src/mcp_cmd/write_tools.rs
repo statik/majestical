@@ -1,4 +1,4 @@
-//! The 20 mutating MCP tools. Every tool takes `confirm: bool` (default
+//! The 21 mutating MCP tools. Every tool takes `confirm: bool` (default
 //! `false`): a dry run returns a structured description of what would
 //! happen (`executed: false`) without touching anything; `confirm: true`
 //! performs the operation for real (`executed: true`). Both arms serialize
@@ -53,6 +53,7 @@
 //! matching on the inner error, since it must match `SyncPullApplyFailed`
 //! itself rather than delegate the whole thing to `tool_error_split`.
 use super::MajServer;
+use crate::describer_key::{self, KeySources};
 use anyhow::Context as _;
 use majestical_core::event::AssetId;
 use majestical_services::app::FsApp;
@@ -1106,27 +1107,31 @@ fn index_run_dry(
 /// would fail to compile for exactly that reason (correctly — nothing about
 /// `FsApp` promises safe concurrent access from two threads at once).
 fn index_run_exec(
-    catalog: &Path,
-    machine_id: &str,
-    author: &str,
+    server: &MajServer,
     kinds: &BTreeSet<String>,
     args: &IndexRunArgs,
+    sources: &KeySources<'_>,
 ) -> anyhow::Result<serde_json::Value> {
+    let catalog = server.catalog.as_path();
+    let notices = Notices::new();
+    let resolved = describer_key::resolve(catalog, sources, &notices);
+    let key_notices = notices.drain();
     let req = majestical_services::index::IndexRunReq {
         kinds: kinds.clone(),
         limit: args.limit,
         threads: args.threads,
-        api_key: crate::describer_cmd::env_api_key(),
+        api_key: resolved.key,
         retry_failed: args.retry_failed,
     };
     let mut outcome = majestical_services::runtime::run_off_tokio_runtime(|| {
-        let app = FsApp::open(catalog, machine_id, author)?;
+        let app = FsApp::open(catalog, &server.machine_id, &server.author)?;
         Ok(majestical_services::index::run(&app, catalog, &req)?)
     })?;
-    let notices = Notices::new();
     majestical_services::index::record_failures(catalog, &outcome, &notices)?;
-    // The ledger update runs after the pass, so its diagnostics belong at the
-    // end of the run's own list rather than in a second field.
+    // The key was resolved before the pass and the ledger updated after it,
+    // so their diagnostics go either side of the run's own rather than in a
+    // second field.
+    outcome.notices.splice(0..0, key_notices);
     outcome.notices.extend(notices.drain());
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
@@ -1140,7 +1145,9 @@ struct SetDescriberArgs {
     model: String,
     #[serde(default)]
     base_url: Option<String>,
-    /// The `OpenRouter` API key to store. Omit to keep the stored key.
+    /// The `OpenRouter` API key to store: in the macOS Keychain, or in
+    /// describer.toml where there is none. Omit to keep the stored key;
+    /// `clear_describer_key` removes it.
     #[serde(default)]
     api_key: Option<String>,
     /// `false` (default) returns a dry-run description of what would
@@ -1150,23 +1157,29 @@ struct SetDescriberArgs {
 }
 
 /// What a confirmed `set_describer` would do with the key, as the tail of
-/// the dry run's `would` sentence; empty when there is no key to speak of.
-fn key_effect(api_key: Option<&str>, current: Option<KeySource>) -> &'static str {
-    match (api_key, current) {
-        (Some(_), _) => ", storing the key in describer.toml",
-        (None, Some(KeySource::File)) => ", keeping the stored key",
-        (None, Some(KeySource::Env | KeySource::Keychain | KeySource::Absent) | None) => "",
+/// the dry run's `would` sentence. A supplied key goes where
+/// `describer_key::store` would put it. Without one, `set` touches no stored
+/// key — true whichever source a run would use — and with no describer
+/// configured yet there is no stored key to speak of.
+fn key_effect(api_key: Option<&str>, keychain_supported: bool, configured: bool) -> &'static str {
+    match (api_key, keychain_supported, configured) {
+        (Some(_), true, _) => ", storing the key in the macOS Keychain",
+        (Some(_), false, _) => ", storing the key in describer.toml",
+        (None, _, true) => ", leaving any stored key unchanged",
+        (None, _, false) => "",
     }
 }
 
 fn set_describer_result(
     catalog: &Path,
     args: &SetDescriberArgs,
+    sources: &KeySources<'_>,
 ) -> anyhow::Result<serde_json::Value> {
     let backend: majestical_describe::BackendKind = args.backend.into();
     let notices = Notices::new();
-    let presence = crate::describer_cmd::key_presence();
     if !args.confirm {
+        // Resolved against the config as it stands: `current` is that state.
+        let presence = describer_key::presence(&describer_key::resolve(catalog, sources, &notices));
         let current = majestical_services::describer_config::show(catalog, presence, &notices)?;
         return Ok(super::with_notices(
             json!({
@@ -1180,31 +1193,88 @@ fn set_describer_result(
                     args.model,
                     key_effect(
                         args.api_key.as_deref(),
-                        current.as_ref().map(|view| view.key_source),
+                        sources.store.supported(),
+                        current.is_some(),
                     ),
                 ),
             }),
             notices.drain(),
         ));
     }
+    let file_key = describer_key::store(args.api_key.clone(), sources.store)?;
     majestical_services::describer_config::set(
         catalog,
         &majestical_services::describer_config::SetArgs {
             backend,
             model: args.model.clone(),
             base_url: args.base_url.clone(),
-            file_key: majestical_services::describer_config::plan_key_write(
-                false,
-                args.api_key.clone(),
-            )
-            .file,
+            file_key,
         },
         &notices,
     )?;
+    // Resolved only now: the Keychain is read for the backend `set` just
+    // stored, not the one it replaced.
+    let presence = describer_key::presence(&describer_key::resolve(catalog, sources, &notices));
     let view = majestical_services::describer_config::show(catalog, presence, &notices)?
         .context("the describer config is missing right after it was stored")?;
     Ok(super::with_notices(
         serde_json::to_value(&view)?,
+        notices.drain(),
+    ))
+}
+
+/// Params for `clear_describer_key`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClearDescriberKeyArgs {
+    /// `false` (default) returns a dry-run description of what would
+    /// happen; `true` executes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// The dry run's `would` sentence. `consulted` is whether the Keychain was
+/// read to build `source`: it is not for a local backend, while
+/// `MAJ_OPENROUTER_KEY` is set, or when the read failed — and then an item
+/// this view cannot see may still be there for a confirmed call to remove.
+fn clear_key_would(source: KeySource, consulted: bool) -> &'static str {
+    match (source, consulted) {
+        (KeySource::Env, _) => {
+            "remove the stored key, if any — MAJ_OPENROUTER_KEY would still supply a key"
+        }
+        (KeySource::Keychain, _) => "remove the stored key (currently from keychain)",
+        (KeySource::File, _) => "remove the stored key (currently from file)",
+        (KeySource::Absent, true) => "no stored key to remove",
+        (KeySource::Absent, false) => "remove the stored key, if any — the Keychain was not read",
+    }
+}
+
+fn clear_describer_key_result(
+    catalog: &Path,
+    confirm: bool,
+    sources: &KeySources<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    let notices = Notices::new();
+    if confirm {
+        let outcome = describer_key::clear(catalog, sources, &notices)?;
+        return Ok(super::with_notices(
+            serde_json::to_value(&outcome)?,
+            notices.drain(),
+        ));
+    }
+    let wants = majestical_services::describer_config::wants_keychain(catalog, &notices);
+    let resolved = describer_key::resolve(catalog, sources, &notices);
+    let current = majestical_services::describer_config::show(
+        catalog,
+        describer_key::presence(&resolved),
+        &notices,
+    )?;
+    let source = current
+        .as_ref()
+        .map_or(KeySource::Absent, |view| view.key_source);
+    // An unsupported store holds nothing, so there is nothing unseen in it.
+    let consulted = (wants && resolved.notice.is_none()) || !sources.store.supported();
+    Ok(super::with_notices(
+        json!({"current": current, "would": clear_key_would(source, consulted)}),
         notices.drain(),
     ))
 }
@@ -1218,11 +1288,16 @@ struct TestDescriberArgs {
     confirm: bool,
 }
 
-fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_json::Value> {
+fn test_describer_result(
+    catalog: &Path,
+    confirm: bool,
+    sources: &KeySources<'_>,
+) -> anyhow::Result<serde_json::Value> {
     let notices = Notices::new();
+    let resolved = describer_key::resolve(catalog, sources, &notices);
     let configured = majestical_services::describer_config::show(
         catalog,
-        crate::describer_cmd::key_presence(),
+        describer_key::presence(&resolved),
         &notices,
     )?;
     if !confirm {
@@ -1237,11 +1312,7 @@ fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_
             notices.drain(),
         ));
     }
-    let probe = majestical_services::describer_config::test(
-        catalog,
-        crate::describer_cmd::env_api_key(),
-        &notices,
-    )?;
+    let probe = majestical_services::describer_config::test(catalog, resolved.key, &notices)?;
     Ok(super::with_notices(
         serde_json::to_value(&probe)?,
         notices.drain(),
@@ -1308,6 +1379,23 @@ impl MajServer {
         confirm_gate(args.confirm, assign_tags_result(&mut app, &args))
     }
 
+    /// Removes this machine's stored describer API key: the macOS Keychain
+    /// item and `describer.toml`'s `api_key`. `false` reports where the key
+    /// currently comes from and what would be removed; `true` removes it and
+    /// reports what was there. A key in `MAJ_OPENROUTER_KEY` is not stored
+    /// and is left alone — `env_still_supplies` says when one is set.
+    #[tool]
+    fn clear_describer_key(
+        &self,
+        Parameters(args): Parameters<ClearDescriberKeyArgs>,
+    ) -> CallToolResult {
+        let store = describer_key::system_store();
+        confirm_gate(
+            args.confirm,
+            clear_describer_key_result(&self.catalog, args.confirm, &KeySources::ambient(&store)),
+        )
+    }
+
     /// Initializes a new catalog directory. Refuses (even with `confirm:
     /// true`) if a catalog already exists at this server's catalog path.
     #[tool]
@@ -1335,7 +1423,8 @@ impl MajServer {
     /// Works one pass of the derivation queue (thumbnails, embeddings,
     /// keyframes, keyframe images, transcripts, OCR, PDF text, captions).
     /// Always a single pass — there is no `--watch` equivalent over MCP. The
-    /// describer API key comes from `MAJ_OPENROUTER_KEY`, same as the CLI.
+    /// describer API key comes from `MAJ_OPENROUTER_KEY`, then the macOS
+    /// Keychain, same as the CLI.
     #[tool]
     fn index_run(&self, Parameters(args): Parameters<IndexRunArgs>) -> CallToolResult {
         let kinds = match parse_index_kinds(args.kinds.as_deref()) {
@@ -1343,7 +1432,8 @@ impl MajServer {
             Err(err) => return super::tool_error(err),
         };
         let result = if args.confirm {
-            index_run_exec(&self.catalog, &self.machine_id, &self.author, &kinds, &args)
+            let store = describer_key::system_store();
+            index_run_exec(self, &kinds, &args, &KeySources::ambient(&store))
         } else {
             match self.open_app() {
                 Ok(app) => index_run_dry(&app, &self.catalog, &kinds, &args),
@@ -1486,7 +1576,11 @@ impl MajServer {
     /// alongside what would be stored; `true` stores it.
     #[tool]
     fn set_describer(&self, Parameters(args): Parameters<SetDescriberArgs>) -> CallToolResult {
-        confirm_gate(args.confirm, set_describer_result(&self.catalog, &args))
+        let store = describer_key::system_store();
+        confirm_gate(
+            args.confirm,
+            set_describer_result(&self.catalog, &args, &KeySources::ambient(&store)),
+        )
     }
 
     /// Sets an LWW metadata field on an asset. `false` reports the field's
@@ -1618,9 +1712,10 @@ impl MajServer {
     /// this server.
     #[tool]
     fn test_describer(&self, Parameters(args): Parameters<TestDescriberArgs>) -> CallToolResult {
+        let store = describer_key::system_store();
         confirm_gate(
             args.confirm,
-            test_describer_result(&self.catalog, args.confirm),
+            test_describer_result(&self.catalog, args.confirm, &KeySources::ambient(&store)),
         )
     }
 
@@ -1650,6 +1745,309 @@ impl MajServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use majestical_secrets::MemoryKeyStore;
+    use majestical_services::describer_config::{DescriberBackend, KeyPresence};
+
+    fn holding(key: &str) -> MemoryKeyStore {
+        MemoryKeyStore {
+            key: std::sync::Mutex::new(Some(key.to_string())),
+            ..MemoryKeyStore::default()
+        }
+    }
+
+    fn held(store: &MemoryKeyStore) -> Option<String> {
+        store.key.lock().expect("lock").clone()
+    }
+
+    fn no_env(store: &MemoryKeyStore) -> KeySources<'_> {
+        KeySources { env: None, store }
+    }
+
+    fn set_args(
+        backend: DescriberBackend,
+        api_key: Option<&str>,
+        confirm: bool,
+    ) -> SetDescriberArgs {
+        SetDescriberArgs {
+            backend,
+            model: "m".to_string(),
+            base_url: None,
+            api_key: api_key.map(str::to_string),
+            confirm,
+        }
+    }
+
+    /// What `describer.toml` alone says about the key: `file` or `none`.
+    fn file_key_source(root: &Path) -> Option<KeySource> {
+        majestical_services::describer_config::show(root, KeyPresence::Absent, &Notices::new())
+            .expect("show")
+            .map(|view| view.key_source)
+    }
+
+    #[test]
+    fn a_confirmed_set_puts_the_key_in_the_keychain_and_echoes_keychain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryKeyStore::default();
+        let echo = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, Some("sk-test"), true),
+            &no_env(&store),
+        )
+        .expect("set");
+        assert_eq!(echo["key_source"], json!("keychain"), "{echo}");
+        assert!(!echo.to_string().contains("sk-test"), "{echo}");
+        assert_eq!(held(&store).as_deref(), Some("sk-test"));
+        assert_eq!(file_key_source(dir.path()), Some(KeySource::Absent));
+    }
+
+    #[test]
+    fn a_confirmed_set_without_a_keychain_puts_the_key_in_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryKeyStore {
+            unsupported: true,
+            ..MemoryKeyStore::default()
+        };
+        let echo = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, Some("sk-test"), true),
+            &no_env(&store),
+        )
+        .expect("set");
+        assert_eq!(echo["key_source"], json!("file"), "{echo}");
+        assert!(!echo.to_string().contains("sk-test"), "{echo}");
+        assert_eq!(held(&store), None);
+    }
+
+    /// The echo names the key's source for the backend `set` just stored,
+    /// not the one it replaced: the Keychain is only read for `OpenRouter`.
+    #[test]
+    fn switching_to_openrouter_echoes_the_key_already_in_the_keychain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = holding("sk-test");
+        let local = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::Ollama, None, true),
+            &no_env(&store),
+        )
+        .expect("set ollama");
+        assert_eq!(local["key_source"], json!("none"), "{local}");
+
+        let hosted = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, None, true),
+            &no_env(&store),
+        )
+        .expect("set open-router");
+        assert_eq!(hosted["key_source"], json!("keychain"), "{hosted}");
+    }
+
+    #[test]
+    fn a_refused_keychain_write_fails_set_before_the_config_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..MemoryKeyStore::default()
+        };
+        let err = set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, Some("sk-test"), true),
+            &no_env(&store),
+        )
+        .expect_err("refused");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("Keychain"), "{rendered}");
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+        assert_eq!(file_key_source(dir.path()), None);
+    }
+
+    #[test]
+    fn the_set_dry_run_says_where_the_key_would_go_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let would = |api_key: Option<&str>, store: &MemoryKeyStore| {
+            let dry = set_describer_result(
+                dir.path(),
+                &set_args(DescriberBackend::OpenRouter, api_key, false),
+                &no_env(store),
+            )
+            .expect("dry run");
+            assert!(!dry.to_string().contains("sk-test"), "{dry}");
+            dry["would"].as_str().expect("would").to_string()
+        };
+        let keychain = MemoryKeyStore::default();
+        let fileonly = MemoryKeyStore {
+            unsupported: true,
+            ..MemoryKeyStore::default()
+        };
+        assert_eq!(
+            would(Some("sk-test"), &keychain),
+            "configure the describer backend to open-router model 'm', \
+             storing the key in the macOS Keychain"
+        );
+        assert_eq!(
+            would(Some("sk-test"), &fileonly),
+            "configure the describer backend to open-router model 'm', \
+             storing the key in describer.toml"
+        );
+        assert_eq!(
+            would(None, &keychain),
+            "configure the describer backend to open-router model 'm'"
+        );
+        assert_eq!(held(&keychain), None);
+        assert_eq!(file_key_source(dir.path()), None);
+
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::Ollama, None, true),
+            &no_env(&keychain),
+        )
+        .expect("set");
+        assert_eq!(
+            would(None, &keychain),
+            "configure the describer backend to open-router model 'm', \
+             leaving any stored key unchanged"
+        );
+    }
+
+    fn clear_dry(root: &Path, sources: &KeySources<'_>) -> serde_json::Value {
+        clear_describer_key_result(root, false, sources).expect("dry run")
+    }
+
+    #[test]
+    fn the_clear_dry_run_names_the_source_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fileonly = MemoryKeyStore {
+            unsupported: true,
+            ..MemoryKeyStore::default()
+        };
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, Some("sk-test"), true),
+            &no_env(&fileonly),
+        )
+        .expect("set a file key");
+
+        let store = holding("sk-test-2");
+        let dry = clear_dry(dir.path(), &no_env(&store));
+        assert_eq!(
+            dry["would"],
+            json!("remove the stored key (currently from keychain)")
+        );
+        assert_eq!(dry["current"]["key_source"], json!("keychain"), "{dry}");
+        assert!(!dry.to_string().contains("sk-test"), "{dry}");
+        assert_eq!(held(&store).as_deref(), Some("sk-test-2"));
+        assert_eq!(file_key_source(dir.path()), Some(KeySource::File));
+
+        let empty = MemoryKeyStore::default();
+        assert_eq!(
+            clear_dry(dir.path(), &no_env(&empty))["would"],
+            json!("remove the stored key (currently from file)")
+        );
+        assert_eq!(file_key_source(dir.path()), Some(KeySource::File));
+
+        let with_env = KeySources {
+            env: Some("sk-test".to_string()),
+            store: &store,
+        };
+        let dry = clear_dry(dir.path(), &with_env);
+        assert_eq!(
+            dry["would"],
+            json!("remove the stored key, if any — MAJ_OPENROUTER_KEY would still supply a key")
+        );
+        assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    }
+
+    #[test]
+    fn the_clear_dry_run_says_so_when_there_is_nothing_or_it_did_not_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = holding("sk-test");
+        // No describer yet: the Keychain is not read, so its item is unseen.
+        assert_eq!(
+            clear_dry(dir.path(), &no_env(&store))["would"],
+            json!("remove the stored key, if any — the Keychain was not read")
+        );
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::Ollama, None, true),
+            &no_env(&store),
+        )
+        .expect("set ollama");
+        assert_eq!(
+            clear_dry(dir.path(), &no_env(&store))["would"],
+            json!("remove the stored key, if any — the Keychain was not read")
+        );
+
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, None, true),
+            &no_env(&store),
+        )
+        .expect("set open-router");
+        let empty = MemoryKeyStore::default();
+        assert_eq!(
+            clear_dry(dir.path(), &no_env(&empty))["would"],
+            json!("no stored key to remove")
+        );
+        let unreadable = MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..MemoryKeyStore::default()
+        };
+        let dry = clear_dry(dir.path(), &no_env(&unreadable));
+        assert_eq!(
+            dry["would"],
+            json!("remove the stored key, if any — the Keychain was not read")
+        );
+        assert!(
+            dry["notices"][0]
+                .as_str()
+                .is_some_and(|n| n.contains("denied")),
+            "{dry}"
+        );
+        let fileonly = MemoryKeyStore {
+            unsupported: true,
+            ..MemoryKeyStore::default()
+        };
+        assert_eq!(
+            clear_dry(dir.path(), &no_env(&fileonly))["would"],
+            json!("no stored key to remove")
+        );
+        assert_eq!(held(&store).as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn a_confirmed_clear_reports_what_it_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryKeyStore::default();
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, Some("sk-test"), true),
+            &no_env(&store),
+        )
+        .expect("set");
+        let cleared = clear_describer_key_result(dir.path(), true, &no_env(&store)).expect("clear");
+        assert_eq!(
+            cleared,
+            json!({"keychain_cleared": true, "file_cleared": false, "env_still_supplies": false})
+        );
+        assert_eq!(held(&store), None);
+        let again = clear_describer_key_result(dir.path(), true, &no_env(&store)).expect("clear");
+        assert_eq!(again["keychain_cleared"], json!(false), "{again}");
+    }
+
+    #[test]
+    fn test_describer_passes_the_keychain_key_to_the_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = holding("sk-test");
+        set_describer_result(
+            dir.path(),
+            &set_args(DescriberBackend::OpenRouter, None, true),
+            &no_env(&store),
+        )
+        .expect("set");
+        let dry = test_describer_result(dir.path(), false, &no_env(&store)).expect("dry run");
+        assert_eq!(dry["configured"]["key_source"], json!("keychain"), "{dry}");
+        assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    }
 
     #[test]
     fn parse_only_maps_every_value_and_rejects_unknown() {

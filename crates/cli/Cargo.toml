@@ -34,6 +34,9 @@ majestical-sync = { path = "../sync" }
 majestical-ingest = { path = "../ingest" }
 majestical-index = { path = "../index" }
 majestical-describe = { path = "../describe" }
+# The heads are the only crates that may touch the secret store — see
+# `crates/secrets/src/lib.rs`.
+majestical-secrets = { path = "../secrets" }
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true

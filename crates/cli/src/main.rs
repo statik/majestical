@@ -1,6 +1,7 @@
 //! `maj`: agent-first CLI over the catalog core. JSON-first output.
 mod commands;
 mod describer_cmd;
+mod describer_key;
 mod inbox_cmd;
 mod index_cmd;
 mod mcp_cmd;
@@ -381,7 +382,8 @@ enum DescriberCmd {
         model: String,
         #[arg(long)]
         base_url: Option<String>,
-        /// The `OpenRouter` API key to store. Omit to keep the stored key.
+        /// The `OpenRouter` API key to store: in the macOS Keychain, or in
+        /// describer.toml where there is none. Omit to keep the stored key.
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -390,6 +392,8 @@ enum DescriberCmd {
     /// Probe the backend: connectivity, model presence, vision capability, and
     /// (`OpenRouter`) whether the key is accepted.
     Test,
+    /// Remove the stored API key (the Keychain item and describer.toml's).
+    ClearKey,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -610,16 +614,16 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
             api_key,
         } => describer_cmd::cmd_set(
             catalog,
-            &majestical_services::describer_config::SetArgs {
+            describer_cmd::SetRequest {
                 backend: backend.into(),
                 model,
                 base_url,
-                file_key: majestical_services::describer_config::plan_key_write(false, api_key)
-                    .file,
+                api_key,
             },
         ),
         DescriberCmd::Show => describer_cmd::cmd_show(catalog),
         DescriberCmd::Test => describer_cmd::cmd_test(catalog),
+        DescriberCmd::ClearKey => describer_cmd::cmd_clear_key(catalog),
     }
 }
 

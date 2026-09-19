@@ -308,25 +308,32 @@ fn carried_key(
     notices: &crate::notices::Notices,
 ) -> Option<String> {
     let stored = stored?;
-    let key = stored.api_key?;
     if stored.backend != backend {
-        notices.push(format!(
-            "note: the stored API key belonged to {} and was not carried over to {} — \
-             set one with `--api-key` if {} needs it",
-            stored.backend.as_str(),
-            backend.as_str(),
-            backend.as_str()
-        ));
+        if stored.api_key.is_some() {
+            notices.push(format!(
+                "note: the stored API key belonged to {} and was not carried over to {} — \
+                 set one with `--api-key` if {} needs it",
+                stored.backend.as_str(),
+                backend.as_str(),
+                backend.as_str()
+            ));
+        }
         return None;
     }
-    if stored.base_url != base_url {
+    // Before reading the file's key, because there may be one this function
+    // cannot see: an `OpenRouter` key lives in the Keychain and leaves the
+    // file keyless, and it is the costliest key to send somewhere new. The
+    // wording therefore never asserts that a key exists.
+    if stored.base_url != base_url
+        && (stored.api_key.is_some() || backend == BackendKind::OpenRouter)
+    {
         notices.push(format!(
-            "note: the stored API key is now being sent to {base_url} (was {}) — \
+            "note: any stored API key is now being sent to {base_url} (was {}) — \
              remove it with `describer clear-key` if that is not intended",
             stored.base_url
         ));
     }
-    Some(key)
+    stored.api_key
 }
 
 /// What a head reports after `clear-key`. Built by the head (it owns the
@@ -769,6 +776,58 @@ mod tests {
         assert!(
             !notices.drain().iter().any(|n| n.contains("now being sent")),
             "an unchanged url must not warn"
+        );
+    }
+
+    /// The costliest key is the one this function cannot see: an
+    /// `OpenRouter` key lives in the Keychain and leaves `describer.toml`
+    /// keyless, so an early return on the file's key would move a paid
+    /// hosted token to a new host in silence.
+    #[test]
+    fn moving_openrouter_warns_even_though_its_key_is_not_in_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notices = Notices::new();
+        // Exactly what a macOS `describer set --api-key` leaves behind: the
+        // key is in the Keychain, the file has none.
+        set(
+            dir.path(),
+            &set_args(BackendKind::OpenRouter, "m", FileKey::Clear),
+            &notices,
+        )
+        .expect("set keyless");
+        assert_eq!(stored(dir.path()).api_key, None);
+        drop(notices.drain());
+
+        let mut moved = set_args(BackendKind::OpenRouter, "m", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:18716".to_string());
+        set(dir.path(), &moved, &notices).expect("set at a new url");
+
+        let said: Vec<String> = notices
+            .drain()
+            .into_iter()
+            .filter(|notice| notice.contains("now being sent to"))
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("http://127.0.0.1:18716"), "{said:?}");
+        // It must not claim a key exists: this function cannot know.
+        assert!(said[0].contains("any stored API key"), "{said:?}");
+
+        // A local backend with no file key has nothing to warn about: its
+        // key could only ever have been the file's.
+        let dir = tempfile::tempdir().expect("tempdir");
+        set(
+            dir.path(),
+            &set_args(BackendKind::LmStudio, "m", FileKey::Clear),
+            &notices,
+        )
+        .expect("set keyless local");
+        drop(notices.drain());
+        let mut moved = set_args(BackendKind::LmStudio, "m", FileKey::Keep);
+        moved.base_url = Some("http://127.0.0.1:1235".to_string());
+        set(dir.path(), &moved, &notices).expect("move local");
+        assert!(
+            !notices.drain().iter().any(|n| n.contains("now being sent")),
+            "a local backend with no stored key must stay quiet"
         );
     }
 

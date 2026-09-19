@@ -56,6 +56,7 @@ use super::MajServer;
 use anyhow::Context as _;
 use majestical_core::event::AssetId;
 use majestical_services::app::FsApp;
+use majestical_services::describer_config::KeySource;
 use majestical_services::error::ServiceError;
 use majestical_services::notices::Notices;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1130,14 +1131,16 @@ fn index_run_exec(
     serde_json::to_value(&outcome).map_err(anyhow::Error::from)
 }
 
-/// Params for `set_describer`.
-#[derive(Debug, Deserialize, JsonSchema)]
+/// Params for `set_describer`. No `Debug`, unlike its siblings: `api_key` is
+/// a real key, and nothing formats this struct.
+#[derive(Deserialize, JsonSchema)]
 struct SetDescriberArgs {
     /// Which describer service to talk to.
     backend: majestical_services::describer_config::DescriberBackend,
     model: String,
     #[serde(default)]
     base_url: Option<String>,
+    /// The `OpenRouter` API key to store. Omit to keep the stored key.
     #[serde(default)]
     api_key: Option<String>,
     /// `false` (default) returns a dry-run description of what would
@@ -1146,14 +1149,25 @@ struct SetDescriberArgs {
     confirm: bool,
 }
 
+/// What a confirmed `set_describer` would do with the key, as the tail of
+/// the dry run's `would` sentence; empty when there is no key to speak of.
+fn key_effect(api_key: Option<&str>, current: Option<KeySource>) -> &'static str {
+    match (api_key, current) {
+        (Some(_), _) => ", storing the key in describer.toml",
+        (None, Some(KeySource::File)) => ", keeping the stored key",
+        (None, Some(KeySource::Env | KeySource::Keychain | KeySource::Absent) | None) => "",
+    }
+}
+
 fn set_describer_result(
     catalog: &Path,
     args: &SetDescriberArgs,
 ) -> anyhow::Result<serde_json::Value> {
     let backend: majestical_describe::BackendKind = args.backend.into();
     let notices = Notices::new();
+    let presence = crate::describer_cmd::key_presence();
     if !args.confirm {
-        let current = majestical_services::describer_config::show(catalog, &notices)?;
+        let current = majestical_services::describer_config::show(catalog, presence, &notices)?;
         return Ok(super::with_notices(
             json!({
                 "backend": args.backend,
@@ -1161,23 +1175,34 @@ fn set_describer_result(
                 "base_url": args.base_url,
                 "current": current,
                 "would": format!(
-                    "configure the describer backend to {} model '{}'",
-                    backend.as_str(), args.model
+                    "configure the describer backend to {} model '{}'{}",
+                    backend.as_str(),
+                    args.model,
+                    key_effect(
+                        args.api_key.as_deref(),
+                        current.as_ref().map(|view| view.key_source),
+                    ),
                 ),
             }),
             notices.drain(),
         ));
     }
-    let view = majestical_services::describer_config::set(
+    majestical_services::describer_config::set(
         catalog,
         &majestical_services::describer_config::SetArgs {
             backend,
             model: args.model.clone(),
             base_url: args.base_url.clone(),
-            api_key: args.api_key.clone(),
+            file_key: majestical_services::describer_config::plan_key_write(
+                false,
+                args.api_key.clone(),
+            )
+            .file,
         },
         &notices,
     )?;
+    let view = majestical_services::describer_config::show(catalog, presence, &notices)?
+        .context("the describer config is missing right after it was stored")?;
     Ok(super::with_notices(
         serde_json::to_value(&view)?,
         notices.drain(),
@@ -1195,7 +1220,11 @@ struct TestDescriberArgs {
 
 fn test_describer_result(catalog: &Path, confirm: bool) -> anyhow::Result<serde_json::Value> {
     let notices = Notices::new();
-    let configured = majestical_services::describer_config::show(catalog, &notices)?;
+    let configured = majestical_services::describer_config::show(
+        catalog,
+        crate::describer_cmd::key_presence(),
+        &notices,
+    )?;
     if !confirm {
         let would = if configured.is_some() {
             "probe the configured backend's connectivity, model presence, and vision \

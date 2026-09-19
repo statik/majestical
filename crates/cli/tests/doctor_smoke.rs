@@ -118,3 +118,59 @@ fn doctor_catalog_flag_reports_ok_for_a_real_catalog() {
         "{catalog_row}"
     );
 }
+
+/// `maj doctor --catalog <root>` for a catalog whose describer is
+/// `OpenRouter` with no key in the file.
+#[cfg(test)]
+fn maj_doctor_with_an_openrouter_describer(dir: &std::path::Path) -> assert_cmd::Command {
+    let (root, state) = common::fixture_catalog(dir);
+    maj(&root, &state)
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .args([
+            "describer",
+            "set",
+            "--backend",
+            "open-router",
+            "--model",
+            "m",
+        ])
+        .assert()
+        .success();
+    let mut cmd = maj(&root, &state);
+    cmd.args(["doctor", "--catalog", root.to_str().expect("utf8")]);
+    cmd
+}
+
+/// This head's reading of `MAJ_OPENROUTER_KEY` reaches the describer row,
+/// as a source and never as the key.
+#[test]
+fn doctor_names_the_env_as_the_openrouter_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = maj_doctor_with_an_openrouter_describer(dir.path())
+        .env("MAJ_OPENROUTER_KEY", "sk-test")
+        .output()
+        .expect("run");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("open-router · m · key from env"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sk-test") && !stderr.contains("sk-test"));
+}
+
+#[test]
+fn doctor_fails_the_describer_row_without_a_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = maj_doctor_with_an_openrouter_describer(dir.path())
+        .env_remove("MAJ_OPENROUTER_KEY")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout.contains("open-router · m · no API key"), "{stdout}");
+    assert!(!stdout.contains("key from"), "{stdout}");
+}

@@ -875,6 +875,76 @@ fn get_describer_matches() {
     );
 }
 
+/// Calls `tool` over a `describer.toml` broken on the line that holds a key
+/// — the line a TOML parse error would quote back — and returns the whole
+/// response, having checked that the key is nowhere in it. The broken line
+/// is line 4.
+#[cfg(test)]
+fn call_over_a_broken_describer_config(tool: &str, args: &serde_json::Value) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    common::break_describer_config(
+        &root,
+        &state,
+        &format!(
+            "{}api_key = \"sk-test\" oops\n",
+            common::DESCRIBER_CONFIG_HEAD
+        ),
+    );
+
+    let mut mcp = Mcp::spawn(&root, &state);
+    let resp = mcp.call_tool(tool, args).to_string();
+    assert!(!resp.contains("sk-test"), "{tool}: {resp}");
+    resp
+}
+
+/// Every describer tool that reads the file fails on a broken one with the
+/// whole error chain (`tool_error` renders `{err:#}`), so the chain has to
+/// name the line without quoting it.
+#[test]
+fn describer_tools_over_a_broken_config_name_the_line_and_never_quote_it() {
+    for (tool, args) in [
+        ("get_describer", serde_json::json!({})),
+        ("test_describer", serde_json::json!({})),
+        ("test_describer", serde_json::json!({"confirm": true})),
+        (
+            "set_describer",
+            serde_json::json!({"backend": "ollama", "model": "m2"}),
+        ),
+        (
+            "set_describer",
+            serde_json::json!({"backend": "ollama", "model": "m2", "confirm": true}),
+        ),
+    ] {
+        let resp = call_over_a_broken_describer_config(tool, &args);
+        let parsed: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            parsed["result"]["isError"],
+            serde_json::json!(true),
+            "{tool} {args}: {resp}"
+        );
+        assert!(
+            resp.contains("describer.toml: line 4: "),
+            "{tool} {args}: {resp}"
+        );
+    }
+}
+
+/// `index_status` degrades a broken describer config to a notice instead of
+/// failing; the notice carries the same chain.
+#[test]
+fn index_status_over_a_broken_describer_config_names_the_line_and_never_quotes_it() {
+    let resp = call_over_a_broken_describer_config("index_status", &serde_json::json!({}));
+    let parsed: serde_json::Value = serde_json::from_str(&resp).expect("json");
+    assert_ne!(
+        parsed["result"]["isError"],
+        serde_json::json!(true),
+        "{resp}"
+    );
+    assert!(resp.contains("ignoring broken describer config"), "{resp}");
+    assert!(resp.contains("describer.toml: line 4: "), "{resp}");
+}
+
 #[test]
 fn suggest_tags_review_matches() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2876,6 +2946,205 @@ fn set_describer_dry_run_then_confirm_is_visible_via_get_describer() {
         structured["describer"]["model"],
         serde_json::json!("llava"),
         "{structured}"
+    );
+}
+
+/// `set_describer` echoes the view `get_describer` would return: the key's
+/// source, never the key. A local backend's key can only come from the
+/// file, so this holds whatever `MAJ_OPENROUTER_KEY` is in the ambient
+/// environment. A second `set_describer` without `api_key` keeps the key.
+#[test]
+fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn(&root, &state);
+
+    // The dry run says what would happen to the key, and nothing when
+    // nothing would.
+    let keyless_dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "first"}),
+    );
+    assert_eq!(
+        keyless_dry["result"]["structuredContent"]["would"],
+        serde_json::json!("configure the describer backend to ollama model 'first'"),
+        "{keyless_dry}"
+    );
+    let keyed_dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "first", "api_key": "sk-test"}),
+    );
+    assert!(!keyed_dry.to_string().contains("sk-test"), "{keyed_dry}");
+    assert_eq!(
+        keyed_dry["result"]["structuredContent"]["would"],
+        serde_json::json!(
+            "configure the describer backend to ollama model 'first', \
+             storing the key in describer.toml"
+        ),
+        "{keyed_dry}"
+    );
+
+    let keyed = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({
+            "backend": "ollama", "model": "first", "api_key": "sk-test", "confirm": true
+        }),
+    );
+    assert_ne!(
+        keyed["result"]["isError"],
+        serde_json::json!(true),
+        "{keyed}"
+    );
+    assert!(!keyed.to_string().contains("sk-test"), "{keyed}");
+    let structured = &keyed["result"]["structuredContent"];
+    assert_eq!(
+        structured["key_source"],
+        serde_json::json!("file"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["api_key"],
+        serde_json::json!(null),
+        "{structured}"
+    );
+
+    let dry = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "second"}),
+    );
+    assert_eq!(
+        dry["result"]["structuredContent"]["current"]["key_source"],
+        serde_json::json!("file"),
+        "{dry}"
+    );
+    assert_eq!(
+        dry["result"]["structuredContent"]["would"],
+        serde_json::json!(
+            "configure the describer backend to ollama model 'second', keeping the stored key"
+        ),
+        "{dry}"
+    );
+
+    let rekeyed = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "ollama", "model": "second", "confirm": true}),
+    );
+    let structured = &rekeyed["result"]["structuredContent"];
+    assert_eq!(
+        structured["model"],
+        serde_json::json!("second"),
+        "{structured}"
+    );
+    assert_eq!(
+        structured["key_source"],
+        serde_json::json!("file"),
+        "{structured}"
+    );
+
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert!(!described.to_string().contains("sk-test"), "{described}");
+    assert_eq!(
+        described["result"]["structuredContent"]["describer"]["key_source"],
+        serde_json::json!("file"),
+        "{described}"
+    );
+}
+
+/// With `OpenRouter` and the key in this head's environment, the source is
+/// the environment.
+#[test]
+fn get_describer_names_the_env_as_the_openrouter_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", "sk-test")]);
+
+    let set = mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+    assert!(!set.to_string().contains("sk-test"), "{set}");
+    assert_eq!(
+        set["result"]["structuredContent"]["key_source"],
+        serde_json::json!("env"),
+        "{set}"
+    );
+
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert!(!described.to_string().contains("sk-test"), "{described}");
+    assert_eq!(
+        described["result"]["structuredContent"]["describer"]["key_source"],
+        serde_json::json!("env"),
+        "{described}"
+    );
+}
+
+/// `test_describer`'s dry run shows the same view `get_describer` would,
+/// so its key source is this head's reading too.
+#[test]
+fn test_describer_dry_run_names_the_env_as_the_keys_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", "sk-test")]);
+    mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+
+    let dry = mcp.call_tool("test_describer", &serde_json::json!({}));
+
+    assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    assert_eq!(
+        dry["result"]["structuredContent"]["configured"]["key_source"],
+        serde_json::json!("env"),
+        "{dry}"
+    );
+}
+
+/// The MCP `doctor` tool's describer row for an `OpenRouter` config, with
+/// `MAJ_OPENROUTER_KEY` as given — an empty value reads as unset, which
+/// keeps the keyless case independent of the ambient environment.
+#[cfg(test)]
+fn mcp_doctor_describer_row(env_key: &str) -> serde_json::Value {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, state) = common::fixture_catalog(dir.path());
+    let mut mcp = Mcp::spawn_with_extra_env(&root, &state, &[("MAJ_OPENROUTER_KEY", env_key)]);
+    mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({"backend": "open-router", "model": "m", "confirm": true}),
+    );
+    let resp = mcp.call_tool(
+        "doctor",
+        &serde_json::json!({"catalog": root.to_str().expect("utf8")}),
+    );
+    assert!(!resp.to_string().contains("sk-test"), "{resp}");
+    resp["result"]["structuredContent"]["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"] == serde_json::json!("describer"))
+        .unwrap_or_else(|| panic!("no `describer` row in {resp}"))
+        .clone()
+}
+
+#[test]
+fn doctor_tool_names_the_env_as_the_openrouter_keys_source() {
+    let row = mcp_doctor_describer_row("sk-test");
+    assert_eq!(row["status"], serde_json::json!("ok"), "{row}");
+    assert_eq!(
+        row["detail"],
+        serde_json::json!("open-router · m · key from env"),
+        "{row}"
+    );
+}
+
+#[test]
+fn doctor_tool_fails_the_describer_row_without_a_key() {
+    let row = mcp_doctor_describer_row("");
+    assert_eq!(row["status"], serde_json::json!("fail"), "{row}");
+    assert_eq!(
+        row["detail"],
+        serde_json::json!("open-router · m · no API key"),
+        "{row}"
     );
 }
 

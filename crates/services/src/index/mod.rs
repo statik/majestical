@@ -1222,6 +1222,38 @@ mod tests {
         );
     }
 
+    /// The broken line is the one holding the key: the notice renders the
+    /// whole error chain, so it must name the line without quoting it.
+    #[test]
+    fn the_broken_describer_config_notice_names_the_line_and_never_quotes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let app = FsApp::init(&root, "m1", "m1").expect("init");
+        let path = crate::describer_config::config_path(&root, app.notices()).expect("config path");
+        std::fs::write(
+            &path,
+            "backend = \"open-router\"\nmodel = \"m\"\napi_key = \"sk-test\" oops\n",
+        )
+        .expect("plant broken config");
+
+        let outcome = status(&app, &root).expect("status");
+
+        let about_the_config: Vec<&String> = outcome
+            .notices
+            .iter()
+            .filter(|n| n.contains("ignoring broken describer config"))
+            .collect();
+        assert!(!about_the_config.is_empty(), "{:?}", outcome.notices);
+        for notice in about_the_config {
+            assert!(notice.contains("describer.toml: line 3: "), "{notice}");
+        }
+        assert!(
+            outcome.notices.iter().all(|n| !n.contains("sk-test")),
+            "{:?}",
+            outcome.notices
+        );
+    }
+
     /// Random passes, small asset alphabet so the same id recurs across
     /// kinds and within one kind: the ledger a pass contributes is exactly
     /// its permanent failures, one row per asset per kind, and no transient

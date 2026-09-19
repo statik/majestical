@@ -86,15 +86,39 @@ pub fn walkdir_find(root: &std::path::Path, name: &str) -> Vec<std::path::PathBu
         .collect()
 }
 
+/// The three lines `maj describer set --backend ollama --model m` writes,
+/// for a caller of [`break_describer_config`] that breaks a line after them
+/// — line 4.
+#[cfg(test)]
+pub const DESCRIBER_CONFIG_HEAD: &str =
+    "backend = \"ollama\"\nbase_url = \"http://localhost:11434\"\nmodel = \"m\"\n";
+
+/// Configures a describer through `maj describer set` — so `describer.toml`
+/// sits wherever the CLI really puts it under `state` — then replaces the
+/// file's contents with `contents`.
+#[cfg(test)]
+pub fn break_describer_config(root: &std::path::Path, state: &std::path::Path, contents: &str) {
+    maj(root, state)
+        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
+        .assert()
+        .success();
+    let paths = walkdir_find(state, "describer.toml");
+    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
+    std::fs::write(&paths[0], contents).expect("rewrite describer.toml");
+}
+
 // Not every integration-test binary that pulls in this module calls
-// `walkdir_find` directly (describer_smoke.rs uses only `maj`), and each
+// `walkdir_find` directly (doctor_smoke.rs never does), and each
 // `tests/*.rs` file is its own crate, so dead-code reachability is judged
 // per binary. This in-module test gives every binary a real caller so the
 // helper never trips `dead_code`, without reaching for `#[allow]` (denied)
 // or `#[expect]` (would itself fail wherever the helper IS otherwise used).
 #[cfg(test)]
 mod tests {
-    use super::{asset_id_of, first_asset_id, fixture_catalog, walkdir_find};
+    use super::{
+        DESCRIBER_CONFIG_HEAD, asset_id_of, break_describer_config, first_asset_id,
+        fixture_catalog, maj, walkdir_find,
+    };
 
     #[test]
     fn walkdir_find_returns_empty_when_name_absent() {
@@ -111,6 +135,32 @@ mod tests {
         let (root, state) = fixture_catalog(dir.path());
         let asset = asset_id_of(&root, &state, "a.txt");
         assert!(asset.starts_with("xxh3:"));
+    }
+
+    // Gives every binary compiling this module a real call site for
+    // `break_describer_config`/`DESCRIBER_CONFIG_HEAD`, same `dead_code`
+    // rationale — and pins the claim the constant makes about `set`.
+    #[test]
+    fn break_describer_config_replaces_what_set_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cat");
+        let state = dir.path().join("state");
+        maj(&root, &state)
+            .args(["catalog", "init"])
+            .assert()
+            .success();
+        maj(&root, &state)
+            .args(["describer", "set", "--backend", "ollama", "--model", "m"])
+            .assert()
+            .success();
+        let paths = walkdir_find(&state, "describer.toml");
+        assert_eq!(
+            std::fs::read_to_string(&paths[0]).expect("read"),
+            DESCRIBER_CONFIG_HEAD
+        );
+
+        break_describer_config(&root, &state, "broken");
+        assert_eq!(std::fs::read_to_string(&paths[0]).expect("read"), "broken");
     }
 
     // Gives every binary compiling this module a real call site for

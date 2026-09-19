@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use majestical_services::describer_config::{
-    self, DescriberConfigView, DescriberProbe, KeyCheck, SetArgs,
+    self, DescriberConfigView, DescriberProbe, KeyCheck, KeyPresence, KeySource, SetArgs,
 };
 use majestical_services::notices::Notices;
 
@@ -15,18 +15,27 @@ pub(crate) fn env_api_key() -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
+/// What this head found outside `describer.toml`, for the views and the
+/// doctor row that name the key's source.
+pub(crate) fn key_presence() -> KeyPresence {
+    if env_api_key().is_some() {
+        KeyPresence::Env
+    } else {
+        KeyPresence::Absent
+    }
+}
+
 pub(crate) fn cmd_set(catalog_root: &Path, args: &SetArgs) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let view = describer_config::set(catalog_root, args, &notices);
+    let stored = describer_config::set(catalog_root, args, &notices);
     crate::drain_notices(&notices);
-    let view = view?;
-    print_view(&view);
-    Ok(())
+    stored?;
+    cmd_show(catalog_root)
 }
 
 pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let shown = describer_config::show(catalog_root, &notices);
+    let shown = describer_config::show(catalog_root, key_presence(), &notices);
     crate::drain_notices(&notices);
     match shown? {
         Some(view) => print_view(&view),
@@ -100,15 +109,29 @@ fn print_view(view: &DescriberConfigView) {
     println!("backend:  {}", view.backend);
     println!("base-url: {}", view.base_url);
     println!("model:    {}", view.model);
-    match &view.api_key {
-        Some(_) => println!("api-key:  (redacted)"),
-        None => println!("api-key:  (none)"),
+    println!("api-key:  {}", key_source_label(view.key_source));
+}
+
+fn key_source_label(source: KeySource) -> &'static str {
+    match source {
+        KeySource::Env => "(from env)",
+        KeySource::Keychain => "(from keychain)",
+        KeySource::File => "(from file)",
+        KeySource::Absent => "(none)",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_api_key_line_names_the_source_and_never_a_key() {
+        assert_eq!(key_source_label(KeySource::Env), "(from env)");
+        assert_eq!(key_source_label(KeySource::Keychain), "(from keychain)");
+        assert_eq!(key_source_label(KeySource::File), "(from file)");
+        assert_eq!(key_source_label(KeySource::Absent), "(none)");
+    }
 
     /// A key that was not checked says nothing, rather than something that
     /// reads as a verdict; every other state gets its line.

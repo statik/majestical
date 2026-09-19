@@ -381,10 +381,11 @@ enum DescriberCmd {
         model: String,
         #[arg(long)]
         base_url: Option<String>,
+        /// The `OpenRouter` API key to store. Omit to keep the stored key.
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Show the current configuration (key redacted).
+    /// Show the current configuration (the key's source, never the key).
     Show,
     /// Probe the backend: connectivity, model presence, vision capability, and
     /// (`OpenRouter`) whether the key is accepted.
@@ -613,7 +614,8 @@ fn dispatch_describer(catalog: &Path, cmd: DescriberCmd) -> Result<()> {
                 backend: backend.into(),
                 model,
                 base_url,
-                api_key,
+                file_key: majestical_services::describer_config::plan_key_write(false, api_key)
+                    .file,
             },
         ),
         DescriberCmd::Show => describer_cmd::cmd_show(catalog),

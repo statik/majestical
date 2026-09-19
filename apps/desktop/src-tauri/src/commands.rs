@@ -28,6 +28,7 @@ use crate::ingest::{
 use majestical_services::app::FsApp;
 use majestical_services::browse::{BrowseListOutcome, BrowseRequest, BrowseTreeOutcome};
 use majestical_services::catalog::AssetDetail;
+use majestical_services::describer_config::KeyPresence;
 use majestical_services::doctor::DoctorOutcome;
 use majestical_services::error::ServiceError;
 use majestical_services::ingest::{IngestPlanOutcome, UnfinishedRunsOutcome};
@@ -58,6 +59,17 @@ pub fn env_api_key() -> Option<String> {
     std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
         .ok()
         .filter(|k| !k.is_empty())
+}
+
+/// What this head found outside `describer.toml`, for the doctor row that
+/// names the key's source. `pub` for the same reason as [`env_api_key`].
+#[must_use]
+pub fn key_presence() -> KeyPresence {
+    if env_api_key().is_some() {
+        KeyPresence::Env
+    } else {
+        KeyPresence::Absent
+    }
 }
 
 /// This app's catalog wiring — managed Tauri state, rebuilt when the user
@@ -220,20 +232,20 @@ pub fn app_status_impl(cfg: Option<&CatalogCfg>) -> AppStatus {
 /// rather than requiring one: doctor is the one command that must work
 /// before catalog selection, same as `maj doctor` at the CLI head.
 ///
-/// `env_key` is passed in rather than read here so the describer row is
+/// `presence` is passed in rather than read here so the describer row is
 /// testable without touching the process environment; the command wrapper
-/// supplies [`env_api_key`], which is the head's own reading of it —
-/// doctor's env key never comes from a client.
+/// supplies [`key_presence`], which is the head's own reading — doctor's
+/// key presence never comes from a client.
 ///
 /// # Errors
 /// In practice never; see the services module's own doc for why.
 pub fn doctor_report_impl(
     cfg: Option<&CatalogCfg>,
-    env_key: Option<String>,
+    presence: KeyPresence,
 ) -> Result<DoctorOutcome, CommandError> {
     let req = majestical_services::doctor::DoctorRequest {
         catalog: cfg.map(|c| c.catalog.clone()),
-        describer_env_key: env_key,
+        describer_key: presence,
     };
     Ok(majestical_services::doctor::doctor(&req)?)
 }
@@ -665,7 +677,7 @@ pub fn app_status(state: State<'_, AppState>) -> AppStatus {
 )]
 #[tauri::command]
 pub fn doctor_report(state: State<'_, AppState>) -> Result<DoctorOutcome, CommandError> {
-    doctor_report_impl(selected_catalog(&state).as_ref(), env_api_key())
+    doctor_report_impl(selected_catalog(&state).as_ref(), key_presence())
 }
 
 /// Searches the catalog. `limit` defaults to 50 results.

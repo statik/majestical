@@ -106,6 +106,21 @@ spec's as-built section at close.
   switch changes whether the backend is OpenRouter).
 - **Eight PR chunks, not seven**: the Keychain work is two chunks so each
   stays at 1-2 tasks.
+- **`KeyPresence` is a three-variant enum** (`Env`, `Keychain`, `Absent`),
+  not two booleans (Task 5's quality review): "both true" can never be
+  produced because the head's resolver stops at env, and with booleans the
+  env-before-Keychain order was encoded twice. It is `serde(skip)`, never
+  on the wire. `KeySource`'s absent variant is `Absent`, serialized `none`.
+- **Task 5b closes a key leak that predates the phase.** A parse error on
+  `describer.toml` quoted the offending line, which can be the `api_key`
+  line, and `describer show|test`, the index-status notice and four MCP
+  tools printed it. Task 5's spec reviewer reproduced it on every path.
+- **`KeyCheck` has a fourth state, `missing`** (added in chunk 3's quality
+  review): OpenRouter with no effective key. `describer test` used to
+  promise caption work in that case and the next `index run` failed every
+  item. The wire type in Task 8 and `testLines` in Task 9 carry it; the GUI
+  line reuses the approved "No key" status string, so the mockup gains no
+  new wording.
 
 ## File structure (created/modified across the phase)
 
@@ -121,6 +136,8 @@ crates/services/src/index/run.rs                    MOD  caption_failure's third
 crates/services/src/describer_config.rs             MOD  KeyCheck on DescriberProbe; KeySource/KeyPresence/key_source;
                                                          FileKey/plan_key_write; clear_file_key; ClearKeyOutcome; wants_keychain
 crates/services/src/doctor.rs                       MOD  DoctorRequest.describer_key: KeyPresence; row names the source
+crates/describe/src/config.rs                       MOD  Task 5b: Parse error carries line + message, no toml source;
+                                                         atomic 0600 store; redacting Debug
 
 crates/secrets/Cargo.toml                           NEW  majestical-secrets
 crates/secrets/src/lib.rs                           NEW  SecretError, KeyStore, MemoryKeyStore, resolve, ResolvedKey
@@ -574,7 +591,7 @@ pub trait KeyStore {
 
 /// Where the head found the key it will pass to services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadKeySource { Env, Keychain, None }
+pub enum HeadKeySource { Env, Keychain, Absent }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedKey {
@@ -594,9 +611,9 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
     if let Some(key) = env {
         return ResolvedKey { key: Some(key), source: HeadKeySource::Env, notice: None };
     }
-    let none = |notice| ResolvedKey { key: None, source: HeadKeySource::None, notice };
+    let absent = |notice| ResolvedKey { key: None, source: HeadKeySource::Absent, notice };
     if !wants_keychain || !store.supported() {
-        return none(None);
+        return absent(None);
     }
     match store.read() {
         Ok(Some(key)) => ResolvedKey {
@@ -604,8 +621,8 @@ pub fn resolve(env: Option<String>, wants_keychain: bool, store: &dyn KeyStore) 
             source: HeadKeySource::Keychain,
             notice: None,
         },
-        Ok(None) | Err(SecretError::Unsupported) => none(None),
-        Err(SecretError::Store(message)) => none(Some(format!(
+        Ok(None) | Err(SecretError::Unsupported) => absent(None),
+        Err(SecretError::Store(message)) => absent(Some(format!(
             "note: the macOS Keychain could not be read ({message}) — \
              set MAJ_OPENROUTER_KEY to supply the key without it"
         ))),
@@ -713,14 +730,15 @@ mod tests {
 The new services surface:
 
 ```rust
-/// What the head found outside the config file. Services never looks.
+/// Which head-side source supplied a key. Services never looks; the
+/// ordering between env and the Keychain lives in the head.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KeyPresence { pub env: bool, pub keychain: bool }
+pub enum KeyPresence { Env, Keychain, #[default] Absent }
 
 /// Where the key a caption run would use comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum KeySource { Env, Keychain, File, None }
+pub enum KeySource { Env, Keychain, File, #[serde(rename = "none")] Absent }
 
 /// The same order the run resolves in: the head's key (env, then
 /// Keychain) applies to OpenRouter only — `effective_api_key`'s rule —
@@ -728,14 +746,14 @@ pub enum KeySource { Env, Keychain, File, None }
 #[must_use]
 pub fn key_source(config: &DescriberConfig, presence: KeyPresence) -> KeySource {
     let head = match config.backend {
-        BackendKind::OpenRouter if presence.env => Some(KeySource::Env),
-        BackendKind::OpenRouter if presence.keychain => Some(KeySource::Keychain),
-        BackendKind::OpenRouter | BackendKind::Ollama | BackendKind::LmStudio => None,
+        BackendKind::OpenRouter => presence,
+        BackendKind::Ollama | BackendKind::LmStudio => KeyPresence::Absent,
     };
     match (head, &config.api_key) {
-        (Some(source), _) => source,
-        (None, Some(_)) => KeySource::File,
-        (None, None) => KeySource::None,
+        (KeyPresence::Env, _) => KeySource::Env,
+        (KeyPresence::Keychain, _) => KeySource::Keychain,
+        (KeyPresence::Absent, Some(_)) => KeySource::File,
+        (KeyPresence::Absent, None) => KeySource::Absent,
     }
 }
 
@@ -809,7 +827,7 @@ remedy.
 
 The mechanical head edits in THIS task (no Keychain yet, behavior otherwise
 unchanged except the `set` semantic): every head builds
-`KeyPresence { env: env_api_key().is_some(), keychain: false }`;
+`key_presence()` — `Env` when `env_api_key()` is some, else `Absent`;
 `Set`'s `api_key: Option<String>` maps through
 `plan_key_write(false, api_key).file`; `cmd_set` calls `set` then `show`;
 `print_view` prints `api-key:  (from env|keychain|file)` or
@@ -847,6 +865,61 @@ unchanged except the `set` semantic): every head builds
 
 ---
 
+### Task 5b: a broken `describer.toml` never quotes itself
+
+Added during Task 5's spec review, which reproduced the leak with the
+literal `sk-test` on a scratch catalog.
+
+**Files:**
+- Modify: `crates/describe/src/config.rs` (`ConfigError::Parse`, `load`,
+  `store`, `DescriberConfig`'s `Debug`)
+- Modify: `crates/services/src/describer_config.rs` (delete
+  `load_for_key_edit`; its two callers use `load_config`)
+- Modify: `crates/cli/src/mcp_cmd/write_tools.rs` (`SetDescriberArgs`'s
+  `Debug`)
+- Test: `crates/describe/src/config.rs`, `crates/services/src/index/mod.rs`
+  (the broken-config notice), `crates/cli/tests/describer_smoke.rs`,
+  `crates/cli/tests/mcp_smoke.rs`
+
+The cause: `ConfigError::Parse` rendered `toml::de::Error`'s Display, which
+quotes the offending source line, and chained it as `source`, so `{err}`
+showed the line once and `{err:#}` twice. That error's `Debug` holds the
+whole file. The fix is at the source, so every caller is closed at once:
+
+```rust
+#[error("parse {path}: line {line}: {message}")]
+Parse { path: PathBuf, line: usize, message: String },
+```
+
+`message` is `toml::de::Error::message()` (no snippet); `line` is computed
+from `span().start` against the text `load` already holds
+(`text[..start].matches('\n').count() + 1`; line 1 when there is no span).
+No `source` field. `message()` can still quote a wrong VALUE ("unknown
+variant `…`"), so a key pasted into `backend` would show; a key on a valid
+`api_key` line cannot. A test pins both halves of that sentence.
+
+Also here, because this task already owns the file:
+- `DescriberConfig::store` writes `describer.toml.tmp` with mode `0o600`
+  and renames it over the target (the idiom at `services/src/sync.rs:85`).
+  The old open-truncate-write could tear, and Task 5 made that matter:
+  `set`'s Keep arm and `clear_file_key` are read-modify-write over a key
+  that may exist nowhere else. A fresh inode also fixes a rewrite keeping a
+  pre-existing file's looser mode.
+- `DescriberConfig` and MCP's `SetDescriberArgs` get hand-written redacting
+  `Debug` impls; both derive it today while holding the key.
+
+- [ ] Failing tests first: the describe-crate parse test (message names the
+  line number and never contains `sk-test`, in Display, `{:#}` and Debug);
+  the wrong-value caveat; `store` replaces atomically and leaves `0o600`
+  over a pre-existing `0o644` file; the two Debug tests; the index-status
+  notice; `maj describer show` and `maj describer test` on the broken file;
+  MCP `get_describer`, `test_describer` and `index_status`.
+- [ ] Implement; delete `load_for_key_edit` (its tests stay and must pass
+  unchanged: they assert behavior, not wording).
+- [ ] Re-run the spec reviewer's probe table end to end; every row clean.
+- [ ] Commit:
+  `fix: a broken describer.toml is reported by line, never quoted`
+
 ## PR Chunk 5 — the Keychain at the CLI and MCP heads
 
 ### Task 6: `describer_key.rs`, `clear-key`, `set_describer { clear_key }`
@@ -880,9 +953,9 @@ pub(crate) fn resolve(catalog_root: &Path, store: &dyn KeyStore, notices: &Notic
 
 pub(crate) fn presence(resolved: &ResolvedKey) -> KeyPresence {
     match resolved.source {
-        HeadKeySource::Env => KeyPresence { env: true, keychain: false },
-        HeadKeySource::Keychain => KeyPresence { env: false, keychain: true },
-        HeadKeySource::None => KeyPresence::default(),
+        HeadKeySource::Env => KeyPresence::Env,
+        HeadKeySource::Keychain => KeyPresence::Keychain,
+        HeadKeySource::Absent => KeyPresence::Absent,
     }
 }
 
@@ -927,8 +1000,17 @@ Call sites: `cmd_set` = `store(args.api_key)` → `set` → `resolve` → `show`
 → `print_view`. `cmd_test`, `index_cmd.rs:229`, both doctor call sites and
 `get_describer` use `resolve(...)` — `.key` where a key is wanted,
 `presence(&resolved)` where a view or the doctor row is. The doctor call
-with no catalog passes `KeyPresence { env: env_api_key().is_some(),
-keychain: false }` without touching the store.
+with no catalog passes `Env` or `Absent` from `env_api_key()` alone,
+without touching the store.
+
+Two carry-overs from Task 5's review. (1) `set_describer_result` computes
+presence BEFORE `set` and reuses it for the echo; once presence depends on
+the stored backend that is stale (ollama → open-router with a Keychain key
+would echo `none`), so re-resolve AFTER `set`, as `cmd_set` does. (2) The
+dry run's keep suffix must not depend on `key_source`: when no `api_key`
+is given and a config exists, say `, leaving any stored key unchanged` —
+true in every case, including an env key shadowing a file key — and fix
+`key_effect`'s doc to match.
 
 CLI: `DescriberCmd::ClearKey` with doc
 `/// Remove the stored API key (the Keychain item and describer.toml's).`
@@ -1163,7 +1245,7 @@ export interface DescriberSettingsOutcome {
 }
 
 /** `describer_config::KeyCheck`, serialized snake_case. */
-export type KeyCheck = "accepted" | "rejected" | "not_checked";
+export type KeyCheck = "accepted" | "rejected" | "missing" | "not_checked";
 
 /** `captions::DescriberProbeOutcome` — the probe, flattened, plus notices.
  *  `vision` is `null` for every backend but LM Studio. */
@@ -1287,6 +1369,7 @@ export function testLines(probe: DescriberProbeOutcome): TestLine[] {
       text: "Key rejected — OpenRouter answered 401. Save a new key.",
     });
   }
+  if (probe.key === "missing") lines.push({ good: false, text: keyStatusLine("none") });
   return lines;
 }
 ```
@@ -1340,7 +1423,8 @@ a cap is a ratchet. `SettingsView.test.ts` gains the same one mock line.
   - `captions-status.test.ts`: `keyStatusLine` for all four sources
     (byte-exact); `removeKeyVisible` truth table; `keyPlaceholder` both
     arms; `testLines` for: all-good OpenRouter (three lines, exact), model
-    not listed + key rejected, LM Studio vision yes / vision no, Ollama
+    not listed + key rejected, key missing (the line equals
+    `keyStatusLine("none")`), LM Studio vision yes / vision no, Ollama
     (`key: "not_checked"`, `vision: null` → exactly two lines).
   - `CaptionsSection.test.ts` with `mockCommands`/`rejectCommand` from
     `test-support`:

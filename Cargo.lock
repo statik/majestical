@@ -4509,6 +4509,7 @@ dependencies = [
 name = "majestical-describe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.23.0",
  "httpmock",
  "majestical-core",
@@ -4569,6 +4570,15 @@ dependencies = [
  "ulid",
  "walkdir",
  "xxhash-rust",
+]
+
+[[package]]
+name = "majestical-secrets"
+version = "0.1.0"
+dependencies = [
+ "security-framework",
+ "security-framework-sys",
+ "thiserror",
 ]
 
 [[package]]

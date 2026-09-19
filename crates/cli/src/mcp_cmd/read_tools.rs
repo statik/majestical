@@ -315,7 +315,8 @@ impl MajServer {
         }
     }
 
-    /// The configured describer backend for this machine, API key redacted.
+    /// The configured describer backend for this machine, with where its API
+    /// key comes from (`key_source`) and never the key.
     /// Returns `{"configured": false}` when none is set, else
     /// `{"configured": true, "describer": {...}}`.
     #[tool]
@@ -324,7 +325,8 @@ impl MajServer {
             return result;
         }
         let notices = Notices::new();
-        match majestical_services::describer_config::show(&self.catalog, &notices) {
+        let presence = crate::describer_cmd::key_presence();
+        match majestical_services::describer_config::show(&self.catalog, presence, &notices) {
             Ok(Some(view)) => match serde_json::to_value(&view) {
                 Ok(describer) => CallToolResult::structured(super::with_notices(
                     json!({ "configured": true, "describer": describer }),
@@ -403,7 +405,7 @@ impl MajServer {
     fn doctor(&self, Parameters(args): Parameters<DoctorArgs>) -> CallToolResult {
         let req = majestical_services::doctor::DoctorRequest {
             catalog: args.catalog.map(std::path::PathBuf::from),
-            describer_env_key: crate::describer_cmd::env_api_key(),
+            describer_key: crate::describer_cmd::key_presence(),
         };
         match majestical_services::doctor::doctor(&req) {
             Ok(outcome) => super::structured_ok(&outcome),

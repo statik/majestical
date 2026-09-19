@@ -300,26 +300,19 @@ fn describer_test_without_a_key_says_so_and_does_not_promise_captions() {
     key.assert_calls(0);
 }
 
-/// Configures a describer, then breaks `describer.toml` on the line that
-/// holds a key — the line a TOML parse error would quote back. `set` writes
-/// three lines, so the broken one is line 4.
+/// A catalog whose `describer.toml` is broken on the line that holds a key
+/// — the line a TOML parse error would quote back. It is line 4.
 #[cfg(test)]
 fn catalog_with_a_broken_config(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    use std::io::Write as _;
-
     let (root, state) = init_catalog(tmp);
-    maj(&root, &state)
-        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
-        .assert()
-        .success();
-    let paths = common::walkdir_find(&state, "describer.toml");
-    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&paths[0])
-        .expect("open describer.toml");
-    file.write_all(b"api_key = \"sk-test\" oops\n")
-        .expect("break describer.toml");
+    common::break_describer_config(
+        &root,
+        &state,
+        &format!(
+            "{}api_key = \"sk-test\" oops\n",
+            common::DESCRIBER_CONFIG_HEAD
+        ),
+    );
     (root, state)
 }
 
@@ -391,17 +384,11 @@ fn index_status_on_a_broken_config_names_the_line_and_never_quotes_it() {
 fn describer_show_with_a_key_pasted_into_backend_never_quotes_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root, state) = init_catalog(tmp.path());
-    maj(&root, &state)
-        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
-        .assert()
-        .success();
-    let paths = common::walkdir_find(&state, "describer.toml");
-    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
-    std::fs::write(
-        &paths[0],
+    common::break_describer_config(
+        &root,
+        &state,
         "model = \"m\"\nbackend = \"sk-test\"\nbase_url = \"u\"\n",
-    )
-    .expect("rewrite describer.toml");
+    );
 
     let out = maj(&root, &state)
         .env_remove("MAJ_OPENROUTER_KEY")

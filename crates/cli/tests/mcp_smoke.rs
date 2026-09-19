@@ -877,27 +877,20 @@ fn get_describer_matches() {
 
 /// Calls `tool` over a `describer.toml` broken on the line that holds a key
 /// — the line a TOML parse error would quote back — and returns the whole
-/// response, having checked that the key is nowhere in it. `set` writes
-/// three lines, so the broken one is line 4.
+/// response, having checked that the key is nowhere in it. The broken line
+/// is line 4.
 #[cfg(test)]
 fn call_over_a_broken_describer_config(tool: &str, args: &serde_json::Value) -> String {
-    use std::io::Write as _;
-
     let dir = tempfile::tempdir().expect("tempdir");
     let (root, state) = common::fixture_catalog(dir.path());
-    common::maj(&root, &state)
-        .args(["describer", "set", "--backend", "ollama", "--model", "m"])
-        .assert()
-        .success();
-    let paths = common::walkdir_find(&state, "describer.toml");
-    assert_eq!(paths.len(), 1, "exactly one describer config: {paths:?}");
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&paths[0])
-        .expect("open describer.toml");
-    file.write_all(b"api_key = \"sk-test\" oops\n")
-        .expect("break describer.toml");
-    drop(file);
+    common::break_describer_config(
+        &root,
+        &state,
+        &format!(
+            "{}api_key = \"sk-test\" oops\n",
+            common::DESCRIBER_CONFIG_HEAD
+        ),
+    );
 
     let mut mcp = Mcp::spawn(&root, &state);
     let resp = mcp.call_tool(tool, args).to_string();

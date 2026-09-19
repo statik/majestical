@@ -18,18 +18,20 @@ pub enum BackendKind {
 impl<'de> serde::Deserialize<'de> for BackendKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
-        match name.as_str() {
-            "ollama" => Ok(Self::Ollama),
-            "lm-studio" => Ok(Self::LmStudio),
-            "open-router" => Ok(Self::OpenRouter),
-            _ => Err(serde::de::Error::custom(
-                "unknown backend — expected one of ollama, lm-studio, open-router",
-            )),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.as_str() == name)
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "unknown backend — expected one of ollama, lm-studio, open-router",
+                )
+            })
     }
 }
 
 impl BackendKind {
+    pub const ALL: [Self; 3] = [Self::Ollama, Self::LmStudio, Self::OpenRouter];
+
     #[must_use]
     pub fn default_base_url(self) -> &'static str {
         match self {
@@ -55,6 +57,10 @@ impl BackendKind {
 /// so a head can supply the key some other way.
 pub const OPENROUTER_KEY_ENV: &str = "MAJ_OPENROUTER_KEY";
 
+/// Every field must accept any TOML string, or deserialize through a
+/// hand-written impl with fixed error text (see [`BackendKind`]): a refused
+/// value's error reaches CLI/MCP output, and serde's own quotes the value.
+/// `no_field_of_the_config_ever_echoes_a_planted_value` enforces it.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DescriberConfig {
     pub backend: BackendKind,
@@ -93,13 +99,12 @@ pub enum ConfigError {
     },
     /// Carries no `toml::de::Error`, neither rendered nor chained: its
     /// Display quotes the offending source line and its Debug holds the whole
-    /// file, and that line can be `api_key = "sk-…"`. `message` is the parser's
-    /// own text without the snippet and without any value from the file: a
-    /// value of the wrong type is named by kind only ("invalid type: integer,
-    /// expected a string" — see `without_echoed_values`), and a `backend`
-    /// outside its set gets [`BackendKind`]'s fixed text. What the message
-    /// does show is the line number, field names ("missing field `model`")
-    /// and the tokens the parser wanted ("expected newline, `#`").
+    /// file, and that line can be `api_key = "sk-…"`. `message` holds no bytes
+    /// of any value in the file. It is one of: the parser's own text without
+    /// the snippet, which names fields ("missing field `model`") and the
+    /// tokens the parser wanted ("expected newline, `#`"); the fixed sentence
+    /// `without_echoed_values` puts in place of a type error; or
+    /// [`BackendKind`]'s fixed text for a `backend` outside its set.
     #[error("parse {path}: line {line}: {message}")]
     Parse {
         path: String,
@@ -126,12 +131,7 @@ impl DescriberConfig {
                 });
             }
         };
-        let config = toml::from_str(&text).map_err(|error| ConfigError::Parse {
-            path: path.display().to_string(),
-            line: line_of(&text, error.span()),
-            message: without_echoed_values(error.message()),
-        })?;
-        Ok(Some(config))
+        parse(path, &text).map(Some)
     }
 
     /// Write config to `path` via a same-directory `<path>.tmp` + rename, so
@@ -139,7 +139,8 @@ impl DescriberConfig {
     /// may exist nowhere else. The temp file is created with 0600 permissions
     /// from the start (may hold an API key, so it must never exist
     /// world/group-readable even for the instant between create and chmod),
-    /// and being a fresh file it replaces an older, wider one's mode too.
+    /// and being a fresh file it replaces an older, wider one's mode too — and
+    /// a `describer.toml` that is a symlink is replaced by a regular file.
     ///
     /// A store that fails once the temp file exists removes it before
     /// returning. The temp name is fixed rather than per-writer for the case
@@ -155,13 +156,16 @@ impl DescriberConfig {
             path: path.display().to_string(),
             source,
         };
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
+        let tmp = tmp_path(path);
         match std::fs::remove_file(&tmp) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(write_error(source)),
+            Err(source) => {
+                return Err(ConfigError::Write {
+                    path: tmp.display().to_string(),
+                    source,
+                });
+            }
         }
         let mut file = create_private(&tmp).map_err(write_error)?;
         let written = file
@@ -202,6 +206,16 @@ impl DescriberConfig {
     }
 }
 
+/// Generic so the tests can hold it to a struct with fields
+/// [`DescriberConfig`] does not have yet.
+fn parse<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Result<T, ConfigError> {
+    toml::from_str(text).map_err(|error| ConfigError::Parse {
+        path: path.display().to_string(),
+        line: line_of(text, error.span()),
+        message: without_echoed_values(error.message()),
+    })
+}
+
 /// The 1-based line `span` starts on; 1 when the parser gave no position or
 /// one that is not inside `text`.
 fn line_of(text: &str, span: Option<std::ops::Range<usize>>) -> usize {
@@ -209,29 +223,27 @@ fn line_of(text: &str, span: Option<std::ops::Range<usize>>) -> usize {
         .map_or(1, |before| before.matches('\n').count() + 1)
 }
 
-/// `message` without the value a type error quotes back: serde renders an
-/// unexpected scalar as its kind plus the value in backticks ("integer
-/// `5`"), ahead of ", expected …". Only that part is touched, and only in
-/// those messages — elsewhere backticks name fields and tokens. An unpaired
-/// backtick drops everything after it.
+/// What a type error is reported as; see [`without_echoed_values`].
+const WRONG_TYPE: &str = "a value has the wrong type — \
+    every value in this file is a quoted string";
+
+/// `message`, unless it is one of serde's type errors ("invalid type: integer
+/// `5`, expected a string"), which quote the refused value back — in
+/// backticks, or for a string in escaped double quotes that no cut is sound
+/// for. Those become [`WRONG_TYPE`] whole, so every byte shown is ours.
 fn without_echoed_values(message: &str) -> String {
-    if !(message.starts_with("invalid type:") || message.starts_with("invalid value:")) {
-        return message.to_string();
+    if message.starts_with("invalid type:") || message.starts_with("invalid value:") {
+        return WRONG_TYPE.to_string();
     }
-    let (found, expected) = match message.find(", expected ") {
-        Some(at) => message.split_at(at),
-        None => (message, ""),
-    };
-    let mut kept = String::new();
-    for (index, piece) in found.split('`').enumerate() {
-        if index % 2 == 0 {
-            kept.push_str(piece);
-        } else {
-            kept.truncate(kept.trim_end().len());
-        }
-    }
-    kept.truncate(kept.trim_end().len());
-    kept + expected
+    message.to_string()
+}
+
+/// The temp file [`DescriberConfig::store`] writes before renaming it over
+/// `path`.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
 }
 
 /// Creates `path` anew, refusing an existing file: `mode` applies only on
@@ -291,10 +303,17 @@ mod tests {
         "backend = \"open-router\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"m\"\n\n";
 
     fn load_error_of(text: &str) -> ConfigError {
+        load_error_in_dir(text).0
+    }
+
+    /// [`load_error_of`] plus the temp dir the file sat in, for a caller that
+    /// has to tell the dir's own name from the file's contents.
+    fn load_error_in_dir(text: &str) -> (ConfigError, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("describer.toml");
         std::fs::write(&path, text).expect("plant config");
-        DescriberConfig::load(&path).expect_err("must not parse")
+        let err = DescriberConfig::load(&path).expect_err("must not parse");
+        (err, dir)
     }
 
     /// Every rendering a head can reach: Display, Debug, and the whole chain
@@ -376,60 +395,35 @@ mod tests {
         }
     }
 
-    /// A well-formed value of the wrong type is named by kind only. The file's
-    /// key serves every backend, so an all-digit token pasted without quotes
-    /// is a key like any other.
+    /// Through `load`, against the real parser: a well-formed value of the
+    /// wrong type is reported as the fixed sentence. The file's key serves
+    /// every backend, so an all-digit token pasted without quotes is a key
+    /// like any other. Trips if a dependency bump rewords serde's type errors.
     #[test]
     fn a_wrong_typed_value_is_never_echoed() {
         let keyless = "backend = \"ollama\"\nbase_url = \"u\"\n";
-        for (text, line, kind, echoes) in [
-            (
-                format!("{VALID_HEAD}api_key = 12345\n"),
-                5,
-                "integer",
-                vec!["12345"],
-            ),
-            (
-                format!("{VALID_HEAD}api_key = 1.5\n"),
-                5,
-                "floating point",
-                vec!["1.5"],
-            ),
-            (
-                format!("{VALID_HEAD}api_key = true\n"),
-                5,
-                "boolean",
-                vec!["true"],
-            ),
+        for (text, line, echoes) in [
+            (format!("{VALID_HEAD}api_key = 12345\n"), 5, vec!["12345"]),
+            (format!("{VALID_HEAD}api_key = 1.5\n"), 5, vec!["1.5"]),
+            (format!("{VALID_HEAD}api_key = true\n"), 5, vec!["true"]),
             (
                 format!("{VALID_HEAD}api_key = 123456789012345678901234\n"),
                 5,
-                "integer",
                 vec!["1234567890", "901234"],
             ),
             (
                 format!("{VALID_HEAD}api_key = 0xfeed42\n"),
                 5,
-                "integer",
                 vec!["feed42", "16706882"],
             ),
-            (
-                format!("{keyless}model = 12345\n"),
-                3,
-                "integer",
-                vec!["12345"],
-            ),
+            (format!("{keyless}model = 12345\n"), 3, vec!["12345"]),
         ] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("describer.toml");
-            std::fs::write(&path, &text).expect("plant config");
-            let err = DescriberConfig::load(&path).expect_err("must not parse");
+            let (err, dir) = load_error_in_dir(&text);
             let display = err.to_string();
             assert!(
-                display.contains(&format!("describer.toml: line {line}: ")),
+                display.ends_with(&format!("describer.toml: line {line}: {WRONG_TYPE}")),
                 "{display}"
             );
-            assert!(display.contains(kind), "{display}");
             for rendering in renderings_of(err) {
                 // The temp dir's own name holds digits.
                 let rendering = rendering.replace(&dir.path().display().to_string(), "<dir>");
@@ -443,6 +437,81 @@ mod tests {
         for rendering in renderings_of(err) {
             assert!(!rendering.contains("sk-test"), "{rendering}");
         }
+    }
+
+    /// Replaces each field of `populated` in turn with a string, an integer,
+    /// a float and a boolean, and holds every refusal to: no rendering carries
+    /// the planted value or any other value of the file. The field list comes
+    /// from the struct's own serialization, so a new field is covered the day
+    /// it is added. `populated` must leave no field out (no `None`).
+    fn assert_no_field_echoes_a_planted_value<T>(populated: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let table = toml::Table::try_from(populated).expect("a populated config is a table");
+        let planted = [
+            (toml::Value::String("sk-test".into()), "sk-test"),
+            (toml::Value::Integer(8_675_309), "8675309"),
+            (toml::Value::Float(86753.09), "86753"),
+        ];
+        for field in table.keys() {
+            for (value, echo) in &planted {
+                let mut table = table.clone();
+                table.insert(field.clone(), value.clone());
+                let text = toml::to_string(&table).expect("serialize");
+                let Err(err) = parse::<T>(Path::new("describer.toml"), &text) else {
+                    continue;
+                };
+                for rendering in renderings_of(err) {
+                    assert!(!rendering.contains(echo), "{field} = {value}: {rendering}");
+                    assert!(
+                        !rendering.contains("sk-test"),
+                        "{field} = {value}: {rendering}"
+                    );
+                }
+            }
+        }
+
+        // "true" is too common a substring to look for; a refused boolean is
+        // a type error, so the whole message is ours.
+        for field in table.keys() {
+            let mut table = table.clone();
+            table.insert(field.clone(), toml::Value::Boolean(true));
+            let text = toml::to_string(&table).expect("serialize");
+            match parse::<T>(Path::new("describer.toml"), &text) {
+                Ok(_) => {}
+                Err(ConfigError::Parse { message, .. }) => assert_eq!(message, WRONG_TYPE),
+                Err(other) => panic!("{field} = true: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_field_of_the_config_ever_echoes_a_planted_value() {
+        let populated = keyed_config();
+        assert!(populated.api_key.is_some(), "a `None` field is not covered");
+        assert_no_field_echoes_a_planted_value(&populated);
+    }
+
+    /// The fields [`DescriberConfig`] does not have: a number, a float and a
+    /// flag each refuse a string, and serde's refusal quotes it. This is the
+    /// case the test above exists for, held here so it is proven before the
+    /// first such field arrives.
+    #[test]
+    fn no_field_of_a_config_with_non_string_fields_would_echo_one_either() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct WithOtherKinds {
+            api_key: String,
+            timeout_secs: u32,
+            temperature: f64,
+            enabled: bool,
+        }
+        assert_no_field_echoes_a_planted_value(&WithOtherKinds {
+            api_key: "sk-test".into(),
+            timeout_secs: 30,
+            temperature: 0.5,
+            enabled: false,
+        });
     }
 
     /// A missing field belongs to no line; the parser points at the table's
@@ -473,11 +542,7 @@ mod tests {
     fn every_backend_round_trips_through_toml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("describer.toml");
-        for backend in [
-            BackendKind::Ollama,
-            BackendKind::LmStudio,
-            BackendKind::OpenRouter,
-        ] {
+        for backend in BackendKind::ALL {
             let config = DescriberConfig {
                 backend,
                 base_url: "u".into(),
@@ -495,35 +560,29 @@ mod tests {
     }
 
     #[test]
-    fn without_echoed_values_drops_what_a_type_error_quotes_and_nothing_else() {
-        assert_eq!(
-            without_echoed_values("invalid type: integer `12345`, expected a string"),
-            "invalid type: integer, expected a string"
-        );
-        assert_eq!(
-            without_echoed_values("invalid value: integer `7`, expected one of `1`, `2`"),
-            "invalid value: integer, expected one of `1`, `2`"
-        );
-        assert_eq!(
-            without_echoed_values("invalid type: integer `12` as `i128`, expected a string"),
-            "invalid type: integer as, expected a string"
-        );
-        assert_eq!(
-            without_echoed_values("invalid type: integer `12345, expected a string"),
-            "invalid type: integer, expected a string",
-            "an unpaired backtick still takes the value with it"
-        );
-        assert_eq!(
-            without_echoed_values("invalid type: character ```"),
-            "invalid type: character"
-        );
+    fn a_type_error_becomes_the_fixed_sentence_and_every_other_message_is_kept() {
+        for echoing in [
+            "invalid type: integer `12345`, expected a string",
+            "invalid type: string \"sk-test\", expected u32",
+            "invalid value: integer `7`, expected one of `1`, `2`",
+        ] {
+            assert_eq!(without_echoed_values(echoing), WRONG_TYPE);
+        }
         for untouched in [
-            "invalid type: map, expected a string",
             "missing field `backend`",
             "invalid string, expected `\"`, `'`",
             "unknown backend — expected one of ollama, lm-studio, open-router",
         ] {
             assert_eq!(without_echoed_values(untouched), untouched);
+        }
+    }
+
+    fn keyed_config() -> DescriberConfig {
+        DescriberConfig {
+            backend: BackendKind::OpenRouter,
+            base_url: "https://openrouter.ai/api".into(),
+            model: "m".into(),
+            api_key: Some("sk-test".into()),
         }
     }
 
@@ -540,22 +599,26 @@ mod tests {
         let err = keyed_config().store(&path).expect_err("rename must fail");
 
         assert!(matches!(err, ConfigError::Write { .. }), "{err}");
-        assert!(!tmp_sibling(&path).exists());
+        assert!(!tmp_path(&path).exists());
     }
 
-    fn tmp_sibling(path: &Path) -> std::path::PathBuf {
-        let mut name = path.as_os_str().to_owned();
-        name.push(".tmp");
-        name.into()
-    }
+    /// A stale `<path>.tmp` that can't be removed is what the reader has to
+    /// fix, so the error names it rather than the target.
+    #[test]
+    fn a_stale_tmp_that_cannot_be_removed_is_named_in_the_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("describer.toml");
+        let tmp = tmp_path(&path);
+        std::fs::create_dir(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("occupant"), "x").expect("occupy");
 
-    fn keyed_config() -> DescriberConfig {
-        DescriberConfig {
-            backend: BackendKind::OpenRouter,
-            base_url: "https://openrouter.ai/api".into(),
-            model: "m".into(),
-            api_key: Some("sk-test".into()),
-        }
+        let err = keyed_config()
+            .store(&path)
+            .expect_err("a directory is not removed");
+
+        assert!(matches!(err, ConfigError::Write { .. }), "{err}");
+        assert!(err.to_string().contains("describer.toml.tmp: "), "{err}");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -568,7 +631,7 @@ mod tests {
 
         keyed_config().store(&path).expect("store");
 
-        assert!(!tmp_sibling(&path).exists());
+        assert!(!tmp_path(&path).exists());
         assert_eq!(
             DescriberConfig::load(&path).expect("load"),
             Some(keyed_config())
@@ -610,7 +673,7 @@ mod tests {
     fn store_survives_a_stale_tmp_from_a_crashed_run() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("describer.toml");
-        let tmp = tmp_sibling(&path);
+        let tmp = tmp_path(&path);
         std::fs::write(&tmp, "half a fi").expect("plant stale tmp");
         #[cfg(unix)]
         {

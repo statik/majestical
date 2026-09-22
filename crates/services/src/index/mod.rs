@@ -56,8 +56,14 @@ pub const VALID_KINDS: &[&str] = &[
     "transcripts",
     "ocr",
     "pdf",
-    "captions",
+    CAPTIONS_KIND,
 ];
+
+/// The one kind that calls a describer, and so the only one whose run needs
+/// an API key. Named because a head must decide whether to go looking for
+/// that key — on macOS that means touching the Keychain — before it builds
+/// the request; see the CLI's `describer_key::resolve_for_index`.
+pub const CAPTIONS_KIND: &str = "captions";
 
 /// The state-dir file holding the failure ledger: every permanent per-item
 /// failure this catalog has accumulated, which the planner holds back and

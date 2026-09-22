@@ -1,41 +1,55 @@
-//! `maj describer set|show|test` — per-machine backend configuration.
-//! Compute for all three lives in `majestical_services::describer_config`;
-//! this module only reads the API-key env var and renders.
+//! `maj describer set|show|test|clear-key` — per-machine backend
+//! configuration. Compute lives in `majestical_services::describer_config`;
+//! the key's reading and writing in `crate::describer_key`; this module
+//! renders.
 
 use std::path::Path;
 
 use majestical_services::describer_config::{
-    self, DescriberConfigView, DescriberProbe, KeyCheck, KeyPresence, KeySource, SetArgs,
+    self, ClearKeyOutcome, DescriberConfigView, DescriberProbe, KeyCheck, KeySource, SetArgs,
 };
 use majestical_services::notices::Notices;
 
-pub(crate) fn env_api_key() -> Option<String> {
-    std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
-        .ok()
-        .filter(|k| !k.is_empty())
+use crate::describer_key::{self, KeySources};
+
+/// `maj describer set`'s arguments as the command line gives them: the key
+/// still unplaced, where [`SetArgs`] already says what the file does with it.
+pub(crate) struct SetRequest {
+    pub(crate) backend: majestical_describe::BackendKind,
+    pub(crate) model: String,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
 }
 
-/// What this head found outside `describer.toml`, for the views and the
-/// doctor row that name the key's source.
-pub(crate) fn key_presence() -> KeyPresence {
-    if env_api_key().is_some() {
-        KeyPresence::Env
-    } else {
-        KeyPresence::Absent
-    }
-}
-
-pub(crate) fn cmd_set(catalog_root: &Path, args: &SetArgs) -> anyhow::Result<()> {
+/// Key first, then the config, then the echo: the Keychain write must
+/// precede the file's (see `describer_key::store`), and the echo names the
+/// key's source for the backend `set` just stored.
+pub(crate) fn cmd_set(
+    catalog_root: &Path,
+    request: SetRequest,
+    sources: &KeySources<'_>,
+) -> anyhow::Result<()> {
+    let file_key = describer_key::store(request.backend, request.api_key, sources.store)?;
     let notices = Notices::new();
-    let stored = describer_config::set(catalog_root, args, &notices);
+    let stored = describer_config::set(
+        catalog_root,
+        &SetArgs {
+            backend: request.backend,
+            model: request.model,
+            base_url: request.base_url,
+            file_key,
+        },
+        &notices,
+    );
     crate::drain_notices(&notices);
     stored?;
-    cmd_show(catalog_root)
+    cmd_show(catalog_root, sources)
 }
 
-pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_show(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let shown = describer_config::show(catalog_root, key_presence(), &notices);
+    let resolved = describer_key::resolve(catalog_root, sources, &notices);
+    let shown = describer_config::show(catalog_root, describer_key::presence(&resolved), &notices);
     crate::drain_notices(&notices);
     match shown? {
         Some(view) => print_view(&view),
@@ -46,9 +60,36 @@ pub(crate) fn cmd_show(catalog_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_test(catalog_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_clear_key(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
     let notices = Notices::new();
-    let probe = describer_config::test(catalog_root, env_api_key(), &notices);
+    let cleared = describer_key::clear(catalog_root, sources, &notices);
+    crate::drain_notices(&notices);
+    for line in clear_key_lines(&cleared?) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `clear-key` prints: what was removed, then — when it is — that the
+/// environment goes on supplying a key all the same.
+fn clear_key_lines(outcome: &ClearKeyOutcome) -> Vec<&'static str> {
+    let removed = match (outcome.keychain_cleared, outcome.file_cleared) {
+        (true, true) => "removed the key from the Keychain and describer.toml",
+        (true, false) => "removed the key from the Keychain",
+        (false, true) => "removed the key from describer.toml",
+        (false, false) => "no stored key to remove",
+    };
+    let mut lines = vec![removed];
+    if outcome.env_still_supplies {
+        lines.push("MAJ_OPENROUTER_KEY is set and still supplies a key");
+    }
+    lines
+}
+
+pub(crate) fn cmd_test(catalog_root: &Path, sources: &KeySources<'_>) -> anyhow::Result<()> {
+    let notices = Notices::new();
+    let resolved = describer_key::resolve(catalog_root, sources, &notices);
+    let probe = describer_config::test(catalog_root, resolved.key, &notices);
     crate::drain_notices(&notices);
     let probe = probe?;
     println!("backend reachable: yes");
@@ -131,6 +172,65 @@ mod tests {
         assert_eq!(key_source_label(KeySource::Keychain), "(from keychain)");
         assert_eq!(key_source_label(KeySource::File), "(from file)");
         assert_eq!(key_source_label(KeySource::Absent), "(none)");
+    }
+
+    /// The write order, at this head: a Keychain that refuses the key stops
+    /// `set` before `describer.toml` exists, so no keyless config is left
+    /// behind claiming a key that was never stored.
+    #[test]
+    fn a_refused_keychain_write_fails_cli_set_before_the_config_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = majestical_secrets::MemoryKeyStore {
+            fail: Some("denied".to_string()),
+            ..majestical_secrets::MemoryKeyStore::default()
+        };
+        let sources = KeySources {
+            env: None,
+            store: &store,
+        };
+        let request = SetRequest {
+            backend: majestical_describe::BackendKind::OpenRouter,
+            model: "m".to_string(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+        };
+        let err = cmd_set(dir.path(), request, &sources).expect_err("refused");
+        let rendered = format!("{err} {err:#} {err:?}");
+        assert!(rendered.contains("Keychain"), "{rendered}");
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+        let path = describer_config::config_path(dir.path(), &Notices::new()).expect("path");
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn clear_key_says_what_was_removed_and_whether_the_env_still_supplies() {
+        let lines = |keychain_cleared, file_cleared, env_still_supplies| {
+            clear_key_lines(&ClearKeyOutcome {
+                keychain_cleared,
+                file_cleared,
+                env_still_supplies,
+            })
+        };
+        assert_eq!(
+            lines(true, true, false),
+            ["removed the key from the Keychain and describer.toml"]
+        );
+        assert_eq!(
+            lines(true, false, false),
+            ["removed the key from the Keychain"]
+        );
+        assert_eq!(
+            lines(false, true, false),
+            ["removed the key from describer.toml"]
+        );
+        assert_eq!(lines(false, false, false), ["no stored key to remove"]);
+        assert_eq!(
+            lines(false, false, true),
+            [
+                "no stored key to remove",
+                "MAJ_OPENROUTER_KEY is set and still supplies a key"
+            ]
+        );
     }
 
     /// A key that was not checked says nothing, rather than something that

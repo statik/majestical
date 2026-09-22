@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 /// an explicit `machine "x"` in the Gherkin text.
 const DEFAULT_MACHINE: &str = "acceptance";
 
+/// Never the default service: no scenario may reach the Keychain item the
+/// developer's own `maj` keeps. No scenario stores a key, so one fixed name
+/// is enough and nothing needs deleting.
+const THROWAWAY_KEYCHAIN_SERVICE: &str = "majestical-test-acceptance";
+
 #[derive(Debug, World)]
 #[world(init = Self::new)]
 struct SearchWorld {
@@ -96,7 +101,8 @@ impl SearchWorld {
         cmd.env("MAJ_CATALOG", catalog)
             .env("MAJ_MACHINE_ID", machine)
             .env("MAJ_STATE_DIR", state)
-            .env("MAJ_MODEL_DIR", model);
+            .env("MAJ_MODEL_DIR", model)
+            .env(majestical_secrets::SERVICE_ENV, THROWAWAY_KEYCHAIN_SERVICE);
         Ok(cmd)
     }
 

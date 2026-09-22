@@ -47,10 +47,19 @@ impl Mcp {
         extra_env: &[(&str, &str)],
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_maj"));
+        // A throwaway Keychain service per server, before `extra_env` so a
+        // test that must find its item again can name its own.
         command
+            .env(
+                majestical_secrets::SERVICE_ENV,
+                common::throwaway_keychain_service(),
+            )
             .env("MAJ_CATALOG", catalog)
             .env("MAJ_MACHINE_ID", "m1")
             .env("MAJ_STATE_DIR", state)
+            // The developer's own key must not decide a `key_source`; a test
+            // that wants one passes it in `extra_env`.
+            .env_remove("MAJ_OPENROUTER_KEY")
             .arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
@@ -146,6 +155,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "browse_assets",
     "browse_tree",
     "catalog_init",
+    "clear_describer_key",
     "doctor",
     "file_assets",
     "get_asset",
@@ -915,6 +925,8 @@ fn describer_tools_over_a_broken_config_name_the_line_and_never_quote_it() {
             "set_describer",
             serde_json::json!({"backend": "ollama", "model": "m2", "confirm": true}),
         ),
+        ("clear_describer_key", serde_json::json!({})),
+        ("clear_describer_key", serde_json::json!({"confirm": true})),
     ] {
         let resp = call_over_a_broken_describer_config(tool, &args);
         let parsed: serde_json::Value = serde_json::from_str(&resp).expect("json");
@@ -1039,12 +1051,13 @@ fn list_unfinished_ingests_matches_service_outcome() {
     assert!(runs[0]["run_id"].is_string(), "{resp}");
 }
 
-/// The 20 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —
+/// The 21 mutating tools, distinct from `EXPECTED_TOOLS`'s full roster —
 /// every one of these takes `confirm: bool`, checked below.
 const MUTATING_TOOLS: &[&str] = &[
     "add_sync_location",
     "assign_tags",
     "catalog_init",
+    "clear_describer_key",
     "file_assets",
     "index_run",
     "ingest_source",
@@ -2949,45 +2962,78 @@ fn set_describer_dry_run_then_confirm_is_visible_via_get_describer() {
     );
 }
 
+/// Where `set_describer` puts an `api_key` on this platform, as `key_source`
+/// names it, and the tail of the dry run's `would` sentence that says so.
+const STORED_KEY_SOURCE: &str = if cfg!(target_os = "macos") {
+    "keychain"
+} else {
+    "file"
+};
+const STORING_THE_KEY: &str = if cfg!(target_os = "macos") {
+    ", storing the key in the macOS Keychain"
+} else {
+    ", storing the key in describer.toml"
+};
+
+/// An MCP server over a fresh fixture catalog, under a throwaway Keychain
+/// service of the test's own — so the item a confirmed `set_describer`
+/// stores is deleted when the returned guard drops.
+#[cfg(test)]
+fn mcp_with_a_keychain(dir: &std::path::Path) -> (Mcp, common::KeychainCleanup) {
+    let (root, state) = common::fixture_catalog(dir);
+    let service = common::throwaway_keychain_service();
+    let cleanup = common::KeychainCleanup::new(&service);
+    let mcp = Mcp::spawn_with_extra_env(
+        &root,
+        &state,
+        &[(majestical_secrets::SERVICE_ENV, &service)],
+    );
+    (mcp, cleanup)
+}
+
 /// `set_describer` echoes the view `get_describer` would return: the key's
-/// source, never the key. A local backend's key can only come from the
-/// file, so this holds whatever `MAJ_OPENROUTER_KEY` is in the ambient
-/// environment. A second `set_describer` without `api_key` keeps the key.
+/// source, never the key. A second `set_describer` without `api_key` keeps
+/// the key.
 #[test]
 fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (root, state) = common::fixture_catalog(dir.path());
-    let mut mcp = Mcp::spawn(&root, &state);
+    let (mut mcp, _cleanup) = mcp_with_a_keychain(dir.path());
 
     // The dry run says what would happen to the key, and nothing when
     // nothing would.
     let keyless_dry = mcp.call_tool(
         "set_describer",
-        &serde_json::json!({"backend": "ollama", "model": "first"}),
+        &serde_json::json!({"backend": "open-router", "model": "first"}),
     );
     assert_eq!(
         keyless_dry["result"]["structuredContent"]["would"],
-        serde_json::json!("configure the describer backend to ollama model 'first'"),
+        serde_json::json!("configure the describer backend to open-router model 'first'"),
         "{keyless_dry}"
     );
     let keyed_dry = mcp.call_tool(
         "set_describer",
-        &serde_json::json!({"backend": "ollama", "model": "first", "api_key": "sk-test"}),
+        &serde_json::json!({"backend": "open-router", "model": "first", "api_key": "sk-test"}),
     );
     assert!(!keyed_dry.to_string().contains("sk-test"), "{keyed_dry}");
     assert_eq!(
         keyed_dry["result"]["structuredContent"]["would"],
-        serde_json::json!(
-            "configure the describer backend to ollama model 'first', \
-             storing the key in describer.toml"
-        ),
+        serde_json::json!(format!(
+            "configure the describer backend to open-router model 'first'{STORING_THE_KEY}"
+        )),
         "{keyed_dry}"
+    );
+    // A dry run stores nothing, the key least of all.
+    let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+    assert_eq!(
+        described["result"]["structuredContent"]["configured"],
+        serde_json::json!(false),
+        "{described}"
     );
 
     let keyed = mcp.call_tool(
         "set_describer",
         &serde_json::json!({
-            "backend": "ollama", "model": "first", "api_key": "sk-test", "confirm": true
+            "backend": "open-router", "model": "first", "api_key": "sk-test", "confirm": true
         }),
     );
     assert_ne!(
@@ -2999,7 +3045,7 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     let structured = &keyed["result"]["structuredContent"];
     assert_eq!(
         structured["key_source"],
-        serde_json::json!("file"),
+        serde_json::json!(STORED_KEY_SOURCE),
         "{structured}"
     );
     assert_eq!(
@@ -3010,24 +3056,25 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
 
     let dry = mcp.call_tool(
         "set_describer",
-        &serde_json::json!({"backend": "ollama", "model": "second"}),
+        &serde_json::json!({"backend": "open-router", "model": "second"}),
     );
     assert_eq!(
         dry["result"]["structuredContent"]["current"]["key_source"],
-        serde_json::json!("file"),
+        serde_json::json!(STORED_KEY_SOURCE),
         "{dry}"
     );
     assert_eq!(
         dry["result"]["structuredContent"]["would"],
         serde_json::json!(
-            "configure the describer backend to ollama model 'second', keeping the stored key"
+            "configure the describer backend to open-router model 'second', \
+             leaving any stored key unchanged"
         ),
         "{dry}"
     );
 
     let rekeyed = mcp.call_tool(
         "set_describer",
-        &serde_json::json!({"backend": "ollama", "model": "second", "confirm": true}),
+        &serde_json::json!({"backend": "open-router", "model": "second", "confirm": true}),
     );
     let structured = &rekeyed["result"]["structuredContent"];
     assert_eq!(
@@ -3037,7 +3084,7 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     );
     assert_eq!(
         structured["key_source"],
-        serde_json::json!("file"),
+        serde_json::json!(STORED_KEY_SOURCE),
         "{structured}"
     );
 
@@ -3045,8 +3092,60 @@ fn set_describer_names_the_keys_source_and_keeps_a_stored_key() {
     assert!(!described.to_string().contains("sk-test"), "{described}");
     assert_eq!(
         described["result"]["structuredContent"]["describer"]["key_source"],
-        serde_json::json!("file"),
+        serde_json::json!(STORED_KEY_SOURCE),
         "{described}"
+    );
+}
+
+/// `clear_describer_key`'s dry run names where the key comes from and
+/// removes nothing; confirmed, it removes the key and says from where.
+#[test]
+fn clear_describer_key_dry_run_then_confirm_removes_the_stored_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut mcp, _cleanup) = mcp_with_a_keychain(dir.path());
+    let key_source = |mcp: &mut Mcp| {
+        let described = mcp.call_tool("get_describer", &serde_json::json!({}));
+        described["result"]["structuredContent"]["describer"]["key_source"].clone()
+    };
+    mcp.call_tool(
+        "set_describer",
+        &serde_json::json!({
+            "backend": "open-router", "model": "m", "api_key": "sk-test", "confirm": true
+        }),
+    );
+    assert_eq!(key_source(&mut mcp), serde_json::json!(STORED_KEY_SOURCE));
+
+    let dry = mcp.call_tool("clear_describer_key", &serde_json::json!({}));
+    assert!(!dry.to_string().contains("sk-test"), "{dry}");
+    let structured = &dry["result"]["structuredContent"];
+    assert_eq!(structured["executed"], serde_json::json!(false), "{dry}");
+    assert_eq!(
+        structured["would"],
+        serde_json::json!(format!(
+            "remove the stored key (currently from {STORED_KEY_SOURCE})"
+        )),
+        "{dry}"
+    );
+    assert_eq!(key_source(&mut mcp), serde_json::json!(STORED_KEY_SOURCE));
+
+    let confirmed = mcp.call_tool("clear_describer_key", &serde_json::json!({"confirm": true}));
+    assert_eq!(
+        confirmed["result"]["structuredContent"],
+        serde_json::json!({
+            "keychain_cleared": cfg!(target_os = "macos"),
+            "file_cleared": !cfg!(target_os = "macos"),
+            "env_still_supplies": false,
+            "executed": true,
+        }),
+        "{confirmed}"
+    );
+    assert_eq!(key_source(&mut mcp), serde_json::json!("none"));
+
+    let dry = mcp.call_tool("clear_describer_key", &serde_json::json!({}));
+    assert_eq!(
+        dry["result"]["structuredContent"]["would"],
+        serde_json::json!("no stored key to remove"),
+        "{dry}"
     );
 }
 

@@ -801,3 +801,89 @@ fn unreadable_tags_blob_skips_with_a_note_and_others_still_list() {
         .stderr(contains("skipping unreadable"))
         .stdout(contains("topic/valid"));
 }
+
+/// The Keychain's reason to exist, proven end to end: a key stored by
+/// `describer set` — never written to `describer.toml`, never in the
+/// environment — is what authorizes the caption request. Both mocks refuse
+/// any other `Authorization` header, so a run that resolved no key, or the
+/// wrong one, cannot reach them and writes no caption.
+///
+/// macOS only: elsewhere there is no Keychain and the key stays in the file,
+/// which `describer_smoke.rs` covers.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_keychain_key_authorizes_the_caption_run() {
+    let server = MockServer::start();
+    let bearer = |when: httpmock::When, body: &str| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .body_includes(body)
+    };
+    let caption = server.mock(|when, then| {
+        bearer(when, "Describe this image");
+        then.status(200).json_body(caption_response());
+    });
+    server.mock(|when, then| {
+        bearer(when, "Suggest tags");
+        then.status(200).json_body(tags_response());
+    });
+
+    let media = tempfile::tempdir().expect("tempdir");
+    write_red_png(&media.path().join("red.png"));
+    let catalog = tempfile::tempdir().expect("tempdir");
+    let root = catalog.path().join("cat");
+    let state = catalog.path().join("state");
+    let model_dir = tempfile::tempdir().expect("tempdir");
+    let service = common::throwaway_keychain_service();
+    let _cleanup = common::KeychainCleanup::new(&service);
+    let maj_keyed = || {
+        let mut command = common::maj_with_keychain(&root, &state, &service);
+        // The key must come from the Keychain alone: an ambient env key
+        // would authorize the request no matter what the store held.
+        command.env_remove("MAJ_OPENROUTER_KEY");
+        command
+    };
+
+    maj_keyed().args(["catalog", "init"]).assert().success();
+    maj_keyed()
+        .args(["scan"])
+        .arg(media.path())
+        .assert()
+        .success();
+    maj_keyed()
+        .args(["describer", "set", "--backend", "open-router"])
+        .args(["--model", "mock-model", "--base-url", &server.base_url()])
+        .args(["--api-key", "sk-test"])
+        .assert()
+        .success()
+        .stdout(contains("api-key:  (from keychain)"))
+        .stdout(contains("sk-test").not());
+
+    // The key is in the Keychain and nowhere else on disk.
+    assert!(common::keychain_item_exists(&service), "{service}");
+    let configs = walkdir_find(&state, "describer.toml");
+    assert_eq!(configs.len(), 1, "{configs:?}");
+    let written = std::fs::read_to_string(&configs[0]).expect("read describer.toml");
+    assert!(!written.contains("sk-test"), "{written}");
+    assert!(!written.contains("api_key"), "{written}");
+
+    maj_keyed()
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "thumbs"])
+        .assert()
+        .success();
+    let run = maj_keyed()
+        .env("MAJ_MODEL_DIR", model_dir.path())
+        .args(["index", "run", "--kinds", "captions"])
+        .assert()
+        .success()
+        .stdout(contains("captions: 1 written"))
+        .stdout(contains("sk-test").not());
+    let output = run.get_output();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("sk-test"),
+        "the key must not reach stderr either"
+    );
+    caption.assert_calls(1);
+}

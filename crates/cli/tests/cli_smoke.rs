@@ -2015,8 +2015,7 @@ fn search_query_and_saved_together_is_a_clap_conflict_not_a_panic() {
 /// without them, just with an actionable message instead of a usage error.
 #[test]
 fn volumes_list_without_catalog_or_machine_id_names_the_remedy() {
-    assert_cmd::Command::cargo_bin("maj")
-        .expect("bin")
+    common::maj_bin()
         .env_remove("MAJ_CATALOG")
         .env_remove("MAJ_MACHINE_ID")
         .args(["volumes", "list"])

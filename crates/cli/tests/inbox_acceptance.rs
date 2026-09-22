@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 /// one identity.
 const MACHINE: &str = "inbox-acceptance";
 
+/// Never the default service: no scenario may reach the Keychain item the
+/// developer's own `maj` keeps. No scenario stores a key, so one fixed name
+/// is enough and nothing needs deleting.
+const THROWAWAY_KEYCHAIN_SERVICE: &str = "majestical-test-inbox-acceptance";
+
 #[derive(Debug, World)]
 #[world(init = Self::new)]
 struct InboxWorld {
@@ -123,7 +128,8 @@ impl InboxWorld {
         let mut cmd = Command::cargo_bin("maj").map_err(|e| e.to_string())?;
         cmd.env("MAJ_CATALOG", self.catalog()?)
             .env("MAJ_MACHINE_ID", MACHINE)
-            .env("MAJ_STATE_DIR", self.state()?);
+            .env("MAJ_STATE_DIR", self.state()?)
+            .env(majestical_secrets::SERVICE_ENV, THROWAWAY_KEYCHAIN_SERVICE);
         Ok(cmd)
     }
 

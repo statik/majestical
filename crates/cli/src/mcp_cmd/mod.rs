@@ -22,7 +22,7 @@
 //! a failure's warnings have. See `split_notices`/`tool_error_split` below.
 //!
 //! Split into submodules by concern: `read_tools` (the 15 read-only tools),
-//! `write_tools` (the 20 mutating tools, each gated behind a `confirm`
+//! `write_tools` (the 21 mutating tools, each gated behind a `confirm`
 //! parameter — see that module's own doc for the dry-run/execute
 //! contract), and `resources` (the `majestical://` MCP resources: thumbnails
 //! and keyframe manifests). This file keeps only what every submodule

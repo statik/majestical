@@ -1,6 +1,7 @@
 //! The desktop head: a Tauri shell over `majestical_services`. Commands are
 //! thin wrappers returning services outcome structs as-is (parity by
 //! construction, same rule as `maj mcp`).
+pub mod captions;
 pub mod commands;
 pub mod config;
 pub mod indexer;
@@ -10,6 +11,32 @@ pub mod thumb_protocol;
 pub mod tray;
 
 use tauri::Manager;
+
+/// Startup, in this order and for these reasons: republish the catalog the
+/// user picked last run; resolve the describer key against it, because which
+/// backend that catalog has configured decides whether the Keychain is
+/// consulted at all; then start the scheduler loop, whose very first tick
+/// reads both; then build the tray over what they found.
+///
+/// A named function rather than a closure so it sits outside [`run`]'s
+/// blanket `expect_used`/`exit` expectations — those exist for the Tauri
+/// macros, not for logic of ours.
+///
+/// # Errors
+/// Returns an error if the platform has no config directory, or the tray
+/// cannot be built.
+fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    commands::restore_persisted_catalog(app.handle())?;
+    let cache = app.state::<captions::DescriberKeyCache>();
+    let store = captions::system_store();
+    captions::refresh_key(
+        &captions::KeyRefresh::ambient(&cache, &store),
+        commands::selected_catalog(&app.state::<commands::AppState>()).as_ref(),
+    );
+    indexer::spawn_loop(app.handle());
+    tray::build_tray(app.handle())?;
+    Ok(())
+}
 
 /// Builds and runs the Tauri app.
 ///
@@ -91,12 +118,12 @@ pub fn run() {
         // a field on `SchedulerShared`: a `Condvar` pairs with a `Mutex`,
         // not with that `RwLock`.
         .manage(indexer::SchedulerWake::default())
-        .setup(|app| {
-            commands::restore_persisted_catalog(app.handle())?;
-            indexer::spawn_loop(app.handle());
-            tray::build_tray(app.handle())?;
-            Ok(())
-        })
+        // The head's describer key, resolved once and reused. Managed state
+        // because the scheduler loop and every Captions command read the
+        // same one: a per-tick Keychain read is a macOS access check that a
+        // denied prompt does not remember, so it would prompt on every poll.
+        .manage(captions::DescriberKeyCache::default())
+        .setup(setup_app)
         // Closing the window hides it to the tray instead of quitting —
         // "Quit Majestical" on the tray menu or the system's Cmd+Q are the
         // ways out (see `tray.rs::handle_menu_event`). On macOS the Dock
@@ -157,6 +184,10 @@ pub fn run() {
             indexer::scheduler_state,
             indexer::set_throttle,
             indexer::retry_failed_items,
+            captions::describer_settings,
+            captions::save_describer,
+            captions::clear_describer_key,
+            captions::test_describer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running majestical desktop");

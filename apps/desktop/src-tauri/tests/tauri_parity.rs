@@ -177,9 +177,33 @@ fn maj_binary() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Every `maj` child this suite spawns, and the ONE place it is spawned:
+/// each gets a throwaway Keychain service and no `MAJ_OPENROUTER_KEY`, so no
+/// parity row can read, write or delete the item the developer's own `maj`
+/// keeps under the default name, and no ambient key can decide a result.
+/// The desktop analogue of `crates/cli/tests/common::maj_bin()` — since Task
+/// 7 the desktop head reaches a real store too, and `keychain_guard.rs`
+/// only scans `crates/cli/tests`.
+#[cfg(test)]
+fn maj_command(maj: &Path) -> std::process::Command {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut command = std::process::Command::new(maj);
+    command
+        .env(
+            majestical_secrets::SERVICE_ENV,
+            format!(
+                "majestical-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
+        .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
+    command
+}
+
 #[cfg(test)]
 fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
-    let output = std::process::Command::new(maj)
+    let output = maj_command(maj)
         .arg("--catalog")
         .arg(&cfg.catalog)
         .arg("--machine-id")
@@ -206,7 +230,7 @@ fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
 /// no-catalog-selected doctor run instead of `catalog`'s.
 #[cfg(test)]
 fn cli_doctor_json(maj: &Path, catalog: &Path) -> serde_json::Value {
-    let output = std::process::Command::new(maj)
+    let output = maj_command(maj)
         .args(["doctor", "--catalog"])
         .arg(catalog)
         .arg("--json")
@@ -225,7 +249,7 @@ fn cli_doctor_json(maj: &Path, catalog: &Path) -> serde_json::Value {
 /// has already pointed it at this test's tempdir.
 #[cfg(test)]
 fn cli_json(maj: &Path, cfg: &CatalogCfg, args: &[&str]) -> serde_json::Value {
-    let output = std::process::Command::new(maj)
+    let output = maj_command(maj)
         .arg("--catalog")
         .arg(&cfg.catalog)
         .arg("--machine-id")
@@ -396,11 +420,21 @@ fn doctor_matches_cli_json() {
     with_state_dir(|| {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = seeded_cfg(dir.path().join("cat"));
-        let outcome = majestical_desktop::commands::doctor_report_impl(
+        // The head's own reading, taken the way the app takes it: from the
+        // key cache the setup hook filled. No environment key and no real
+        // store on either side — `maj_command` strips both from the child —
+        // so both binaries report the same absent key.
+        let cache = majestical_desktop::captions::DescriberKeyCache::default();
+        majestical_desktop::captions::refresh_key(
+            &majestical_desktop::captions::KeyRefresh {
+                cache: &cache,
+                store: &majestical_secrets::MemoryKeyStore::default(),
+                env: None,
+            },
             Some(&cfg),
-            majestical_desktop::commands::key_presence(),
-        )
-        .expect("command");
+        );
+        let outcome = majestical_desktop::commands::doctor_report_impl(Some(&cfg), cache.presence())
+            .expect("command");
         assert_eq!(
             serde_json::to_value(&outcome).expect("serialize command outcome"),
             cli_doctor_json(&maj, &cfg.catalog),

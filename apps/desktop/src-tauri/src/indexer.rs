@@ -9,6 +9,7 @@
 //! spawn time, so a catalog change from `initialize_catalog`/
 //! `use_existing_catalog` re-aims the loop for free on its very next tick —
 //! no extra signaling between that command and this module is needed.
+use crate::captions::DescriberKeyCache;
 use crate::commands::{AppState, CatalogCfg, CommandError, open_app, selected_catalog};
 use crate::power::{POWER_PROBE_AVAILABLE, read_power_state};
 use majestical_services::autopilot::{
@@ -235,6 +236,7 @@ fn publish_poll(
 fn poll_and_decide(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
+    keys: &DescriberKeyCache,
 ) -> Result<(SchedulerDecision, Option<IndexRunReq>), CommandError> {
     // `AssertUnwindSafe` (inside `catch_panic`): the closure captures only
     // `&CatalogCfg`, which is plain data with no interior mutability for a
@@ -254,10 +256,11 @@ fn poll_and_decide(
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
     publish_poll(&mut shared, &status, power, decision);
     drop(shared);
-    Ok((
-        decision,
-        batch_request(decision, crate::commands::env_api_key()),
-    ))
+    // The CACHED key, never a fresh resolve: reading the Keychain is a macOS
+    // access check that a denied prompt does not remember, so resolving here
+    // could prompt on every poll. `captions::refresh_key` refills the cache
+    // at startup, on `adopt_catalog`, and after a save or a clear.
+    Ok((decision, batch_request(decision, keys.key())))
 }
 
 /// Every kind's `failed` list, summed — what [`batch_outcome_pace`] reports
@@ -354,7 +357,8 @@ fn run_tick(app: &AppHandle) -> Duration {
         return TICK;
     };
     let scheduler = app.state::<SchedulerState>();
-    let (decision, req) = match poll_and_decide(&cfg, &scheduler) {
+    let keys = app.state::<DescriberKeyCache>();
+    let (decision, req) = match poll_and_decide(&cfg, &scheduler, &keys) {
         Ok(pair) => pair,
         Err(err) => {
             scheduler
@@ -798,6 +802,48 @@ mod tests {
             assert_eq!(req.threads, threads);
             assert!(!req.retry_failed, "the scheduler never clears the ledger");
         }
+    }
+
+    /// The tick takes the key from the cache the head filled at startup, at
+    /// `adopt_catalog`, and after a save — never from the environment. A
+    /// Keychain read is a macOS access check whose denial is not remembered,
+    /// so a per-tick read can prompt on every poll; that is the whole point
+    /// of the cache, and reading `env_api_key()` here again would both skip
+    /// the Keychain and defeat it.
+    #[test]
+    fn the_tick_reads_the_cached_key_not_the_environment() {
+        let _guard = crate::captions::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = crate::captions::DescriberKeyCache::default();
+        *cache
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = majestical_secrets::ResolvedKey {
+            key: Some("sk-test-2".to_string()),
+            source: majestical_secrets::HeadKeySource::Keychain,
+            notice: None,
+        };
+        // SAFETY: serialized by ENV_LOCK; no other thread reads env mid-test.
+        unsafe { std::env::set_var(majestical_describe::config::OPENROUTER_KEY_ENV, "sk-test") };
+        let cached = cache.key();
+        let empty = crate::captions::DescriberKeyCache::default().key();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(majestical_describe::config::OPENROUTER_KEY_ENV) };
+
+        assert_eq!(empty, None, "an unfilled cache supplies no key");
+        assert_eq!(
+            cached.as_deref(),
+            Some("sk-test-2"),
+            "the cache's key wins over the ambient environment"
+        );
+        assert_eq!(
+            batch_request(SchedulerDecision::RunFull, cached)
+                .expect("a batch")
+                .api_key
+                .as_deref(),
+            Some("sk-test-2")
+        );
     }
 
     #[test]

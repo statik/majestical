@@ -19,6 +19,7 @@
 //! worth the blocking pool anyway), the mount-table listing, and the two
 //! ingest calls that walk and hash a whole source directory. The rest read
 //! the projection and return promptly.
+use crate::captions::{DescriberKeyCache, KeyRefresh};
 use crate::config::{self, GuiConfig};
 use crate::ingest::{
     INGEST_PROGRESS_EVENT, IngestProgress, IngestState, IngestStateWire, ProgressSink, StartIngest,
@@ -59,17 +60,6 @@ pub fn env_api_key() -> Option<String> {
     std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
         .ok()
         .filter(|k| !k.is_empty())
-}
-
-/// What this head found outside `describer.toml`, for the doctor row that
-/// names the key's source. `pub` for the same reason as [`env_api_key`].
-#[must_use]
-pub fn key_presence() -> KeyPresence {
-    if env_api_key().is_some() {
-        KeyPresence::Env
-    } else {
-        KeyPresence::Absent
-    }
 }
 
 /// This app's catalog wiring — managed Tauri state, rebuilt when the user
@@ -234,8 +224,8 @@ pub fn app_status_impl(cfg: Option<&CatalogCfg>) -> AppStatus {
 ///
 /// `presence` is passed in rather than read here so the describer row is
 /// testable without touching the process environment; the command wrapper
-/// supplies [`key_presence`], which is the head's own reading — doctor's
-/// key presence never comes from a client.
+/// supplies [`crate::captions::DescriberKeyCache::presence`], which is the
+/// head's own reading — doctor's key presence never comes from a client.
 ///
 /// # Errors
 /// In practice never; see the services module's own doc for why.
@@ -560,6 +550,10 @@ pub fn use_existing_catalog_impl(cfg: &CatalogCfg) -> Result<(), CommandError> {
 /// `use_existing_catalog`, which differ only in `validate`. Nothing is
 /// persisted or published when validation fails.
 ///
+/// The key cache is refilled here too: a catalog switch changes which
+/// describer backend is configured, and so whether the Keychain is consulted
+/// at all.
+///
 /// # Errors
 /// Returns `validate`'s error, or any failure writing the config file.
 pub fn adopt_catalog(
@@ -567,6 +561,7 @@ pub fn adopt_catalog(
     state: &AppState,
     catalog: PathBuf,
     validate: fn(&CatalogCfg) -> Result<(), CommandError>,
+    keys: &KeyRefresh<'_>,
 ) -> Result<AppStatus, CommandError> {
     let identity = machine_identity();
     let cfg = CatalogCfg {
@@ -582,6 +577,7 @@ pub fn adopt_catalog(
         },
     )?;
     let status = app_status_impl(Some(&cfg));
+    crate::captions::refresh_key(keys, Some(&cfg));
     *state.0.write().unwrap_or_else(PoisonError::into_inner) = Some(cfg);
     Ok(status)
 }
@@ -636,7 +632,7 @@ pub fn selected_catalog(state: &AppState) -> Option<CatalogCfg> {
         .clone()
 }
 
-fn require_catalog(state: &State<'_, AppState>) -> Result<CatalogCfg, CommandError> {
+pub(crate) fn require_catalog(state: &State<'_, AppState>) -> Result<CatalogCfg, CommandError> {
     selected_catalog(state).ok_or_else(|| {
         CommandError::new("no catalog selected yet — initialize or choose one first")
     })
@@ -645,7 +641,7 @@ fn require_catalog(state: &State<'_, AppState>) -> Result<CatalogCfg, CommandErr
 /// Runs a command impl on Tauri's blocking pool, so a slow search never
 /// stalls an async worker. The impl itself still hops to a plain OS thread
 /// for Lance's sake; this is the outer half of that pairing.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
 ) -> Result<T, CommandError> {
     tauri::async_runtime::spawn_blocking(f)
@@ -676,8 +672,11 @@ pub fn app_status(state: State<'_, AppState>) -> AppStatus {
     reason = "tauri::command hands a handler its state and arguments by value"
 )]
 #[tauri::command]
-pub fn doctor_report(state: State<'_, AppState>) -> Result<DoctorOutcome, CommandError> {
-    doctor_report_impl(selected_catalog(&state).as_ref(), key_presence())
+pub fn doctor_report(
+    state: State<'_, AppState>,
+    cache: State<'_, DescriberKeyCache>,
+) -> Result<DoctorOutcome, CommandError> {
+    doctor_report_impl(selected_catalog(&state).as_ref(), cache.presence())
 }
 
 /// Searches the catalog. `limit` defaults to 50 results.
@@ -1009,6 +1008,7 @@ pub fn archive_node(
 pub fn initialize_catalog(
     app: AppHandle,
     state: State<'_, AppState>,
+    cache: State<'_, DescriberKeyCache>,
     path: String,
 ) -> Result<AppStatus, CommandError> {
     adopt_catalog(
@@ -1016,6 +1016,7 @@ pub fn initialize_catalog(
         &state,
         PathBuf::from(path),
         initialize_catalog_impl,
+        &KeyRefresh::ambient(&cache, &crate::captions::system_store()),
     )
 }
 
@@ -1032,6 +1033,7 @@ pub fn initialize_catalog(
 pub fn use_existing_catalog(
     app: AppHandle,
     state: State<'_, AppState>,
+    cache: State<'_, DescriberKeyCache>,
     path: String,
 ) -> Result<AppStatus, CommandError> {
     adopt_catalog(
@@ -1039,6 +1041,7 @@ pub fn use_existing_catalog(
         &state,
         PathBuf::from(path),
         use_existing_catalog_impl,
+        &KeyRefresh::ambient(&cache, &crate::captions::system_store()),
     )
 }
 

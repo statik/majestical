@@ -201,6 +201,40 @@ fn maj_command(maj: &Path) -> std::process::Command {
     command
 }
 
+/// Both halves of [`maj_command`]'s protection, asserted on the built
+/// command rather than on this file's source text. `get_envs` reports what
+/// a child would actually receive — a set variable as `Some`, an explicitly
+/// removed one as `None` — so neither half can be deleted with a green
+/// suite. The CLI's `keychain_guard.rs` scans source instead and is
+/// structurally weaker: one `.env(` occurrence satisfies it for a whole
+/// file, so a second spawn site rides along unchecked.
+#[test]
+fn a_spawned_child_gets_a_throwaway_service_and_no_ambient_key() {
+    use std::ffi::OsStr;
+    let command = maj_command(Path::new("maj"));
+    let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
+
+    let service = envs
+        .get(OsStr::new(majestical_secrets::SERVICE_ENV))
+        .copied()
+        .flatten()
+        .expect("every child is given MAJ_KEYCHAIN_SERVICE")
+        .to_str()
+        .expect("a UTF-8 service name");
+    assert!(
+        service.starts_with("majestical-test-"),
+        "a child must never address the developer's own Keychain item: {service}"
+    );
+    assert_eq!(
+        envs.get(OsStr::new(
+            majestical_describe::config::OPENROUTER_KEY_ENV
+        )),
+        Some(&None),
+        "every child must have MAJ_OPENROUTER_KEY explicitly removed, so no \
+         ambient key can decide a parity result"
+    );
+}
+
 #[cfg(test)]
 fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
     let output = maj_command(maj)

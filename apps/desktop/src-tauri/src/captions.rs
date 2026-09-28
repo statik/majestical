@@ -779,6 +779,206 @@ mod tests {
     }
 
     /// No network: an unconfigured catalog is refused before any request.
+    /// Seeds `describer.toml` with an `OpenRouter` backend, so the head's
+    /// resolve wants the Keychain and `clear` has a file half to do.
+    fn seed_openrouter(cfg: &CatalogCfg, file_key: FileKey) {
+        describer_config::set(
+            &cfg.catalog,
+            &SetArgs {
+                backend: BackendKind::OpenRouter,
+                model: "m".to_string(),
+                base_url: None,
+                file_key,
+            },
+            &Notices::new(),
+        )
+        .expect("seed describer.toml");
+    }
+
+    /// Makes `describer.toml` unparsable, so every verb that loads it fails.
+    fn break_config(cfg: &CatalogCfg) {
+        std::fs::write(config_path(cfg), "backend = oops\n").expect("break describer.toml");
+    }
+
+    /// A Keychain read the user denied must reach the panel as a notice.
+    /// Without it the Settings surface renders a describer that quietly
+    /// claims no key is configured — the user is never told the Keychain
+    /// refused, and nothing on screen suggests a retry.
+    #[test]
+    fn a_refused_keychain_read_reaches_the_panel_as_a_notice() {
+        with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = cfg_for(dir.path());
+            seed_openrouter(&cfg, FileKey::Keep);
+            let store = MemoryKeyStore::failing("denied");
+            let cache = DescriberKeyCache::default();
+            refresh_key(
+                &KeyRefresh {
+                    cache: &cache,
+                    store: &store,
+                    env: None,
+                },
+                Some(&cfg),
+            );
+
+            let outcome = describer_settings_impl(&cfg, &cache, &store).expect("settings");
+
+            assert!(
+                outcome
+                    .notices
+                    .iter()
+                    .any(|notice| notice.contains("the macOS Keychain could not be read")),
+                "the denied read must be reported: {:?}",
+                outcome.notices
+            );
+            assert_eq!(cache.presence(), KeyPresence::Absent);
+        });
+    }
+
+    /// The failure path keeps the notices the steps before it collected: a
+    /// denied Keychain read is still reported when the read that follows it
+    /// fails outright, rather than being swallowed with the error.
+    #[test]
+    fn a_failing_read_still_carries_the_earlier_notices() {
+        with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = cfg_for(dir.path());
+            seed_openrouter(&cfg, FileKey::Keep);
+            let store = MemoryKeyStore::failing("denied");
+            let cache = DescriberKeyCache::default();
+            refresh_key(
+                &KeyRefresh {
+                    cache: &cache,
+                    store: &store,
+                    env: None,
+                },
+                Some(&cfg),
+            );
+            break_config(&cfg);
+
+            let err = describer_settings_impl(&cfg, &cache, &store).expect_err("broken config");
+
+            assert!(
+                err.notices
+                    .iter()
+                    .any(|notice| notice.contains("the macOS Keychain could not be read")),
+                "a failure must carry the notices collected before it: {:?}",
+                err.notices
+            );
+        });
+    }
+
+    /// An unreadable `describer.toml` stops a clear before the store is
+    /// touched: deleting the Keychain item and then failing on the file
+    /// would destroy the one copy of a key while reporting an error that
+    /// never says so.
+    #[test]
+    fn clear_over_a_broken_config_fails_before_touching_the_store() {
+        with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = cfg_for(dir.path());
+            seed_openrouter(&cfg, FileKey::Keep);
+            break_config(&cfg);
+            let store = MemoryKeyStore::holding("sk-test");
+            let cache = DescriberKeyCache::default();
+            let wake = SchedulerWake::default();
+
+            let err = clear_describer_key_impl(&cfg, &deps(&cache, &store, &wake))
+                .expect_err("a broken config refuses the clear");
+
+            assert!(err.message.contains("describer.toml"), "{err:?}");
+            assert_eq!(
+                store.held().as_deref(),
+                Some("sk-test"),
+                "the Keychain item must outlive a clear that cannot finish"
+            );
+            assert!(!nudged(&wake), "a refused clear must not wake the scheduler");
+        });
+    }
+
+    /// A refused Keychain delete leaves the file's key where it was. The
+    /// Keychain goes first for exactly this reason: clearing the file half
+    /// first and then failing would wipe the user's only copy while
+    /// reporting that nothing could be removed.
+    #[test]
+    fn a_refused_keychain_delete_is_an_error_and_leaves_the_file_key() {
+        with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = cfg_for(dir.path());
+            seed_openrouter(&cfg, FileKey::Set("sk-test".to_string()));
+            let store = MemoryKeyStore::failing("denied");
+            let cache = DescriberKeyCache::default();
+            let wake = SchedulerWake::default();
+
+            let err = clear_describer_key_impl(&cfg, &deps(&cache, &store, &wake))
+                .expect_err("a refused Keychain delete fails the clear");
+
+            assert!(err.message.contains("Keychain"), "{err:?}");
+            assert!(
+                config_text(&cfg).contains("api_key"),
+                "the file's key must survive a refused Keychain delete"
+            );
+            assert!(
+                !format!("{err:?}").contains("sk-test"),
+                "the key must never render"
+            );
+        });
+    }
+
+    /// An unsupported store is never called — its `delete` is
+    /// `Unsupported`, which would fail the clear — and the file half still
+    /// happens, so a non-macOS user can still remove a file key.
+    #[test]
+    fn clear_never_calls_an_unsupported_store() {
+        with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = cfg_for(dir.path());
+            seed_openrouter(&cfg, FileKey::Set("sk-test".to_string()));
+            let store = MemoryKeyStore {
+                unsupported: true,
+                ..MemoryKeyStore::default()
+            };
+            let cache = DescriberKeyCache::default();
+            let wake = SchedulerWake::default();
+
+            let outcome =
+                clear_describer_key_impl(&cfg, &deps(&cache, &store, &wake)).expect("clear");
+
+            assert!(
+                !config_text(&cfg).contains("api_key"),
+                "the file half still happens without a store"
+            );
+            assert!(!outcome.keychain_supported);
+        });
+    }
+
+    /// `system_store()` must honor `MAJ_KEYCHAIN_SERVICE`. Without it every
+    /// desktop store call — read, write and DELETE — addresses the
+    /// developer's own `majestical` Keychain item. Asserted on the name the
+    /// store carries, never by performing a store operation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_store_honors_the_keychain_service_override() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let service = format!("majestical-test-{}-system-store", std::process::id());
+        // SAFETY: serialized by ENV_LOCK; no other thread reads env mid-test.
+        unsafe { std::env::set_var(majestical_secrets::SERVICE_ENV, &service) };
+        let overridden = system_store();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(majestical_secrets::SERVICE_ENV) };
+        let defaulted = system_store();
+
+        assert_eq!(overridden.service_name(), service);
+        assert_eq!(
+            defaulted.service_name(),
+            "majestical",
+            "with nothing set the default IS the developer's real item, so \
+             the override is the only thing keeping a test off it"
+        );
+    }
+
     #[test]
     fn test_describer_without_a_describer_is_an_error() {
         with_state_dir(|| {

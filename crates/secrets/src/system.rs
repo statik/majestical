@@ -47,6 +47,17 @@ impl SystemKeyStore {
             Self {}
         }
     }
+
+    /// Which Keychain item this store addresses. It exists to be asserted
+    /// on: a head's test must be able to prove it built a store under a
+    /// throwaway service name WITHOUT making a Keychain call, because the
+    /// default name is the developer's own item. macOS only — off macOS
+    /// there is no item and every call is `Unsupported`.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service
+    }
 }
 
 impl Default for SystemKeyStore {

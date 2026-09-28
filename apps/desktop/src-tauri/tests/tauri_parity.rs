@@ -20,6 +20,7 @@
 //! points `MAJ_BIN` at it. Without it they skip loudly rather than failing,
 //! the same rule `services_parity.rs` follows for `/tmp/maj-ref`.
 use majestical_desktop::commands::{CatalogCfg, initialize_catalog_impl, search_assets_impl};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -147,17 +148,141 @@ fn search_rows_match_cli_json() {
     });
 }
 
-/// The `maj` binary to compare against, or `None` after saying loudly in
-/// the test log which check is being skipped and how to stop skipping it.
-/// `what` names the comparison, e.g. "browse tree vs `maj browse tree
-/// --json`".
+/// The only route from this suite to a `maj` child process.
+///
+/// [`Maj`] holds the binary's path in a field private to THIS module and
+/// exposes no way to read it, so a spawn site outside the module cannot
+/// build a `std::process::Command` of its own: every child necessarily goes
+/// through [`Maj::run`], which applies both protections and then asserts
+/// them on the built command in the statement before the spawn.
+///
+/// That placement is the point. Asserting on a command built specially for
+/// a test proves only that one construction; asserting on the way to each
+/// spawn proves every child. The CLI's `keychain_guard.rs` scans source
+/// text instead and is weaker twice over — one `.env(` occurrence satisfies
+/// it for a whole file, and it only scans `crates/cli/tests`, so since Task
+/// 7 it says nothing about this head at all.
+mod guarded {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    /// A located `maj` binary. Construct with [`Maj::find`], run with
+    /// [`Maj::run`]; there is deliberately no accessor for the path.
+    pub(super) struct Maj(PathBuf);
+
+    impl Maj {
+        /// `MAJ_BIN`, else the workspace's own debug build (this test binary
+        /// runs with the package directory as its working directory).
+        /// `None` when neither exists.
+        #[cfg(test)]
+        pub(super) fn find() -> Option<Self> {
+            let path = std::env::var_os("MAJ_BIN")
+                .map_or_else(|| PathBuf::from("../../../target/debug/maj"), PathBuf::from);
+            path.is_file().then_some(Self(path))
+        }
+
+        /// Runs `maj <args>` to completion under a throwaway Keychain
+        /// service and with `MAJ_OPENROUTER_KEY` removed, so no parity row
+        /// can read, write or delete the item the developer's own `maj`
+        /// keeps under the default name, and no ambient key can decide a
+        /// result. `MAJ_STATE_DIR` is inherited — [`super::with_state_dir`]
+        /// has already pointed it at the calling test's tempdir.
+        #[cfg(test)]
+        pub(super) fn run(&self, args: &[&OsStr]) -> Output {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let mut command = Command::new(&self.0);
+            command
+                .args(args)
+                .env(
+                    majestical_secrets::SERVICE_ENV,
+                    format!(
+                        "majestical-test-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ),
+                )
+                .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
+            assert_guarded(&command);
+            command
+                .output()
+                .unwrap_or_else(|err| panic!("run maj {args:?}: {err}"))
+        }
+    }
+
+    /// Refuses to let a child be spawned unless it carries both
+    /// protections. Reads `get_envs`, which reports what the child would
+    /// actually receive — a set variable as `Some`, an explicitly removed
+    /// one as `None` — rather than what the source says was asked for.
+    #[cfg(test)]
+    fn assert_guarded(command: &Command) {
+        let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
+        let service = envs
+            .get(OsStr::new(majestical_secrets::SERVICE_ENV))
+            .copied()
+            .flatten()
+            .expect("a maj child must be given MAJ_KEYCHAIN_SERVICE")
+            .to_str()
+            .expect("a UTF-8 Keychain service name");
+        assert!(
+            service.starts_with("majestical-test-"),
+            "a maj child must never address the developer's own Keychain item: {service}"
+        );
+        assert_eq!(
+            envs.get(OsStr::new(
+                majestical_describe::config::OPENROUTER_KEY_ENV
+            )),
+            Some(&None),
+            "a maj child must have MAJ_OPENROUTER_KEY explicitly removed, so no ambient key \
+             can decide a parity result"
+        );
+    }
+
+    /// What [`assert_guarded`] refuses — the tests that fail if the guard
+    /// itself is deleted or weakened. None of these spawns anything: each
+    /// builds a command and hands it to the guard.
+    #[cfg(test)]
+    mod tests {
+        use super::{Command, assert_guarded};
+
+        #[test]
+        #[should_panic(expected = "must be given MAJ_KEYCHAIN_SERVICE")]
+        fn a_child_with_no_service_override_is_refused() {
+            assert_guarded(&Command::new("maj"));
+        }
+
+        #[test]
+        #[should_panic(expected = "never address the developer's own Keychain item")]
+        fn a_child_pointed_at_the_real_service_is_refused() {
+            let mut command = Command::new("maj");
+            command
+                .env(majestical_secrets::SERVICE_ENV, "majestical")
+                .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
+            assert_guarded(&command);
+        }
+
+        #[test]
+        #[should_panic(expected = "MAJ_OPENROUTER_KEY explicitly removed")]
+        fn a_child_that_would_inherit_the_ambient_key_is_refused() {
+            let mut command = Command::new("maj");
+            command.env(majestical_secrets::SERVICE_ENV, "majestical-test-guard");
+            assert_guarded(&command);
+        }
+    }
+}
+
+use guarded::Maj;
+
+/// A located `maj`, or `None` after saying loudly in the test log which
+/// check is being skipped and how to stop skipping it. `what` names the
+/// comparison, e.g. "browse tree vs `maj browse tree --json`".
 #[cfg(test)]
 #[expect(
     clippy::print_stderr,
     reason = "a skipped parity check must say so in the test log"
 )]
-fn maj_or_skip(what: &str) -> Option<PathBuf> {
-    let found = maj_binary();
+fn maj_or_skip(what: &str) -> Option<Maj> {
+    let found = Maj::find();
     if found.is_none() {
         eprintln!(
             "SKIP parity({what}): no maj binary at MAJ_BIN or ../../../target/debug/maj — run \
@@ -167,85 +292,20 @@ fn maj_or_skip(what: &str) -> Option<PathBuf> {
     found
 }
 
-/// The `maj` binary to compare against: `MAJ_BIN`, else the workspace's own
-/// debug build (this test binary runs with the package directory as its
-/// working directory).
 #[cfg(test)]
-fn maj_binary() -> Option<PathBuf> {
-    let path = std::env::var_os("MAJ_BIN")
-        .map_or_else(|| PathBuf::from("../../../target/debug/maj"), PathBuf::from);
-    path.is_file().then_some(path)
-}
-
-/// Every `maj` child this suite spawns, and the ONE place it is spawned:
-/// each gets a throwaway Keychain service and no `MAJ_OPENROUTER_KEY`, so no
-/// parity row can read, write or delete the item the developer's own `maj`
-/// keeps under the default name, and no ambient key can decide a result.
-/// The desktop analogue of `crates/cli/tests/common::maj_bin()` — since Task
-/// 7 the desktop head reaches a real store too, and `keychain_guard.rs`
-/// only scans `crates/cli/tests`.
-#[cfg(test)]
-fn maj_command(maj: &Path) -> std::process::Command {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let mut command = std::process::Command::new(maj);
-    command
-        .env(
-            majestical_secrets::SERVICE_ENV,
-            format!(
-                "majestical-test-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ),
-        )
-        .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
-    command
-}
-
-/// Both halves of [`maj_command`]'s protection, asserted on the built
-/// command rather than on this file's source text. `get_envs` reports what
-/// a child would actually receive — a set variable as `Some`, an explicitly
-/// removed one as `None` — so neither half can be deleted with a green
-/// suite. The CLI's `keychain_guard.rs` scans source instead and is
-/// structurally weaker: one `.env(` occurrence satisfies it for a whole
-/// file, so a second spawn site rides along unchecked.
-#[test]
-fn a_spawned_child_gets_a_throwaway_service_and_no_ambient_key() {
-    use std::ffi::OsStr;
-    let command = maj_command(Path::new("maj"));
-    let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
-
-    let service = envs
-        .get(OsStr::new(majestical_secrets::SERVICE_ENV))
-        .copied()
-        .flatten()
-        .expect("every child is given MAJ_KEYCHAIN_SERVICE")
-        .to_str()
-        .expect("a UTF-8 service name");
-    assert!(
-        service.starts_with("majestical-test-"),
-        "a child must never address the developer's own Keychain item: {service}"
-    );
-    assert_eq!(
-        envs.get(OsStr::new(
-            majestical_describe::config::OPENROUTER_KEY_ENV
-        )),
-        Some(&None),
-        "every child must have MAJ_OPENROUTER_KEY explicitly removed, so no \
-         ambient key can decide a parity result"
-    );
-}
-
-#[cfg(test)]
-fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
-    let output = maj_command(maj)
-        .arg("--catalog")
-        .arg(&cfg.catalog)
-        .arg("--machine-id")
-        .arg(&cfg.machine_id)
-        .args(["search", QUERY, "--json", "--limit"])
-        .arg(LIMIT.to_string())
-        .output()
-        .expect("run maj search");
+fn cli_search_json(maj: &Maj, cfg: &CatalogCfg) -> serde_json::Value {
+    let limit = LIMIT.to_string();
+    let output = maj.run(&[
+        OsStr::new("--catalog"),
+        cfg.catalog.as_os_str(),
+        OsStr::new("--machine-id"),
+        OsStr::new(&cfg.machine_id),
+        OsStr::new("search"),
+        OsStr::new(QUERY),
+        OsStr::new("--json"),
+        OsStr::new("--limit"),
+        OsStr::new(&limit),
+    ]);
     assert!(
         output.status.success(),
         "maj search failed: {}",
@@ -263,13 +323,13 @@ fn cli_search_json(maj: &Path, cfg: &CatalogCfg) -> serde_json::Value {
 /// field `cmd_doctor` never reads, silently comparing against a
 /// no-catalog-selected doctor run instead of `catalog`'s.
 #[cfg(test)]
-fn cli_doctor_json(maj: &Path, catalog: &Path) -> serde_json::Value {
-    let output = maj_command(maj)
-        .args(["doctor", "--catalog"])
-        .arg(catalog)
-        .arg("--json")
-        .output()
-        .expect("run maj doctor");
+fn cli_doctor_json(maj: &Maj, catalog: &Path) -> serde_json::Value {
+    let output = maj.run(&[
+        OsStr::new("doctor"),
+        OsStr::new("--catalog"),
+        catalog.as_os_str(),
+        OsStr::new("--json"),
+    ]);
     assert!(
         output.status.success(),
         "maj doctor failed: {}",
@@ -279,18 +339,16 @@ fn cli_doctor_json(maj: &Path, catalog: &Path) -> serde_json::Value {
 }
 
 /// Runs `maj <args>` against `cfg`'s catalog and parses its one JSON line.
-/// `MAJ_STATE_DIR` comes from the inherited environment — [`with_state_dir`]
-/// has already pointed it at this test's tempdir.
 #[cfg(test)]
-fn cli_json(maj: &Path, cfg: &CatalogCfg, args: &[&str]) -> serde_json::Value {
-    let output = maj_command(maj)
-        .arg("--catalog")
-        .arg(&cfg.catalog)
-        .arg("--machine-id")
-        .arg(&cfg.machine_id)
-        .args(args)
-        .output()
-        .unwrap_or_else(|err| panic!("run maj {args:?}: {err}"));
+fn cli_json(maj: &Maj, cfg: &CatalogCfg, args: &[&str]) -> serde_json::Value {
+    let mut argv: Vec<&OsStr> = vec![
+        OsStr::new("--catalog"),
+        cfg.catalog.as_os_str(),
+        OsStr::new("--machine-id"),
+        OsStr::new(&cfg.machine_id),
+    ];
+    argv.extend(args.iter().map(|arg| OsStr::new(*arg)));
+    let output = maj.run(&argv);
     assert!(
         output.status.success(),
         "maj {args:?} failed: {}",

@@ -153,15 +153,30 @@ fn search_rows_match_cli_json() {
 /// [`Maj`] holds the binary's path in a field private to THIS module and
 /// exposes no way to read it, so a spawn site outside the module cannot
 /// build a `std::process::Command` of its own: every child necessarily goes
-/// through [`Maj::run`], which applies both protections and then asserts
-/// them on the built command in the statement before the spawn.
+/// through [`Maj::run`], which applies both protections and then checks
+/// them on the built command.
 ///
-/// That placement is the point. Asserting on a command built specially for
-/// a test proves only that one construction; asserting on the way to each
-/// spawn proves every child. The CLI's `keychain_guard.rs` scans source
-/// text instead and is weaker twice over — one `.env(` occurrence satisfies
-/// it for a whole file, and it only scans `crates/cli/tests`, so since Task
-/// 7 it says nothing about this head at all.
+/// The check is not a statement that can be dropped: [`guarded`] CONSUMES
+/// the `Command` and hands back a [`Guarded`], and only a [`Guarded`] can
+/// be spawned. Deleting the call leaves a bare `Command`, whose `output`
+/// returns `io::Result<Output>` where this returns `Output` — a type error,
+/// the same way the private path field makes a bypassing spawn site a
+/// privacy error.
+///
+/// What that does NOT cover, stated so nobody reads more into it: an edit
+/// INSIDE this module can still drop the guard and re-unwrap
+/// (`command.output().unwrap_or_else(..)`), because `Command::output` is
+/// inherent and the binding is in scope. Types cannot close that — any
+/// expression yielding a `Command` can spawn one — so what covers this
+/// module is its size and the three `should_panic` tests below. The type
+/// and privacy walls are what protect the SIX spawn sites outside it, which
+/// is where a second unguarded site would realistically appear.
+///
+/// Checking every spawn is the point. Asserting on a command built
+/// specially for a test proves only that one construction. The CLI's
+/// `keychain_guard.rs` scans source text instead and is weaker twice over —
+/// one `.env(` occurrence satisfies it for a whole file, and it only scans
+/// `crates/cli/tests`, so since Task 7 it says nothing about this head.
 mod guarded {
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -203,8 +218,21 @@ mod guarded {
                     ),
                 )
                 .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
-            assert_guarded(&command);
-            command
+            guarded(command).output(args)
+        }
+    }
+
+    /// A command that has passed [`guarded`]. The only thing in this file
+    /// that can spawn, and [`guarded`] is its only constructor.
+    #[cfg(test)]
+    pub(super) struct Guarded(Command);
+
+    impl Guarded {
+        /// Spawns the child and waits for it. `args` is for the panic
+        /// message only — the command already carries them.
+        #[cfg(test)]
+        fn output(mut self, args: &[&OsStr]) -> Output {
+            self.0
                 .output()
                 .unwrap_or_else(|err| panic!("run maj {args:?}: {err}"))
         }
@@ -215,7 +243,7 @@ mod guarded {
     /// actually receive — a set variable as `Some`, an explicitly removed
     /// one as `None` — rather than what the source says was asked for.
     #[cfg(test)]
-    fn assert_guarded(command: &Command) {
+    fn guarded(command: Command) -> Guarded {
         let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
         let service = envs
             .get(OsStr::new(majestical_secrets::SERVICE_ENV))
@@ -236,19 +264,21 @@ mod guarded {
             "a maj child must have MAJ_OPENROUTER_KEY explicitly removed, so no ambient key \
              can decide a parity result"
         );
+        Guarded(command)
     }
 
-    /// What [`assert_guarded`] refuses — the tests that fail if the guard
-    /// itself is deleted or weakened. None of these spawns anything: each
-    /// builds a command and hands it to the guard.
+    /// What [`guarded`] refuses — the tests that fail if the guard itself is
+    /// deleted or weakened. None of these spawns anything: each builds a
+    /// command and hands it to the guard, and the [`Guarded`] it would
+    /// return is never run.
     #[cfg(test)]
     mod tests {
-        use super::{Command, assert_guarded};
+        use super::{Command, guarded};
 
         #[test]
         #[should_panic(expected = "must be given MAJ_KEYCHAIN_SERVICE")]
         fn a_child_with_no_service_override_is_refused() {
-            assert_guarded(&Command::new("maj"));
+            let _refused = guarded(Command::new("maj"));
         }
 
         #[test]
@@ -258,7 +288,7 @@ mod guarded {
             command
                 .env(majestical_secrets::SERVICE_ENV, "majestical")
                 .env_remove(majestical_describe::config::OPENROUTER_KEY_ENV);
-            assert_guarded(&command);
+            let _refused = guarded(command);
         }
 
         #[test]
@@ -266,7 +296,7 @@ mod guarded {
         fn a_child_that_would_inherit_the_ambient_key_is_refused() {
             let mut command = Command::new("maj");
             command.env(majestical_secrets::SERVICE_ENV, "majestical-test-guard");
-            assert_guarded(&command);
+            let _refused = guarded(command);
         }
     }
 }

@@ -462,4 +462,29 @@ mod tests {
         assert!(rendered.contains("denied"), "{rendered}");
         assert_eq!(key_source(dir.path()), KeySource::File);
     }
+
+    /// `system_store()` must honor `MAJ_KEYCHAIN_SERVICE`: every test child of
+    /// `maj` relies on it to stay off the developer's own `majestical` item,
+    /// and the guard in `tests/common` only checks what a child is TOLD.
+    /// Asserted on the name the store carries, never by a store operation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_store_honors_the_keychain_service_override() {
+        let service = format!("majestical-test-{}-system-store", std::process::id());
+        // SAFETY: std serializes its own env access, and no other test in
+        // this binary reads or writes this variable.
+        unsafe { std::env::set_var(majestical_secrets::SERVICE_ENV, &service) };
+        let overridden = system_store();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(majestical_secrets::SERVICE_ENV) };
+        let defaulted = system_store();
+
+        assert_eq!(overridden.service_name(), service);
+        assert_eq!(
+            defaulted.service_name(),
+            "majestical",
+            "with nothing set the default IS the developer's real item, so \
+             the override is the only thing keeping a test off it"
+        );
+    }
 }

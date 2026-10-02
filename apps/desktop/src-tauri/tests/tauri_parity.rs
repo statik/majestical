@@ -369,6 +369,14 @@ fn cli_doctor_json(maj: &Maj, catalog: &Path) -> serde_json::Value {
 /// Runs `maj <args>` against `cfg`'s catalog and parses its one JSON line.
 #[cfg(test)]
 fn cli_json(maj: &Maj, cfg: &CatalogCfg, args: &[&str]) -> serde_json::Value {
+    serde_json::from_str(&cli_stdout(maj, cfg, args))
+        .unwrap_or_else(|err| panic!("maj {args:?} must print one JSON object: {err}"))
+}
+
+/// Runs `maj <args>` against `cfg`'s catalog, asserts it succeeded, and
+/// returns what it printed.
+#[cfg(test)]
+fn cli_stdout(maj: &Maj, cfg: &CatalogCfg, args: &[&str]) -> String {
     let mut argv: Vec<&OsStr> = vec![
         OsStr::new("--catalog"),
         cfg.catalog.as_os_str(),
@@ -382,8 +390,8 @@ fn cli_json(maj: &Maj, cfg: &CatalogCfg, args: &[&str]) -> serde_json::Value {
         "maj {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|err| panic!("maj {args:?} must print one JSON object: {err}"))
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|err| panic!("maj {args:?} must print UTF-8: {err}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,5 +569,75 @@ fn doctor_matches_cli_json() {
             cli_doctor_json(&maj, &cfg.catalog),
             "doctor_report and `maj doctor --json` must render the same document"
         );
+    });
+}
+
+/// `describer_settings` against `maj describer show`, on a catalog the CLI
+/// binary itself configured. `describer show` has no `--json` — it prints
+/// one `label: value` line per field — so this compares the view field by
+/// field against those lines rather than whole documents.
+///
+/// A fresh catalog, not [`seeded_cfg`]: nothing here searches, and the
+/// describer config is the whole subject. Ollama needs no key, so the store
+/// passed to the head is [`majestical_secrets::PanickingKeyStore`] — this row
+/// also proves neither the refresh nor the read touches a store for a local
+/// backend. `Maj::run` gives the child a throwaway Keychain service and no
+/// ambient key, so both sides report source `none`.
+#[test]
+fn describer_settings_matches_cli_show() {
+    let Some(maj) = maj_or_skip("describer_settings vs `maj describer show`") else {
+        return;
+    };
+    with_state_dir(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = CatalogCfg {
+            catalog: dir.path().join("cat"),
+            machine_id: "gui-test".into(),
+            author: "gui-test".into(),
+        };
+        initialize_catalog_impl(&cfg).expect("init");
+        cli_stdout(
+            &maj,
+            &cfg,
+            &[
+                "describer",
+                "set",
+                "--backend",
+                "ollama",
+                "--model",
+                "llava",
+            ],
+        );
+
+        let store = majestical_secrets::PanickingKeyStore;
+        let cache = majestical_desktop::captions::DescriberKeyCache::default();
+        majestical_desktop::captions::refresh_key(
+            &majestical_desktop::captions::KeyRefresh {
+                cache: &cache,
+                store: &store,
+                env: None,
+            },
+            Some(&cfg),
+        );
+        let outcome = majestical_desktop::captions::describer_settings_impl(&cfg, &cache, &store)
+            .expect("command");
+        let view = serde_json::to_value(&outcome.describer).expect("serialize view");
+        assert_eq!(view["backend"], serde_json::json!("ollama"), "{view}");
+        assert_eq!(view["model"], serde_json::json!("llava"), "{view}");
+
+        let shown = cli_stdout(&maj, &cfg, &["describer", "show"]);
+        let field = |label: &str| -> String {
+            shown
+                .lines()
+                .find_map(|line| line.strip_prefix(label))
+                .unwrap_or_else(|| panic!("`maj describer show` has no {label} line: {shown}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(view["backend"], serde_json::json!(field("backend:")));
+        assert_eq!(view["base_url"], serde_json::json!(field("base-url:")));
+        assert_eq!(view["model"], serde_json::json!(field("model:")));
+        assert_eq!(field("api-key:"), "(none)", "{shown}");
+        assert_eq!(view["key_source"], serde_json::json!("none"), "{view}");
     });
 }

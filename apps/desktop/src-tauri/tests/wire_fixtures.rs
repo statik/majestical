@@ -9,6 +9,7 @@
 //! `*_impl` (the path `tests/commands.rs` uses) — there is nothing private
 //! to round-trip through a service call for.
 use majestical_core::event::{AssetId, VerifyOutcome};
+use majestical_desktop::captions::{DescriberProbeOutcome, DescriberSettingsOutcome};
 use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
 use majestical_desktop::indexer::SchedulerStateOutcome;
 use majestical_desktop::ingest::{FinishedIngest, IngestProgress, IngestStateWire};
@@ -22,6 +23,9 @@ use majestical_services::browse::{
     BrowseFolder, BrowseListOutcome, BrowseTreeOutcome, BrowseVolume,
 };
 use majestical_services::catalog::{AssetDetail, AssetInstance, AssetVerification};
+use majestical_services::describer_config::{
+    DescriberConfigView, DescriberProbe, KeyCheck, KeySource,
+};
 use majestical_services::doctor::{CheckStatus, DoctorCheck, DoctorOutcome};
 use majestical_services::ingest::{
     IngestPlanOutcome, IngestRun, UnfinishedRun, UnfinishedRunsOutcome,
@@ -75,6 +79,36 @@ fn assert_fully_populated(name: &str, value: &serde_json::Value) {
 #[cfg(test)]
 fn check_or_update(name: &str, value: &serde_json::Value) {
     assert_fully_populated(name, value);
+    write_or_compare(name, value);
+}
+
+/// [`check_or_update`] for a shape whose `null` IS the contract — an
+/// `Option` serialized without `skip_serializing_if`, which the TS side
+/// types as `T | null` rather than `T?`. Each JSON pointer in `nulls` must
+/// be present and `null`; everything else must still be fully populated.
+#[cfg(test)]
+fn check_or_update_with_nulls(name: &str, value: &serde_json::Value, nulls: &[&str]) {
+    let mut rest = value.clone();
+    for pointer in nulls {
+        let (parent, key) = pointer
+            .rsplit_once('/')
+            .unwrap_or_else(|| panic!("{name}: {pointer} is not a JSON pointer"));
+        let removed = rest
+            .pointer_mut(parent)
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|object| object.remove(key));
+        assert_eq!(
+            removed,
+            Some(serde_json::Value::Null),
+            "{name}{pointer}: must be present and null"
+        );
+    }
+    assert_fully_populated(name, &rest);
+    write_or_compare(name, value);
+}
+
+#[cfg(test)]
+fn write_or_compare(name: &str, value: &serde_json::Value) {
     let path = fixtures_dir().join(format!("{name}.json"));
     let rendered = serde_json::to_string_pretty(value).expect("fixture serializes");
     if std::env::var_os("MAJ_UPDATE_FIXTURES").is_some() {
@@ -707,5 +741,62 @@ fn scheduler_state_held_fixture() {
     check_or_update(
         "scheduler_state_held",
         &serde_json::to_value(&scheduler_state).expect("serialize"),
+    );
+}
+
+/// An `OpenRouter` describer whose key the Keychain holds, plus a notice —
+/// what the Captions section renders once a key is saved. The view has no
+/// key field, so `key_source` is the only trace of one.
+#[test]
+fn describer_settings_fixture() {
+    let settings = DescriberSettingsOutcome {
+        describer: Some(DescriberConfigView {
+            backend: "open-router".to_string(),
+            base_url: "https://openrouter.ai/api".to_string(),
+            model: "google/gemini-2.5-flash".to_string(),
+            key_source: KeySource::Keychain,
+        }),
+        keychain_supported: true,
+        notices: vec!["a notice the settings read collected".to_string()],
+    };
+    check_or_update(
+        "describer_settings",
+        &serde_json::to_value(&settings).expect("serialize"),
+    );
+}
+
+/// Nothing configured yet: `describer` is present and `null`, not absent,
+/// and an empty `notices` is skipped.
+#[test]
+fn describer_settings_unconfigured_fixture() {
+    let settings = DescriberSettingsOutcome {
+        describer: None,
+        keychain_supported: true,
+        notices: Vec::new(),
+    };
+    check_or_update_with_nulls(
+        "describer_settings_unconfigured",
+        &serde_json::to_value(&settings).expect("serialize"),
+        &["/describer"],
+    );
+}
+
+/// An `OpenRouter` probe the key passed: the probe's fields flattened beside
+/// `notices`, and `vision` present and `null` — only LM Studio reports it.
+#[test]
+fn describer_probe_fixture() {
+    let probe = DescriberProbeOutcome {
+        probe: DescriberProbe {
+            model: "google/gemini-2.5-flash".to_string(),
+            model_listed: true,
+            vision: None,
+            key: KeyCheck::Accepted,
+        },
+        notices: vec!["a notice the probe collected".to_string()],
+    };
+    check_or_update_with_nulls(
+        "describer_probe",
+        &serde_json::to_value(&probe).expect("serialize"),
+        &["/vision"],
     );
 }

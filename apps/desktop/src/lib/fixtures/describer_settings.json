@@ -1,0 +1,12 @@
+{
+  "describer": {
+    "backend": "open-router",
+    "base_url": "https://openrouter.ai/api",
+    "key_source": "keychain",
+    "model": "google/gemini-2.5-flash"
+  },
+  "keychain_supported": true,
+  "notices": [
+    "a notice the settings read collected"
+  ]
+}

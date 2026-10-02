@@ -60,7 +60,7 @@ function isolateKeychain(): string {
  * will get, then — as its last step, before the tauri-service spawns the
  * app — on the env the app WILL get (`{ ...process.env, ...capability env
  * }`). It checks the result, not what `isolateKeychain` meant to set, so
- * losing the isolation call or the capability's env entry fails the run.
+ * losing the isolation call fails the run.
  * No later hook can do this job: the service spawns the app in its own
  * `onPrepare`, right after this one. What stays unguarded is a change that
  * deletes these calls too — a TypeScript harness has no equivalent of
@@ -199,7 +199,10 @@ export const config: Config = {
       await prepare(capabilities as TauriCapability[]);
     } catch (error) {
       if (error instanceof SevereServiceError) throw error;
-      throw new SevereServiceError(error instanceof Error ? error.message : String(error));
+      // The constructor takes only a message; keep the original for its stack.
+      const severe = new SevereServiceError(error instanceof Error ? error.message : String(error));
+      severe.cause = error;
+      throw severe;
     }
   },
   // Removes the fixture's mkdtemp tree (catalog, state dir, GUI config) —

@@ -130,8 +130,9 @@ pub fn refresh_key(keys: &KeyRefresh<'_>, cfg: Option<&CatalogCfg>) {
 }
 
 /// The Captions section's whole state: the configured describer (`null` when
-/// there is none), whether this platform can store a key at all — the cue to
-/// hide the save/remove controls — and any notices the read collected.
+/// there is none), whether this build's head can reach a Keychain — where it
+/// cannot (off macOS), a saved `OpenRouter` key goes to `describer.toml`
+/// instead — and any notices the read collected.
 #[derive(Debug, Serialize)]
 pub struct DescriberSettingsOutcome {
     pub describer: Option<DescriberConfigView>,

@@ -4,11 +4,15 @@
   // view never sorts. It is read-only the same as Volumes: nothing here
   // fixes a check, it only reports it and offers to look again.
   //
-  // Plus the Always-on section (`AlwaysOnSection.svelte`), which is NOT
-  // read-only: its throttle radio and "start at login" toggle both act.
+  // Plus two sections that are NOT read-only: Captions
+  // (`CaptionsSection.svelte`) saves and tests the describer, and re-runs
+  // the health checks after a change so the `describer` row follows it;
+  // Always-on (`AlwaysOnSection.svelte`) sets the throttle radio and the
+  // "start at login" toggle.
   import { api, errorMessage, errorNotices } from "./api";
   import type { DoctorOutcome } from "./api-alwayson";
   import AlwaysOnSection from "./AlwaysOnSection.svelte";
+  import CaptionsSection from "./CaptionsSection.svelte";
   import Notices from "./Notices.svelte";
 
   let outcome = $state<DoctorOutcome | null>(null);
@@ -75,6 +79,8 @@
       </ul>
     {/if}
   </section>
+
+  <CaptionsSection onchanged={() => void load()} />
 
   <AlwaysOnSection />
 </div>

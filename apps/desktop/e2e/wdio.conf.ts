@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
+import { SevereServiceError } from "webdriverio";
 import {
   FIXTURE_ENV_VAR,
   setupFixtureCatalog,
@@ -33,15 +35,60 @@ type Config = Omit<WebdriverIO.Config, "capabilities"> & {
   capabilities: TauriCapability[];
 };
 
+// The app under test and every `maj` the fixture setup runs would otherwise
+// read and write the developer's REAL login-Keychain item. Each run gets its
+// own throwaway service instead, under the same `majestical-test-` prefix the
+// Rust test guards insist on (crates/secrets/src/system.rs). The tauri-service
+// spawns the app with `{ ...process.env, ...options.env }` from this launcher
+// process, so an ambient key can only be kept out by deleting it here.
+const KEYCHAIN_SERVICE_ENV = "MAJ_KEYCHAIN_SERVICE";
+const OPENROUTER_KEY_ENV = "MAJ_OPENROUTER_KEY";
+const THROWAWAY_KEYCHAIN_PREFIX = "majestical-test-";
+
+/** Points this launcher (and so the app and the fixture's `maj` children
+ *  it spawns) at a throwaway Keychain service and drops an inherited
+ *  OpenRouter key. */
+function isolateKeychain(): string {
+  const service = `${THROWAWAY_KEYCHAIN_PREFIX}e2e-${String(process.pid)}-${randomUUID()}`;
+  process.env[KEYCHAIN_SERVICE_ENV] = service;
+  delete process.env[OPENROUTER_KEY_ENV];
+  return service;
+}
+
+/**
+ * The backstop. `prepare` runs it on the env the fixture's `maj` children
+ * will get, then — as its last step, before the tauri-service spawns the
+ * app — on the env the app WILL get (`{ ...process.env, ...capability env
+ * }`). It checks the result, not what `isolateKeychain` meant to set, so
+ * losing the isolation call fails the run.
+ * No later hook can do this job: the service spawns the app in its own
+ * `onPrepare`, right after this one. What stays unguarded is a change that
+ * deletes these calls too — a TypeScript harness has no equivalent of
+ * crates/cli/tests/keychain_guard.rs scanning it, so review is the limit.
+ */
+function assertKeychainIsolated(env: Record<string, string | undefined>): void {
+  const service = env[KEYCHAIN_SERVICE_ENV];
+  if (service === undefined || !service.startsWith(THROWAWAY_KEYCHAIN_PREFIX)) {
+    throw new Error(
+      `refusing to launch: ${KEYCHAIN_SERVICE_ENV} is ${String(service)}, ` +
+        `not a ${THROWAWAY_KEYCHAIN_PREFIX}* throwaway service`,
+    );
+  }
+  if (env[OPENROUTER_KEY_ENV] !== undefined) {
+    throw new Error(`refusing to launch: ${OPENROUTER_KEY_ENV} would be inherited`);
+  }
+}
+
 // Explicit order, ingest LAST: an ingest run appends immutable events (two
 // new assets, a new volume for the destination) that `volumes.e2e.ts`'s
 // exact-count asserts would see; nothing can undo them, so nothing runs
 // after it. Every spec file must be listed here (a new one goes before
-// ingest); `onPrepare` refuses a full run when a file on disk is missing
-// from this list, since the old glob would have picked it up silently and
-// this list would not. A module const, not read back from the config: the
-// launcher rewrites `config.specs` with a `--spec` filter before `onPrepare`
-// runs, and a single-spec debugging run must keep working.
+// ingest); `onPrepare` stops every run, single-spec ones included, when the
+// files on disk and this list differ, since the old glob would have picked
+// a new file up silently and this list would not. A module const, not read
+// back from the config: the launcher rewrites `config.specs` with a `--spec`
+// filter before `onPrepare` runs, and a single-spec debugging run must keep
+// working.
 const SPEC_FILES = [
   "./specs/smoke.e2e.ts",
   "./specs/search.e2e.ts",
@@ -51,6 +98,51 @@ const SPEC_FILES = [
   "./specs/settings.e2e.ts",
   "./specs/ingest.e2e.ts",
 ];
+
+/** Fails when the spec files on disk and `SPEC_FILES` differ. */
+async function assertSpecListComplete(): Promise<void> {
+  const onDisk = (await readdir(path.join(import.meta.dirname, "specs"))).filter((file) =>
+    file.endsWith(".e2e.ts"),
+  );
+  const listed = SPEC_FILES.map((spec) => path.basename(spec));
+  const same = onDisk.length === listed.length && onDisk.every((file) => listed.includes(file));
+  if (!same) {
+    throw new Error(
+      `spec files on disk [${onDisk.join(", ")}] differ from wdio.conf.ts's list [${listed.join(", ")}]`,
+    );
+  }
+}
+
+/**
+ * The launcher's setup, before any worker (and so the app under test)
+ * spawns. Keychain isolation comes first, ahead of anything that can spawn
+ * `maj` or fail. Seeds the fixture catalog once, then hands the app its
+ * `MAJ_DESKTOP_CONFIG_DIR`/`MAJ_STATE_DIR`/`MAJ_KEYCHAIN_SERVICE` via the
+ * tauri-service's per-capability `env` override, and hands the fixture's
+ * own details to the spec via `FIXTURE_ENV_VAR` (the local runner's workers
+ * inherit the launcher's env, so this needs no file or capability
+ * round-trip).
+ */
+async function prepare(capabilities: TauriCapability[]): Promise<void> {
+  const keychainService = isolateKeychain();
+  assertKeychainIsolated(process.env);
+  await assertSpecListComplete();
+  const fixture = await setupFixtureCatalog(repoRoot);
+  process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
+
+  const [capability] = capabilities;
+  if (capability === undefined) {
+    throw new Error("expected exactly one capability");
+  }
+  capability["wdio:tauriServiceOptions"] = {
+    env: {
+      MAJ_DESKTOP_CONFIG_DIR: fixture.configDir,
+      MAJ_STATE_DIR: fixture.stateDir,
+      [KEYCHAIN_SERVICE_ENV]: keychainService,
+    },
+  };
+  assertKeychainIsolated({ ...process.env, ...capability["wdio:tauriServiceOptions"].env });
+}
 
 export const config: Config = {
   runner: "local",
@@ -98,37 +190,20 @@ export const config: Config = {
       },
     },
   ],
-  // Seeds the fixture catalog once, in the launcher process, before any
-  // worker (and so the app under test) spawns — then hands the app its
-  // `MAJ_DESKTOP_CONFIG_DIR`/`MAJ_STATE_DIR` via the tauri-service's
-  // per-capability `env` override, and hands the fixture's own details to
-  // the spec via `FIXTURE_ENV_VAR` (the local runner's workers inherit the
-  // launcher's env, so this needs no file or capability round-trip).
+  // WDIO 9's `runLauncherHook` (@wdio/cli) logs a plain Error thrown from
+  // this hook and carries on into the tauri-service's own `onPrepare`, which
+  // spawns the app; only a `SevereServiceError` stops the run. So every
+  // refusal in `prepare` is rethrown as one.
   onPrepare: async (_wdioConfig, capabilities) => {
-    const onDisk = (await readdir(path.join(import.meta.dirname, "specs"))).filter((file) =>
-      file.endsWith(".e2e.ts"),
-    );
-    const listed = SPEC_FILES.map((spec) => path.basename(spec));
-    const same =
-      onDisk.length === listed.length && onDisk.every((file) => listed.includes(file));
-    if (!same) {
-      throw new Error(
-        `spec files on disk [${onDisk.join(", ")}] differ from wdio.conf.ts's list [${listed.join(", ")}]`,
-      );
+    try {
+      await prepare(capabilities as TauriCapability[]);
+    } catch (error) {
+      if (error instanceof SevereServiceError) throw error;
+      // The constructor takes only a message; keep the original for its stack.
+      const severe = new SevereServiceError(error instanceof Error ? error.message : String(error));
+      severe.cause = error;
+      throw severe;
     }
-    const fixture = await setupFixtureCatalog(repoRoot);
-    process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
-
-    const [capability] = capabilities as TauriCapability[];
-    if (capability === undefined) {
-      throw new Error("expected exactly one capability");
-    }
-    capability["wdio:tauriServiceOptions"] = {
-      env: {
-        MAJ_DESKTOP_CONFIG_DIR: fixture.configDir,
-        MAJ_STATE_DIR: fixture.stateDir,
-      },
-    };
   },
   // Removes the fixture's mkdtemp tree (catalog, state dir, GUI config) —
   // by now the service has already torn down the app and its embedded

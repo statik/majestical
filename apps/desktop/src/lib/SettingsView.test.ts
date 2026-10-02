@@ -1,6 +1,9 @@
 import { clearMocks } from "@tauri-apps/api/mocks";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
+import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test } from "vitest";
+import describerSettings from "./fixtures/describer_settings.json";
+import describerSettingsUnconfigured from "./fixtures/describer_settings_unconfigured.json";
 import doctorOutcome from "./fixtures/doctor_outcome.json";
 import schedulerState from "./fixtures/scheduler_state.json";
 import { mockCommands, rejectCommand } from "./test-support";
@@ -8,18 +11,20 @@ import SettingsView from "./SettingsView.svelte";
 
 afterEach(clearMocks);
 
-// Every test here mounts the whole Settings surface, which now also mounts
-// `AlwaysOnSection` — its own suite (`AlwaysOnSection.test.ts`) pins that
-// component's behavior; these two commands are mocked in every test below
-// only so mounting it does not throw "unexpected command" and drown an
-// unrelated assertion in a rejected promise.
-const alwaysOn = {
+// Every test here mounts the whole Settings surface, which also mounts
+// `CaptionsSection` and `AlwaysOnSection` — their own suites
+// (`CaptionsSection.test.ts`, `AlwaysOnSection.test.ts`) pin their
+// behavior; these commands are mocked in every test below only so mounting
+// them does not throw "unexpected command" and drown an unrelated
+// assertion in a rejected promise.
+const siblings = {
+  describer_settings: () => describerSettingsUnconfigured,
   scheduler_state: () => schedulerState,
   "plugin:autostart|is_enabled": () => false,
 };
 
 test("renders one row per check from doctor_report, in the outcome's order", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
+  mockCommands({ doctor_report: () => doctorOutcome, ...siblings });
   const { container } = render(SettingsView);
 
   const rows = await screen.findAllByRole("listitem");
@@ -49,7 +54,7 @@ test("renders one row per check from doctor_report, in the outcome's order", asy
 });
 
 test("the Fail row shows its remedy and the Ok row shows none", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
+  mockCommands({ doctor_report: () => doctorOutcome, ...siblings });
   render(SettingsView);
 
   const rows = await screen.findAllByRole("listitem");
@@ -63,7 +68,7 @@ test("the Fail row shows its remedy and the Ok row shows none", async () => {
 });
 
 test("the outcome's notices render above the rows", async () => {
-  mockCommands({ doctor_report: () => doctorOutcome, ...alwaysOn });
+  mockCommands({ doctor_report: () => doctorOutcome, ...siblings });
   render(SettingsView);
 
   expect(
@@ -78,7 +83,7 @@ test('"Run checks again" re-invokes doctor_report', async () => {
       calls += 1;
       return doctorOutcome;
     },
-    ...alwaysOn,
+    ...siblings,
   });
   render(SettingsView);
 
@@ -95,11 +100,42 @@ test('"Run checks again" re-invokes doctor_report', async () => {
 test("a rejected command renders the error through Notices, not a blank panel", async () => {
   const message = "no catalog selected yet — initialize or choose one first";
   const notice = "notice: the failing call still collected this";
-  mockCommands({ doctor_report: () => rejectCommand(message, [notice]), ...alwaysOn });
+  mockCommands({ doctor_report: () => rejectCommand(message, [notice]), ...siblings });
   render(SettingsView);
 
   const alert = await screen.findByRole("alert");
   expect(alert.textContent).toBe(message);
   expect(await screen.findByText(notice)).toBeTruthy();
   expect(screen.queryAllByRole("listitem")).toEqual([]);
+});
+
+test("a Captions save re-runs doctor_report so the describer row follows it", async () => {
+  let calls = 0;
+  mockCommands({
+    doctor_report: () => {
+      calls += 1;
+      return doctorOutcome;
+    },
+    ...siblings,
+    save_describer: () => describerSettings,
+  });
+  render(SettingsView);
+
+  await screen.findAllByRole("listitem");
+  expect(calls).toBe(1);
+
+  await userEvent.type(screen.getByLabelText("Model"), "llava");
+  await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(calls).toBe(2));
+});
+
+test("the sections stand in order: Health, Captions, Always-on", async () => {
+  mockCommands({ doctor_report: () => doctorOutcome, ...siblings });
+  render(SettingsView);
+
+  await screen.findAllByRole("listitem");
+  expect(
+    screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
+  ).toEqual(["Health", "Captions", "Always-on"]);
 });

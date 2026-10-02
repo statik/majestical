@@ -118,6 +118,22 @@ describe("Majestical desktop — Settings — Captions", () => {
     await $('[data-e2e="captions-save"]').click();
     await $('[data-e2e="captions-saved"]').waitForDisplayed();
 
-    await browser.waitUntil(async () => (await describerDetail()) === "ollama · llava");
+    // Not `timeoutMsg`: WebdriverIO reads it when the wait starts, so it
+    // could never name the last detail seen. The rethrow can.
+    let lastSeen = "";
+    await browser
+      .waitUntil(
+        async () => {
+          lastSeen = await describerDetail();
+          return lastSeen === "ollama · llava";
+        },
+        { timeout: 10_000 },
+      )
+      .catch((error: unknown) => {
+        throw new Error(
+          `describer row never became "ollama · llava" in 10s; last seen: "${lastSeen}"`,
+          { cause: error },
+        );
+      });
   });
 });

@@ -15,6 +15,9 @@ export const BACKENDS: { value: DescriberBackend; label: string; baseUrl: string
   { value: "open-router", label: "OpenRouter", baseUrl: "https://openrouter.ai/api" },
 ];
 
+export const SECTION_SUBTITLE =
+  "The service that writes captions and suggests tags. Ollama and LM Studio run on this " +
+  "Mac; OpenRouter is a hosted API.";
 export const UNCONFIGURED_LINE = "No describer is configured — captions are off.";
 export const SAVED_LINE = "Saved.";
 

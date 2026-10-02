@@ -5,7 +5,9 @@ import {
   keyPlaceholder,
   keyStatusLine,
   removeKeyVisible,
+  SAVED_LINE,
   testLines,
+  UNCONFIGURED_LINE,
 } from "./captions-status";
 import describerSettings from "./fixtures/describer_settings.json";
 
@@ -44,7 +46,14 @@ test("only a stored key can be removed", () => {
 
 test("keyPlaceholder offers to keep a stored key, and shows the key's shape otherwise", () => {
   expect(keyPlaceholder("keychain")).toBe("Leave empty to keep the stored key");
+  expect(keyPlaceholder("file")).toBe("Leave empty to keep the stored key");
+  expect(keyPlaceholder("env")).toBe("sk-or-…");
   expect(keyPlaceholder("none")).toBe("sk-or-…");
+});
+
+test("the unconfigured and saved lines read the mockup's words", () => {
+  expect(UNCONFIGURED_LINE).toBe("No describer is configured — captions are off.");
+  expect(SAVED_LINE).toBe("Saved.");
 });
 
 test("testLines for an all-good OpenRouter probe", () => {

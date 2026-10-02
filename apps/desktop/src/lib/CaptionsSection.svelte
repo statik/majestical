@@ -25,6 +25,7 @@
     keyStatusLine,
     removeKeyVisible,
     SAVED_LINE,
+    SECTION_SUBTITLE,
     testLines,
     UNCONFIGURED_LINE,
   } from "./captions-status";
@@ -162,10 +163,7 @@
   <div class="settings-section-head">
     <div>
       <h3>Captions</h3>
-      <p class="settings-section-sub">
-        The service that writes captions and suggests tags. Ollama and LM Studio run on this
-        Mac; OpenRouter is a hosted API.
-      </p>
+      <p class="settings-section-sub">{SECTION_SUBTITLE}</p>
     </div>
   </div>
 

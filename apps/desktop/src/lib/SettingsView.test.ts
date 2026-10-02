@@ -129,3 +129,13 @@ test("a Captions save re-runs doctor_report so the describer row follows it", as
 
   await waitFor(() => expect(calls).toBe(2));
 });
+
+test("the sections stand in order: Health, Captions, Always-on", async () => {
+  mockCommands({ doctor_report: () => doctorOutcome, ...siblings });
+  render(SettingsView);
+
+  await screen.findAllByRole("listitem");
+  expect(
+    screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
+  ).toEqual(["Health", "Captions", "Always-on"]);
+});

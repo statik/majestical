@@ -354,4 +354,30 @@ mod tests {
         ));
         assert!(matches!(store.delete(), Err(SecretError::Unsupported)));
     }
+    // `PanickingKeyStore` is how three crates' tests assert a store was never
+    // touched, so a passing suite never calls it. These pin that it still
+    // panics, and that it claims support — a store that reported itself
+    // unsupported would be skipped, and the assertion would prove nothing.
+    #[test]
+    fn the_panicking_store_claims_support() {
+        assert!(PanickingKeyStore.supported());
+    }
+
+    #[test]
+    #[should_panic(expected = "the store must not be touched")]
+    fn the_panicking_store_panics_on_read() {
+        let _ = PanickingKeyStore.read();
+    }
+
+    #[test]
+    #[should_panic(expected = "the store must not be touched")]
+    fn the_panicking_store_panics_on_store() {
+        let _ = PanickingKeyStore.store("sk-test");
+    }
+
+    #[test]
+    #[should_panic(expected = "the store must not be touched")]
+    fn the_panicking_store_panics_on_delete() {
+        let _ = PanickingKeyStore.delete();
+    }
 }

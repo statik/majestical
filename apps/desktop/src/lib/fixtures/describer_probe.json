@@ -1,0 +1,9 @@
+{
+  "key": "accepted",
+  "model": "google/gemini-2.5-flash",
+  "model_listed": true,
+  "notices": [
+    "a notice the probe collected"
+  ],
+  "vision": null
+}

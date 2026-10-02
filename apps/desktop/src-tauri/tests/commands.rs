@@ -6,6 +6,7 @@
 //! `MAJ_STATE_DIR` is process-global env, so every test takes `ENV_LOCK` and
 //! points the var at its own tempdir — the same reason the CLI's suites set
 //! it per child process; here the "process" is this test binary.
+use majestical_desktop::captions::{DescriberKeyCache, KeyRefresh};
 use majestical_desktop::commands::{
     AppState, CatalogCfg, CommandError, add_para_node_impl, adopt_catalog, app_status_impl,
     archive_node_impl, assign_tags_impl, browse_list_impl, browse_tree_impl, file_assets_impl,
@@ -23,6 +24,8 @@ use majestical_desktop::ingest::{
     plan_ingest_impl, start_ingest_impl,
 };
 use majestical_desktop::thumb_protocol;
+use majestical_secrets::PanickingKeyStore;
+use majestical_services::describer_config::KeyPresence;
 use majestical_services::index::{self, IndexRunOutcome, ItemFailure};
 use majestical_services::notices::Notices;
 use std::path::Path;
@@ -48,6 +51,20 @@ fn with_state_dir<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     drop(state);
     out
+}
+
+/// What `adopt_catalog` refills the key cache through. A
+/// [`PanickingKeyStore`] and an environment key: the key comes from the
+/// environment, so the refresh is observable (`KeyPresence::Env`) and the
+/// developer's real Keychain is never reached — touching it at all would
+/// panic the test rather than prompt.
+#[cfg(test)]
+fn key_refresh(cache: &DescriberKeyCache) -> KeyRefresh<'_> {
+    KeyRefresh {
+        cache,
+        store: &PanickingKeyStore,
+        env: Some("sk-test".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -636,11 +653,13 @@ fn adopting_a_catalog_persists_it_and_publishes_it_to_the_state() {
         let state = AppState(RwLock::new(None));
         let catalog = dir.path().join("cat");
 
+        let cache = DescriberKeyCache::default();
         let status = adopt_catalog(
             &config_dir,
             &state,
             catalog.clone(),
             initialize_catalog_impl,
+            &key_refresh(&cache),
         )
         .expect("initialize");
         assert!(status.catalog_ready);
@@ -650,6 +669,9 @@ fn adopting_a_catalog_persists_it_and_publishes_it_to_the_state() {
         );
         let published = state.0.read().expect("state").clone();
         assert_eq!(published.expect("published cfg").catalog, catalog);
+        // A catalog switch changes which describer backend is configured, so
+        // the head's key cache is refilled with it.
+        assert_eq!(cache.presence(), KeyPresence::Env);
     });
 }
 
@@ -660,16 +682,23 @@ fn a_refused_catalog_is_neither_persisted_nor_published() {
         let config_dir = dir.path().join("config");
         let state = AppState(RwLock::new(None));
 
+        let cache = DescriberKeyCache::default();
         let err = adopt_catalog(
             &config_dir,
             &state,
             dir.path().join("nothing-here"),
             use_existing_catalog_impl,
+            &key_refresh(&cache),
         )
         .expect_err("no catalog there");
         assert!(err.message.contains("maj catalog init"), "{}", err.message);
         assert_eq!(majestical_desktop::config::load(&config_dir).catalog, None);
         assert!(state.0.read().expect("state").is_none());
+        assert_eq!(
+            cache.presence(),
+            KeyPresence::Absent,
+            "a refused catalog must leave the key cache alone"
+        );
     });
 }
 

@@ -5115,6 +5115,7 @@ dependencies = [
  "majestical-describe",
  "majestical-index",
  "majestical-ingest",
+ "majestical-secrets",
  "majestical-services",
  "percent-encoding",
  "serde",
@@ -5174,6 +5175,15 @@ dependencies = [
  "ulid",
  "walkdir",
  "xxhash-rust",
+]
+
+[[package]]
+name = "majestical-secrets"
+version = "0.1.0"
+dependencies = [
+ "security-framework",
+ "security-framework-sys",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

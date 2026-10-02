@@ -100,7 +100,11 @@ pub fn key_source(config: &DescriberConfig, presence: KeyPresence) -> KeySource 
 /// GUI): it has no key field at all, only where a key would come from, so
 /// this struct can never expose the real key. `base_url`/`model` are always
 /// present in a stored config, so they're plain `String`, not `Option`.
-#[derive(serde::Serialize)]
+///
+/// `Debug` is derived rather than withheld for exactly that reason — there
+/// is no key here to leak — and a head's outcome struct carrying this one
+/// needs it (`apps/desktop/src-tauri/src/captions.rs`).
+#[derive(Debug, serde::Serialize)]
 pub struct DescriberConfigView {
     pub backend: String,
     pub base_url: String,

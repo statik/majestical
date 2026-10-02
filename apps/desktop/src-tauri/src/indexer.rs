@@ -9,6 +9,7 @@
 //! spawn time, so a catalog change from `initialize_catalog`/
 //! `use_existing_catalog` re-aims the loop for free on its very next tick —
 //! no extra signaling between that command and this module is needed.
+use crate::captions::DescriberKeyCache;
 use crate::commands::{AppState, CatalogCfg, CommandError, open_app, selected_catalog};
 use crate::power::{POWER_PROBE_AVAILABLE, read_power_state};
 use majestical_services::autopilot::{
@@ -235,6 +236,7 @@ fn publish_poll(
 fn poll_and_decide(
     cfg: &CatalogCfg,
     scheduler: &SchedulerState,
+    keys: &DescriberKeyCache,
 ) -> Result<(SchedulerDecision, Option<IndexRunReq>), CommandError> {
     // `AssertUnwindSafe` (inside `catch_panic`): the closure captures only
     // `&CatalogCfg`, which is plain data with no interior mutability for a
@@ -254,10 +256,8 @@ fn poll_and_decide(
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
     publish_poll(&mut shared, &status, power, decision);
     drop(shared);
-    Ok((
-        decision,
-        batch_request(decision, crate::commands::env_api_key()),
-    ))
+    // The CACHED key, never a fresh resolve — see `captions`.
+    Ok((decision, batch_request(decision, keys.key())))
 }
 
 /// Every kind's `failed` list, summed — what [`batch_outcome_pace`] reports
@@ -354,7 +354,8 @@ fn run_tick(app: &AppHandle) -> Duration {
         return TICK;
     };
     let scheduler = app.state::<SchedulerState>();
-    let (decision, req) = match poll_and_decide(&cfg, &scheduler) {
+    let keys = app.state::<DescriberKeyCache>();
+    let (decision, req) = match poll_and_decide(&cfg, &scheduler, &keys) {
         Ok(pair) => pair,
         Err(err) => {
             scheduler
@@ -595,10 +596,11 @@ pub fn set_throttle(
 #[cfg(test)]
 mod tests {
     use super::{
-        BATCH_LIMIT, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
-        SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome, SchedulerWake,
-        ThrottleOverride, batch_outcome_pace, batch_request, failed_items, pending_items,
-        publish_poll, retry_failed_items_impl, set_throttle_impl, success_pace, total_failures,
+        BATCH_LIMIT, CatalogCfg, HoldReason, IndexStatusOutcome, PACE_LOW, PowerSource, PowerState,
+        RwLock, SchedulerDecision, SchedulerShared, SchedulerState, SchedulerStateOutcome,
+        SchedulerWake, ThrottleOverride, batch_outcome_pace, batch_request, failed_items,
+        pending_items, poll_and_decide, publish_poll, retry_failed_items_impl, set_throttle_impl,
+        success_pace, total_failures,
     };
     use majestical_services::index::{IndexRunOutcome, ItemFailure, KindStatusRow};
     use std::time::{Duration, Instant};
@@ -798,6 +800,78 @@ mod tests {
             assert_eq!(req.threads, threads);
             assert!(!req.retry_failed, "the scheduler never clears the ledger");
         }
+    }
+
+    /// The same rule at the tick itself, not at the helpers it calls: with
+    /// a key in the cache AND a different one in the environment, the
+    /// request `poll_and_decide` builds carries the cached one. Reading the
+    /// environment here would both skip the Keychain and defeat the cache
+    /// the head fills once.
+    ///
+    /// `ThrottleOverride::Full` rather than `Auto` so the decision does not
+    /// depend on whether this machine is on AC.
+    #[test]
+    fn poll_and_decide_carries_the_cached_key_not_the_environment() {
+        // `with_state_dir` holds `captions::ENV_LOCK` for this closure, so
+        // the environment writes below are serialized with every other
+        // env-touching test in the crate.
+        crate::captions::with_state_dir(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = seeded_cfg(dir.path());
+            let scheduler = SchedulerState(RwLock::new(SchedulerShared {
+                throttle: ThrottleOverride::Full,
+                ..SchedulerShared::default()
+            }));
+            let cache = crate::captions::DescriberKeyCache::default();
+            crate::captions::refresh_key(
+                &crate::captions::KeyRefresh {
+                    cache: &cache,
+                    store: &majestical_secrets::PanickingKeyStore,
+                    env: Some("sk-test-2".to_string()),
+                },
+                None,
+            );
+            // SAFETY: serialized by ENV_LOCK, held by `with_state_dir`.
+            unsafe {
+                std::env::set_var(majestical_describe::config::OPENROUTER_KEY_ENV, "sk-test");
+            }
+            let polled = poll_and_decide(&cfg, &scheduler, &cache);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(majestical_describe::config::OPENROUTER_KEY_ENV) };
+
+            let (decision, req) = polled.expect("poll");
+            assert_eq!(decision, SchedulerDecision::RunFull);
+            assert_eq!(
+                req.expect("a batch").api_key.as_deref(),
+                Some("sk-test-2"),
+                "the tick must carry the CACHED key, never the environment's"
+            );
+        });
+    }
+
+    /// A catalog holding one real, ONLINE image, so a poll finds pending
+    /// thumbnail work and the tick gets past `HoldReason::NoPendingWork`.
+    ///
+    /// Scanned with an auto-detected volume identity (`None`) rather than
+    /// emitted by hand: `gather_sources` resolves an instance against
+    /// `volume_identity::mounted_volumes()`'s real device ids, so a made-up
+    /// volume string makes every item offline and every kind's `pending`
+    /// zero.
+    fn seeded_cfg(root: &std::path::Path) -> CatalogCfg {
+        let cfg = CatalogCfg {
+            catalog: root.join("cat"),
+            machine_id: "gui-test".into(),
+            author: "gui-test".into(),
+        };
+        crate::commands::initialize_catalog_impl(&cfg).expect("init");
+        let media = root.join("media");
+        std::fs::create_dir_all(&media).expect("mkdir");
+        std::fs::write(media.join("clip.jpg"), b"not really a jpeg").expect("write image");
+        let mut app =
+            majestical_services::app::FsApp::open(&cfg.catalog, &cfg.machine_id, &cfg.author)
+                .expect("open");
+        majestical_services::scan::scan(&mut app, &media, None).expect("scan");
+        cfg
     }
 
     #[test]

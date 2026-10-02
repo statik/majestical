@@ -264,3 +264,19 @@ test("a failed Test renders the alert", async () => {
   expect(alert.textContent).toBe(message);
   expect(container.querySelector(".captions-results")).toBeNull();
 });
+
+test("leaving OpenRouter drops a typed key, so a saved local backend can still be tested", async () => {
+  mockCommands({ describer_settings: () => ollama });
+  render(CaptionsSection);
+  await loaded("llava");
+  const backend = screen.getByLabelText("Backend");
+
+  await userEvent.selectOptions(backend, "OpenRouter");
+  await userEvent.type(field("API key"), "sk-test");
+  await userEvent.selectOptions(backend, "Ollama");
+
+  expect(button("Test").disabled).toBe(false);
+  expect(button("Test").hasAttribute("title")).toBe(false);
+  await userEvent.selectOptions(backend, "OpenRouter");
+  expect(field("API key").value).toBe("");
+});

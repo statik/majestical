@@ -85,12 +85,14 @@
   }
 
   /** A URL still holding some backend's default follows the backend; one
-   *  the operator typed is theirs and stays. */
+   *  the operator typed is theirs and stays. A typed key is dropped when the
+   *  key field goes away: no secret is held that the operator cannot see. */
   function changeBackend(next: DescriberBackend) {
     const untouched =
       baseUrl.trim() === "" || BACKENDS.some((entry) => entry.baseUrl === baseUrl.trim());
     backend = next;
     if (untouched) baseUrl = defaultUrl(next);
+    if (next !== "open-router") apiKey = "";
     edited();
   }
 

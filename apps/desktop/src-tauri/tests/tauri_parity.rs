@@ -257,9 +257,7 @@ mod guarded {
             "a maj child must never address the developer's own Keychain item: {service}"
         );
         assert_eq!(
-            envs.get(OsStr::new(
-                majestical_describe::config::OPENROUTER_KEY_ENV
-            )),
+            envs.get(OsStr::new(majestical_describe::config::OPENROUTER_KEY_ENV)),
             Some(&None),
             "a maj child must have MAJ_OPENROUTER_KEY explicitly removed, so no ambient key \
              can decide a parity result"
@@ -544,7 +542,7 @@ fn doctor_matches_cli_json() {
         let cfg = seeded_cfg(dir.path().join("cat"));
         // The head's own reading, taken the way the app takes it: from the
         // key cache the setup hook filled. No environment key and no real
-        // store on either side — `maj_command` strips both from the child —
+        // store on either side — `Maj::run` strips both from the child —
         // so both binaries report the same absent key.
         let cache = majestical_desktop::captions::DescriberKeyCache::default();
         majestical_desktop::captions::refresh_key(
@@ -555,8 +553,9 @@ fn doctor_matches_cli_json() {
             },
             Some(&cfg),
         );
-        let outcome = majestical_desktop::commands::doctor_report_impl(Some(&cfg), cache.presence())
-            .expect("command");
+        let outcome =
+            majestical_desktop::commands::doctor_report_impl(Some(&cfg), cache.presence())
+                .expect("command");
         assert_eq!(
             serde_json::to_value(&outcome).expect("serialize command outcome"),
             cli_doctor_json(&maj, &cfg.catalog),

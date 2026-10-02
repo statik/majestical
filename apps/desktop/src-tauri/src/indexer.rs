@@ -256,10 +256,7 @@ fn poll_and_decide(
     let mut shared = scheduler.0.write().unwrap_or_else(PoisonError::into_inner);
     publish_poll(&mut shared, &status, power, decision);
     drop(shared);
-    // The CACHED key, never a fresh resolve: reading the Keychain is a macOS
-    // access check that a denied prompt does not remember, so resolving here
-    // could prompt on every poll. `captions::refresh_key` refills the cache
-    // at startup, on `adopt_catalog`, and after a save or a clear.
+    // The CACHED key, never a fresh resolve — see `captions`.
     Ok((decision, batch_request(decision, keys.key())))
 }
 
@@ -805,48 +802,6 @@ mod tests {
         }
     }
 
-    /// The tick takes the key from the cache the head filled at startup, at
-    /// `adopt_catalog`, and after a save — never from the environment. A
-    /// Keychain read is a macOS access check whose denial is not remembered,
-    /// so a per-tick read can prompt on every poll; that is the whole point
-    /// of the cache, and reading `env_api_key()` here again would both skip
-    /// the Keychain and defeat it.
-    #[test]
-    fn the_tick_reads_the_cached_key_not_the_environment() {
-        let _guard = crate::captions::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cache = crate::captions::DescriberKeyCache::default();
-        *cache
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = majestical_secrets::ResolvedKey {
-            key: Some("sk-test-2".to_string()),
-            source: majestical_secrets::HeadKeySource::Keychain,
-            notice: None,
-        };
-        // SAFETY: serialized by ENV_LOCK; no other thread reads env mid-test.
-        unsafe { std::env::set_var(majestical_describe::config::OPENROUTER_KEY_ENV, "sk-test") };
-        let cached = cache.key();
-        let empty = crate::captions::DescriberKeyCache::default().key();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(majestical_describe::config::OPENROUTER_KEY_ENV) };
-
-        assert_eq!(empty, None, "an unfilled cache supplies no key");
-        assert_eq!(
-            cached.as_deref(),
-            Some("sk-test-2"),
-            "the cache's key wins over the ambient environment"
-        );
-        assert_eq!(
-            batch_request(SchedulerDecision::RunFull, cached)
-                .expect("a batch")
-                .api_key
-                .as_deref(),
-            Some("sk-test-2")
-        );
-    }
-
     /// The same rule at the tick itself, not at the helpers it calls: with
     /// a key in the cache AND a different one in the environment, the
     /// request `poll_and_decide` builds carries the cached one. Reading the
@@ -868,17 +823,18 @@ mod tests {
                 ..SchedulerShared::default()
             }));
             let cache = crate::captions::DescriberKeyCache::default();
-            *cache
-                .0
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                majestical_secrets::ResolvedKey {
-                    key: Some("sk-test-2".to_string()),
-                    source: majestical_secrets::HeadKeySource::Keychain,
-                    notice: None,
-                };
+            crate::captions::refresh_key(
+                &crate::captions::KeyRefresh {
+                    cache: &cache,
+                    store: &majestical_secrets::PanickingKeyStore,
+                    env: Some("sk-test-2".to_string()),
+                },
+                None,
+            );
             // SAFETY: serialized by ENV_LOCK, held by `with_state_dir`.
-            unsafe { std::env::set_var(majestical_describe::config::OPENROUTER_KEY_ENV, "sk-test") };
+            unsafe {
+                std::env::set_var(majestical_describe::config::OPENROUTER_KEY_ENV, "sk-test");
+            }
             let polled = poll_and_decide(&cfg, &scheduler, &cache);
             // SAFETY: as above.
             unsafe { std::env::remove_var(majestical_describe::config::OPENROUTER_KEY_ENV) };

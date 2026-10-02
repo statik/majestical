@@ -118,10 +118,8 @@ pub fn run() {
         // a field on `SchedulerShared`: a `Condvar` pairs with a `Mutex`,
         // not with that `RwLock`.
         .manage(indexer::SchedulerWake::default())
-        // The head's describer key, resolved once and reused. Managed state
-        // because the scheduler loop and every Captions command read the
-        // same one: a per-tick Keychain read is a macOS access check that a
-        // denied prompt does not remember, so it would prompt on every poll.
+        // The head's describer key, shared by the scheduler loop and every
+        // Captions command. Cached, never read per tick — see `captions`.
         .manage(captions::DescriberKeyCache::default())
         .setup(setup_app)
         // Closing the window hides it to the tray instead of quitting —

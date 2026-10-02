@@ -2,8 +2,9 @@
 //!
 //! The key is resolved (`MAJ_OPENROUTER_KEY`, then the Keychain) at
 //! startup, when a catalog is adopted, and after a save or a clear — never
-//! per scheduler tick, so a denied macOS prompt is asked once, not every
-//! poll.
+//! per scheduler tick. A Keychain read is a macOS access check that a denied
+//! prompt does not remember, so a per-tick read would prompt on every poll;
+//! cached, a denied prompt is asked once.
 //!
 //! The desktop twin of `crates/cli/src/describer_key.rs`: same rules, same
 //! order, a different head. The pure decisions — where a new key goes, what
@@ -30,7 +31,7 @@ const KEYCHAIN_WRITE_REFUSED: &str =
 /// Managed state: what the scheduler and doctor use as the head's key.
 /// Refilled by [`refresh_key`] only — at startup, on `adopt_catalog`, and
 /// after a save or a clear.
-pub struct DescriberKeyCache(pub RwLock<ResolvedKey>);
+pub struct DescriberKeyCache(RwLock<ResolvedKey>);
 
 impl Default for DescriberKeyCache {
     fn default() -> Self {
@@ -91,9 +92,19 @@ impl<'a> KeyRefresh<'a> {
         Self {
             cache,
             store,
-            env: crate::commands::env_api_key(),
+            env: env_api_key(),
         }
     }
+}
+
+/// `MAJ_OPENROUTER_KEY`, when set and not empty — the same variable the CLI
+/// reads, so a GUI launched from a shell honors the same override. A
+/// login-item launch has no shell environment, so this is `None` there and
+/// the Keychain (when the backend wants it) is the only source.
+fn env_api_key() -> Option<String> {
+    std::env::var(majestical_describe::config::OPENROUTER_KEY_ENV)
+        .ok()
+        .filter(|k| !k.is_empty())
 }
 
 /// What the mutating impls need, kept to one parameter each.
@@ -112,9 +123,8 @@ pub struct CaptionDeps<'a> {
 pub fn refresh_key(keys: &KeyRefresh<'_>, cfg: Option<&CatalogCfg>) {
     // `wants_keychain` swallows its own read failure (the verb that follows
     // reports it), so its notices sink is a local one nothing drains.
-    let wants = cfg.is_some_and(|cfg| {
-        describer_config::wants_keychain(&cfg.catalog, &Notices::new())
-    });
+    let wants =
+        cfg.is_some_and(|cfg| describer_config::wants_keychain(&cfg.catalog, &Notices::new()));
     let resolved = majestical_secrets::resolve(keys.env.clone(), wants, keys.store);
     *keys.cache.0.write().unwrap_or_else(PoisonError::into_inner) = resolved;
 }
@@ -437,8 +447,8 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Test-only: runs `f` with `MAJ_STATE_DIR` pointed at a fresh tempdir, so
 /// `describer.toml` lands there instead of in the user's real data dir. The
-/// eleven-line twin of `tests/commands.rs`'s helper, which a unit-test
-/// module cannot import.
+/// twin of the helpers in `tests/commands.rs` and `tests/tauri_parity.rs`,
+/// which a unit-test module cannot import.
 #[cfg(test)]
 pub(crate) fn with_state_dir<T>(f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK
@@ -621,10 +631,7 @@ mod tests {
             assert_eq!(err.message, "a model name is required");
             assert_eq!(store.held(), None, "nothing reaches the Keychain");
             assert!(!config_path(&cfg).exists(), "nothing reaches the file");
-            assert!(
-                !nudged(&wake),
-                "a refused save must not wake the scheduler"
-            );
+            assert!(!nudged(&wake), "a refused save must not wake the scheduler");
         });
     }
 
@@ -653,7 +660,10 @@ mod tests {
             );
             let rendered = format!("{err:?}");
             assert!(!rendered.contains("sk-test"), "the key must never render");
-            assert!(!rendered.contains("denied"), "the store's message is dropped");
+            assert!(
+                !rendered.contains("denied"),
+                "the store's message is dropped"
+            );
             assert!(!config_path(&cfg).exists(), "nothing was saved");
         });
     }
@@ -778,7 +788,6 @@ mod tests {
         });
     }
 
-    /// No network: an unconfigured catalog is refused before any request.
     /// Seeds `describer.toml` with an `OpenRouter` backend, so the head's
     /// resolve wants the Keychain and `clear` has a file half to do.
     fn seed_openrouter(cfg: &CatalogCfg, file_key: FileKey) {
@@ -892,7 +901,10 @@ mod tests {
                 Some("sk-test"),
                 "the Keychain item must outlive a clear that cannot finish"
             );
-            assert!(!nudged(&wake), "a refused clear must not wake the scheduler");
+            assert!(
+                !nudged(&wake),
+                "a refused clear must not wake the scheduler"
+            );
         });
     }
 
@@ -979,6 +991,7 @@ mod tests {
         );
     }
 
+    /// No network: an unconfigured catalog is refused before any request.
     #[test]
     fn test_describer_without_a_describer_is_an_error() {
         with_state_dir(|| {

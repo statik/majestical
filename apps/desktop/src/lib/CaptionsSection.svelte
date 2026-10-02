@@ -16,6 +16,7 @@
     DescriberBackend,
     DescriberProbeOutcome,
     DescriberSettingsOutcome,
+    KeySource,
     SaveDescriberReq,
   } from "./api-captions";
   import { captionsApi } from "./api-captions";
@@ -47,7 +48,11 @@
   let busy = $state(false);
 
   const describer = $derived(outcome?.describer ?? null);
-  const keySource = $derived(describer?.key_source ?? "none");
+  /** A stored key belongs to the saved backend: Save drops it across a
+   *  backend switch (`describer_config::carried_key`). */
+  const formKeySource = $derived<KeySource>(
+    describer !== null && describer.backend === backend ? describer.key_source : "none",
+  );
   const dirty = $derived(
     describer === null ||
       backend !== describer.backend ||
@@ -200,11 +205,11 @@
         id="captions-key"
         type="password"
         autocomplete="off"
-        placeholder={keyPlaceholder(keySource)}
+        placeholder={keyPlaceholder(formKeySource)}
         bind:value={apiKey}
         oninput={edited}
       />
-      <p class="captions-key-status">{keyStatusLine(keySource)}</p>
+      <p class="captions-key-status">{keyStatusLine(formKeySource)}</p>
     {/if}
   </div>
 
@@ -226,7 +231,7 @@
     {#if saved}
       <span class="captions-saved" data-e2e="captions-saved">{SAVED_LINE}</span>
     {/if}
-    {#if backend === "open-router" && removeKeyVisible(keySource)}
+    {#if backend === "open-router" && removeKeyVisible(formKeySource)}
       <span class="spacer"></span>
       <button
         type="button"

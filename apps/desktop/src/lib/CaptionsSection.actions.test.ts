@@ -219,3 +219,27 @@ test("a Test in flight disables Save, Test and Remove key", async () => {
   pending.settle(probe);
   await waitFor(() => expect(button("Save").disabled).toBe(false));
 });
+
+test("a key stored for a local backend does not show as OpenRouter's", async () => {
+  // Save drops a stored key across a backend switch
+  // (`describer_config::carried_key`), so the form must not offer to keep it.
+  mockCommands({
+    describer_settings: () => ({
+      keychain_supported: true,
+      describer: {
+        backend: "ollama",
+        base_url: "http://localhost:11434",
+        model: "llava",
+        key_source: "file",
+      },
+    }),
+  });
+  render(CaptionsSection);
+  await loaded("llava");
+
+  await userEvent.selectOptions(backendSelect(), "OpenRouter");
+
+  expect(field("API key").placeholder).toBe("sk-or-…");
+  expect(screen.getByText("No key. Captions cannot run until one is saved.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Remove key" })).toBeNull();
+});

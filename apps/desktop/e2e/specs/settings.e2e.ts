@@ -86,3 +86,38 @@ describe("Majestical desktop — Settings — Always-on throttle", () => {
     await expect($(".settings-status")).not.toHaveText("Paused");
   });
 });
+
+/** The Health panel's describer row detail, looked up by name and re-queried
+ *  on every call: the panel re-renders its rows after a Save. */
+async function describerDetail(): Promise<string> {
+  const rows = await $$(".settings-check");
+  const names = await rows.map((el) => el.$(".settings-check-name").getText());
+  const row = rows[names.indexOf("describer")];
+  if (row === undefined) throw new Error("no describer row");
+  return row.$(".settings-check-detail").getText();
+}
+
+// Saving a describer makes caption work plannable for the rest of the
+// session, and nothing listens on localhost:11434, so the scheduler's next
+// batch fails. That is safe here: the only spec after this file,
+// ingest.e2e.ts, asserts nothing about the scheduler's status or errors.
+// Ollama is the preselected backend, so the `<select>` — which this embedded
+// WebKit driver cannot change through `selectByVisibleText` — is never
+// touched; Save stores no key and makes no network call.
+describe("Majestical desktop — Settings — Captions", () => {
+  before(async () => {
+    await suppressAutoFocusRecovery(browser);
+    await $('[data-e2e="nav-search"]').waitForDisplayed({ timeout: 20_000 });
+    await openSurface('[data-e2e="nav-settings"]', ".settings-checks");
+  });
+
+  it("saving an Ollama describer changes the Health describer row", async () => {
+    expect(await describerDetail()).toBe("no describer configured — captions off");
+
+    await $('[data-e2e="captions-model"]').setValue("llava");
+    await $('[data-e2e="captions-save"]').click();
+    await $('[data-e2e="captions-saved"]').waitForDisplayed();
+
+    await browser.waitUntil(async () => (await describerDetail()) === "ollama · llava");
+  });
+});

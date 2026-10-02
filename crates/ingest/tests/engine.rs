@@ -75,7 +75,7 @@ fn copies_verifies_and_places_to_every_destination() {
     )
     .expect("run");
     assert_eq!(outcome.placed.len(), 2);
-    assert!(outcome.failed.is_empty());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     for d in [d1.path(), d2.path()] {
         assert_eq!(
             std::fs::read(d.join("Projects/x/day1/clips/a.mov")).expect("placed"),
@@ -265,7 +265,7 @@ fn duplicate_skip_does_not_copy() {
         &silent_control(),
     )
     .expect("run");
-    assert!(outcome.placed.is_empty());
+    assert!(outcome.placed.is_empty(), "{:?}", outcome.placed);
     assert_eq!(outcome.skipped_duplicates.len(), 1);
     assert!(!d1.path().join("Projects/x/day1/dup.mov").exists());
 }
@@ -313,7 +313,7 @@ fn a_correctly_predicted_prehash_does_not_block_the_copy() {
         "a prehash that matches the actual bytes must not block the copy: {:?}",
         outcome.failed
     );
-    assert!(outcome.failed.is_empty());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
 /// One file's slice of a run's event stream. Workers race globally, so a

@@ -582,7 +582,7 @@ mod tests {
         let outcome = execute(src.path(), dst.path(), &plan).expect("execute");
         assert_eq!(outcome.segments_copied, 1);
         assert_eq!(outcome.blobs_copied, 4);
-        assert!(outcome.failures.is_empty());
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
         let events_new: usize = outcome.events_added.iter().map(|(_, n)| *n).sum();
         assert_eq!(events_new, 2);
 

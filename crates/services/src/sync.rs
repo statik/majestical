@@ -1022,7 +1022,7 @@ mod tests {
     fn locations_list_of_an_unconfigured_catalog_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = locations_list(dir.path()).expect("locations_list");
-        assert!(outcome.locations.is_empty());
+        assert!(outcome.locations.is_empty(), "{:?}", outcome.locations);
         assert!(!outcome.readonly);
     }
 
@@ -1211,7 +1211,7 @@ mod location_add_rm_tests {
         location_rm(&catalog, "nas", &Notices::new()).expect("rm");
         let cfg = SyncConfig::load(&config_path(&catalog, &Notices::new()).expect("config_path"))
             .expect("load");
-        assert!(cfg.locations.is_empty());
+        assert!(cfg.locations.is_empty(), "{:?}", cfg.locations);
         assert!(loc.join("events").is_dir(), "rm must not touch the files");
     }
 }
@@ -1414,7 +1414,11 @@ mod push_pull_tests {
             notices: vec![],
         };
         assert!(all_skipped.no_location_ran());
-        assert!(all_skipped.failing_locations().is_empty());
+        assert!(
+            all_skipped.failing_locations().is_empty(),
+            "{:?}",
+            all_skipped.failing_locations()
+        );
         let ran_with_failures = PushOutcome {
             rows: vec![LocationRow::Ran {
                 name: "b".into(),
@@ -1448,7 +1452,11 @@ mod push_pull_tests {
             notices: vec![],
         };
         assert!(all_skipped.no_location_ran());
-        assert!(all_skipped.failing_locations().is_empty());
+        assert!(
+            all_skipped.failing_locations().is_empty(),
+            "{:?}",
+            all_skipped.failing_locations()
+        );
         assert!(all_skipped.overall_failed());
         let ran_with_failures = PullOutcome {
             rows: vec![LocationRow::Ran {
@@ -1606,7 +1614,10 @@ mod push_pull_tests {
             "the completed transfer row must survive the apply failure"
         );
         assert!(matches!(rows[0], LocationRow::Ran { .. }));
-        assert!(!source.to_string().is_empty());
+        assert!(
+            !source.to_string().is_empty(),
+            "source.to_string() is empty"
+        );
     }
 
     /// Pins the carrier at the public `pull` boundary: a legacy `catalog.db`

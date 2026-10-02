@@ -1082,7 +1082,7 @@ mod history_tests {
         assert_eq!(report.altered, vec!["clips/a.mov".to_string()]);
         assert_eq!(report.missing, vec!["b space.wav".to_string()]);
         assert_eq!(report.new_files, vec!["c.txt".to_string()]);
-        assert!(report.verified.is_empty());
+        assert!(report.verified.is_empty(), "{:?}", report.verified);
         assert_eq!(report.written.generation, 2);
 
         let second = read_generation(&report.written.path).expect("read new generation");
@@ -1129,9 +1129,9 @@ mod history_tests {
         assert_eq!(next_generation(dir.path()).expect("next_generation"), 2);
 
         let report = verify_dir(dir.path(), "2026-07-30T00:01:00Z").expect("verify_dir");
-        assert!(report.altered.is_empty());
-        assert!(report.missing.is_empty());
-        assert!(report.new_files.is_empty());
+        assert!(report.altered.is_empty(), "{:?}", report.altered);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert!(report.new_files.is_empty(), "{:?}", report.new_files);
         assert_eq!(report.written.generation, 2);
     }
 
@@ -1152,9 +1152,9 @@ mod history_tests {
         // Nothing changes on disk before the second pass.
         let report = verify_dir(dir.path(), "2026-07-30T00:01:00Z").expect("verify_dir");
         assert_eq!(report.verified.len(), 2);
-        assert!(report.altered.is_empty());
-        assert!(report.missing.is_empty());
-        assert!(report.new_files.is_empty());
+        assert!(report.altered.is_empty(), "{:?}", report.altered);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert!(report.new_files.is_empty(), "{:?}", report.new_files);
 
         let second = read_generation(&report.written.path).expect("read new generation");
         assert_eq!(second.entries.len(), 2);

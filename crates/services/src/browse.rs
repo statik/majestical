@@ -639,9 +639,17 @@ mod tests {
         assert_eq!(folder(v, "").recursive_count, 3);
         assert_eq!(folder(v, "A").children, vec!["B"]);
         assert_eq!(folder(v, "A").recursive_count, 2);
-        assert!(folder(v, "A/B").children.is_empty());
+        assert!(
+            folder(v, "A/B").children.is_empty(),
+            "{:?}",
+            folder(v, "A/B").children
+        );
         assert_eq!(folder(v, "A/B").recursive_count, 1);
-        assert!(folder(v, "C").children.is_empty());
+        assert!(
+            folder(v, "C").children.is_empty(),
+            "{:?}",
+            folder(v, "C").children
+        );
         assert_eq!(folder(v, "C").recursive_count, 1);
 
         let w = out
@@ -652,7 +660,11 @@ mod tests {
         assert!(!w.online, "an unmounted label must read offline");
         assert_eq!(folder(w, "").children, vec!["D"]);
         assert_eq!(folder(w, "").recursive_count, 1);
-        assert!(folder(w, "D").children.is_empty());
+        assert!(
+            folder(w, "D").children.is_empty(),
+            "{:?}",
+            folder(w, "D").children
+        );
         assert_eq!(folder(w, "D").recursive_count, 1);
 
         assert!(

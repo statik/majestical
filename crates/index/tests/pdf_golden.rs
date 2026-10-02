@@ -11,7 +11,7 @@ const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixtu
 #[test]
 fn extracts_per_page_text() {
     let content = pdf::extract_text(std::path::Path::new(FIXTURE)).expect("extract");
-    assert!(!content.pages.is_empty());
+    assert!(!content.pages.is_empty(), "content.pages is empty");
     let all = content.pages.join(" ");
     assert!(all.contains("Majestical fixture"), "got: {all}");
     assert!(all.contains("7734"), "got: {all}");

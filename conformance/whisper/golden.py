@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["faster-whisper==1.2.1"]
+# dependencies = ["faster-whisper==1.2.1", "av==18.1.0"]
 # ///
 """Reference transcription of a fixture WAV via pinned faster-whisper.
 
@@ -11,6 +11,9 @@ it isn't exposed to torch's MPS auto-selection bug that corrupted the
 text-encoder oracle on CI's virtualized Metal in this phase's PR 2 — but
 `device="cpu"` is set anyway (CTranslate2 also has a CoreML/GPU path) to pin
 the oracle's execution device explicitly rather than rely on its default.
+
+`av` is pinned because faster-whisper 1.2.1 leaves it unbounded and calls
+`av.open(..., metadata_errors=...)`, a keyword PyAV 19.0.0 removed.
 
 Usage: uv run conformance/whisper/golden.py --revision <sha> --audio fixture.wav --out golden.json
 """

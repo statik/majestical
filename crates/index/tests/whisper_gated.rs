@@ -70,6 +70,9 @@ fn transcribes_spoken_fixture_with_sane_timestamps() {
     // Matches both paths: our own say fixture, and the recipe's fixture
     // (`just whisper-conformance`'s `say` text starts with the same sentence).
     assert!(lower.contains("quick brown fox"), "got: {lower}");
-    assert!(!transcript.segments.is_empty());
+    assert!(
+        !transcript.segments.is_empty(),
+        "transcript.segments is empty"
+    );
     assert!(transcript.segments[0].end_ms > transcript.segments[0].start_ms);
 }

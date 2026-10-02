@@ -61,9 +61,9 @@ mod tests {
 
         let report = verify_dir_op(dir.path()).expect("verify_dir_op");
         assert_eq!(report.verified, vec!["a.mov".to_string()]);
-        assert!(report.altered.is_empty());
-        assert!(report.missing.is_empty());
-        assert!(report.new_files.is_empty());
+        assert!(report.altered.is_empty(), "{:?}", report.altered);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert!(report.new_files.is_empty(), "{:?}", report.new_files);
         assert_eq!(report.generation, 2);
     }
 
@@ -94,14 +94,14 @@ mod tests {
         let report = verify_dir_op(dir.path()).expect("verify_dir_op");
         assert_eq!(report.new_files, vec!["b.mov".to_string()]);
         assert_eq!(report.verified, vec!["a.mov".to_string()]);
-        assert!(report.altered.is_empty());
-        assert!(report.missing.is_empty());
+        assert!(report.altered.is_empty(), "{:?}", report.altered);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
     }
 
     #[test]
     fn verify_dir_op_with_no_history_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = verify_dir_op(dir.path()).expect_err("must fail");
-        assert!(!err.to_string().is_empty());
+        assert!(!err.to_string().is_empty(), "err.to_string() is empty");
     }
 }

@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn empty_frames_yield_no_keyframes() {
         let keyframes = detect_scenes(&[], 2000, 10_000);
-        assert!(keyframes.is_empty());
+        assert!(keyframes.is_empty(), "{keyframes:?}");
     }
 
     /// `frames.len() < 2` is the "too few frames to compare" guard — exactly

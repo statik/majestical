@@ -296,3 +296,235 @@ in tests.
 - Wire-layer codegen, Windows/Linux artifacts, ledger keying finer than
   `(kind, asset)`, MCP progress notifications, CLI ingest progress
   rendering, the ingest queue, localization (carried again).
+
+## As-built (phase 7G)
+
+What shipped, where it differs from the design above. Written for the
+state once this closing PR merges: main at #145 plus this PR. Six chunk
+PRs squash-merged after green CI (#135, #136, #137, #138, #143, #145),
+plus #134 (spec + plan + mockup), #139 (a mid-phase handoff), #144 (an
+unplanned CI fix) and this closing one. Every task went through the same
+loop: a fresh implementer subagent, an adversarial spec-compliance
+reviewer that probed empirically and mutation-tested the claims, a
+code-quality reviewer, and fix rounds until both approved. The plan has
+eight chunks where the Delivery list above has seven: the Keychain work
+became two chunks so each stayed at 1-2 tasks.
+
+**Planning-time amendments** (recorded in the plan's header, decided
+while reading the code for it):
+
+- The adapter is a trait, not three free functions: `crates/secrets`
+  exposes `trait KeyStore` with `SystemKeyStore` (real) and
+  `MemoryKeyStore` (the test double both heads' tests use), so head tests
+  drive the write path without a real Keychain.
+- `PortFailure::CredentialsRejected` carries which problem it was
+  (`CredentialsProblem::{KeyRejected, OutOfCredit}`), because services
+  picks the named reason from it.
+- `DoctorRequest.describer_env_key: Option<String>` became
+  `describer_key: KeyPresence`: the row only ever needed presence, and it
+  now names the source.
+- `describer_config::set` returns `()`; the head calls `show` for the
+  echo, because the view depends on the head's key presence.
+- The state-dir leak had a second source the `cfg(test)` seam cannot
+  reach: unit tests in `crates/cli/src` and `apps/desktop/src-tauri/src`
+  link the non-test build of services. Task 1 measured each suite and
+  added a justfile-level `MAJ_STATE_DIR` for the `test` recipes.
+- `CaptionsSection` imports `captionsApi` directly, not through the `api`
+  object (`api.ts` was at 559/560).
+- `App.test.ts` was at a refused cap, so Task 9 performed the split its
+  cap comment promised (`src/App.settings.test.ts`).
+- The desktop key cache also refills in `adopt_catalog` (a catalog switch
+  changes whether the backend is OpenRouter).
+- Eight PR chunks, not seven (above).
+- `KeyPresence` is a three-variant enum (`Env`, `Keychain`, `Absent`),
+  not two booleans: "both true" can never be produced because the head's
+  resolver stops at env. It is `serde(skip)`, never on the wire.
+  `KeySource`'s absent variant is `Absent`, serialized `none`.
+- Task 5b closed a key leak that predates the phase (below, #137).
+- `KeyCheck` has a fourth state, `missing`: OpenRouter with no effective
+  key. The GUI line reuses the approved "No key" string, so the mockup
+  gained no new wording.
+
+**PR #134 — spec + plan + mockup** (docs). This spec, the plan
+`docs/superpowers/plans/2026-09-18-phase7g-captions-parity.md`, and the
+mockup `docs/superpowers/specs/mockups/2026-09-18-phase7g/captions-section.html`,
+approved by the user before Task 9.
+
+**PR #135 — the state-dir leak stops at its source** (chunk 2, Task 1).
+`state_dir::state_base()` falls back to `default_base()`, whose
+`cfg(test)` body returns a directory under the system temp dir; a guard
+test asserts that fallback is never under the platform data dir. `just
+test`, `just gui-test` and the desktop `cargo test` CI step set
+`MAJ_STATE_DIR`. Measured: `cargo test -p majestical-services --lib`
+went from +90 directories per run to 0; the CLI `--bins` suite, the
+desktop `--lib` suite, `just test` and `just gui-test` measured 0. The
+directories already leaked (about 42,389) are not removed: their names
+are one-way hashes (watchlist).
+
+**PR #136 — named key failures** (chunk 3, Tasks 2 and 3). As designed:
+a 401/402 is `CredentialsRejected`, transient, aborts the caption pass,
+never reaches the ledger, and carries a named reason for OpenRouter (a
+local backend's 401 keeps the server's text). `describer test` checks
+the key through `GET {base_url}/v1/key`; `DescriberProbe.key` is
+`accepted`, `rejected`, `missing` or `not_checked`. AMENDED: the
+`missing` state (above), so `describer test` no longer promises caption
+work for OpenRouter with no key. One equivalent mutant is known: the arm
+order in `post_chat`, because 401 and 402 deliberately stay in
+`NOT_ABOUT_THE_PAYLOAD` so `is_client_rejection` is truthful on its own.
+
+**PR #137 — `crates/secrets`, key-source views, config errors that never
+quote the file** (chunk 4, Tasks 4, 5, 5b). No head touched the Keychain
+yet. `resolve(env, wants_keychain, &store)` reads the store only when env
+is absent and the configured backend is OpenRouter; a read failure is a
+notice. `ResolvedKey` has a redacting `Debug` and never derives
+`Serialize`; a non-UTF-8 stored value is a fixed error.
+`DescriberConfigView` carries `key_source` in place of the old redacted
+`api_key` marker. AMENDED behaviour: `describer set` without a key now
+keeps the stored key (it used to drop it silently). **Task 5b, a leak
+that predates the phase**: a parse error on `describer.toml` quoted the
+offending line, which can be the `api_key` line, through `describer
+show|test`, the index-status notice and four MCP tools.
+`ConfigError::Parse` now carries a line number and a message and no toml
+source; a type error is one fixed sentence; a wrong `backend` value gets
+fixed text. `DescriberConfig::store` is atomic (0600 temp file, sync,
+rename) and replaces a symlinked `describer.toml` with a regular file.
+
+**PR #138 — the Keychain at the CLI and MCP heads; `describer clear-key`**
+(chunk 5, Task 6). `crates/cli/src/describer_key.rs` is the heads' one
+key path. MCP gained a separate `clear_describer_key { confirm }` tool,
+because `set_describer` requires a backend and a model. `index run`
+resolves the key once above the `--watch` loop and only when the
+requested kinds include caption work. Credential fixes found in review,
+each proven on the wire: only an OpenRouter key goes to the Keychain (a
+local backend's token had been moved where nothing read it); a stored key
+never follows a backend switch (`carried_key`, dropped with a notice
+naming both backends); a host move warns, including for a Keychain key
+with a keyless file; the dry run names the destination read off
+`plan_key_write`; notices raised in services name no head. The test seam:
+`SystemKeyStore` takes a service name, `MAJ_KEYCHAIN_SERVICE` overrides
+it at a head, every CLI test child gets a throwaway service through
+`common::maj_bin()`, `keychain_guard.rs` fails a test file that spawns
+the binary another way, and both cleanup guards refuse a non-throwaway
+name. No parity normalizer was needed: every parity row uses Ollama with
+no key.
+
+**PR #139 — mid-phase handoff** (docs). Resumed the phase at chunk 6;
+superseded and deleted by this closing PR, its still-true content carried
+into `docs/superpowers/HANDOFF-phase7H.md` and the watchlist.
+
+**PR #143 — the desktop head and its wire** (chunk 6, Tasks 7 and 8).
+`apps/desktop/src-tauri/src/captions.rs`: `DescriberKeyCache` (managed
+state; a poisoned lock is recovered), four one-line commands over
+`*_impl`s, the key resolved once and refilled at startup, on
+`adopt_catalog`, and after a save or clear; `save_describer` writes the
+Keychain first and stops if refused. Task 7 amendments, all reviewed and
+approved:
+
+1. `CaptionDeps` is `{ keys: KeyRefresh, wake }`, not the plan's flat
+   four-field struct: `adopt_catalog` also refills the cache, and the
+   flat shape would have taken it to seven parameters. It is at five.
+2. `DescriberConfigView` (services) derives `Debug`, required because
+   `DescriberSettingsOutcome` derives it and `expect_err` needs it. The
+   view has no key field by construction.
+3. `SystemKeyStore::service_name() -> &str`, macOS-only, so a test proves
+   `system_store()` honoured `MAJ_KEYCHAIN_SERVICE` without a store call.
+4. A blank `base_url` is treated as absent: a Settings text input sends
+   `""`, which `set` would otherwise store verbatim.
+5. `lib.rs`'s setup closure became a named `setup_app` (`run()` reached
+   103 lines).
+6. A refused Keychain delete keeps the store's own message (`{err}`), as
+   the CLI does; only the write message is fixed by mockup frame 8.
+7. `commands::key_presence()` was deleted outright;
+   `DescriberKeyCache::presence()` replaces it.
+
+The Task 7 code-quality review's fixes (`821497f`): fmt (CI would have
+failed), a non-discriminating indexer test deleted, the cache's field
+made private, `env_api_key` moved private into `captions.rs`, stale docs,
+rationale deduplicated. Three adversarial spec-review rounds rejected
+missing or defeatable guards, never the behaviour; the result is the
+private `mod guarded` in `tauri_parity.rs`, which makes an unguarded
+`maj` spawn a compile error (mutation 34b, deleting the guard inside the
+module, is a documented irreducible limit). Three reviewer write-ups
+were never delivered (watchlist). Task 8 deviations: `maj describer
+show` has no `--json`, so the `describer_settings_matches_cli_show` row
+parses its text lines (`cli_stdout` split from `cli_json`);
+`wire_fixtures.rs` gained `check_or_update_with_nulls(name, value,
+&[json pointers])`, where each named pointer must be present and null and
+every other field populated; the parity row uses `PanickingKeyStore` and
+a fresh catalog (not `seeded_cfg`), proving an Ollama catalog never reads
+the store; the fixture's backend string is derived from
+`BackendKind::as_str`. Task 8's spec review ran 25 mutants, 22 killed,
+the survivors two equivalents and the TS-only-field case (watchlist).
+
+**PR #144 — CI under Rust 1.99 and PyAV 19** (unplanned, between chunks
+6 and 7). Main broke with no commit: CI installs current stable Rust and
+resolves faster-whisper's `av` unbounded. Rust 1.99's clippy
+`assert_is_empty` failed `-D warnings` on 64 asserts across both
+workspaces (rewritten to print the value or name what was empty), and
+two `#[expect]`s no longer fulfilled were removed (`float_cmp` in
+`crates/describe/src/client.rs`; `exit` on `tauri::generate_context!` in
+the desktop `lib.rs`). PyAV 19.0.0 removed the `metadata_errors` keyword
+faster-whisper 1.2.1 passes; `conformance/whisper/golden.py` pins
+`av==18.1.0`. No test logic changed.
+
+**PR #145 — the Captions section, end to end** (chunk 7, Tasks 9 and
+10). `CaptionsSection.svelte` and `captions-status.ts`, mounted between
+Health and Always-on, strings and layout per the approved mockup. Task 9
+deviations: strings beyond the plan taken from the mockup (the subtitle
+as a `SECTION_SUBTITLE` constant, the Model placeholder, "API key", the
+button labels); the plan's `config.rs:18` reference corrected to `:37`;
+a `modelLine()` helper (oxlint `unicorn/no-immediate-mutation`). Caps:
+`App.test.ts` `max-lines` 385 → 320 (split out, while `IngestView.test.ts`
+stays at 385), its `import/max-dependencies` override removed, the
+12-import override moved to `App.settings.test.ts`; no cap raised. Tests
+split into `CaptionsSection.test.ts`, `CaptionsSection.actions.test.ts`
+and `captions-test-support.ts`. Spec review round 1 was REJECTED (42
+mutants, 21 survived) for one behaviour bug — a key typed under
+OpenRouter, then the backend switched away, kept Test disabled and
+reappeared on switching back; the typed key is now cleared when the form
+leaves OpenRouter — and a set of test gaps; round 2 approved with 15 of
+the 21 killed and the rest equivalent or nits. The code-quality review
+found the UI promising to keep a file key stored for a local backend
+when the form switched to OpenRouter, which Save drops (`carried_key`):
+`formKeySource` is the saved `key_source` only when the saved backend
+equals the form's, else `none`. Remove key clears stale Test results and
+"Saved.". `keychain_supported` is unused by the UI; its Rust doc no
+longer promises UI behaviour. Task 10 deviations: the Captions
+`describe` stays in `settings.e2e.ts` (only `ingest.e2e.ts` runs after
+it, and it asserts nothing scheduler-related; the plan's "four specs that
+run after" was stale). The e2e Keychain exposure is closed:
+`wdio.conf.ts`'s `isolateKeychain()` sets `MAJ_KEYCHAIN_SERVICE` to
+`majestical-test-e2e-<pid>-<uuid>` and deletes `MAJ_OPENROUTER_KEY` from
+`process.env` before anything spawns (`@wdio/tauri-service` 1.3.0 spawns
+the app with `{...process.env, ...options.env}`). Review found that
+WDIO's `runLauncherHook` (`@wdio/cli` 9.31.3) aborts only on
+`SevereServiceError` — a plain `Error` from the config's `onPrepare` is
+logged and the app launches anyway — so neither the new guard nor the
+pre-existing spec-list check could stop a launch. `onPrepare` now wraps
+its work and rethrows as `SevereServiceError` (cause kept), isolation
+runs first, and a backstop `assertKeychainIsolated()` runs on
+`process.env` before the fixture `maj` children and on the merged
+capability env right before the service spawns the app. A `waitUntil`
+`.catch` rethrows with the last-seen detail, because WebdriverIO reads
+`timeoutMsg` at wait start. Locally the Settings spec passed 5/5 and the
+full suite 7/7 spec files; the debug bundle plus `cargo build -p
+majestical-cli` took 505 s on a warm desktop target. **Task 10's hand
+check is the user's and is outstanding**: save an OpenRouter key in
+Settings; Keychain Access shows `majestical` / `openrouter-api-key`;
+`maj describer show` says `(from keychain)` after one macOS allow prompt;
+Remove key deletes the item.
+
+**This closing PR** (chunk 8, Tasks 11 and 12). cargo-mutants over the
+files this phase changed, with `system_store` excluded from the
+automated runs and hand-checked, because `SystemKeyStore::default()`
+names the real Keychain item; three test commits close the survivors
+that were real gaps (`PanickingKeyStore`'s own behaviour, the CLI
+`system_store` override, the desktop `env_api_key` and
+`SaveDescriberReq`'s `Debug`). The triage is in the watchlist's
+"cargo-mutants triage (phase 7G)". No temporary parity normalizer was
+added this phase, so none was deleted; `services_parity` (56) and
+`tauri_parity` (11) pass with no SKIP against a reference rebuilt at
+`064c40f`. Also: the phase 7G deferrals, this section,
+`docs/superpowers/HANDOFF-phase7H.md`, and the deletion of the mid-phase
+handoff. `docs/RELEASING.md` is unchanged: the Keychain adds no release
+step.

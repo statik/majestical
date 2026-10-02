@@ -2009,6 +2009,243 @@ counter-mutant family is otherwise gone: the two-asset rule held, and
 this phase's new planner pass (`plan_keyframe_images`) shipped with the
 same shape of test, so it contributed no survivors.
 
+## Phase 7G deferrals
+
+Recorded during the phase 7G PR chain (#134-#139, #143, #144, #145) and
+this closing PR. Items marked "(spec)" come from
+`docs/superpowers/specs/2026-09-18-phase7g-captions-parity-design.md`'s
+own Deferred list; the rest were found during execution, attributed to the
+PR whose work or review found them. Items the mid-phase handoff recorded
+without naming a PR carry the range of chunks 2-5 (#135-#138). Three
+phase 7F deferrals are closed by this phase: GUI describer settings (#143,
+#145), the unit-test state-dir leak at its source (#135), and naming an
+invalid or unfunded OpenRouter key (#136).
+
+- **Cleanup of the state directories already leaked** (spec; measured in
+  #135 and the chunk-6 handoff). About 42,389 directories remain under
+  `~/Library/Application Support/majestical/catalogs/` from before #135.
+  Their names are one-way hashes, so a leaked directory cannot be told
+  from a real catalog's state by name; cleanup needs a safe
+  discriminator. #135's own measurements: `cargo test -p
+  majestical-services --lib` leaked +90 directories per run before and 0
+  after; `cargo test -p majestical-cli --bins`, the desktop `--lib` suite,
+  `just test` and `just gui-test` all measured 0 after. No residual leak
+  was measured under any suite.
+- **A model picker fed by the backend's model list** (spec).
+- **A shared Keychain access group** (spec), so the CLI and the app read
+  one item without a per-binary macOS prompt. Needs both binaries signed
+  by one team.
+- **A secret store on Linux and Windows** (spec). Off macOS the
+  `SystemKeyStore` stub is `Unsupported` and a key stays in the file.
+- **Per-catalog keys** (spec). The Keychain item is per machine by
+  decision.
+- **Wire-layer codegen, Windows/Linux artifacts, ledger keying finer than
+  `(kind, asset)`, MCP progress notifications, CLI ingest progress
+  rendering, the ingest queue, localization** (spec, carried again).
+  Everything else the phase 7F list carried is carried again.
+- **`MAJ_STATE_DIR=""` is accepted as a relative base** (#135-#138,
+  pre-existing).
+- **No services unit test covers `MAJ_STATE_DIR`'s precedence** (#135-#138,
+  pre-existing).
+- **The models dir ignores `MAJ_STATE_DIR`** (#135-#138) and resolves under the
+  real data dir.
+- **`RUSTDOCFLAGS='-D warnings' cargo doc -p majestical-services` fails
+  with 19 pre-existing errors** (#135-#138); none from this phase. The doc gate
+  cannot vouch for anything until they are fixed.
+- **`crates/services/src/sync.rs` chains the toml error when parsing
+  `sync.toml`** (#137). That file holds no secrets, so Task 5b's
+  never-quote-the-file rule was not applied there.
+- **`keychain_guard`'s strict `.env(` requirement is structurally
+  unpinned** (#138). An allow-listed file satisfies it with ONE
+  occurrence, so a second spawn site in the same file rides along
+  unchecked. Since #143, `crates/cli/tests/keychain_guard.rs` is the
+  weaker of the two Keychain guards: the desktop's `tauri_parity.rs`
+  makes an unguarded spawn a compile error. Port the desktop's
+  `get_envs` assertion into `common::maj_bin()` and retire the text
+  scan's weakness rather than carrying it again.
+- **The MCP `set_describer` dry run under-promises when
+  `MAJ_OPENROUTER_KEY` is set** (#138). It says a stored file key is
+  unchanged where the confirmed call drops it. Deliberate (it errs away
+  from over-promising a destructive act) and documented on `key_effect`.
+- **`clear_describer_key_result` loads `describer.toml` three times**
+  (#138). A proposed simplification was DECLINED with evidence: it would
+  have made the dry run deny a deletion it was about to perform for a
+  local backend.
+- **`acceptance.rs` / `inbox_acceptance.rs` use fixed throwaway service
+  names shared across runs** (#138). Harmless while no scenario stores a
+  key.
+- **The `ld: __eh_frame section too large` linker warning** is
+  pre-existing.
+- **`tauri_parity.rs`'s `seeded_cfg` is offline by construction** (#143).
+  Its hand-emitted `VolumeSeen`/`AssetSeen` use a made-up `vol1`, and
+  `gather_sources` (`crates/services/src/index/mod.rs:118`) resolves
+  instances against `volume_identity::mounted_volumes()`'s real device
+  ids, so every seeded item is offline, never pending. Fine for the
+  search rows it was written for; it silently reports zero pending for a
+  status- or plan-shaped row. A new parity row should scan a real
+  directory with an auto-detected identity (`scan(&mut app, &media,
+  None)`, the trick `index/mod.rs:693` documents).
+- **Mutation 34b is an accepted irreducible limit of the desktop spawn
+  guard** (#143). Deleting the guard call AND rewriting the spawn to
+  re-unwrap still compiles inside `mod guarded` (`Command::output` is
+  inherent and the path is reachable inside the module). Three structural
+  fixes were tried and all dissolve: any function that can reach the path
+  can spawn. The six spawn sites outside the module are protected by
+  types and privacy; the module itself by its three `should_panic` tests.
+  Do not "fix" this with a source scan.
+- **The reference-binary trap has three forms** (#143, phase-wide; affects
+  `services_parity.rs` and `tauri_parity.rs` alike). `/tmp/maj-ref`
+  missing (the suite skips every diff and still reports green);
+  `target/debug/maj` stale (a binary predating the Keychain code compared
+  against the wrong thing and reported green); `target/debug/maj` absent.
+  `maj_or_skip` only checks the file exists. All three appeared in chunk 6
+  alone. Make it structural — fail rather than skip, and check the
+  binary's freshness — instead of carrying it as a warning again.
+- **TS fixture tests cast with `as`** (#143, Task 8 spec review). A field
+  that exists only in the TS interface passes its fixture test. A
+  repo-wide pattern; fix with `Record<keyof T, true>` key pins.
+- **CI floats the Rust toolchain and the conformance scripts' Python
+  dependencies** (#144). Rust 1.99 (2026-09-28) and PyAV 19.0.0
+  (2026-09-29) each broke main with no commit: clippy's `assert_is_empty`
+  failed `-D warnings` on 64 asserts across both workspaces, and PyAV
+  removed the `metadata_errors` argument faster-whisper 1.2.1 passes to
+  `av.open`. #144 fixed both (`conformance/whisper/golden.py` now pins
+  `av==18.1.0`). Consider a `rust-toolchain.toml` and locking the
+  conformance scripts' dependencies.
+- **Off macOS, the "file" key status line says "Save a key here to move
+  it to the Keychain"** (#145), which those builds cannot do. A different
+  line needs a string the approved mockup lacks (the user's call).
+  `keychain_supported` is on the wire but unused by the UI; its Rust doc
+  no longer promises UI behaviour.
+- **The key-status line describes the SAVED backend** (#145). With a
+  saved local backend and a leftover Keychain key or `MAJ_OPENROUTER_KEY`,
+  switching the form to OpenRouter says "No key" though Save would pick
+  one up. It understates rather than over-promises; accepted.
+- **The e2e harness's Keychain backstop can be deleted along with the
+  isolation** (#145). `assertKeychainIsolated()` checks the result of
+  `isolateKeychain()`, but deleting both calls is not caught; there is no
+  TS equivalent of `keychain_guard.rs`. A documented limit; review is the
+  guard.
+- **Nothing deletes the e2e run's throwaway Keychain service** (#145).
+  Runs leave no item today because the Ollama flow stores no key.
+- **`apps/desktop/e2e/wdio.conf.ts` has two pre-existing lines over 100
+  characters** (#145): `appBundlePath` and the spec-list error template.
+- **`MemoryKeyStore { unsupported: true, ..MemoryKeyStore::default() }`
+  appears 17 times repo-wide** (this closing PR). A
+  `MemoryKeyStore::unsupported()` constructor would replace them.
+- **cargo-mutants must exclude or hand-check `system_store` at any head
+  that builds a `SystemKeyStore`** (this closing PR; a standing rule).
+  `SystemKeyStore` implements `Default` with the real `majestical`
+  service, so cargo-mutants generates `replace system_store ->
+  SystemKeyStore with Default::default()` at the CLI and desktop heads;
+  under that mutant the CLI's test children would write `sk-test` to and
+  delete the developer's real item. Run it alone, by hand, against only a
+  test that makes no store call. See the triage below.
+- **Clean both `target` dirs between phases** (proposal from the chunk-6
+  handoff). On 2026-09-19 the two `target` dirs held 2,172,728 files /
+  435 GiB (root) and 319,777 files / 139 GiB (desktop);
+  `target/debug/deps` alone held 1.8M files, and the macOS Security
+  framework scans the calling binary's directory, so every Keychain call
+  from a test binary took 9-24 seconds (a 13-test suite took 60 s; 0.3 s
+  after the clean). If Keychain tests get slow again, check the file
+  count first.
+- **Three reviewer write-ups from Task 7 were never delivered** (#143).
+  PROBE2 (the refused-Keychain-delete message rendered under `{err}`,
+  `{err:#}` and `{err:?}`), the verdict on deriving `Debug` for
+  `DescriberConfigView`, and the reviewer's own watchlist. The headline
+  verdicts were "no key on any rendering" and "leak-free"; the full
+  outputs were lost to report truncation. The watchlist part is folded
+  into this list as far as it was reported.
+
+### cargo-mutants triage (phase 7G)
+
+cargo-mutants 27.1.0 on rustc 1.99.0. Five scoped runs, `--in-place`,
+foreground or watched, one at a time, `git status` clean after each:
+`majestical-secrets` (the whole crate), `majestical-services` on
+`describer_config.rs`, `majestical-describe` on `client.rs`,
+`majestical-cli` on `describer_key.rs`, and the desktop workspace on
+`src/captions.rs`. The default auto-timeouts were too short for the CLI
+suite (7 false TIMEOUTs); that run was repeated with `--timeout 900`.
+
+**Keychain safety, before any run.** `SystemKeyStore` implements
+`Default` with the REAL `majestical` service, so cargo-mutants generates
+`replace system_store -> SystemKeyStore with Default::default()` at the
+CLI and desktop heads. Under that mutant the CLI's test children would
+write `sk-test` to and delete the developer's real item, and no CLI test
+caught it. So: (1) a CLI unit test,
+`the_system_store_honors_the_keychain_service_override` (a port of the
+desktop's), was added and proven by hand to fail on that mutant, running
+only that in-process test; (2) `system_store` was excluded
+(`--exclude-re system_store`) from the automated CLI and desktop runs;
+(3) the desktop `system_store` mutant was run alone with `-- --lib` (lib
+unit tests only; no test calls a command function): caught. The secrets
+crate's own tests all construct `Cleanup::new(&service)` first, which
+panics on a non-throwaway name, so its `tests::service -> ""`/`"xyzzy"`
+mutants panic before any Keychain call.
+
+**`majestical-secrets`** (whole crate): 70 mutants, **37 caught, 11
+unviable, 22 missed** in the crate's own suite.
+
+- `MemoryKeyStore::held` (3) and `SystemKeyStore::service_name` (2):
+  covered at another head. A second pass with `--test-package
+  majestical-cli --test-package majestical-services` caught all five
+  (`service_name` by the new CLI `system_store` test).
+- `PanickingKeyStore` (7: `supported` → false; `read`/`store`/`delete`
+  returning `Ok`): the double is never called by a passing suite. Killed
+  by new tests in `crates/secrets/src/lib.rs`
+  (`the_panicking_store_claims_support` and three `should_panic` tests);
+  re-run 9/9 caught. Commit "test: pin PanickingKeyStore's own
+  behaviour".
+- `system.rs:91-103` (7: the non-macOS stub's `supported`/`read`/
+  `store`/`delete`): not compiled on macOS; covered by the stub's own
+  tests (`the_stub_is_unsupported_everywhere` and siblings) on the Linux
+  CI leg.
+- `system.rs:115:21` and `:130:21` (2: the `err.code() ==
+  errSecItemNotFound` guard → `true` in `read_item`/`delete_item`):
+  killing them needs a Keychain fault other than not-found, and there is
+  no injection seam. Accepted.
+- `system.rs:165:13` (1: `Drop for Cleanup` → `()`): cleanup matters only
+  when a test fails mid-way; every test deletes its own item. Equivalent
+  for a passing suite.
+
+**`crates/services/src/describer_config.rs`**: 32 mutants, **22 caught,
+10 unviable, 0 missed**.
+
+**`crates/describe/src/client.rs`**: 40 mutants, **28 caught, 12
+unviable, 0 missed**.
+
+**`crates/cli/src/describer_key.rs`** (`system_store` excluded): 14
+mutants, **10 caught, 4 unviable, 0 missed**. The excluded `system_store`
+mutant is caught by the new unit test (run by hand).
+
+**`apps/desktop/src-tauri/src/captions.rs`** (`system_store` excluded):
+27 mutants, **10 caught, 12 unviable, 5 missed**. `env_api_key` ×4 (only
+the command layer calls it, and no test drives a command) and
+`SaveDescriberReq`'s hand-written `Debug` → `Ok(())` (rendering nothing
+passed the no-key check). Killed by new tests
+`the_env_key_is_read_only_when_set_and_not_empty` and
+`a_save_request_debugs_with_its_key_redacted`; re-run 5/5 caught. The
+`system_store` mutant, run alone with `-- --lib`: caught.
+
+**Mutation testing inside the review loop** (recorded in the chunk PRs,
+not re-run here): Task 8's spec review ran 25 mutants, 22 killed; the
+three survivors are `KeyCheck`'s camelCase rename (equivalent:
+`"accepted"` is the same string), presence hard-coded to Keychain
+(equivalent for Ollama: `key_source` forces `Absent`), and a TS interface
+gaining a TS-only field (the repo-wide `as` cast pattern above). Task 9's
+spec review ran 42 mutants, 21 surviving in round 1; after the fixes
+round 2 killed 15 of the 21, and the rest are equivalent or nits.
+
+**Parity, re-run end to end against `/tmp/maj-ref` rebuilt at `064c40f`
+(the closing PR's merge-base)**: `services_parity` — 56 passed, no SKIP;
+`tauri_parity` — 11 passed, no SKIP. No temporary normalizer was added
+this phase (every parity row uses Ollama with no key), so there was none
+to delete. The `sk-` scan (`rg -n "sk-" --glob '!*.md' .`) finds only
+`sk-test`, `sk-test-2`, the `sk-or-…` placeholder, and literals predating
+7G (`sk-env`, `sk-file`, `sk-SUPERSECRET` from #130; `sk-secret` from
+#43; a `sk-…` doc comment; the non-UTF-8 byte test in `system.rs`), plus
+two non-key substrings (`mask-image`, `disk-for-clip`).
+
 ## Phase 7F deferrals
 
 Recorded during the phase 7F PR chain (#125, #126, #128, #130, #131, #132)

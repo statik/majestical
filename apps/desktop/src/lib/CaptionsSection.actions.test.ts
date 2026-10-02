@@ -163,21 +163,29 @@ test("Remove key is hidden when the form's backend is not OpenRouter", async () 
   expect(screen.queryByRole("button", { name: "Remove key" })).toBeNull();
 });
 
-test("Remove key replaces the status with the answer and calls onchanged", async () => {
+test("Remove key replaces the status, clears stale results and Saved., and calls onchanged", async () => {
   let changes = 0;
   mockCommands({
     describer_settings: () => openRouter,
+    save_describer: () => openRouter,
+    test_describer: () => probe,
     clear_describer_key: () => withKeySource("none"),
   });
-  render(CaptionsSection, { onchanged: () => (changes += 1) });
+  const { container } = render(CaptionsSection, { onchanged: () => (changes += 1) });
   await loaded("google/gemini-2.5-flash");
+  await userEvent.click(button("Save"));
+  await screen.findByText("Saved.");
+  await userEvent.click(button("Test"));
+  await screen.findByText("Key accepted.");
 
   await userEvent.click(button("Remove key"));
 
   expect(await screen.findByText(keyStatusLine("none"))).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Remove key" })).toBeNull();
   expect(field("API key").placeholder).toBe("sk-or-…");
-  expect(changes).toBe(1);
+  expect(container.querySelector(".captions-results")).toBeNull();
+  expect(screen.queryByText("Saved.")).toBeNull();
+  expect(changes).toBe(2);
 });
 
 test("a failed Remove key shows the alert and keeps the status", async () => {
@@ -202,7 +210,9 @@ test("a Save in flight disables Save, Test and Remove key", async () => {
 
   await userEvent.click(button("Save"));
 
-  await waitFor(() => expect(ACTIONS.map((name) => button(name).disabled)).toEqual([true, true, true]));
+  await waitFor(() =>
+    expect(ACTIONS.map((name) => button(name).disabled)).toEqual([true, true, true]),
+  );
   pending.settle(openRouter);
   await waitFor(() => expect(button("Save").disabled).toBe(false));
 });
@@ -215,7 +225,9 @@ test("a Test in flight disables Save, Test and Remove key", async () => {
 
   await userEvent.click(button("Test"));
 
-  await waitFor(() => expect(ACTIONS.map((name) => button(name).disabled)).toEqual([true, true, true]));
+  await waitFor(() =>
+    expect(ACTIONS.map((name) => button(name).disabled)).toEqual([true, true, true]),
+  );
   pending.settle(probe);
   await waitFor(() => expect(button("Save").disabled).toBe(false));
 });

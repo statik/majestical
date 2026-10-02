@@ -154,6 +154,9 @@
     busy = true;
     try {
       outcome = await captionsApi.clearDescriberKey();
+      // The results and "Saved." described the config before the key went.
+      probe = null;
+      saved = false;
       succeed();
       onchanged();
     } catch (failure) {

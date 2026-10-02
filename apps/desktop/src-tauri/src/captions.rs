@@ -992,6 +992,43 @@ mod tests {
         );
     }
 
+    /// The command layer is the only caller of `env_api_key`, and no test
+    /// drives a command, so its three cases are pinned here directly.
+    #[test]
+    fn the_env_key_is_read_only_when_set_and_not_empty() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let var = majestical_describe::config::OPENROUTER_KEY_ENV;
+        // SAFETY: serialized by ENV_LOCK; no other thread reads env mid-test.
+        unsafe { std::env::set_var(var, "sk-test") };
+        let set = env_api_key();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(var, "") };
+        let empty = env_api_key();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(var) };
+        let unset = env_api_key();
+
+        assert_eq!(
+            (set.as_deref(), empty, unset),
+            (Some("sk-test"), None, None)
+        );
+    }
+
+    /// The hand-written `Debug` must still describe the request — a mutant
+    /// that renders nothing would pass a "no key in the output" check.
+    #[test]
+    fn a_save_request_debugs_with_its_key_redacted() {
+        let rendered = format!(
+            "{:?}",
+            save_req(DescriberBackend::OpenRouter, Some("sk-test"))
+        );
+        assert!(rendered.starts_with("SaveDescriberReq"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("sk-test"), "{rendered}");
+    }
+
     /// No network: an unconfigured catalog is refused before any request.
     #[test]
     fn test_describer_without_a_describer_is_an_error() {

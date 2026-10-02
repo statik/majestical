@@ -9,6 +9,7 @@
 //! `*_impl` (the path `tests/commands.rs` uses) — there is nothing private
 //! to round-trip through a service call for.
 use majestical_core::event::{AssetId, VerifyOutcome};
+use majestical_describe::BackendKind;
 use majestical_desktop::captions::{DescriberProbeOutcome, DescriberSettingsOutcome};
 use majestical_desktop::commands::{AppStatus, CommandError, MountedRoot, SavedSearches};
 use majestical_desktop::indexer::SchedulerStateOutcome;
@@ -751,7 +752,7 @@ fn scheduler_state_held_fixture() {
 fn describer_settings_fixture() {
     let settings = DescriberSettingsOutcome {
         describer: Some(DescriberConfigView {
-            backend: "open-router".to_string(),
+            backend: BackendKind::OpenRouter.as_str().to_string(),
             base_url: "https://openrouter.ai/api".to_string(),
             model: "google/gemini-2.5-flash".to_string(),
             key_source: KeySource::Keychain,

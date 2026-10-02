@@ -19,6 +19,9 @@
 //! The cross-binary tests need a built `maj`: `just gui-test` builds one and
 //! points `MAJ_BIN` at it. Without it they skip loudly rather than failing,
 //! the same rule `services_parity.rs` follows for `/tmp/maj-ref`.
+use majestical_desktop::captions::{
+    DescriberKeyCache, KeyRefresh, describer_settings_impl, refresh_key,
+};
 use majestical_desktop::commands::{CatalogCfg, initialize_catalog_impl, search_assets_impl};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -552,9 +555,9 @@ fn doctor_matches_cli_json() {
         // key cache the setup hook filled. No environment key and no real
         // store on either side — `Maj::run` strips both from the child —
         // so both binaries report the same absent key.
-        let cache = majestical_desktop::captions::DescriberKeyCache::default();
-        majestical_desktop::captions::refresh_key(
-            &majestical_desktop::captions::KeyRefresh {
+        let cache = DescriberKeyCache::default();
+        refresh_key(
+            &KeyRefresh {
                 cache: &cache,
                 store: &majestical_secrets::MemoryKeyStore::default(),
                 env: None,
@@ -610,17 +613,16 @@ fn describer_settings_matches_cli_show() {
         );
 
         let store = majestical_secrets::PanickingKeyStore;
-        let cache = majestical_desktop::captions::DescriberKeyCache::default();
-        majestical_desktop::captions::refresh_key(
-            &majestical_desktop::captions::KeyRefresh {
+        let cache = DescriberKeyCache::default();
+        refresh_key(
+            &KeyRefresh {
                 cache: &cache,
                 store: &store,
                 env: None,
             },
             Some(&cfg),
         );
-        let outcome = majestical_desktop::captions::describer_settings_impl(&cfg, &cache, &store)
-            .expect("command");
+        let outcome = describer_settings_impl(&cfg, &cache, &store).expect("command");
         let view = serde_json::to_value(&outcome.describer).expect("serialize view");
         assert_eq!(view["backend"], serde_json::json!("ollama"), "{view}");
         assert_eq!(view["model"], serde_json::json!("llava"), "{view}");

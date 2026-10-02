@@ -323,9 +323,9 @@ mod tests {
         let manifest = load_manifest(dir.path()).expect("load").expect("present");
         assert_eq!(manifest.contributor, "dana");
         let check = check_files(dir.path(), &manifest).expect("check");
-        assert!(check.waiting.is_empty());
-        assert!(check.unlisted.is_empty());
-        assert!(check.refused.is_empty());
+        assert!(check.waiting.is_empty(), "{:?}", check.waiting);
+        assert!(check.unlisted.is_empty(), "{:?}", check.unlisted);
+        assert!(check.refused.is_empty(), "{:?}", check.refused);
     }
 
     #[test]

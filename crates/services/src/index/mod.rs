@@ -669,7 +669,7 @@ mod tests {
         let plan_none = WorkPlan::default();
         let notices = crate::notices::Notices::new();
         push_platform_unavailable_notices(&plan_none, &notices);
-        assert!(notices.drain().is_empty());
+        assert!(notices.drain().is_empty(), "{:?}", notices.drain());
     }
 
     /// Phase 7C Task 9 clause (c), macOS shape: an online image and an

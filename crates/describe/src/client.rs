@@ -534,7 +534,7 @@ mod tests {
             .suggest_tags(TagSubject::Captions(&captions), &[])
             .expect("suggest_tags");
 
-        assert!(suggestions.is_empty());
+        assert!(suggestions.is_empty(), "{suggestions:?}");
         mock.assert_calls(1);
     }
 
@@ -572,12 +572,6 @@ mod tests {
     }
 
     #[test]
-    // f64::clamp returns the bound itself (no arithmetic), so 1.0/0.0 here
-    // are exact, not the result of computation clippy::float_cmp guards against.
-    #[expect(
-        clippy::float_cmp,
-        reason = "clamp returns the exact bound, not a computed float"
-    )]
     fn suggest_tags_clamps_confidence_to_unit_interval() {
         let server = MockServer::start();
         let response = serde_json::json!({

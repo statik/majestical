@@ -1344,8 +1344,12 @@ mod semantic_tests {
 
     #[test]
     fn rrf_merge_of_no_lists_or_only_empty_lists_is_empty() {
-        assert!(rrf_merge(&[], 10).is_empty());
-        assert!(rrf_merge(&[vec![], vec![]], 10).is_empty());
+        assert!(rrf_merge(&[], 10).is_empty(), "{:?}", rrf_merge(&[], 10));
+        assert!(
+            rrf_merge(&[vec![], vec![]], 10).is_empty(),
+            "{:?}",
+            rrf_merge(&[vec![], vec![]], 10)
+        );
     }
 
     #[test]
@@ -1639,7 +1643,7 @@ mod semantic_tests {
     #[test]
     fn dedupe_hits_on_no_hits_is_empty() {
         let (ranked, keyframe_ts) = dedupe_hits(Vec::new());
-        assert!(ranked.is_empty());
+        assert!(ranked.is_empty(), "{ranked:?}");
         assert!(keyframe_ts.is_empty());
     }
 

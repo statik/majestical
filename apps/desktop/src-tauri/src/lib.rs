@@ -97,11 +97,6 @@ pub fn run() {
         clippy::expect_used,
         reason = "no recovery exists if the shell cannot start"
     )]
-    #[expect(
-        clippy::exit,
-        reason = "tauri::generate_context! expands to a process::exit for a malformed \
-                  context; the call is inside the macro, not ours to restructure"
-    )]
     builder
         .manage(commands::AppState(std::sync::RwLock::new(None)))
         // The one in-flight ingest run. Managed state, not webview state:

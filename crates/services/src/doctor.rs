@@ -763,7 +763,7 @@ mod tests {
         let missing = PathBuf::from("/definitely/not/a/real/maj/catalog/path-xyz");
         let check = check_failed_items(Some(&missing), &Notices::new());
         assert_eq!(check.status, CheckStatus::Fail);
-        assert!(!check.detail.is_empty());
+        assert!(!check.detail.is_empty(), "check.detail is empty");
         assert_eq!(check.remedy.as_deref(), Some("see the state_dir row"));
     }
 

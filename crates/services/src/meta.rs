@@ -149,7 +149,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (app, asset) = seeded_app(dir.path());
         let outcome = meta_get(&app, &asset.0, Some("missing")).expect("meta_get");
-        assert!(outcome.fields.is_empty());
+        assert!(outcome.fields.is_empty(), "{:?}", outcome.fields);
     }
 
     #[test]

@@ -2697,7 +2697,11 @@ mod tests {
     /// list — never the first twelve.
     #[test]
     fn select_described_timestamps_keeps_short_lists_and_samples_long_ones() {
-        assert!(select_described_timestamps(&[]).is_empty());
+        assert!(
+            select_described_timestamps(&[]).is_empty(),
+            "{:?}",
+            select_described_timestamps(&[])
+        );
 
         let short: Vec<u64> = (0..5).map(|i| i * 1000).collect();
         assert_eq!(select_described_timestamps(&short), short);
@@ -2907,14 +2911,22 @@ mod tests {
         let outcome = run(&app, &root, &req).expect("run");
 
         assert_eq!(outcome.thumbs.written, 0);
-        assert!(outcome.thumbs.failed.is_empty());
+        assert!(
+            outcome.thumbs.failed.is_empty(),
+            "{:?}",
+            outcome.thumbs.failed
+        );
         assert_eq!(outcome.embed.written, 0);
         assert_eq!(outcome.keyframes.videos_done, 0);
         assert_eq!(outcome.transcribe.written, 0);
         assert_eq!(outcome.ocr.images_written, 0);
         assert_eq!(outcome.pdf.written, 0);
         assert_eq!(outcome.captions.written, 0);
-        assert!(outcome.transcript_failures().is_empty());
+        assert!(
+            outcome.transcript_failures().is_empty(),
+            "{:?}",
+            outcome.transcript_failures()
+        );
 
         // A second pass over the same catalog stays clean — the heal step
         // and blob↔Lance diffs are all no-ops with nothing to heal/load.
@@ -3203,7 +3215,11 @@ mod tests {
         };
         let outcome = run(&app, &root, &req).expect("run");
         assert_eq!(outcome.thumbs.written, 0);
-        assert!(outcome.thumbs.failed.is_empty());
+        assert!(
+            outcome.thumbs.failed.is_empty(),
+            "{:?}",
+            outcome.thumbs.failed
+        );
     }
 
     #[test]

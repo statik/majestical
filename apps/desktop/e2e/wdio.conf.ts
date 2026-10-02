@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -32,6 +33,32 @@ type TauriCapability = WebdriverIO.Capabilities & {
 type Config = Omit<WebdriverIO.Config, "capabilities"> & {
   capabilities: TauriCapability[];
 };
+
+// The app under test and every `maj` the fixture setup runs would otherwise
+// read and write the developer's REAL login-Keychain item. Each run gets its
+// own throwaway service instead, under the same `majestical-test-` prefix the
+// Rust test guards insist on (crates/secrets/src/system.rs). The tauri-service
+// spawns the app with `{ ...process.env, ...options.env }` from this launcher
+// process, so an ambient key can only be kept out by deleting it here.
+const KEYCHAIN_SERVICE_ENV = "MAJ_KEYCHAIN_SERVICE";
+const OPENROUTER_KEY_ENV = "MAJ_OPENROUTER_KEY";
+const THROWAWAY_KEYCHAIN_PREFIX = "majestical-test-";
+
+/** Points this launcher (and so the app and the fixture's `maj` children
+ *  it spawns) at a throwaway Keychain service and drops an inherited
+ *  OpenRouter key. Throws rather than launch with anything else. */
+function isolateKeychain(): string {
+  const service = `${THROWAWAY_KEYCHAIN_PREFIX}e2e-${String(process.pid)}-${randomUUID()}`;
+  process.env[KEYCHAIN_SERVICE_ENV] = service;
+  delete process.env[OPENROUTER_KEY_ENV];
+  if (!process.env[KEYCHAIN_SERVICE_ENV]?.startsWith(THROWAWAY_KEYCHAIN_PREFIX)) {
+    throw new Error(`refusing to launch: ${KEYCHAIN_SERVICE_ENV} is not a throwaway service`);
+  }
+  if (process.env[OPENROUTER_KEY_ENV] !== undefined) {
+    throw new Error(`refusing to launch: ${OPENROUTER_KEY_ENV} is still set`);
+  }
+  return service;
+}
 
 // Explicit order, ingest LAST: an ingest run appends immutable events (two
 // new assets, a new volume for the destination) that `volumes.e2e.ts`'s
@@ -116,6 +143,7 @@ export const config: Config = {
         `spec files on disk [${onDisk.join(", ")}] differ from wdio.conf.ts's list [${listed.join(", ")}]`,
       );
     }
+    const keychainService = isolateKeychain();
     const fixture = await setupFixtureCatalog(repoRoot);
     process.env[FIXTURE_ENV_VAR] = JSON.stringify(fixture);
 
@@ -127,6 +155,7 @@ export const config: Config = {
       env: {
         MAJ_DESKTOP_CONFIG_DIR: fixture.configDir,
         MAJ_STATE_DIR: fixture.stateDir,
+        [KEYCHAIN_SERVICE_ENV]: keychainService,
       },
     };
   },

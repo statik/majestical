@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(cursors2[0].offset > cursors[0].offset);
         let (empty, cursors3) = log.read_since_reporting(&cursors2, |_| {}).expect("read");
-        assert!(empty.is_empty());
+        assert!(empty.is_empty(), "{empty:?}");
         assert_eq!(cursors2, cursors3);
     }
 

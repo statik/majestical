@@ -847,7 +847,7 @@ mod tests {
         .expect("plan");
         assert_eq!(outcome.subdir, "Projects/client-x/raw");
         assert_eq!(outcome.plan.files.len(), 1);
-        assert!(!outcome.node_id.is_empty());
+        assert!(!outcome.node_id.is_empty(), "outcome.node_id is empty");
     }
 
     #[test]
@@ -886,7 +886,7 @@ mod tests {
         )
         .expect("run_ingest");
         assert_eq!(run.outcome.placed.len(), 1);
-        assert!(run.outcome.failed.is_empty());
+        assert!(run.outcome.failed.is_empty(), "{:?}", run.outcome.failed);
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains(&run.run_id));
         assert!(notices[0].contains("--resume"));

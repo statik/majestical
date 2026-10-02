@@ -478,6 +478,6 @@ mod describer_tests {
         let tags = describer
             .suggest_tags(TagSubject::Image(b"bytes"), &[])
             .expect("suggest_tags");
-        assert!(tags.is_empty());
+        assert!(tags.is_empty(), "{tags:?}");
     }
 }

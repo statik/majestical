@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn resolve_never_panics_on_a_missing_path() {
         let identity = resolve(Path::new("/definitely/does/not/exist/anywhere"));
-        assert!(!identity.id.is_empty());
-        assert!(!identity.label.is_empty());
+        assert!(!identity.id.is_empty(), "identity.id is empty");
+        assert!(!identity.label.is_empty(), "identity.label is empty");
     }
 }

@@ -1241,7 +1241,7 @@ mod organize_tests {
         tag_add(&mut app, &asset_id(0).0, "x").expect("add");
         let err = tag_rename(&mut app, "x", "x").expect_err("must fail");
         assert!(err.to_string().contains("two different names"));
-        assert!(renames(&app).is_empty());
+        assert!(renames(&app).is_empty(), "{:?}", renames(&app));
     }
 
     #[test]
@@ -1271,7 +1271,7 @@ mod organize_tests {
         let err = tag_merge(&mut app, "a", "b").expect_err("must fail");
         let message = err.to_string();
         assert!(message.contains("maj tag rename"), "{message}");
-        assert!(renames(&app).is_empty());
+        assert!(renames(&app).is_empty(), "{:?}", renames(&app));
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ mod organize_tests {
         tag_add(&mut app, &asset_id(0).0, "a").expect("add");
         let err = tag_merge(&mut app, "a", "a").expect_err("must fail");
         assert!(err.to_string().contains("two different tags"));
-        assert!(renames(&app).is_empty());
+        assert!(renames(&app).is_empty(), "{:?}", renames(&app));
     }
 
     #[test]
@@ -1333,7 +1333,7 @@ mod organize_tests {
         let mut app = seeded_app(dir.path(), 1);
         let err = tags_assign(&mut app, &[], &["x".to_string()]).expect_err("must fail");
         assert!(err.to_string().contains("non-empty"), "{err}");
-        assert!(adds(&app).is_empty());
+        assert!(adds(&app).is_empty(), "{:?}", adds(&app));
     }
 
     #[test]
@@ -1342,7 +1342,7 @@ mod organize_tests {
         let mut app = seeded_app(dir.path(), 1);
         let err = tags_assign(&mut app, &[asset_id(0).0.clone()], &[]).expect_err("must fail");
         assert!(err.to_string().contains("non-empty"), "{err}");
-        assert!(adds(&app).is_empty());
+        assert!(adds(&app).is_empty(), "{:?}", adds(&app));
     }
 
     /// The all-failed policy: when EVERY requested asset fails, there is no

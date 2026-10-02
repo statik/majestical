@@ -591,7 +591,7 @@ mod para_file_tests {
         add(&mut app, "project", "client-x").expect("add node");
         let err = para_file(&mut app, &[], "project/client-x").expect_err("must fail");
         assert!(err.to_string().contains("non-empty"), "{err}");
-        assert!(para_sets(&app).is_empty());
+        assert!(para_sets(&app).is_empty(), "{:?}", para_sets(&app));
     }
 
     /// The all-failed policy: when EVERY requested asset fails, there is no

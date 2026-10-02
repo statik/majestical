@@ -395,7 +395,7 @@ fn volumes_list_shows_auto_detected_volume() {
     let volumes = parsed["volumes"].as_array().unwrap();
     assert_eq!(volumes.len(), 1);
     let id = volumes[0]["id"].as_str().unwrap();
-    assert!(!id.is_empty());
+    assert!(!id.is_empty(), "id is empty");
     assert!(
         id.starts_with("uuid:") || id.starts_with("label:"),
         "expected an auto-detected id prefix, got {id}"

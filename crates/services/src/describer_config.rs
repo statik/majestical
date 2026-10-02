@@ -1214,7 +1214,11 @@ mod tests {
 
         assert_eq!(probe.key, KeyCheck::NotChecked);
         key.assert_calls(0);
-        assert!(key_notices(&notices).is_empty());
+        assert!(
+            key_notices(&notices).is_empty(),
+            "{:?}",
+            key_notices(&notices)
+        );
     }
 
     /// A key endpoint that answers neither success nor 401 judged nothing:
@@ -1262,7 +1266,11 @@ mod tests {
 
         assert_eq!(probe.key, KeyCheck::Missing);
         key.assert_calls(0);
-        assert!(key_notices(&notices).is_empty());
+        assert!(
+            key_notices(&notices).is_empty(),
+            "{:?}",
+            key_notices(&notices)
+        );
     }
 
     fn key_notices(notices: &Notices) -> Vec<String> {

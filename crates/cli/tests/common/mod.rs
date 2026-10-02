@@ -264,7 +264,11 @@ mod tests {
     #[test]
     fn walkdir_find_returns_empty_when_name_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(walkdir_find(dir.path(), "no-such-file").is_empty());
+        assert!(
+            walkdir_find(dir.path(), "no-such-file").is_empty(),
+            "{:?}",
+            walkdir_find(dir.path(), "no-such-file")
+        );
     }
 
     // Gives every binary compiling this module a real call site for

@@ -593,7 +593,7 @@ fn app_status_reports_no_catalog_then_missing_then_ready() {
         let dir = tempfile::tempdir().expect("tempdir");
         let none = app_status_impl(None);
         assert!(!none.catalog_ready);
-        assert!(none.catalog_path.is_empty());
+        assert!(none.catalog_path.is_empty(), "{:?}", none.catalog_path);
 
         let cfg = cfg_for(dir.path());
         assert!(!app_status_impl(Some(&cfg)).catalog_ready);
@@ -1124,7 +1124,10 @@ fn assign_tags_applies_every_pair_and_reports_an_unknown_asset() {
         );
         assert_eq!(outcome.failed.len(), 1);
         assert_eq!(outcome.failed[0].asset, "xxh3:never-scanned");
-        assert!(!outcome.failed[0].reason.is_empty());
+        assert!(
+            !outcome.failed[0].reason.is_empty(),
+            "outcome.failed[0].reason is empty"
+        );
     });
 }
 
@@ -1197,7 +1200,7 @@ fn para_add_rename_list_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = browse_cfg_with_assets(dir.path(), 0);
         let node = add_para_node_impl(&cfg, "project", "client-x").expect("add node");
-        assert!(!node.is_empty());
+        assert!(!node.is_empty(), "node is empty");
 
         rename_para_node_impl(&cfg, &node, "client-y").expect("rename node");
 
@@ -1341,7 +1344,10 @@ fn the_root_volumes_label_is_the_shared_root_label() {
 /// nonsensical — so the hostname fallback has to produce something.
 #[test]
 fn machine_identity_is_never_empty() {
-    assert!(!majestical_desktop::commands::machine_identity().is_empty());
+    assert!(
+        !majestical_desktop::commands::machine_identity().is_empty(),
+        "majestical_desktop::commands::machine_identity() is empty"
+    );
 }
 
 #[test]
@@ -1576,7 +1582,7 @@ fn plan_ingest_counts_every_file_it_walked() {
         .expect("plan_ingest");
         assert_eq!(planned.plan.files.len(), 3);
         assert_eq!(planned.subdir, "Projects/client-x/raw");
-        assert!(!planned.node_id.is_empty());
+        assert!(!planned.node_id.is_empty(), "planned.node_id is empty");
     });
 }
 

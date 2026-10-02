@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn empty_transcript_yields_no_chunks() {
-        assert!(chunk_segments(&[]).is_empty());
+        assert!(chunk_segments(&[]).is_empty(), "{:?}", chunk_segments(&[]));
     }
 
     proptest! {

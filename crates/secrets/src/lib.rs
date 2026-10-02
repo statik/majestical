@@ -354,6 +354,7 @@ mod tests {
         ));
         assert!(matches!(store.delete(), Err(SecretError::Unsupported)));
     }
+
     // `PanickingKeyStore` is how three crates' tests assert a store was never
     // touched, so a passing suite never calls it. These pin that it still
     // panics, and that it claims support — a store that reported itself

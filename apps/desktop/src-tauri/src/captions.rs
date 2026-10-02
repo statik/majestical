@@ -992,8 +992,9 @@ mod tests {
         );
     }
 
-    /// The command layer is the only caller of `env_api_key`, and no test
-    /// drives a command, so its three cases are pinned here directly.
+    /// Only the command layer reaches `env_api_key` (through
+    /// `KeyRefresh::ambient`), and no test drives a command, so its three
+    /// cases are pinned here directly.
     #[test]
     fn the_env_key_is_read_only_when_set_and_not_empty() {
         let _guard = ENV_LOCK

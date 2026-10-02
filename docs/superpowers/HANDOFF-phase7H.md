@@ -227,7 +227,8 @@ Carried from the 7G handoffs:
    found by a reviewer reproducing it on the wire rather than reading the
    code. Do not shortcut it.
 2. **Merge as you go**: chunk PRs (1-2 tasks each), squash-merge after CI
-   is green (including `gui-e2e`, by convention). Never push to main
+   is green (including `gui-e2e`, by convention), without asking per PR
+   (the user's standing instruction). Never push to main
    directly. **Never `gh pr merge --auto`** — on this repo it merges
    immediately; watch the checks, then merge explicitly.
 3. **NO Claude-Session trailers or session links in commit messages**
@@ -273,7 +274,8 @@ Carried from the 7G handoffs:
     with the verdict and anything that went wrong. A promised follow-up
     may never arrive — chase it. Consider `model: opus` or `sonnet`
     explicitly when dispatching (credits for one model ran out mid-phase
-    and an implementer died with its work uncommitted).
+    and an implementer died with its work uncommitted). Tell implementers
+    to use narrow, crate-scoped commands.
 13. **Give each agent uniquely named scratch files.** Two agents sharing
     one scratchpad collided once (a reviewer's script was overwritten).
 14. **`origin/main` goes stale** in this SSH-less checkout. Fetch/pull

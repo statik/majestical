@@ -2243,7 +2243,8 @@ this phase (every parity row uses Ollama with no key), so there was none
 to delete. The `sk-` scan (`rg -n "sk-" --glob '!*.md' .`) finds only
 `sk-test`, `sk-test-2`, the `sk-or-…` placeholder, and literals predating
 7G (`sk-env`, `sk-file`, `sk-SUPERSECRET` from #130; `sk-secret` from
-#42; a `sk-…` doc comment; the non-UTF-8 byte test in `system.rs`).
+#43; a `sk-…` doc comment; the non-UTF-8 byte test in `system.rs`), plus
+two non-key substrings (`mask-image`, `disk-for-clip`).
 
 ## Phase 7F deferrals
 

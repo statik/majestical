@@ -1343,3 +1343,75 @@ main > .error {
 .settings-failed {
   color: var(--attention);
 }
+
+/* Captions (`CaptionsSection.svelte`): the describer form. Rules copied
+   from the approved mockup
+   (`docs/superpowers/specs/mockups/2026-09-18-phase7g/captions-section.html`). */
+.captions-form {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+  margin-top: 0.25rem;
+}
+
+.captions-form label {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.captions-form input,
+.captions-form select {
+  width: 100%;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.captions-key-status {
+  grid-column: 2;
+  margin: -0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.captions-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.captions-actions .spacer {
+  flex: 1;
+}
+
+.captions-saved {
+  color: var(--ok);
+  font-size: 0.8rem;
+}
+
+.captions-results {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.85rem;
+}
+
+.captions-results li {
+  padding: 0.15rem 0;
+}
+
+.captions-results .good::before {
+  content: "✓ ";
+  color: var(--ok);
+}
+
+.captions-results .bad::before {
+  content: "✕ ";
+  color: var(--alert);
+}

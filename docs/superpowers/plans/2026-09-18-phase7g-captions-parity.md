@@ -1377,7 +1377,7 @@ export function testLines(probe: DescriberProbeOutcome): TestLine[] {
 The two base URLs duplicated here must equal
 `BackendKind::default_base_url()`: `captions-status.test.ts` pins them
 against the Rust-generated `describer_settings.json` fixture for
-OpenRouter, and a comment names `crates/describe/src/config.rs:18` for the
+OpenRouter, and a comment names `crates/describe/src/config.rs:37` for the
 other two.
 
 The component — behavior, in the order the tests below pin it:

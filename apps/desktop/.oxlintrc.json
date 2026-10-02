@@ -92,38 +92,40 @@
     },
     {
       // A suite's length tracks how many behaviours it pins, not how
-      // complicated any of them is, and both of these are already split by
-      // subject: the shell and the Ingest setup board, beside a live-run
-      // suite (225 lines) and an outcome suite (243) that are under the
-      // default and stay there. Raised again for phase 7E: the shell suite
-      // (376 lines) picked up `ALWAYS_ON`, the two commands every Settings
-      // mount now needs mocked (`AlwaysOnSection` mounts alongside the
-      // health panel and asks `scheduler_state`/`plugin:autostart|
-      // is_enabled` on mount) — not a new subject, just the existing
-      // Settings-surface test paying for a sibling component's mount
-      // effects. The cap sits just above that, so the next subject still
-      // gets its own file — which is what keeps them findable — rather
-      // than being folded in here. Next raise is refused: the two
-      // Settings-shell tests ("the settings surface swaps in with the
-      // doctor's health rows" and "the tray's navigate-settings event
-      // selects the Settings surface") move to their own
-      // `src/App.settings.test.ts` instead.
-      "files": ["src/App.test.ts", "src/lib/IngestView.test.ts"],
+      // complicated any of them is. `IngestView.test.ts` is the Ingest
+      // setup board's suite, already split by subject: a live-run suite
+      // (225 lines) and an outcome suite (243) sit beside it under the
+      // default and stay there. The cap sits just above it, so the next
+      // subject gets its own file — which is what keeps them findable —
+      // rather than being folded in here.
+      "files": ["src/lib/IngestView.test.ts"],
       "rules": {
         "max-lines": ["warn", { "max": 385 }]
       }
     },
     {
-      // `ALWAYS_ON`'s `scheduler_state` mock reuses `scheduler_state.json`
-      // (also imported by `AlwaysOnSection.test.ts` and `fixtures.test.ts`)
-      // rather than inlining a third copy of the wire shape, which is the
-      // one dependency over the default here. Raised by one more for phase
-      // 7F's api.ts split: `NAVIGATE_SETTINGS_EVENT` now comes from its own
-      // `api-alwayson.ts` module alongside `./lib/api`. Same next-split
-      // plan as the `max-lines` override above: the two Settings-shell
-      // tests move to `src/App.settings.test.ts`, taking this import with
-      // them.
+      // The shell suite: one test per surface the sidebar swaps in, plus
+      // the first-run, startup-failure and inspector rules that span
+      // surfaces. Its Settings tests live in `src/App.settings.test.ts`,
+      // which carries the mocks every Settings section needs on mount, so
+      // this file mocks none of them. The cap sits at the file's length
+      // rounded up to the next 5: the next subject gets its own file.
       "files": ["src/App.test.ts"],
+      "rules": {
+        "max-lines": ["warn", { "max": 320 }]
+      }
+    },
+    {
+      // `App.settings.test.ts` mounts the whole shell and then Settings,
+      // whose three sections each ask the backend something on mount; it
+      // answers them from the committed fixtures (`doctor_outcome`,
+      // `describer_settings_unconfigured`, `scheduler_state`) rather than
+      // inlining more copies of the wire shapes, and reaches the tray's
+      // event through `api-alwayson.ts`. That is the two dependencies over
+      // the default. This is the cap `App.test.ts` carried before these
+      // tests moved here, at the same value; that file is now under the
+      // default and has no override.
+      "files": ["src/App.settings.test.ts"],
       "rules": {
         "import/max-dependencies": ["warn", { "max": 12 }]
       }
